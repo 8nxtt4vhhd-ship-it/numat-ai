@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+venv/
+backend/.env
+backend/venv/
+backend/__pycache__/
+backend/data/filemaker_crm_cache.json
+backend/data/*.csv
