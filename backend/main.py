@@ -5,6 +5,7 @@ from html import escape
 from html.parser import HTMLParser
 import os
 import secrets
+from threading import Lock, Thread
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Request, UploadFile
@@ -44,6 +45,16 @@ from filemaker import (
 
 app = FastAPI()
 
+CRM_SYNC_STATUS_LOCK = Lock()
+CRM_SYNC_STATUS = {
+    "running": False,
+    "started_at": "",
+    "finished_at": "",
+    "status": "",
+    "saved": False,
+    "message": "",
+}
+
 
 PREVIEW_AUTH_EXEMPT_PATHS = {
     "/health",
@@ -75,6 +86,61 @@ def unauthorized_preview_response():
         status_code=401,
         headers={"WWW-Authenticate": 'Basic realm="Numat AI Preview"'},
     )
+
+
+def get_crm_sync_status():
+    with CRM_SYNC_STATUS_LOCK:
+        return dict(CRM_SYNC_STATUS)
+
+
+def update_crm_sync_status(**updates):
+    with CRM_SYNC_STATUS_LOCK:
+        CRM_SYNC_STATUS.update(updates)
+
+
+def run_crm_sync_in_background():
+    started_at = format_optional_datetime(datetime.now())
+    update_crm_sync_status(
+        running=True,
+        started_at=started_at,
+        finished_at="",
+        status="running",
+        saved=False,
+        message="Full CRM sync started. You can keep using the app while it runs.",
+    )
+
+    try:
+        result = sync_filemaker_crm_cache()
+        finished_at = format_optional_datetime(datetime.now())
+
+        if result.get("status") == "ok":
+            update_crm_sync_status(
+                running=False,
+                finished_at=finished_at,
+                status="ok",
+                saved=True,
+                message="Full CRM sync completed and the hosted cache was refreshed.",
+            )
+        else:
+            update_crm_sync_status(
+                running=False,
+                finished_at=finished_at,
+                status=result.get("status", "error"),
+                saved=False,
+                message=(
+                    "Full CRM sync did not complete. "
+                    f"Latest status: {result.get('status', 'error')}."
+                ),
+            )
+    except Exception as exc:
+        finished_at = format_optional_datetime(datetime.now())
+        update_crm_sync_status(
+            running=False,
+            finished_at=finished_at,
+            status="error",
+            saved=False,
+            message=f"Full CRM sync failed: {str(exc)}",
+        )
 
 
 @app.middleware("http")
@@ -314,9 +380,24 @@ async def upload_crm_data(file: UploadFile = File(...)):
 
 @app.post("/crm-sync-full", response_class=HTMLResponse)
 def post_crm_sync_full():
-    result = sync_filemaker_crm_cache()
-    result["saved"] = result.get("status") == "ok"
-    return render_crm_data_page(sync_result=result)
+    sync_status = get_crm_sync_status()
+
+    if not sync_status.get("running"):
+        worker = Thread(target=run_crm_sync_in_background, daemon=True)
+        worker.start()
+        sync_result = {
+            "status": "started",
+            "saved": False,
+            "message": "Full CRM sync started in the background.",
+        }
+    else:
+        sync_result = {
+            "status": "running",
+            "saved": False,
+            "message": "A full CRM sync is already running.",
+        }
+
+    return render_crm_data_page(sync_result=sync_result)
 
 
 def render_home_page():
@@ -2919,6 +3000,7 @@ def render_crm_data_page(upload_result=None, sync_result=None):
     current_path = get_crm_sample_csv_path()
     uploaded_path = get_uploaded_crm_csv_path()
     sync_cache_path = get_filemaker_crm_cache_path()
+    background_sync_status = get_crm_sync_status()
     active_result = fetch_crm_activities()
     order_result = get_orders_for_analysis()
     status = sync_result or upload_result or validation
@@ -2972,7 +3054,12 @@ def render_crm_data_page(upload_result=None, sync_result=None):
 
     message = ""
     if sync_result:
-        if sync_result.get("saved"):
+        if sync_result.get("status") in ["started", "running"]:
+            message = (
+                "<p class='status'>Full CRM sync is running in the background. "
+                "You can refresh this page in a minute or two to check progress.</p>"
+            )
+        elif sync_result.get("saved"):
             message = (
                 "<p class='status success'>Full CRM sync completed and the local cache was refreshed.</p>"
             )
@@ -2991,6 +3078,14 @@ def render_crm_data_page(upload_result=None, sync_result=None):
                 "<p class='status error'>Upload was not saved. "
                 "Fix the issues below and try again.</p>"
             )
+
+    if not message and background_sync_status.get("running"):
+        message = (
+            "<p class='status'>Full CRM sync is running in the background. "
+            "You can keep using the app while it finishes.</p>"
+        )
+
+    sync_status_panel = render_crm_sync_status_panel(background_sync_status)
 
     body = f"""
         {message}
@@ -3054,9 +3149,13 @@ def render_crm_data_page(upload_result=None, sync_result=None):
                 and save a fast local cache for the app to use.
             </p>
             <form class="upload-form" method="post" action="/crm-sync-full">
-                <button type="submit">Sync Full CRM from FileMaker</button>
+                <button type="submit" {"disabled" if background_sync_status.get("running") else ""}>
+                    {"Sync Running..." if background_sync_status.get("running") else "Sync Full CRM from FileMaker"}
+                </button>
             </form>
         </section>
+
+        {sync_status_panel}
 
         <section class="panel">
             <h2>Upload CRM CSV</h2>
@@ -3085,6 +3184,39 @@ def render_crm_data_page(upload_result=None, sync_result=None):
     """
 
     return render_page(title="CRM Data", body=body)
+
+
+def render_crm_sync_status_panel(sync_status):
+    if not sync_status.get("status") and not sync_status.get("running"):
+        return ""
+
+    tone = "success" if sync_status.get("saved") else ("error" if sync_status.get("status") == "error" else "")
+    started_at = sync_status.get("started_at") or "Not started"
+    finished_at = sync_status.get("finished_at") or ("In progress" if sync_status.get("running") else "Not finished")
+    state_label = "Running" if sync_status.get("running") else (
+        "Completed" if sync_status.get("saved") else sync_status.get("status", "Idle").replace("_", " ").title()
+    )
+
+    return f"""
+        <section class="panel">
+            <h2>Sync Status</h2>
+            <div class="summary">
+                <div>
+                    <span class="label">State</span>
+                    <strong>{escape(state_label)}</strong>
+                </div>
+                <div>
+                    <span class="label">Started</span>
+                    <strong>{escape(started_at)}</strong>
+                </div>
+                <div>
+                    <span class="label">Finished</span>
+                    <strong>{escape(finished_at)}</strong>
+                </div>
+            </div>
+            <p class="status {tone}">{escape(sync_status.get("message") or "No sync activity yet.")}</p>
+        </section>
+    """
 
 
 def render_validation_panel(title, validation):
