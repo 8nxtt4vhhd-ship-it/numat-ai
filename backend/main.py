@@ -1020,6 +1020,15 @@ def build_late_customers_response():
     return build_customers_needing_attention_response()
 
 
+def should_add_ai_explanations():
+    return os.getenv("ENABLE_AI_EXPLANATIONS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def build_customers_needing_attention_response():
     order_result = get_orders_for_analysis()
 
@@ -1057,7 +1066,11 @@ def build_customers_needing_attention_response():
                 if latest_crm_activity else None
             )
 
-    late_with_explanations = add_ai_explanations(late)
+    late_with_explanations = (
+        add_ai_explanations(late)
+        if should_add_ai_explanations()
+        else late
+    )
     return {
         "source": order_result["source"],
         "status": "ok",
