@@ -1029,6 +1029,15 @@ def should_add_ai_explanations():
     }
 
 
+def should_enable_full_crm_sync():
+    return os.getenv("ENABLE_FULL_CRM_SYNC", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def build_attention_explanation(customer):
     explanation = str(customer.get("explanation", "") or "").strip()
 
@@ -3051,6 +3060,7 @@ def render_crm_data_page(upload_result=None, sync_result=None):
         if activity.get("direction") == "unknown"
     )
     crm_source = str(active_result.get("source", "")).strip().lower()
+    full_sync_enabled = should_enable_full_crm_sync()
     active_location_label = (
         "Active FileMaker Layout" if crm_source == "filemaker" else "Active CSV Path"
     )
@@ -3070,7 +3080,7 @@ def render_crm_data_page(upload_result=None, sync_result=None):
         else ""
     )
     source_note = (
-        "Live FileMaker email data is active. CSV upload remains available as a fallback."
+        "Recent live FileMaker email history is active for the hosted preview. CSV upload remains available as a fallback."
         if crm_source == "filemaker"
         else (
             "Synced full FileMaker CRM cache is active."
@@ -3112,7 +3122,33 @@ def render_crm_data_page(upload_result=None, sync_result=None):
             "You can keep using the app while it finishes.</p>"
         )
 
-    sync_status_panel = render_crm_sync_status_panel(background_sync_status)
+    sync_status_panel = render_crm_sync_status_panel(background_sync_status) if full_sync_enabled else ""
+    sync_section = (
+        f"""
+        <section class="panel">
+            <h2>Sync Full FileMaker CRM</h2>
+            <p class="muted">
+                Pull the full email table from FileMaker in batches, normalize it,
+                and save a fast local cache for the app to use.
+            </p>
+            <form class="upload-form" method="post" action="/crm-sync-full">
+                <button type="submit" {"disabled" if background_sync_status.get("running") else ""}>
+                    {"Sync Running..." if background_sync_status.get("running") else "Sync Full CRM from FileMaker"}
+                </button>
+            </form>
+        </section>
+        """
+        if full_sync_enabled else
+        """
+        <section class="panel">
+            <h2>Live CRM Preview Mode</h2>
+            <p class="muted">
+                The hosted preview is currently using recent live CRM history from FileMaker.
+                Full CRM sync is disabled here to keep the preview stable for sales reps.
+            </p>
+        </section>
+        """
+    )
 
     body = f"""
         {message}
@@ -3169,18 +3205,7 @@ def render_crm_data_page(upload_result=None, sync_result=None):
             </div>
         </div>
 
-        <section class="panel">
-            <h2>Sync Full FileMaker CRM</h2>
-            <p class="muted">
-                Pull the full email table from FileMaker in batches, normalize it,
-                and save a fast local cache for the app to use.
-            </p>
-            <form class="upload-form" method="post" action="/crm-sync-full">
-                <button type="submit" {"disabled" if background_sync_status.get("running") else ""}>
-                    {"Sync Running..." if background_sync_status.get("running") else "Sync Full CRM from FileMaker"}
-                </button>
-            </form>
-        </section>
+        {sync_section}
 
         {sync_status_panel}
 
