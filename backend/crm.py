@@ -338,14 +338,25 @@ def build_filemaker_crm_result():
 def sync_filemaker_crm_cache():
     layout = get_filemaker_emails_layout()
     batch_size = get_filemaker_crm_batch_size()
+    sort_field = get_filemaker_crm_sort_field()
     offset = 1
-    rows = []
+    activities = []
+    total_rows = 0
+    excluded_internal_only = 0
+    unknown_direction_count = 0
+    customer_keys = set()
 
     while True:
         result = fetch_layout_records(
             layout,
             limit=batch_size,
             offset=offset,
+            sort_fields=[
+                {
+                    "fieldName": sort_field,
+                    "sortOrder": "descend",
+                }
+            ] if sort_field else None,
         )
 
         if result["status"] != "ok":
@@ -355,7 +366,24 @@ def sync_filemaker_crm_cache():
             record.get("fieldData", {})
             for record in result.get("records", [])
         ]
-        rows.extend(batch_rows)
+        total_rows += len(batch_rows)
+
+        for index, row in enumerate(batch_rows, start=offset):
+            activity = normalize_crm_row(row, index=index)
+
+            if activity["exclude"]:
+                excluded_internal_only += 1
+                continue
+
+            if activity["direction"] == "unknown":
+                unknown_direction_count += 1
+
+            customer_primary_key = str(activity.get("customer_primary_key") or "").strip()
+
+            if customer_primary_key:
+                customer_keys.add(customer_primary_key)
+
+            activities.append(activity)
 
         if len(batch_rows) < batch_size:
             break
@@ -363,12 +391,21 @@ def sync_filemaker_crm_cache():
         offset += batch_size
 
     synced_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    result = build_crm_result_from_rows(
-        rows,
-        source="filemaker_sync_cache",
-        path=str(get_filemaker_crm_cache_path()),
-        synced_at=synced_at,
-    )
+    result = {
+        "source": "filemaker_sync_cache",
+        "status": "ok",
+        "path": str(get_filemaker_crm_cache_path()),
+        "activities": activities,
+        "activity_map": build_activity_map(activities),
+        "counts": {
+            "total_rows": total_rows,
+            "kept_rows": len(activities),
+            "excluded_internal_only": excluded_internal_only,
+            "customer_count": len(customer_keys),
+            "unknown_direction_count": unknown_direction_count,
+        },
+        "synced_at": synced_at,
+    }
 
     if result["status"] == "ok":
         cache_path = get_filemaker_crm_cache_path()
