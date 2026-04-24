@@ -1029,6 +1029,20 @@ def should_add_ai_explanations():
     }
 
 
+def build_attention_explanation(customer):
+    explanation = str(customer.get("explanation", "") or "").strip()
+
+    if explanation:
+        return explanation
+
+    return (
+        f"{customer.get('customer', 'This customer')} needs attention because it has been "
+        f"{customer.get('days_since_last', '0')} days since the last order, compared with "
+        f"the usual average gap of {customer.get('avg_gap', '0')} days. "
+        f"Recommended action: {customer.get('action', 'Review account')}."
+    )
+
+
 def build_customers_needing_attention_response():
     order_result = get_orders_for_analysis()
 
@@ -1096,7 +1110,7 @@ def render_late_customer_row(customer):
                     {render_activity_content_note(customer.get("display_last_contact", ""))}
                 </div>
             </td>
-            <td>{escape(str(customer["explanation"]))}</td>
+            <td>{escape(build_attention_explanation(customer))}</td>
         </tr>
     """
 
