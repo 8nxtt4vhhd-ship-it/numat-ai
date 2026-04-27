@@ -3,15 +3,19 @@ import base64
 from datetime import datetime, timedelta
 from html import escape
 from html.parser import HTMLParser
+import json
 import os
+from pathlib import Path
+import re
 import secrets
 from threading import Lock, Thread
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
 from ai import add_ai_explanations
+from ai import generate_outreach_prep
 from analysis import (
     calculate_average_gap,
     get_analysis_today,
@@ -29,9 +33,11 @@ from data_sources import (
 )
 from crm import (
     MAX_CRM_SAMPLE_ROWS,
+    extract_emails,
     fetch_crm_activities,
     get_crm_data_source,
     get_filemaker_crm_cache_path,
+    is_customer_service_activity,
     get_crm_sample_csv_path,
     get_uploaded_crm_csv_path,
     sync_filemaker_crm_cache,
@@ -55,6 +61,9 @@ CRM_SYNC_STATUS = {
     "saved": False,
     "message": "",
 }
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_ACTION_PLAN_DISMISSALS_PATH = BASE_DIR / "data" / "action_plan_dismissals.json"
 
 
 PREVIEW_AUTH_EXEMPT_PATHS = {
@@ -227,6 +236,7 @@ def get_crm_activities():
 def get_crm_activities_view(
     customer: str = "",
     direction: str = "",
+    category: str = "",
     subject: str = "",
     date_from: str = "",
     date_to: str = "",
@@ -249,6 +259,7 @@ def get_crm_activities_view(
         result["activities"],
         customer=customer,
         direction=direction,
+        category=category,
         subject=subject,
         date_from=date_from,
         date_to=date_to,
@@ -268,6 +279,7 @@ def get_crm_activities_view(
     has_active_filters = any([
         customer.strip(),
         direction.strip(),
+        category.strip(),
         subject.strip(),
         date_from.strip(),
         date_to.strip(),
@@ -291,6 +303,7 @@ def get_crm_activities_view(
         total_filtered=total_filtered,
         customer=customer,
         direction=direction,
+        category=category,
         subject=subject,
         date_from=date_from,
         date_to=date_to,
@@ -322,7 +335,7 @@ def get_crm_activities_view(
             </div>
         </div>
 
-        {render_crm_filter_form(customer, direction, subject, page_size, date_from, date_to, range_key)}
+        {render_crm_filter_form(customer, direction, category, subject, page_size, date_from, date_to, range_key)}
         {filter_summary}
 
         <div class="table-wrap tall-table crm-activities-wrap">
@@ -337,7 +350,7 @@ def get_crm_activities_view(
         </table>
         </div>
 
-        {render_crm_pagination(customer, direction, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered)}
+        {render_crm_pagination(customer, direction, category, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered)}
     """
 
     return render_page(title="CRM Activities", body=body)
@@ -403,6 +416,26 @@ def post_crm_sync_full():
     return render_crm_data_page(sync_result=sync_result)
 
 
+@app.post("/action-plan-dismiss")
+def post_action_plan_dismiss(
+    customer: str = Form(...),
+    last_order: str = Form(""),
+    reason: str = Form(""),
+    return_to: str = Form("/#action-plan"),
+):
+    dismiss_action_plan_customer(customer, last_order, reason)
+    return RedirectResponse(url=return_to or "/#action-plan", status_code=303)
+
+
+@app.post("/action-plan-restore")
+def post_action_plan_restore(
+    customer: str = Form(...),
+    return_to: str = Form("/#action-plan"),
+):
+    restore_action_plan_customer(customer)
+    return RedirectResponse(url=return_to or "/#action-plan", status_code=303)
+
+
 def render_home_page():
     order_result = get_orders_for_analysis()
     attention_result = build_customers_needing_attention_response()
@@ -422,62 +455,14 @@ def render_home_page():
     grouped_orders = group_by_customer(orders)
     customer_count = len(group_by_customer(orders))
     recent_activity_count = count_recent_attention_activity(attention_customers)
-    action_plan = build_home_action_plan(attention_customers, grouped_orders)
+    action_plan = build_home_action_plan(
+        attention_customers,
+        grouped_orders,
+        attention_result.get("dismissed_customers", []),
+    )
 
     body = f"""
-        <section class="hero">
-            <div>
-                <p>
-                    Review customer order rhythm, spot accounts needing attention,
-                    and check recent contact before reaching out.
-                </p>
-            </div>
-        </section>
-
         {render_data_availability_banner(order_result)}
-
-        {render_dashboard_context(order_result["source"])}
-
-        <div class="summary home-summary">
-            <div>
-                <span class="label">Source</span>
-                <strong>{escape(order_result["source"])}</strong>
-            </div>
-            <div>
-                <span class="label">Orders</span>
-                <strong>{len(orders)}</strong>
-            </div>
-            <div>
-                <span class="label">Customers</span>
-                <strong>{customer_count}</strong>
-            </div>
-            <div>
-                <span class="label">Need Attention</span>
-                <strong>{len(attention_customers)}</strong>
-            </div>
-            <div>
-                <span class="label">Recently Contacted</span>
-                <strong>{recent_activity_count}</strong>
-            </div>
-        </div>
-
-        <section class="cards sales-cards">
-            <a class="nav-card" href="/customers-needing-attention-view">
-                <span class="label">Follow-up queue</span>
-                <strong>Customers Needing Attention</strong>
-                <p>Prioritized by how far each customer is beyond their usual cycle.</p>
-            </a>
-            <a class="nav-card" href="/orders-view">
-                <span class="label">Order browser</span>
-                <strong>Orders</strong>
-                <p>Filter, sort, and drill into individual customer order history.</p>
-            </a>
-            <a class="nav-card" href="/customers-view">
-                <span class="label">Customer summary</span>
-                <strong>Customers</strong>
-                <p>Compare order cycles, value, last activity, and attention status by customer.</p>
-            </a>
-        </section>
 
         {render_home_action_plan(action_plan)}
 
@@ -498,8 +483,46 @@ def render_home_page():
     return render_page(
         title="Numat AI Sales Assistant",
         body=body,
-        top_right=render_home_admin_links(),
+        show_title=False,
     )
+
+
+@app.get("/outreach-prep", response_class=HTMLResponse)
+def get_outreach_prep(customer: str):
+    order_result = get_orders_for_analysis()
+    crm_result = fetch_crm_activities()
+
+    if order_result["status"] != "ok":
+        return render_page(
+            title="Outreach Prep",
+            body=(
+                f"<p class='status error'>Could not load orders from "
+                f"{escape(order_result['source'])}: {escape(order_result['status'])}</p>"
+            ),
+        )
+
+    customer_orders = [
+        order
+        for order in order_result["orders"]
+        if str(order.get("customer", "")).lower() == str(customer).lower()
+    ]
+
+    if not customer_orders:
+        return render_page(
+            title="Outreach Prep",
+            body=f"<p class='status'>No orders found for {escape(customer)}.</p>",
+        )
+
+    attention = build_customers_needing_attention_response_map().get(customer)
+    outreach_context = build_outreach_context(customer, customer_orders, attention, crm_result)
+    outreach_result = generate_outreach_prep(outreach_context)
+    body = render_outreach_prep_page(
+        customer=customer,
+        context=outreach_context,
+        result=outreach_result,
+        data_results=[order_result, crm_result],
+    )
+    return render_page(title=f"Outreach Prep: {customer}", body=body)
 
 
 @app.get("/sample-data", response_class=HTMLResponse)
@@ -655,6 +678,8 @@ def get_customers_needing_attention_view(
 ):
     result = build_customers_needing_attention_response()
     late_customers = result["late_customers"]
+    dismissed_customers = result.get("dismissed_customers", [])
+    dismissed_customers = result.get("dismissed_customers", [])
 
     if result["status"] != "ok":
         return render_page(
@@ -744,6 +769,13 @@ def get_customers_needing_attention_view(
             <tbody>{rows}</tbody>
         </table>
         </div>
+
+        {render_dismissed_action_plan_items(
+            dismissed_customers,
+            return_to="/customers-needing-attention-view#dismissed-urgency",
+            section_id="dismissed-urgency",
+            summary_label="Dismissed urgency items",
+        )}
     """
 
     return render_page(title="Customers Needing Attention", body=body)
@@ -860,6 +892,7 @@ def get_customer_view(
     crm_limit: int = 12,
     crm_page: int = 1,
     crm_direction: str = "",
+    crm_category: str = "",
 ):
     result = get_orders_for_analysis()
     crm_result = fetch_crm_activities()
@@ -911,25 +944,18 @@ def get_customer_view(
         crm_result.get("activity_map", {}).get(customer_primary_key, [])
         if crm_result["status"] == "ok" else []
     )
+    sales_crm_activities = get_sales_outreach_activities(crm_activities)
     filtered_crm_activities = filter_customer_crm_activities(
         crm_activities,
         direction=crm_direction,
+        category=crm_category,
     )
     latest_crm_activity = crm_activities[0] if crm_activities else None
-    latest_crm_activity_date = parse_crm_datetime(
-        latest_crm_activity.get("date_created", "")
-    ) if latest_crm_activity else None
-    display_last_activity = last_activity or latest_crm_activity_date
-
-    last_activity_content = (
-        last_activity_info["content"]
-        if last_activity_info else ""
-    )
-    display_last_contact, _last_contact_source = build_last_contact_display(
-        last_activity_content,
-        latest_crm_activity,
-        crm_activities=crm_activities,
-    )
+    latest_sales_crm_activity = sales_crm_activities[0] if sales_crm_activities else None
+    latest_sales_crm_activity_date = parse_crm_datetime(
+        latest_sales_crm_activity.get("date_created", "")
+    ) if latest_sales_crm_activity else None
+    display_last_activity = last_activity or latest_sales_crm_activity_date
 
     body = f"""
         {render_data_availability_banner(result, crm_result)}
@@ -968,12 +994,6 @@ def get_customer_view(
                 <span class="label">Latest CRM Email</span>
                 <strong>{escape(format_optional_datetime(latest_crm_activity.get("date_created") if latest_crm_activity else ""))}</strong>
             </div>
-            <div class="wide-summary-item">
-                <span class="label">Last Contact</span>
-                <strong class="activity-content-summary">
-                    {escape(display_last_contact) or "Not available"}
-                </strong>
-            </div>
             <div>
                 <span class="label">Total Value</span>
                 <strong>{format_currency(total_value)}</strong>
@@ -1000,11 +1020,12 @@ def get_customer_view(
             crm_limit,
             crm_page,
             crm_direction,
+            crm_category,
             sort,
             direction,
         )}
 
-        {render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction)}
+        {render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category)}
 
         <div class="table-wrap tall-table">
         <table>
@@ -1082,13 +1103,22 @@ def build_customers_needing_attention_response():
         if crm_result["status"] == "ok" else {}
     )
     late = find_late_customers(customers)
+    dismissals = read_action_plan_dismissals()
+    dismissed_customers = []
+    active_customers = []
 
     for customer in late:
         customer_orders = customers.get(customer["customer"], [])
+        customer["last_order"] = (
+            max(order.get("order_date", "") for order in customer_orders)
+            if customer_orders else ""
+        )
         customer_primary_key = get_customer_primary_key(customer_orders)
         crm_matches = crm_activity_map.get(customer_primary_key, [])
+        sales_crm_matches = get_sales_outreach_activities(crm_matches)
         latest_crm_activity = crm_matches[0] if crm_matches else None
-        crm_recent_days = get_crm_days_since_latest_activity(latest_crm_activity)
+        latest_sales_crm_activity = sales_crm_matches[0] if sales_crm_matches else None
+        crm_recent_days = get_crm_days_since_latest_activity(latest_sales_crm_activity)
         display_last_contact, _last_contact_source = build_last_contact_display(
             customer.get("last_activity_content", ""),
             latest_crm_activity,
@@ -1098,25 +1128,44 @@ def build_customers_needing_attention_response():
         if customer.get("days_since_last_activity") is None and crm_recent_days is not None:
             customer["days_since_last_activity"] = crm_recent_days
             customer["last_activity_date"] = (
-                latest_crm_activity.get("date_created", "")[:10]
-                if latest_crm_activity else None
+                latest_sales_crm_activity.get("date_created", "")[:10]
+                if latest_sales_crm_activity else None
             )
 
+        dismissal = get_action_plan_dismissal(
+            customer.get("customer", ""),
+            customer.get("last_order", ""),
+            dismissals=dismissals,
+        )
+        if dismissal:
+            customer["dismiss_reason"] = dismissal.get("reason", "")
+            customer["dismissed_at"] = dismissal.get("dismissed_at", "")
+            dismissed_customers.append(customer)
+            continue
+
+        active_customers.append(customer)
+
     late_with_explanations = (
-        add_ai_explanations(late)
+        add_ai_explanations(active_customers)
         if should_add_ai_explanations()
-        else late
+        else active_customers
     )
     return {
         "source": order_result["source"],
         "status": "ok",
-        "late_customers": late_with_explanations
+        "late_customers": late_with_explanations,
+        "dismissed_customers": sort_late_customers(
+            dismissed_customers,
+            sort_key="priority_score",
+            direction="desc",
+        ),
     }
 
 
 def render_late_customer_row(customer):
     customer_name = str(customer["customer"])
     customer_url = f"/customer-view?customer={quote(customer_name)}"
+    dismiss_reason = str(customer.get("dismiss_reason") or "").strip()
 
     return f"""
         <tr>
@@ -1124,7 +1173,24 @@ def render_late_customer_row(customer):
             <td>{escape(str(customer["avg_gap"]))} days</td>
             <td>{escape(str(customer["days_since_last"]))} days</td>
             <td><span class="score">{escape(str(customer["priority_score"]))}</span></td>
-            <td>{escape(str(customer["action"]))}</td>
+            <td>
+                <div class="attention-action-cell">
+                    <span>{escape(str(customer["action"]))}</span>
+                    <form method="post" action="/action-plan-dismiss" class="attention-dismiss-form">
+                        <input type="hidden" name="customer" value="{escape(customer_name)}">
+                        <input type="hidden" name="last_order" value="{escape(str(customer.get('last_order', '')))}">
+                        <input type="hidden" name="return_to" value="/customers-needing-attention-view#dismissed-urgency">
+                        <button type="submit" class="button secondary small-button action-dismiss-button">Dismiss</button>
+                        <input
+                            type="text"
+                            name="reason"
+                            class="dismiss-reason-input"
+                            placeholder="Reason for dismissing urgency"
+                            value="{escape(dismiss_reason)}"
+                        >
+                    </form>
+                </div>
+            </td>
             <td>
                 <div class="activity-cell">
                     <span class="activity-summary">{escape(format_activity_summary(customer))}</span>
@@ -1192,11 +1258,12 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
         attention = attention_by_customer.get(customer_name)
         customer_primary_key = get_customer_primary_key(customer_orders)
         crm_activities = crm_activity_map.get(customer_primary_key, [])
-        latest_crm_activity = crm_activities[0] if crm_activities else None
-        latest_crm_activity_date = parse_crm_datetime(
-            latest_crm_activity.get("date_created", "")
-        ) if latest_crm_activity else None
-        display_last_activity = last_activity or latest_crm_activity_date
+        sales_crm_activities = get_sales_outreach_activities(crm_activities)
+        latest_sales_crm_activity = sales_crm_activities[0] if sales_crm_activities else None
+        latest_sales_crm_activity_date = parse_crm_datetime(
+            latest_sales_crm_activity.get("date_created", "")
+        ) if latest_sales_crm_activity else None
+        display_last_activity = last_activity or latest_sales_crm_activity_date
 
         summaries.append({
             "customer": customer_name,
@@ -1210,8 +1277,8 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
             "last_activity": last_activity,
             "display_last_activity": display_last_activity,
             "latest_crm_activity": (
-                latest_crm_activity.get("date_created", "")
-                if latest_crm_activity else ""
+                latest_sales_crm_activity.get("date_created", "")
+                if latest_sales_crm_activity else ""
             ),
             "attention": attention,
         })
@@ -1243,7 +1310,7 @@ def render_customer_summary_row(summary):
     """
 
 
-def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_direction, sort, direction):
+def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_direction, crm_category, sort, direction):
     total_pages = max(1, (len(activities) + crm_limit - 1) // crm_limit)
     crm_page = max(1, min(crm_page, total_pages))
     start_index = (crm_page - 1) * crm_limit
@@ -1252,6 +1319,7 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
     summary_html = render_customer_crm_timeline_summary(
         activities=activities,
         crm_direction=crm_direction,
+        crm_category=crm_category,
         start_index=start_index,
         shown_count=shown_count,
     )
@@ -1273,15 +1341,16 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
         total_pages=total_pages,
         crm_limit=crm_limit,
         crm_direction=crm_direction,
+        crm_category=crm_category,
         sort=sort,
         direction=direction,
     )
 
     return f"""
-        <section class="panel">
+        <section class="panel" id="crm-timeline">
             <h2>CRM Timeline</h2>
             {summary_html}
-            {render_customer_crm_timeline_controls(customer, crm_direction, crm_limit, sort, direction)}
+            {render_customer_crm_timeline_controls(customer, crm_direction, crm_category, crm_limit, sort, direction)}
             <div class="table-wrap tall-table crm-timeline-wrap">
             <table class="crm-timeline-table">
                 <thead>
@@ -1301,7 +1370,7 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
     """
 
 
-def render_customer_crm_timeline_summary(activities, crm_direction, start_index, shown_count):
+def render_customer_crm_timeline_summary(activities, crm_direction, crm_category, start_index, shown_count):
     parts = [
         (
             f"Showing {start_index + 1 if activities else 0} to "
@@ -1327,6 +1396,10 @@ def render_customer_crm_timeline_summary(activities, crm_direction, start_index,
         if unknown_count:
             parts.append(f"unknown: {unknown_count}")
 
+    category_value = str(crm_category or "").strip().lower()
+    if category_value:
+        parts.append(f"category: {category_value.replace('_', ' ').title()}")
+
     return (
         "<p class=\"filter-summary\">"
         + " | ".join(escape(part) for part in parts)
@@ -1334,12 +1407,17 @@ def render_customer_crm_timeline_summary(activities, crm_direction, start_index,
     )
 
 
-def render_customer_crm_timeline_controls(customer, crm_direction, crm_limit, sort, direction):
+def render_customer_crm_timeline_controls(customer, crm_direction, crm_category, crm_limit, sort, direction):
     direction_options = {
         "": "All",
         "inbound": "Inbound",
         "outbound": "Outbound",
         "unknown": "Unknown",
+    }
+    category_options = {
+        "": "All",
+        "sales_outreach": "Sales Outreach",
+        "customer_services": "Customer Services",
     }
     limit_options = {
         "12": "12 rows",
@@ -1348,7 +1426,7 @@ def render_customer_crm_timeline_controls(customer, crm_direction, crm_limit, so
     }
 
     return f"""
-        <form class="controls compact crm-timeline-controls" method="get" action="/customer-view">
+        <form class="controls compact crm-timeline-controls" method="get" action="/customer-view#crm-timeline">
             <input type="hidden" name="customer" value="{escape(customer)}">
             <input type="hidden" name="sort" value="{escape(sort)}">
             <input type="hidden" name="direction" value="{escape(direction)}">
@@ -1358,6 +1436,13 @@ def render_customer_crm_timeline_controls(customer, crm_direction, crm_limit, so
                 <span>CRM Direction</span>
                 <select name="crm_direction">
                     {render_select_options(direction_options, crm_direction)}
+                </select>
+            </label>
+
+            <label>
+                <span>CRM Category</span>
+                <select name="crm_category">
+                    {render_select_options(category_options, crm_category)}
                 </select>
             </label>
 
@@ -1373,7 +1458,7 @@ def render_customer_crm_timeline_controls(customer, crm_direction, crm_limit, so
     """
 
 
-def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, crm_direction, sort, direction):
+def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, crm_direction, crm_category, sort, direction):
     if total_pages <= 1:
         return ""
 
@@ -1383,18 +1468,19 @@ def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, c
     base_query = (
         f"customer={quote(customer)}&sort={quote(sort)}&direction={quote(direction)}"
         f"&crm_limit={crm_limit}&crm_direction={quote(crm_direction)}"
+        f"&crm_category={quote(crm_category)}"
     )
 
     if crm_page > 1:
         previous_link = (
             f'<a class="button secondary small-button pager-button" '
-            f'href="/customer-view?{base_query}&crm_page={crm_page - 1}">Previous</a>'
+            f'href="/customer-view?{base_query}&crm_page={crm_page - 1}#crm-timeline">Previous</a>'
         )
 
     if crm_page < total_pages:
         next_link = (
             f'<a class="button secondary small-button pager-button" '
-            f'href="/customer-view?{base_query}&crm_page={crm_page + 1}">Next</a>'
+            f'href="/customer-view?{base_query}&crm_page={crm_page + 1}#crm-timeline">Next</a>'
         )
 
     return f"""
@@ -1416,13 +1502,26 @@ def render_customer_crm_activity(activity):
     elif activity.get("direction") == "outbound":
         direction_class = "crm-direction outbound"
 
+    category_value = get_activity_category(activity)
+    category_label = (
+        "Customer Services"
+        if category_value == "customer_services"
+        else "Sales Outreach"
+    )
+    category_class = f"crm-category {category_value.replace('_', '-')}"
+
     full_text = clean_activity_content(activity.get("body", ""))
     preview = truncate_text(full_text, 260)
 
     return f"""
         <tr>
             <td>{escape(format_optional_datetime(activity.get("date_created", "")))}</td>
-            <td><span class="{direction_class}">{escape(activity.get("direction", "unknown"))}</span></td>
+            <td>
+                <div class="crm-pill-stack">
+                    <span class="{category_class}">{escape(category_label)}</span>
+                    <span class="{direction_class}">{escape(activity.get("direction", "unknown"))}</span>
+                </div>
+            </td>
             <td>{escape(activity.get("subject", ""))}</td>
             <td>
                 <div><strong>From:</strong> {escape(activity.get("sender_email", ""))}</div>
@@ -1561,12 +1660,17 @@ def build_contact_recommendation(
     }
 
 
-def render_crm_filter_form(customer, direction, subject, page_size, date_from, date_to, range_key):
+def render_crm_filter_form(customer, direction, category, subject, page_size, date_from, date_to, range_key):
     direction_options = {
         "": "All",
         "inbound": "Inbound",
         "outbound": "Outbound",
         "unknown": "Unknown",
+    }
+    category_options = {
+        "": "All",
+        "sales_outreach": "Sales Outreach",
+        "customer_services": "Customer Services",
     }
     page_size_options = {
         "50": "50 rows",
@@ -1586,11 +1690,13 @@ def render_crm_filter_form(customer, direction, subject, page_size, date_from, d
     )
     recent_link = (
         f'/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}'
-        f'&subject={quote(subject)}&range_key=90d&page_size={page_size}'
+        f'&category={quote(category)}&subject={quote(subject)}'
+        f'&range_key=90d&page_size={page_size}'
     )
     all_link = (
         f'/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}'
-        f'&subject={quote(subject)}&range_key=all&page_size={page_size}'
+        f'&category={quote(category)}&subject={quote(subject)}'
+        f'&range_key=all&page_size={page_size}'
     )
     recent_class = "toggle-chip"
     all_class = "toggle-chip"
@@ -1624,6 +1730,13 @@ def render_crm_filter_form(customer, direction, subject, page_size, date_from, d
                 <span>Direction</span>
                 <select name="direction">
                     {render_select_options(direction_options, direction)}
+                </select>
+            </label>
+
+            <label class="crm-field category">
+                <span>Category</span>
+                <select name="category">
+                    {render_select_options(category_options, category)}
                 </select>
             </label>
 
@@ -1671,7 +1784,7 @@ def render_crm_filter_form(customer, direction, subject, page_size, date_from, d
     """
 
 
-def render_crm_filter_summary(total_filtered, customer="", direction="", subject="", date_from="", date_to="", range_key="all"):
+def render_crm_filter_summary(total_filtered, customer="", direction="", category="", subject="", date_from="", date_to="", range_key="all"):
     parts = [f"{total_filtered:,} matches"]
     effective_date_from, effective_date_to = get_crm_effective_date_range(
         date_from,
@@ -1684,6 +1797,9 @@ def render_crm_filter_summary(total_filtered, customer="", direction="", subject
 
     if direction.strip():
         parts.append(f"direction: {direction.strip().title()}")
+
+    if category.strip():
+        parts.append(f"category: {category.strip().replace('_', ' ').title()}")
 
     if subject.strip():
         parts.append(f"subject: {subject.strip()}")
@@ -1713,7 +1829,7 @@ def render_crm_filter_summary(total_filtered, customer="", direction="", subject
     )
 
 
-def render_crm_pagination(customer, direction, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered):
+def render_crm_pagination(customer, direction, category, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered):
     if total_filtered <= page_size:
         return ""
 
@@ -1723,13 +1839,13 @@ def render_crm_pagination(customer, direction, subject, date_from, date_to, rang
     if page > 1:
         previous_link = (
             f'<a class="button secondary small-button pager-button" '
-            f'href="/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page - 1}&page_size={page_size}">Previous</a>'
+            f'href="/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}&category={quote(category)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page - 1}&page_size={page_size}">Previous</a>'
         )
 
     if page < total_pages:
         next_link = (
             f'<a class="button secondary small-button pager-button" '
-            f'href="/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page + 1}&page_size={page_size}">Next</a>'
+            f'href="/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}&category={quote(category)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page + 1}&page_size={page_size}">Next</a>'
         )
 
     return f"""
@@ -1770,9 +1886,10 @@ def render_crm_activity_row(activity):
     """
 
 
-def filter_crm_activities(activities, customer="", direction="", subject="", date_from="", date_to="", range_key="all"):
+def filter_crm_activities(activities, customer="", direction="", category="", subject="", date_from="", date_to="", range_key="all"):
     customer_filter = customer.strip().lower()
     direction_filter = direction.strip().lower()
+    category_filter = category.strip().lower()
     subject_filter = subject.strip().lower()
     effective_date_from, effective_date_to = get_crm_effective_date_range(
         date_from,
@@ -1791,11 +1908,15 @@ def filter_crm_activities(activities, customer="", direction="", subject="", dat
         ).lower()
         subject_value = str(activity.get("subject") or "").lower()
         direction_value = str(activity.get("direction") or "").lower()
+        category_value = get_activity_category(activity)
 
         if customer_filter and customer_filter not in customer_value:
             continue
 
         if direction_filter and direction_filter != direction_value:
+            continue
+
+        if category_filter and category_filter != category_value:
             continue
 
         if subject_filter and subject_filter not in subject_value:
@@ -1841,17 +1962,22 @@ def parse_crm_datetime(value):
         return None
 
 
-def filter_customer_crm_activities(activities, direction=""):
+def filter_customer_crm_activities(activities, direction="", category=""):
     direction_filter = str(direction or "").strip().lower()
+    category_filter = str(category or "").strip().lower()
 
-    if not direction_filter:
-        return activities
+    filtered = []
 
-    return [
-        activity
-        for activity in activities
-        if str(activity.get("direction") or "").strip().lower() == direction_filter
-    ]
+    for activity in activities:
+        if direction_filter and str(activity.get("direction") or "").strip().lower() != direction_filter:
+            continue
+
+        if category_filter and get_activity_category(activity) != category_filter:
+            continue
+
+        filtered.append(activity)
+
+    return filtered
 
 
 def build_crm_activity_map(activities):
@@ -2298,6 +2424,293 @@ def build_last_contact_display(last_activity_content, latest_crm_activity, crm_a
     return "", ""
 
 
+def build_outreach_context(customer, customer_orders, attention, crm_result):
+    customer_primary_key = get_customer_primary_key(customer_orders)
+    crm_activities = (
+        crm_result.get("activity_map", {}).get(customer_primary_key, [])
+        if crm_result.get("status") == "ok" else []
+    )
+    sales_activities = get_sales_outreach_activities(crm_activities)
+    customer_service_activities = [
+        activity for activity in crm_activities
+        if get_activity_category(activity) == "customer_services"
+    ]
+    outbound_sales = [
+        activity for activity in sales_activities
+        if str(activity.get("direction") or "").strip().lower() == "outbound"
+    ]
+    inbound_sales = [
+        activity for activity in sales_activities
+        if str(activity.get("direction") or "").strip().lower() == "inbound"
+    ]
+    replied_sales_context = []
+    latest_replied_outreach = inbound_sales[0] if inbound_sales else None
+    recent_sales_context = []
+
+    for activity in sales_activities[:5]:
+        recent_sales_context.append({
+            "date": format_optional_datetime(activity.get("date_created", "")),
+            "direction": str(activity.get("direction") or "").strip().title() or "Unknown",
+            "subject": str(activity.get("subject") or "").strip(),
+            "preview": truncate_text(clean_activity_content(activity.get("body", "")) or activity.get("subject", ""), 180),
+        })
+
+    last_sales_activity = sales_activities[0] if sales_activities else None
+    last_sales_activity_date = (
+        format_optional_datetime(last_sales_activity.get("date_created", ""))
+        if last_sales_activity else "Not available"
+    )
+    latest_sales_subject = (
+        str(last_sales_activity.get("subject") or "").strip()
+        if last_sales_activity else ""
+    )
+    latest_sales_preview = (
+        truncate_text(
+            clean_activity_content(last_sales_activity.get("body", "")) or latest_sales_subject,
+            220,
+        )
+        if last_sales_activity else ""
+    )
+    last_reply_date = (
+        format_optional_datetime(inbound_sales[0].get("date_created", ""))
+        if inbound_sales else "No reply recorded"
+    )
+    latest_replied_subject = (
+        str(latest_replied_outreach.get("subject") or "").strip()
+        if latest_replied_outreach else ""
+    )
+    latest_replied_preview = (
+        truncate_text(
+            clean_activity_content(latest_replied_outreach.get("body", "")) or latest_replied_subject,
+            180,
+        )
+        if latest_replied_outreach else ""
+    )
+    latest_replied_context = (
+        {
+            "date": format_optional_datetime(latest_replied_outreach.get("date_created", "")),
+            "direction": str(latest_replied_outreach.get("direction") or "").strip().title() or "Unknown",
+            "subject": latest_replied_subject,
+            "preview": latest_replied_preview,
+        }
+        if latest_replied_outreach else None
+    )
+    approx_response_rate = 0
+    if outbound_sales:
+        approx_response_rate = round((len(inbound_sales) / len(outbound_sales)) * 100)
+
+    has_recent_sales_activity = False
+    if last_sales_activity:
+        recent_days = get_crm_days_since_latest_activity(last_sales_activity)
+        has_recent_sales_activity = recent_days is not None and recent_days <= 14
+
+    likely_preferred_mode = (
+        "Email"
+        if inbound_sales else
+        ("Call" if len(outbound_sales) >= 3 else "Email")
+    )
+    top_contacts = build_outreach_contact_signals(sales_activities)
+    primary_contact = top_contacts[0] if top_contacts else None
+
+    return {
+        "customer": customer,
+        "priority_score": attention.get("priority_score") if attention else "",
+        "action": attention.get("action") if attention else "",
+        "days_since_last_order": attention.get("days_since_last") if attention else "",
+        "average_cycle": round(calculate_average_gap(customer_orders), 1) if calculate_average_gap(customer_orders) is not None else "Not enough orders",
+        "last_order_date": max(order.get("order_date", "") for order in customer_orders),
+        "first_order_date": min(order.get("order_date", "") for order in customer_orders),
+        "order_count": len(customer_orders),
+        "total_value": format_currency(sum_order_amounts(customer_orders)),
+        "average_value_per_order": format_currency(average_order_amount(customer_orders)),
+        "territory": get_customer_territory(customer_orders),
+        "state": get_order_state(customer_orders[-1]) if customer_orders else "",
+        "sales_outreach_sent_count": len(outbound_sales),
+        "sales_reply_count": len(inbound_sales),
+        "approx_response_rate": f"{approx_response_rate}%" if outbound_sales else "n/a",
+        "last_reply_date": last_reply_date,
+        "likely_preferred_mode": likely_preferred_mode,
+        "customer_services_present": bool(customer_service_activities),
+        "customer_service_activity_count": len(customer_service_activities),
+        "sales_activity_count": len(sales_activities),
+        "latest_sales_outreach": last_sales_activity_date,
+        "latest_sales_outreach_subject": latest_sales_subject,
+        "latest_sales_outreach_preview": latest_sales_preview,
+        "latest_replied_outreach_date": last_reply_date,
+        "latest_replied_outreach_subject": latest_replied_subject,
+        "latest_replied_outreach_preview": latest_replied_preview,
+        "latest_replied_context": latest_replied_context,
+        "has_recent_sales_activity": has_recent_sales_activity,
+        "recent_sales_context": recent_sales_context,
+        "top_contacts": top_contacts,
+        "primary_contact": primary_contact,
+    }
+
+
+def render_outreach_prep_page(customer, context, result, data_results):
+    rationale_items = "".join(
+        f"<li>{escape(str(item))}</li>"
+        for item in result.get("rationale_bullets", [])
+        if str(item).strip()
+    ) or "<li>No rationale available.</li>"
+    call_points = "".join(
+        f"<li>{escape(str(item))}</li>"
+        for item in result.get("call_talking_points", [])
+        if str(item).strip()
+    ) or "<li>No call outline available.</li>"
+    recent_sales_rows = "".join(
+        render_outreach_sales_context_row(item)
+        for item in context.get("recent_sales_context", [])
+    ) or "<li class='empty-action'>No recent sales outreach history available.</li>"
+    latest_replied_row = (
+        render_outreach_sales_context_row(context.get("latest_replied_context"))
+        if context.get("latest_replied_context")
+        else "<li class='empty-action'>No reply-backed outreach context available yet.</li>"
+    )
+    contact_rows = "".join(
+        render_outreach_contact_row(contact)
+        for contact in context.get("top_contacts", [])
+    ) or "<li class='empty-action'>No clear contact signals available yet.</li>"
+    target_contact = "Not available"
+    if result.get("recommended_contact_name") or result.get("recommended_contact_email"):
+        target_contact = " - ".join(
+            part for part in [
+                str(result.get("recommended_contact_name") or "").strip(),
+                str(result.get("recommended_contact_email") or "").strip(),
+            ]
+            if part
+        ) or "Not available"
+
+    body = f"""
+        {render_data_availability_banner(*data_results)}
+
+        <div class="panel-head outreach-head">
+            <div>
+                <h1>Outreach Prep</h1>
+                <p class="muted">{escape(customer)}</p>
+            </div>
+            <div class="outreach-links">
+                <a class="button secondary small-button" href="/#action-plan">Back to Action Plan</a>
+                <a class="button secondary small-button" href="/customer-view?customer={quote(customer)}">Open Customer Record</a>
+            </div>
+        </div>
+
+        <div class="summary outreach-summary">
+            <div><span class="label">Priority</span><strong>{escape(str(context.get("priority_score", "")) or "n/a")}</strong></div>
+            <div><span class="label">Days Since Last Order</span><strong>{escape(str(context.get("days_since_last_order", "")) or "n/a")}</strong></div>
+            <div><span class="label">Average Cycle</span><strong>{escape(str(context.get("average_cycle", "")) or "n/a")}</strong></div>
+            <div><span class="label">Last Order</span><strong>{escape(str(context.get("last_order_date", "")) or "n/a")}</strong></div>
+            <div><span class="label">Last Sales Outreach</span><strong>{escape(str(context.get("latest_sales_outreach", "")) or "n/a")}</strong></div>
+            <div><span class="label">Sales Outreach History</span><strong>{escape(str(context.get("sales_activity_count", 0)))}</strong></div>
+        </div>
+
+        <div class="outreach-grid">
+            <section class="panel">
+                <h2>Recommended Next Move</h2>
+                <div class="summary compact-summary outreach-recommendation-summary">
+                    <div><span class="label">Suggested Mode</span><strong>{escape(str(result.get("suggested_mode", "")) or "Not available")}</strong></div>
+                    <div><span class="label">Tone</span><strong>{escape(str(result.get("tone", "")) or "Not available")}</strong></div>
+                    <div><span class="label">Confidence</span><strong>{escape(str(result.get("confidence", "")) or "Not available")}</strong></div>
+                    <div><span class="label">Target Contact</span><strong>{escape(target_contact)}</strong></div>
+                </div>
+                <p class="outreach-pattern"><strong>Targeting note:</strong> {escape(str(result.get("targeting_note", "No specific targeting note available.")))}</p>
+                <h3>Why This Was Suggested</h3>
+                <ul class="outreach-rationale-list">{rationale_items}</ul>
+            </section>
+
+            <section class="panel">
+                <h2>Why This Was Suggested</h2>
+                <div class="summary compact-summary outreach-evidence-summary">
+                    <div><span class="label">Sales Outreach Sent</span><strong>{escape(str(result.get("sales_outreach_count", 0)))}</strong></div>
+                    <div><span class="label">Observed Replies</span><strong>{escape(str(result.get("observed_reply_count", 0)))}</strong></div>
+                    <div><span class="label">Approx. Response Rate</span><strong>{escape(str(result.get("approx_response_rate", "n/a")))}</strong></div>
+                    <div><span class="label">Last Reply</span><strong>{escape(str(result.get("last_reply_date", "Not available")))}</strong></div>
+                    <div><span class="label">Likely Preferred Mode</span><strong>{escape(str(result.get("likely_preferred_mode", "Not available")))}</strong></div>
+                    <div><span class="label">Evidence Strength</span><strong>{escape(str(result.get("evidence_strength", "Not available")))}</strong></div>
+                </div>
+                <p class="outreach-pattern"><strong>Observed pattern:</strong> {escape(str(result.get("observed_pattern", "No pattern noted.")))}</p>
+                <p class="outreach-pattern"><strong>Customer service traffic present:</strong> {"Yes" if result.get("customer_services_present") else "No"}</p>
+            </section>
+        </div>
+
+        <section class="panel">
+            <h2>Draft Outreach</h2>
+            <div class="outreach-draft-block">
+                <span class="label">Subject</span>
+                <div class="outreach-draft-subject">{escape(str(result.get("email_subject", "")) or "Not available")}</div>
+            </div>
+            <div class="outreach-draft-block">
+                <span class="label">Draft Message</span>
+                <div class="outreach-draft-body">{escape(str(result.get("email_body", "")) or "Not available")}</div>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>Likely Sales Contacts</h2>
+            <ul class="dismissed-list">{contact_rows}</ul>
+        </section>
+
+        <div class="outreach-grid">
+            <section class="panel">
+                <h2>Call Version</h2>
+                <p class="outreach-pattern"><strong>Call objective:</strong> {escape(str(result.get("call_objective", "")) or "Not available")}</p>
+                <ul class="outreach-rationale-list">{call_points}</ul>
+                <div class="outreach-draft-block">
+                    <span class="label">Suggested Voicemail</span>
+                    <div class="outreach-draft-body">{escape(str(result.get("voicemail_draft", "")) or "Not available")}</div>
+                </div>
+                <div class="outreach-draft-block">
+                    <span class="label">Suggested Text Message</span>
+                    <div class="outreach-draft-body">{escape(str(result.get("suggested_text_message", "")) or "Not available")}</div>
+                </div>
+            </section>
+
+            <section class="panel">
+                <h2>Recent Sales Outreach Context</h2>
+                <ul class="dismissed-list">{recent_sales_rows}</ul>
+            </section>
+        </div>
+
+        <section class="panel">
+            <h2>Latest Replied Outreach</h2>
+            <ul class="dismissed-list">{latest_replied_row}</ul>
+        </section>
+    """
+    return body
+
+
+def render_outreach_sales_context_row(item):
+    if not item:
+        return ""
+    return f"""
+        <li>
+            <div class="action-item outreach-context-item">
+                <div class="action-main">
+                    <strong>{escape(str(item.get("subject") or "No subject"))}</strong>
+                    <span class="action-meta">{escape(str(item.get("date") or ""))} • {escape(str(item.get("direction") or ""))}</span>
+                    <span class="action-cue">{escape(str(item.get("preview") or ""))}</span>
+                </div>
+            </div>
+        </li>
+    """
+
+
+def render_outreach_contact_row(contact):
+    return f"""
+        <li>
+            <div class="action-item outreach-context-item">
+                <div class="action-main">
+                    <strong>{escape(str(contact.get("name") or "Unknown contact"))}</strong>
+                    <span class="action-meta">{escape(str(contact.get("email") or ""))}</span>
+                    <span class="action-meta">{escape(str(contact.get("role") or "Unknown role"))} • Influence {escape(str(contact.get("influence") or "Low"))} • Last active {escape(str(contact.get("last_active") or "Not available"))}</span>
+                    <span class="action-cue">{escape(str(contact.get("note") or ""))}</span>
+                    <span class="action-cue">Replies {escape(str(contact.get("inbound_count", 0)))} • Outbound touches {escape(str(contact.get("outbound_count", 0)))}</span>
+                </div>
+            </div>
+        </li>
+    """
+
+
 def clean_activity_content(content):
     content = str(content or "").strip()
 
@@ -2309,6 +2722,216 @@ def clean_activity_content(content):
 
     content = tidy_activity_text(content)
     return strip_activity_noise(content)
+
+
+def get_internal_email_domains():
+    raw_domains = os.getenv(
+        "CRM_INTERNAL_DOMAINS",
+        "numatsystems.com,nufox.com",
+    )
+    return {
+        domain.strip().lower()
+        for domain in raw_domains.split(",")
+        if domain.strip()
+    }
+
+
+def is_external_email_address(email):
+    email = str(email or "").strip().lower()
+
+    if "@" not in email:
+        return False
+
+    domain = email.split("@", 1)[1].strip().lower()
+    return bool(domain) and domain not in get_internal_email_domains()
+
+
+def infer_contact_display_name(email):
+    email = str(email or "").strip().lower()
+
+    if "@" not in email:
+        return "Unknown contact"
+
+    local_part = email.split("@", 1)[0].strip()
+
+    if not local_part:
+        return "Unknown contact"
+
+    if any(separator in local_part for separator in [".", "_", "-"]):
+        parts = [
+            part.capitalize()
+            for part in re.split(r"[._-]+", local_part)
+            if part
+        ]
+        return " ".join(parts) or email
+
+    if len(local_part) >= 5 and local_part[-1].isalpha() and local_part[:-1].isalpha():
+        return f"{local_part[:-1].capitalize()} {local_part[-1].upper()}"
+
+    return local_part.capitalize()
+
+
+def infer_contact_role_signal(contact):
+    combined_text = " ".join(contact.get("context_snippets", [])).lower()
+    finance_hits = sum(
+        keyword in combined_text
+        for keyword in [
+            "invoice",
+            "purchase order",
+            "accounts payable",
+            "payment",
+            "paid",
+            "shipping document",
+            "shipping documents",
+            "po number",
+        ]
+    )
+    decision_hits = sum(
+        keyword in combined_text
+        for keyword in [
+            "gm",
+            "general manager",
+            "plant manager",
+            "manager doesn't want",
+            "don't want",
+            "do not want",
+            "out of my control",
+            "out of my hands",
+            "approval",
+            "approved",
+            "president",
+            "director",
+            "owner",
+        ]
+    )
+    operational_hits = sum(
+        keyword in combined_text
+        for keyword in [
+            "plant",
+            "site",
+            "visit",
+            "tour",
+            "repair",
+            "damaged mats",
+            "mat repair",
+            "processing",
+            "facility",
+            "buyer",
+            "purchasing",
+            "merchandise control",
+            "operations",
+        ]
+    )
+
+    if finance_hits and finance_hits >= max(decision_hits, operational_hits):
+        return "Finance / admin", "Low", "Mainly finance or admin traffic."
+    if decision_hits:
+        return "Decision path / blocker", "High", "Replies reference decision-makers or approval blockers."
+    if operational_hits:
+        return "Operational contact", "Medium", "Recent history is mostly operational or plant-level discussion."
+    if contact.get("inbound_count", 0) >= 2:
+        return "Active responder", "Medium", "This contact has replied directly more than once."
+    return "Unknown role", "Low", "Limited signal on role from recent sales history."
+
+
+def build_outreach_contact_signals(sales_activities):
+    contacts = {}
+
+    for activity in sales_activities:
+        direction = str(activity.get("direction") or "").strip().lower()
+        subject = str(activity.get("subject") or "").strip()
+        preview = truncate_text(
+            clean_activity_content(activity.get("body", "")) or subject,
+            140,
+        )
+        activity_date_raw = str(activity.get("date_created") or "").strip()
+        activity_date = parse_crm_datetime(activity_date_raw)
+
+        contact_emails = []
+        if direction == "inbound":
+            sender_email = str(activity.get("sender_email") or "").strip().lower()
+            if is_external_email_address(sender_email):
+                contact_emails.append(sender_email)
+        else:
+            for email in extract_emails(str(activity.get("to") or "")):
+                normalized_email = str(email or "").strip().lower()
+                if is_external_email_address(normalized_email):
+                    contact_emails.append(normalized_email)
+
+        for email in dict.fromkeys(contact_emails):
+            contact = contacts.setdefault(email, {
+                "name": infer_contact_display_name(email),
+                "email": email,
+                "inbound_count": 0,
+                "outbound_count": 0,
+                "unknown_count": 0,
+                "last_active_raw": "",
+                "last_active": "Not available",
+                "latest_subject": "",
+                "latest_preview": "",
+                "context_snippets": [],
+            })
+
+            if direction == "inbound":
+                contact["inbound_count"] += 1
+            elif direction == "outbound":
+                contact["outbound_count"] += 1
+            else:
+                contact["unknown_count"] += 1
+
+            if activity_date and (
+                not contact["last_active_raw"]
+                or activity_date > parse_crm_datetime(contact["last_active_raw"])
+            ):
+                contact["last_active_raw"] = activity_date_raw
+                contact["last_active"] = format_optional_datetime(activity_date_raw)
+                contact["latest_subject"] = subject
+                contact["latest_preview"] = preview
+
+            snippet = " ".join(
+                part for part in [subject, preview] if part
+            ).strip()
+            if snippet and len(contact["context_snippets"]) < 6:
+                contact["context_snippets"].append(snippet)
+
+    enriched_contacts = []
+    today = get_analysis_today()
+
+    for contact in contacts.values():
+        role, influence, note = infer_contact_role_signal(contact)
+        last_active_dt = parse_crm_datetime(contact["last_active_raw"])
+        recency_score = 0
+        if last_active_dt:
+            days_old = max(0, (today - last_active_dt).days)
+            recency_score = max(0, 60 - min(days_old, 60))
+
+        contact_score = (
+            contact["inbound_count"] * 5
+            + contact["outbound_count"] * 3
+            + recency_score
+            + (25 if influence == "High" else 12 if influence == "Medium" else 0)
+        )
+        enriched_contacts.append({
+            "name": contact["name"],
+            "email": contact["email"],
+            "role": role,
+            "influence": influence,
+            "note": note,
+            "last_active": contact["last_active"],
+            "inbound_count": contact["inbound_count"],
+            "outbound_count": contact["outbound_count"],
+            "latest_subject": contact["latest_subject"],
+            "latest_preview": contact["latest_preview"],
+            "score": contact_score,
+        })
+
+    enriched_contacts.sort(
+        key=lambda item: (
+            -item["score"],
+            item["name"].lower(),
+        )
+    )
+    return enriched_contacts[:3]
 
 
 def looks_like_html(content):
@@ -2754,9 +3377,10 @@ def render_top_attention_row(customer):
     """
 
 
-def build_home_action_plan(attention_customers, grouped_orders):
-    territory_map = {"east": [], "west": []}
+def build_home_action_plan(attention_customers, grouped_orders, dismissed_customers=None):
+    due_today_customers = []
     hold_customers = []
+    dismissed_customers = dismissed_customers or []
 
     for customer in attention_customers:
         customer_name = str(customer.get("customer", ""))
@@ -2773,38 +3397,28 @@ def build_home_action_plan(attention_customers, grouped_orders):
             hold_customers.append(enriched_customer)
             continue
 
-        if territory in territory_map:
-            territory_map[territory].append(enriched_customer)
-
-    for territory in territory_map:
-        territory_customers = sort_late_customers(
-            territory_map[territory],
-            sort_key="priority_score",
-            direction="desc",
-        )
-        territory_map[territory] = {
-            "due_today": [
-                customer
-                for customer in territory_customers
-                if float(customer.get("priority_score") or 0) >= 1.5
-            ][:4],
-            "watch_next": [
-                customer
-                for customer in territory_customers
-                if float(customer.get("priority_score") or 0) < 1.5
-            ][:4],
-        }
+        if float(enriched_customer.get("priority_score") or 0) >= 1.5:
+            due_today_customers.append(enriched_customer)
 
     hold_customers = sort_late_customers(
         hold_customers,
         sort_key="days_since_last_activity",
         direction="asc",
     )[:6]
+    due_today_customers = sort_late_customers(
+        due_today_customers,
+        sort_key="priority_score",
+        direction="desc",
+    )[:10]
+    dismissed_customers = [
+        customer for customer in dismissed_customers
+        if float(customer.get("priority_score") or 0) >= 1.5
+    ]
 
     return {
-        "east": territory_map["east"],
-        "west": territory_map["west"],
+        "due_today": due_today_customers,
         "hold_customers": hold_customers,
+        "dismissed": dismissed_customers,
     }
 
 
@@ -2815,6 +3429,84 @@ def get_customer_territory(customer_orders):
         if str(get_order_territory(order) or "").strip()
     )
     return territories.most_common(1)[0][0] if territories else ""
+
+
+def get_action_plan_dismissals_path():
+    raw_path = os.getenv("ACTION_PLAN_DISMISSALS_PATH", "").strip()
+
+    if raw_path:
+        return Path(raw_path).expanduser()
+
+    return DEFAULT_ACTION_PLAN_DISMISSALS_PATH
+
+
+def read_action_plan_dismissals():
+    dismissals_path = get_action_plan_dismissals_path()
+
+    try:
+        if not dismissals_path.exists():
+            return {}
+
+        payload = json.loads(dismissals_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized = {}
+
+    for customer_name, dismissal in payload.items():
+        if not isinstance(dismissal, dict):
+            continue
+
+        normalized[str(customer_name)] = {
+            "last_order": str(dismissal.get("last_order") or "").strip(),
+            "dismissed_at": str(dismissal.get("dismissed_at") or "").strip(),
+            "reason": str(dismissal.get("reason") or "").strip(),
+        }
+
+    return normalized
+
+
+def write_action_plan_dismissals(dismissals):
+    dismissals_path = get_action_plan_dismissals_path()
+    dismissals_path.parent.mkdir(parents=True, exist_ok=True)
+    dismissals_path.write_text(json.dumps(dismissals, indent=2), encoding="utf-8")
+
+
+def get_action_plan_dismissal(customer_name, last_order, dismissals=None):
+    dismissals = dismissals or read_action_plan_dismissals()
+    dismissal = dismissals.get(str(customer_name))
+
+    if not dismissal:
+        return None
+
+    if str(dismissal.get("last_order") or "").strip() != str(last_order or "").strip():
+        return None
+
+    return dismissal
+
+def is_action_plan_dismissed(customer_name, last_order, dismissals=None):
+    return bool(get_action_plan_dismissal(customer_name, last_order, dismissals=dismissals))
+
+
+def dismiss_action_plan_customer(customer_name, last_order, reason=""):
+    dismissals = read_action_plan_dismissals()
+    dismissals[str(customer_name)] = {
+        "last_order": str(last_order or "").strip(),
+        "dismissed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": str(reason or "").strip(),
+    }
+    write_action_plan_dismissals(dismissals)
+
+
+def restore_action_plan_customer(customer_name):
+    dismissals = read_action_plan_dismissals()
+
+    if str(customer_name) in dismissals:
+        dismissals.pop(str(customer_name), None)
+        write_action_plan_dismissals(dismissals)
 
 
 def get_order_territory(order):
@@ -2849,49 +3541,54 @@ def get_crm_days_since_latest_activity(latest_crm_activity):
     return (get_analysis_today().date() - activity_date.date()).days
 
 
+def get_sales_outreach_activities(activities):
+    return [
+        activity
+        for activity in activities
+        if get_activity_category(activity) != "customer_services"
+    ]
+
+
+def get_activity_category(activity):
+    category_value = str(activity.get("activity_category") or "").strip().lower()
+
+    if category_value:
+        return category_value
+
+    sender_email = str(activity.get("sender_email") or "").strip().lower()
+    recipient_emails = extract_emails(str(activity.get("to") or ""))
+    sender_company = str(activity.get("sender_company") or "").strip()
+    subject = str(activity.get("subject") or "").strip()
+    body = str(activity.get("body") or "").strip()
+
+    if is_customer_service_activity(
+        sender_email=sender_email,
+        recipient_emails=recipient_emails,
+        sender_company=sender_company,
+        subject=subject,
+        body=body,
+    ):
+        return "customer_services"
+
+    return "sales_outreach"
+
+
 def render_home_action_plan(action_plan):
-    return f"""
-        <section class="panel action-plan-panel">
-            <div class="panel-head">
-                <div>
-                    <h2>Today's Action Plan</h2>
-                    <p class="muted">Top live follow-ups for each territory, ranked by urgency and filtered to avoid duplicate recent outreach.</p>
-                </div>
-            </div>
-            <div class="action-columns">
-                {render_territory_action_column("East", action_plan["east"])}
-                {render_territory_action_column("West", action_plan["west"])}
-            </div>
-        </section>
-    """
-
-
-def render_territory_action_column(label, customers):
     due_today_items = "".join(
         render_action_plan_item(customer)
-        for customer in customers["due_today"]
-    )
-    watch_next_items = "".join(
-        render_action_plan_item(customer)
-        for customer in customers["watch_next"]
+        for customer in action_plan["due_today"]
     )
 
     if not due_today_items:
         due_today_items = "<li class='empty-action'>No immediate follow-ups right now.</li>"
 
-    if not watch_next_items:
-        watch_next_items = "<li class='empty-action'>Nothing queued next right now.</li>"
-
     return f"""
-        <section class="action-column">
-            <div class="action-column-head">
-                <span class="label">Territory</span>
-                <strong>{escape(label)}</strong>
+        <section class="panel action-plan-panel" id="action-plan">
+            <div class="panel-head action-plan-head">
+                <h2>Today's Action Plan</h2>
             </div>
-            <div class="bucket-head">Due Today</div>
-            <ol class="action-list">{due_today_items}</ol>
-            <div class="bucket-head secondary">Watch Next</div>
-            <ol class="action-list watch-list">{watch_next_items}</ol>
+            <ol class="action-list action-list-wide">{due_today_items}</ol>
+            {render_dismissed_action_plan_items(action_plan.get("dismissed", []))}
         </section>
     """
 
@@ -2913,14 +3610,30 @@ def render_action_plan_item(customer):
 
     return f"""
         <li>
-            <a class="action-item" href="{customer_url}">
-                <div class="action-main">
+            <div class="action-item">
+                <a class="action-main" href="{customer_url}">
                     <strong>{escape(customer_name)}</strong>
                     <span class="action-meta">{escape(' • '.join(summary_bits))}</span>
                     <span class="action-cue">{escape(cue)}</span>
+                </a>
+                <div class="action-side">
+                    <span class="score">{escape(str(customer.get("priority_score", "")))}</span>
+                    <a class="button secondary small-button action-prep-button" href="/outreach-prep?customer={quote(customer_name)}">Prepare outreach</a>
                 </div>
-                <span class="score">{escape(str(customer.get("priority_score", "")))}</span>
-            </a>
+            </div>
+            <form method="post" action="/action-plan-dismiss" class="action-dismiss-row">
+                <input type="hidden" name="customer" value="{escape(customer_name)}">
+                <input type="hidden" name="last_order" value="{escape(str(customer.get('last_order', '')))}">
+                <input type="hidden" name="return_to" value="/#action-plan">
+                <button type="submit" class="button secondary small-button action-dismiss-button">Dismiss</button>
+                <input
+                    type="text"
+                    name="reason"
+                    class="dismiss-reason-input dismiss-reason-wide"
+                    placeholder="Reason for dismissing urgency"
+                    value="{escape(str(customer.get('dismiss_reason', '')))}"
+                >
+            </form>
         </li>
     """
 
@@ -2934,6 +3647,56 @@ def build_action_outreach_cue(customer):
     if priority >= 1.5:
         return "Send a brief follow-up and reference the latest contact or last order."
     return "Keep this one warm and check again soon if no new order lands."
+
+
+def render_dismissed_action_plan_items(
+    customers,
+    return_to="/#action-plan",
+    section_id="dismissed-urgency",
+    summary_label="Dismissed urgency items",
+):
+    if not customers:
+        return ""
+
+    rows = "".join(
+        render_dismissed_action_plan_item(customer, return_to=return_to)
+        for customer in customers
+    )
+
+    return f"""
+        <details class="dismissed-panel" id="{escape(section_id)}">
+            <summary>{escape(summary_label)} ({len(customers)})</summary>
+            <ul class="dismissed-list">{rows}</ul>
+        </details>
+    """
+
+
+def render_dismissed_action_plan_item(customer, return_to="/#action-plan"):
+    customer_name = str(customer.get("customer", ""))
+    customer_url = f"/customer-view?customer={quote(customer_name)}"
+    summary_bits = [
+        f"Priority {customer.get('priority_score')}",
+        f"{customer.get('days_since_last')} days since last order",
+        f"Last order {customer.get('last_order')}",
+    ]
+    dismiss_reason = str(customer.get("dismiss_reason") or "").strip()
+
+    return f"""
+        <li>
+            <div class="action-item dismissed-action-item">
+                <a class="action-main" href="{customer_url}">
+                    <strong>{escape(customer_name)}</strong>
+                    <span class="action-meta">{escape(' • '.join(summary_bits))}</span>
+                    {f'<span class="action-cue">Dismissed reason: {escape(dismiss_reason)}</span>' if dismiss_reason else ''}
+                </a>
+                <form method="post" action="/action-plan-restore" class="action-dismiss-form">
+                    <input type="hidden" name="customer" value="{escape(customer_name)}">
+                    <input type="hidden" name="return_to" value="{escape(return_to)}">
+                    <button type="submit" class="button secondary small-button action-dismiss-button">Restore</button>
+                </form>
+            </div>
+        </li>
+    """
 
 
 def render_recent_contact_holds(customers):
@@ -3587,7 +4350,7 @@ def render_customers_filter_form(customer, state, sort, direction):
     """
 
 
-def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction):
+def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category):
     sort_options = {
         "order_date": "Order Date",
         "amount": "Amount",
@@ -3608,6 +4371,7 @@ def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, cr
             <input type="hidden" name="crm_limit" value="{crm_limit}">
             <input type="hidden" name="crm_page" value="{crm_page}">
             <input type="hidden" name="crm_direction" value="{escape(crm_direction)}">
+            <input type="hidden" name="crm_category" value="{escape(crm_category)}">
 
             <label>
                 <span>Sort</span>
@@ -3649,9 +4413,6 @@ def render_global_nav(title):
         ("Orders", "/orders-view"),
         ("Customers Needing Attention", "/customers-needing-attention-view"),
         ("Customers", "/customers-view"),
-        ("CRM Activities", "/crm-activities-view"),
-        ("CRM Data", "/crm-data"),
-        ("Sample Data", "/sample-data"),
     ]
     items_html = []
 
@@ -3666,26 +4427,51 @@ def render_global_nav(title):
             f"<span class=\"nav-current\">{escape(title.replace('Customer: ', '', 1))}</span>"
         )
 
-    return "<p class=\"nav\">" + "<span>/</span>".join(items_html) + "</p>"
-
-def render_home_admin_links():
-    return """
-        <div class="admin-links nav-admin-links">
-            <span>Admin</span>
-            <a href="/filemaker-health">FileMaker Health</a>
-            <a href="/crm-activities-view">CRM Activities</a>
-            <a href="/crm-data">CRM Data</a>
-            <a href="/sample-data">Sample Data</a>
-            <a href="/api">API</a>
-        </div>
+    admin_menu = """
+        <details class="nav-admin-menu">
+            <summary>Admin</summary>
+            <div class="nav-admin-dropdown">
+                <a href="/filemaker-health">FileMaker Health</a>
+                <a href="/crm-activities-view">CRM Activities</a>
+                <a href="/crm-data">CRM Data</a>
+                <a href="/sample-data">Sample Data</a>
+                <a href="/api">API</a>
+            </div>
+        </details>
     """
 
+    return (
+        "<div class=\"nav-shell\">"
+        "<a class=\"brand-logo\" href=\"/\" aria-label=\"Numat home\">"
+        "<svg class=\"brand-logo-svg\" viewBox=\"0 0 300 300\" aria-hidden=\"true\" focusable=\"false\">"
+        "<rect fill=\"#003786\" width=\"300\" height=\"300\"/>"
+        "<path fill=\"#fff\" d=\"M82.7,142.5c0,9.5,5,13.9,11.3,13.9s10.3-2.8,12.5-5.1v4.3h19.7v-11h-3.6v-19.9h0v-4.4h-19.7v11h3.8v11.2c-.8,1.2-2,2.2-3.9,2.2-4.3,0-4.7-3.3-4.7-8.4s0-7.6,0-10h0v-5.9h-18.6v11h3.3v11.2Z\"/>"
+        "<polygon fill=\"#fff\" points=\"28.7 143.1 24.7 143.1 24.7 155.3 42.3 155.3 42.3 143.1 38.9 143.1 38.9 125.2 57.5 155.2 61.5 155.2 71.7 155.2 71.7 149 71.7 116.8 75.4 116.8 75.4 104.6 57.8 104.6 57.8 116.8 61.5 116.8 61.5 131.9 45.2 104.6 24 104.6 24 116.8 28.7 116.8 28.7 143.1\"/>"
+        "<polygon fill=\"#fff\" points=\"137.1 155.3 147.3 155.3 147.3 155.3 151 155.3 151 143.1 147.3 143.1 147.3 116.8 148.3 116.8 160.8 155.2 166.7 155.2 169 147.8 169.1 148 180.5 116.8 180.7 116.8 180.7 143.1 177.2 143.1 177.2 155.3 180.7 155.3 180.7 155.3 195.5 155.3 195.5 155.3 199.2 155.3 199.2 143.1 195.5 143.1 195.5 116.8 199.1 116.8 199.1 104.6 173.2 104.6 166.3 123.6 160 104.6 134 104.6 134 116.8 137.1 116.8 137.1 143.1 133.4 143.1 133.4 155.3 137.1 155.3 137.1 155.3\"/>"
+        "<path fill=\"#fff\" d=\"M221.7,126.3c2.8,0,5.4,2.5,5.4,4.9s0,4.6,0,4.6c0,0-2.8-2.1-10.8-2.1s-12.9,8.1-12.9,11.6,2.4,11,11.9,11,9.8-1.8,11.7-3.1v2h19.9v-10.8h-4.5v-15c0-2-.9-10.2-18.2-10.2s-21.3,8.6-21.3,8.6l12,2.2s2.4-3.7,6.7-3.7M222.8,148.4c-2.5,0-4.6-2.1-4.6-4.7s2.1-4.7,4.6-4.7,4.6,1.2,4.6,4.7-2,4.7-4.6,4.7\"/>"
+        "<path fill=\"#fff\" d=\"M253,133.1v14c0,6.6,6.4,9.7,11.4,9.7s9.9-3,9.9-3v-11.2c-3.9,2.7-6.2-.4-6.2-3.4v-8.2h6.4v-10.8h-6.4v-14.4l-15.6,8.7.2,5.7h-4.2v10.8h4.4v2.2Z\"/>"
+        "<polygon fill=\"#fff\" points=\"259.8 170.5 150 209.8 40.2 170.5 23.1 170.5 150 224.8 276.9 170.5 259.8 170.5\"/>"
+        "<polygon fill=\"#fff\" points=\"150 191.2 65.4 168.5 48.3 168.5 150 204.1 251.7 168.5 234.6 168.5 150 191.2\"/>"
+        "</svg>"
+        "</a>"
+        "<p class=\"nav\">"
+        + "<span>/</span>".join(items_html)
+        + "</p>"
+        + admin_menu
+        + "</div>"
+    )
 
-def render_page(title, body, top_right=""):
+
+def render_page(title, body, top_right="", show_title=True):
     title_class = "page-title"
 
     if title == "Numat AI Sales Assistant":
         title_class += " home-page-title"
+
+    page_title_html = (
+        f"<h1 class=\"{title_class}\">{escape(title)}</h1>"
+        if show_title else ""
+    )
 
     return f"""
         <!doctype html>
@@ -3748,6 +4534,29 @@ def render_page(title, body, top_right=""):
                         margin: 0 0 14px;
                     }}
 
+                    .nav-shell {{
+                        display: flex;
+                        flex: 1 1 auto;
+                        align-items: center;
+                        gap: 14px;
+                        min-width: 0;
+                    }}
+
+                    .brand-logo {{
+                        display: inline-flex;
+                        align-items: center;
+                        color: var(--blue);
+                        text-decoration: none;
+                        flex-shrink: 0;
+                    }}
+
+                    .brand-logo-svg {{
+                        width: 42px;
+                        height: 42px;
+                        border-radius: 8px;
+                        flex-shrink: 0;
+                    }}
+
                     .nav {{
                         display: flex;
                         flex-wrap: wrap;
@@ -3756,6 +4565,7 @@ def render_page(title, body, top_right=""):
                         color: var(--muted-soft);
                         font-size: 13px;
                         align-items: center;
+                        min-width: 0;
                     }}
 
                     .nav a {{
@@ -3766,6 +4576,60 @@ def render_page(title, body, top_right=""):
                     .nav-current {{
                         color: #314458;
                         font-weight: 700;
+                    }}
+
+                    .nav-admin-menu {{
+                        position: relative;
+                        margin-left: auto;
+                        flex-shrink: 0;
+                    }}
+
+                    .nav-admin-menu summary {{
+                        list-style: none;
+                        cursor: pointer;
+                        padding: 6px 10px;
+                        border: 1px solid var(--border);
+                        border-radius: 6px;
+                        background: var(--surface);
+                        color: #334e68;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }}
+
+                    .nav-admin-menu summary::-webkit-details-marker {{
+                        display: none;
+                    }}
+
+                    .nav-admin-menu[open] summary {{
+                        border-color: var(--border-strong);
+                        box-shadow: var(--shadow-soft);
+                    }}
+
+                    .nav-admin-dropdown {{
+                        position: absolute;
+                        top: calc(100% + 8px);
+                        right: 0;
+                        min-width: 190px;
+                        display: grid;
+                        gap: 4px;
+                        padding: 8px;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
+                        background: var(--surface);
+                        box-shadow: 0 14px 30px rgba(15, 23, 42, 0.12);
+                        z-index: 20;
+                    }}
+
+                    .nav-admin-dropdown a {{
+                        display: block;
+                        padding: 7px 9px;
+                        border-radius: 6px;
+                        color: #334e68;
+                        text-decoration: none;
+                    }}
+
+                    .nav-admin-dropdown a:hover {{
+                        background: #f2f7fd;
                     }}
 
                     .hero {{
@@ -3819,33 +4683,6 @@ def render_page(title, body, top_right=""):
                         font-size: 14px;
                     }}
 
-                    .admin-links {{
-                        display: flex;
-                        flex-wrap: wrap;
-                        gap: 8px;
-                        align-items: center;
-                        justify-content: flex-end;
-                        font-size: 13px;
-                    }}
-
-                    .nav-admin-links {{
-                        margin-left: auto;
-                    }}
-
-                    .admin-links span {{
-                        color: #52606d;
-                        font-weight: 700;
-                    }}
-
-                    .admin-links a {{
-                        padding: 6px 9px;
-                        border: 1px solid var(--border);
-                        border-radius: 6px;
-                        background: var(--surface);
-                        color: #334e68;
-                        text-decoration: none;
-                    }}
-
                     .summary {{
                         display: grid;
                         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -3884,11 +4721,18 @@ def render_page(title, body, top_right=""):
                     }}
 
                     .customer-summary {{
-                        grid-template-columns: repeat(6, minmax(0, 1fr));
+                        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                        gap: 10px;
+                        margin-bottom: 12px;
                     }}
 
-                    .customer-summary .wide-summary-item {{
-                        grid-column: span 4;
+                    .customer-summary div {{
+                        padding: 10px 12px;
+                    }}
+
+                    .customer-summary strong {{
+                        font-size: 15px;
+                        line-height: 1.2;
                     }}
 
                     .label {{
@@ -3966,6 +4810,17 @@ def render_page(title, body, top_right=""):
                         gap: 12px;
                         align-items: start;
                         margin-bottom: 14px;
+                    }}
+
+                    .action-plan-head {{
+                        justify-content: center;
+                        align-items: center;
+                        text-align: center;
+                    }}
+
+                    .action-plan-head h2 {{
+                        font-size: 28px;
+                        line-height: 1.1;
                     }}
 
                     .muted {{
@@ -4048,6 +4903,54 @@ def render_page(title, body, top_right=""):
                         gap: 5px;
                         min-width: 0;
                         flex: 1;
+                        color: inherit;
+                        text-decoration: none;
+                    }}
+
+                    .action-side {{
+                        display: grid;
+                        justify-items: end;
+                        gap: 8px;
+                        flex-shrink: 0;
+                    }}
+
+                    .action-dismiss-form {{
+                        margin: 0;
+                        display: grid;
+                        gap: 6px;
+                        justify-items: end;
+                    }}
+
+                    .action-dismiss-row {{
+                        margin: 8px 0 0 44px;
+                        display: flex;
+                        align-items: center;
+                        gap: 10px;
+                    }}
+
+                    .action-dismiss-button {{
+                        min-width: 88px;
+                        height: 32px;
+                        padding: 6px 10px;
+                        font-size: 12px;
+                    }}
+
+                    .action-prep-button {{
+                        min-width: 138px;
+                        height: 32px;
+                        padding: 6px 10px;
+                        font-size: 12px;
+                    }}
+
+                    .dismiss-reason-input {{
+                        width: 120px;
+                        padding: 6px 8px;
+                        font-size: 12px;
+                    }}
+
+                    .dismiss-reason-wide {{
+                        width: min(420px, 100%);
+                        flex: 1 1 280px;
                     }}
 
                     .action-meta {{
@@ -4074,6 +4977,97 @@ def render_page(title, body, top_right=""):
                         border-radius: 8px;
                         color: var(--muted);
                         background: var(--surface);
+                    }}
+
+                    .dismissed-panel {{
+                        margin-top: 12px;
+                    }}
+
+                    .dismissed-panel summary {{
+                        cursor: pointer;
+                        color: var(--muted);
+                        font-size: 14px;
+                        font-weight: 600;
+                    }}
+
+                    .dismissed-list {{
+                        list-style: none;
+                        margin: 10px 0 0;
+                        padding: 0;
+                        display: grid;
+                        gap: 10px;
+                    }}
+
+                    .dismissed-action-item {{
+                        opacity: 0.9;
+                    }}
+
+                    .outreach-head {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: start;
+                        gap: 16px;
+                        margin-bottom: 14px;
+                    }}
+
+                    .outreach-head h1 {{
+                        margin: 0 0 4px;
+                    }}
+
+                    .outreach-links {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 10px;
+                    }}
+
+                    .outreach-summary {{
+                        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                        margin-bottom: 14px;
+                    }}
+
+                    .outreach-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 14px;
+                        margin-bottom: 14px;
+                    }}
+
+                    .outreach-recommendation-summary,
+                    .outreach-evidence-summary {{
+                        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                        margin-bottom: 12px;
+                    }}
+
+                    .outreach-rationale-list {{
+                        margin: 10px 0 0;
+                        padding-left: 18px;
+                        color: #334e68;
+                        line-height: 1.5;
+                    }}
+
+                    .outreach-pattern {{
+                        margin: 0 0 10px;
+                        color: #334e68;
+                        line-height: 1.45;
+                    }}
+
+                    .outreach-draft-block {{
+                        margin-bottom: 12px;
+                    }}
+
+                    .outreach-draft-subject,
+                    .outreach-draft-body {{
+                        white-space: pre-wrap;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
+                        background: var(--surface-soft);
+                        padding: 12px 14px;
+                        line-height: 1.5;
+                        color: #233142;
+                    }}
+
+                    .outreach-context-item {{
+                        padding: 10px 12px;
                     }}
 
                     .bars {{
@@ -4552,7 +5546,7 @@ def render_page(title, body, top_right=""):
                     .attention-table td:nth-child(2),
                     .attention-table th:nth-child(3),
                     .attention-table td:nth-child(3) {{
-                        width: 8%;
+                        width: 7%;
                     }}
 
                     .attention-table th:nth-child(4),
@@ -4563,18 +5557,18 @@ def render_page(title, body, top_right=""):
 
                     .attention-table th:nth-child(5),
                     .attention-table td:nth-child(5) {{
-                        width: 12%;
+                        width: 22%;
                     }}
 
                     .attention-table th:nth-child(6),
                     .attention-table td:nth-child(6) {{
-                        width: 22%;
+                        width: 16%;
                         overflow-wrap: anywhere;
                     }}
 
                     .attention-table th:nth-child(7),
                     .attention-table td:nth-child(7) {{
-                        width: 24%;
+                        width: 18%;
                         overflow-wrap: anywhere;
                     }}
 
@@ -4661,6 +5655,30 @@ def render_page(title, body, top_right=""):
                         min-width: 0;
                     }}
 
+                    .attention-action-cell {{
+                        display: grid;
+                        gap: 8px;
+                        min-width: 0;
+                    }}
+
+                    .attention-dismiss-form {{
+                        display: grid;
+                        grid-template-columns: 1fr;
+                        gap: 8px;
+                        align-items: stretch;
+                        width: 100%;
+                        justify-items: start;
+                    }}
+
+                    .attention-dismiss-form .action-dismiss-button {{
+                        width: 110px;
+                    }}
+
+                    .attention-dismiss-form .dismiss-reason-input {{
+                        width: 100%;
+                        min-width: 0;
+                    }}
+
                     .activity-summary {{
                         display: block;
                     }}
@@ -4695,6 +5713,35 @@ def render_page(title, body, top_right=""):
                     .crm-direction.outbound {{
                         background: #dbeafe;
                         color: #1d4ed8;
+                    }}
+
+                    .crm-pill-stack {{
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        gap: 6px;
+                    }}
+
+                    .crm-category {{
+                        display: inline-block;
+                        min-width: 96px;
+                        padding: 4px 8px;
+                        border-radius: 6px;
+                        background: #eef2f7;
+                        color: #475569;
+                        font-size: 12px;
+                        font-weight: 700;
+                        text-align: center;
+                    }}
+
+                    .crm-category.sales-outreach {{
+                        background: #ede9fe;
+                        color: #6d28d9;
+                    }}
+
+                    .crm-category.customer-services {{
+                        background: #fff7ed;
+                        color: #c2410c;
                     }}
 
                     .activity-expand {{
@@ -4789,6 +5836,14 @@ def render_page(title, body, top_right=""):
                             font-size: 12px;
                         }}
 
+                        .nav-shell {{
+                            flex-wrap: wrap;
+                        }}
+
+                        .nav-admin-menu {{
+                            margin-left: 0;
+                        }}
+
                         .hero {{
                             grid-template-columns: 1fr;
                             gap: 16px;
@@ -4861,8 +5916,14 @@ def render_page(title, body, top_right=""):
                             grid-template-columns: repeat(2, minmax(0, 1fr));
                         }}
 
-                        .customer-summary .wide-summary-item {{
-                            grid-column: span 2;
+                        .outreach-head,
+                        .outreach-grid {{
+                            grid-template-columns: 1fr;
+                            display: grid;
+                        }}
+
+                        .outreach-links {{
+                            justify-content: stretch;
                         }}
                     }}
                 </style>
@@ -4873,7 +5934,7 @@ def render_page(title, body, top_right=""):
                         {render_global_nav(title)}
                         {top_right}
                     </div>
-                    <h1 class="{title_class}">{escape(title)}</h1>
+                    {page_title_html}
                     {body}
                 </main>
             </body>

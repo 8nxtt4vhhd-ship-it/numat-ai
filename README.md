@@ -24,6 +24,7 @@ Edit `.env` and add your local values:
 ```bash
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
+OUTREACH_CONTEXT_PATH=
 APP_BASIC_AUTH_USERNAME=
 APP_BASIC_AUTH_PASSWORD=
 
@@ -99,6 +100,7 @@ Set environment variables on the server using your hosting platform, process man
 ```bash
 OPENAI_API_KEY
 OPENAI_MODEL
+OUTREACH_CONTEXT_PATH
 APP_BASIC_AUTH_USERNAME
 APP_BASIC_AUTH_PASSWORD
 ORDER_DATA_SOURCE

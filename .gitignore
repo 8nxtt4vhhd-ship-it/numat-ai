@@ -6,5 +6,7 @@ venv/
 backend/.env
 backend/venv/
 backend/__pycache__/
+backend/data/action_plan_dismissals.json
 backend/data/filemaker_crm_cache.json
+backend/data/filemaker_orders_cache.json
 backend/data/*.csv

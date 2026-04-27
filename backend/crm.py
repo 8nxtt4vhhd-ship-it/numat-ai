@@ -86,6 +86,53 @@ def get_internal_domains():
     }
 
 
+def get_customer_service_email():
+    return os.getenv(
+        "CRM_CUSTOMER_SERVICE_EMAIL",
+        "customerservice@numatsystems.com",
+    ).strip().lower()
+
+
+def is_customer_service_activity(
+    sender_email="",
+    recipient_emails=None,
+    sender_company="",
+    subject="",
+    body="",
+):
+    recipient_emails = recipient_emails or []
+    customer_service_email = get_customer_service_email()
+    sender_email = str(sender_email or "").strip().lower()
+    recipient_email_set = {
+        str(email).strip().lower()
+        for email in recipient_emails
+        if str(email).strip()
+    }
+
+    if sender_email == customer_service_email or customer_service_email in recipient_email_set:
+        return True
+
+    sender_company_value = str(sender_company or "").strip().lower()
+    subject_value = str(subject or "").strip().lower()
+    body_value = str(body or "").strip().lower()
+    combined_text = " ".join([sender_company_value, subject_value, body_value])
+
+    if "customer service" in sender_company_value or "numat systems customer service" in combined_text:
+        return True
+
+    service_keywords = [
+        "invoice",
+        "shipping document",
+        "shipping documents",
+        "purchase order",
+        "accounts payable",
+        "please disregard",
+        "automatic reply",
+        "order feedback",
+    ]
+    return any(keyword in combined_text for keyword in service_keywords)
+
+
 def get_crm_data_source():
     return os.getenv("CRM_DATA_SOURCE", "sample_csv").strip().lower()
 
@@ -822,14 +869,27 @@ def normalize_crm_row(row, index):
         (sender_is_internal or not sender_domain)
         and (recipient_has_internal or not recipient_has_external)
     )
+    subject = str(get_row_value(row, "emails::subject", "subject")).strip()
+    body = str(get_row_value(row, "emails::body", "body")).strip()
+    activity_category = (
+        "customer_services"
+        if is_customer_service_activity(
+            sender_email=sender_email,
+            recipient_emails=recipient_emails,
+            sender_company=sender_company,
+            subject=subject,
+            body=body,
+        )
+        else "sales_outreach"
+    )
 
     return {
         "row_number": index,
         "date_created": normalize_crm_date(
             get_row_value(row, "emails::Date Created", "Date Created")
         ),
-        "subject": str(get_row_value(row, "emails::subject", "subject")).strip(),
-        "body": str(get_row_value(row, "emails::body", "body")).strip(),
+        "subject": subject,
+        "body": body,
         "crm_category": str(
             get_row_value(row, "emails::CRM Category", "CRM Category")
         ).strip(),
@@ -851,6 +911,7 @@ def normalize_crm_row(row, index):
         "recipient_company": recipient_company,
         "recipient_primary_key": recipient_primary_key,
         "direction": direction,
+        "activity_category": activity_category,
         "customer_primary_key": customer_primary_key,
         "customer_company": customer_company,
         "sender_is_internal": sender_is_internal,
