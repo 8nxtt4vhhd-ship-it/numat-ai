@@ -16,6 +16,7 @@ DEFAULT_CRM_SAMPLE_CSV_PATH = Path(
 )
 DEFAULT_UPLOADED_CRM_CSV_PATH = BASE_DIR / "data" / "sample_crm.csv"
 DEFAULT_FILEMAKER_CRM_CACHE_PATH = BASE_DIR / "data" / "filemaker_crm_cache.json"
+DEFAULT_FILEMAKER_CRM_RECENT_CACHE_PATH = BASE_DIR / "data" / "filemaker_crm_recent_cache.json"
 MAX_CRM_SAMPLE_ROWS = 50000
 _CRM_CACHE = {
     "key": None,
@@ -61,6 +62,16 @@ def get_filemaker_crm_cache_path():
         return path
 
     return BASE_DIR / path
+
+
+def get_filemaker_crm_recent_cache_path():
+    raw_path = os.getenv("FILEMAKER_CRM_RECENT_CACHE_PATH", "").strip()
+
+    if not raw_path:
+        return DEFAULT_FILEMAKER_CRM_RECENT_CACHE_PATH
+
+    path = Path(raw_path).expanduser()
+    return path if path.is_absolute() else BASE_DIR / path
 
 
 def get_internal_domains():
@@ -291,6 +302,9 @@ def build_filemaker_crm_result():
             )
 
             if result["status"] != "ok":
+                cached_recent_result = read_filemaker_crm_recent_cache()
+                if cached_recent_result is not None:
+                    return cached_recent_result
                 return empty_crm_result("filemaker", layout, result["status"])
 
             batch_rows = [
@@ -321,6 +335,9 @@ def build_filemaker_crm_result():
         )
 
         if result["status"] != "ok":
+            cached_recent_result = read_filemaker_crm_recent_cache()
+            if cached_recent_result is not None:
+                return cached_recent_result
             return empty_crm_result("filemaker", layout, result["status"])
 
         rows = [
@@ -328,11 +345,22 @@ def build_filemaker_crm_result():
             for record in result.get("records", [])
         ]
 
-    return build_crm_result_from_rows(
+    result = build_crm_result_from_rows(
         rows,
         source="filemaker",
         path=layout,
     )
+
+    if result.get("status") == "ok":
+        write_filemaker_crm_recent_cache(result)
+        return result
+
+    cached_recent_result = read_filemaker_crm_recent_cache()
+
+    if cached_recent_result is not None:
+        return cached_recent_result
+
+    return result
 
 
 def sync_filemaker_crm_cache():
@@ -422,6 +450,56 @@ def sync_filemaker_crm_cache():
         clear_crm_cache()
 
     return result
+
+
+def write_filemaker_crm_recent_cache(result):
+    cache_path = get_filemaker_crm_recent_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "filemaker_recent_cache",
+        "status": "ok",
+        "path": result.get("path", ""),
+        "counts": result.get("counts", {}),
+        "activities": result.get("activities", []),
+        "stale": False,
+        "warning": "",
+    }
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def read_filemaker_crm_recent_cache():
+    cache_path = get_filemaker_crm_recent_cache_path()
+
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    activities = sort_crm_activities(payload.get("activities", []))
+    activity_map = build_activity_map(activities)
+    counts = payload.get("counts", {})
+
+    return {
+        "source": "filemaker_recent_cache",
+        "status": "ok",
+        "path": payload.get("path", ""),
+        "activities": activities,
+        "activity_map": activity_map,
+        "counts": {
+            "total_rows": counts.get("total_rows", len(activities)),
+            "kept_rows": counts.get("kept_rows", len(activities)),
+            "excluded_internal_only": counts.get("excluded_internal_only", 0),
+            "customer_count": counts.get("customer_count", len(activity_map)),
+            "unknown_direction_count": counts.get("unknown_direction_count", 0),
+        },
+        "stale": True,
+        "warning": "FileMaker CRM is currently unavailable. Showing the last successful cached CRM snapshot.",
+        "synced_at": payload.get("updated_at", ""),
+    }
 
 
 def read_filemaker_crm_sync_cache():

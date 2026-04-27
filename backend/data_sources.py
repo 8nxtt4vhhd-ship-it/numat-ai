@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ from filemaker import (
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SAMPLE_CSV_PATH = BASE_DIR / "data" / "sample_orders.csv"
+DEFAULT_FILEMAKER_ORDERS_CACHE_PATH = BASE_DIR / "data" / "filemaker_orders_cache.json"
 MAX_SAMPLE_ROWS = 10000
 _FILEMAKER_ORDER_CACHE = {
     "key": None,
@@ -42,6 +44,9 @@ def get_orders_for_analysis():
             "source": "filemaker",
             "status": result["status"],
             "orders": result["orders"],
+            "stale": result.get("stale", False),
+            "cache_updated_at": result.get("cache_updated_at", ""),
+            "warning": result.get("warning", ""),
         }
 
     return {
@@ -85,10 +90,28 @@ def fetch_cached_filemaker_orders():
 
     result = fetch_order_records(limit=limit)
 
+    if result.get("status") == "ok":
+        write_filemaker_orders_cache(result)
+
     if result.get("status") == "ok" and cache_seconds:
         _FILEMAKER_ORDER_CACHE["key"] = cache_key
         _FILEMAKER_ORDER_CACHE["expires_at"] = now + cache_seconds
         _FILEMAKER_ORDER_CACHE["result"] = result
+        return result
+
+    cached_snapshot = read_filemaker_orders_cache()
+
+    if cached_snapshot is not None:
+        return {
+            "connected": False,
+            "status": "ok",
+            "orders": cached_snapshot.get("orders", []),
+            "stale": True,
+            "cache_updated_at": cached_snapshot.get("updated_at", ""),
+            "warning": (
+                "FileMaker is currently unavailable. Showing the last successful cached order data."
+            ),
+        }
 
     return result
 
@@ -105,6 +128,38 @@ def build_filemaker_cache_key(limit):
         config["amount_field"],
         tuple(config["extra_fields"]),
     )
+
+
+def get_filemaker_orders_cache_path():
+    raw_path = os.getenv("FILEMAKER_ORDERS_CACHE_PATH", "").strip()
+
+    if not raw_path:
+        return DEFAULT_FILEMAKER_ORDERS_CACHE_PATH
+
+    path = Path(raw_path).expanduser()
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def write_filemaker_orders_cache(result):
+    cache_path = get_filemaker_orders_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "orders": result.get("orders", []),
+    }
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def read_filemaker_orders_cache():
+    cache_path = get_filemaker_orders_cache_path()
+
+    if not cache_path.exists():
+        return None
+
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def fetch_sample_csv_orders():

@@ -296,6 +296,8 @@ def get_crm_activities_view(
         range_key=range_key,
     )
     body = f"""
+        {render_data_availability_banner(result)}
+
         <div class="summary crm-summary">
             <div>
                 <span class="label">Source</span>
@@ -430,6 +432,8 @@ def render_home_page():
                 </p>
             </div>
         </section>
+
+        {render_data_availability_banner(order_result)}
 
         {render_dashboard_context(order_result["source"])}
 
@@ -570,6 +574,8 @@ def get_orders_view(
         )
 
     body = f"""
+        {render_data_availability_banner(result)}
+
         <div class="summary customer-summary">
             <div>
                 <span class="label">Source</span>
@@ -682,6 +688,8 @@ def get_customers_needing_attention_view(
         )
 
     body = f"""
+        {render_data_availability_banner(result)}
+
         <div class="summary customer-summary">
             <div>
                 <span class="label">Source</span>
@@ -797,6 +805,8 @@ def get_customers_view(
         )
 
     body = f"""
+        {render_data_availability_banner(order_result, crm_result)}
+
         <div class="summary customer-summary">
             <div>
                 <span class="label">Source</span>
@@ -921,6 +931,8 @@ def get_customer_view(
     )
 
     body = f"""
+        {render_data_availability_banner(result, crm_result)}
+
         <div class="summary customer-summary">
             <div>
                 <span class="label">Source</span>
@@ -2984,6 +2996,8 @@ def render_sample_data_page(upload_result=None):
     body = f"""
         {message}
 
+        {render_data_availability_banner(order_result, active_result)}
+
         <div class="summary">
             <div>
                 <span class="label">Current Source</span>
@@ -3061,12 +3075,17 @@ def render_crm_data_page(upload_result=None, sync_result=None):
     )
     crm_source = str(active_result.get("source", "")).strip().lower()
     full_sync_enabled = should_enable_full_crm_sync()
+    using_filemaker_crm = crm_source in {
+        "filemaker",
+        "filemaker_recent_cache",
+        "filemaker_sync_cache",
+    }
     active_location_label = (
-        "Active FileMaker Layout" if crm_source == "filemaker" else "Active CSV Path"
+        "Active FileMaker Layout" if using_filemaker_crm else "Active CSV Path"
     )
     active_location_value = (
         active_result.get("path")
-        if crm_source == "filemaker"
+        if using_filemaker_crm
         else str(current_path)
     )
     upload_summary = (
@@ -3076,12 +3095,12 @@ def render_crm_data_page(upload_result=None, sync_result=None):
                 <strong class="path-value">{escape(str(uploaded_path))}</strong>
             </div>
         """
-        if crm_source != "filemaker"
+        if not using_filemaker_crm
         else ""
     )
     source_note = (
         "Recent live FileMaker email history is active for the hosted preview. CSV upload remains available as a fallback."
-        if crm_source == "filemaker"
+        if crm_source in {"filemaker", "filemaker_recent_cache"}
         else (
             "Synced full FileMaker CRM cache is active."
             if crm_source == "filemaker_sync_cache"
@@ -3336,6 +3355,27 @@ def render_dashboard_context(source):
             Review date: <strong>{analysis_today}</strong>.
             Updated: <strong>{refreshed_at}</strong>.
         </p>
+    """
+
+
+def render_data_availability_banner(*results):
+    warnings = []
+
+    for result in results:
+        warning = str((result or {}).get("warning", "") or "").strip()
+
+        if warning and warning not in warnings:
+            warnings.append(warning)
+
+    if not warnings:
+        return ""
+
+    items = "".join(f"<li>{escape(warning)}</li>" for warning in warnings)
+    return f"""
+        <section class="panel">
+            <p class="status">{' '.join(escape(warning) for warning in warnings)}</p>
+            <ul class="muted">{items}</ul>
+        </section>
     """
 
 
