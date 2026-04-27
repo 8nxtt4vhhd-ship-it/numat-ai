@@ -30,6 +30,7 @@ from data_sources import (
 from crm import (
     MAX_CRM_SAMPLE_ROWS,
     fetch_crm_activities,
+    get_crm_data_source,
     get_filemaker_crm_cache_path,
     get_crm_sample_csv_path,
     get_uploaded_crm_csv_path,
@@ -3046,12 +3047,16 @@ def render_sample_data_page(upload_result=None):
 
 
 def render_crm_data_page(upload_result=None, sync_result=None):
-    validation = validate_crm_csv_path()
+    active_result = fetch_crm_activities()
+    validation = (
+        build_crm_validation_from_result(active_result)
+        if get_crm_data_source() == "filemaker"
+        else validate_crm_csv_path()
+    )
     current_path = get_crm_sample_csv_path()
     uploaded_path = get_uploaded_crm_csv_path()
     sync_cache_path = get_filemaker_crm_cache_path()
     background_sync_status = get_crm_sync_status()
-    active_result = fetch_crm_activities()
     order_result = get_orders_for_analysis()
     status = sync_result or upload_result or validation
     order_keys = {
@@ -3288,6 +3293,26 @@ def render_crm_sync_status_panel(sync_status):
             <p class="status {tone}">{escape(sync_status.get("message") or "No sync activity yet.")}</p>
         </section>
     """
+
+
+def build_crm_validation_from_result(result):
+    status = result.get("status", "unknown")
+    counts = result.get("counts", {})
+    path = result.get("path", "")
+
+    return {
+        "valid": status == "ok",
+        "status": status,
+        "path": path,
+        "row_count": counts.get("total_rows", 0),
+        "customer_count": counts.get("customer_count", 0),
+        "usable_count": counts.get("kept_rows", 0),
+        "excluded_internal_only": counts.get("excluded_internal_only", 0),
+        "warnings": [],
+        "errors": [] if status == "ok" else [
+            f"CRM source returned status: {status}"
+        ],
+    }
 
 
 def render_validation_panel(title, validation):
