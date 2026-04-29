@@ -1,12 +1,14 @@
 import os
 from pathlib import Path
 import json
+import time
 
 from dotenv import load_dotenv
 
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
+_OUTREACH_PREP_CACHE = {}
 
 
 def get_outreach_context_path():
@@ -28,6 +30,66 @@ def load_outreach_business_context():
         return context_path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+def get_outreach_prep_cache_seconds():
+    raw_seconds = os.getenv("OUTREACH_PREP_CACHE_SECONDS", "900").strip()
+
+    try:
+        return max(0, int(raw_seconds))
+    except ValueError:
+        return 900
+
+
+def get_outreach_context_signature():
+    context_path = get_outreach_context_path()
+
+    try:
+        if not context_path.exists():
+            return ("missing", str(context_path))
+
+        stat = context_path.stat()
+        return (str(context_path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return ("unreadable", str(context_path))
+
+
+def build_outreach_prep_cache_key(context):
+    return (
+        os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        get_outreach_context_signature(),
+        json.dumps(context, sort_keys=True, default=str),
+    )
+
+
+def get_cached_outreach_prep(cache_key):
+    cache_seconds = get_outreach_prep_cache_seconds()
+
+    if not cache_seconds:
+        return None
+
+    cached = _OUTREACH_PREP_CACHE.get(cache_key)
+
+    if not cached:
+        return None
+
+    if cached["expires_at"] <= time.time():
+        _OUTREACH_PREP_CACHE.pop(cache_key, None)
+        return None
+
+    return cached["result"]
+
+
+def cache_outreach_prep(cache_key, result):
+    cache_seconds = get_outreach_prep_cache_seconds()
+
+    if not cache_seconds:
+        return
+
+    _OUTREACH_PREP_CACHE[cache_key] = {
+        "expires_at": time.time() + cache_seconds,
+        "result": result,
+    }
 
 
 def fallback_explanation(customer):
@@ -227,9 +289,16 @@ def build_outreach_prep_fallback(context):
 
 def generate_outreach_prep(context):
     api_key = os.getenv("OPENAI_API_KEY")
+    cache_key = build_outreach_prep_cache_key(context)
+    cached_result = get_cached_outreach_prep(cache_key)
+
+    if cached_result is not None:
+        return cached_result
 
     if not api_key:
-        return build_outreach_prep_fallback(context)
+        result = build_outreach_prep_fallback(context)
+        cache_outreach_prep(cache_key, result)
+        return result
 
     fallback = build_outreach_prep_fallback(context)
     business_context = load_outreach_business_context()
@@ -250,6 +319,9 @@ def generate_outreach_prep(context):
                         "Treat the latest sales outreach item as a high-priority signal. If the most recent sales outreach is a visit note, meeting summary, or post-visit follow-up, use that as the primary anchor for the recommendation, rationale, and draft unless a newer reply clearly changes the situation. "
                         "Use the inferred contact signals to decide who the most appropriate target is, and tune the tone for their likely role and influence. "
                         "Reference the latest sales outreach concretely when it is commercially relevant, rather than drifting into a generic follow-up. "
+                        "Pay close attention to dates. Do not describe an activity as recent unless it happened within the last 90 days relative to the current analysis date. "
+                        "If the latest relevant outreach or reply is older than 90 days, describe it as older, historical, previous, or the latest recorded activity instead. "
+                        "If an older message is still important, make that clear without implying it happened recently. "
                         "Return strict JSON with keys: suggested_mode, tone, confidence, rationale_bullets, sales_outreach_count, "
                         "observed_reply_count, approx_response_rate, last_reply_date, likely_preferred_mode, observed_pattern, "
                         "evidence_strength, customer_services_present, recommended_contact_name, recommended_contact_email, targeting_note, email_subject, email_body, call_objective, call_talking_points, voicemail_draft, suggested_text_message. "
@@ -274,10 +346,12 @@ def generate_outreach_prep(context):
 
         raw_text = response.output_text.strip()
         if not raw_text:
+            cache_outreach_prep(cache_key, fallback)
             return fallback
 
         parsed = json.loads(raw_text)
         if not isinstance(parsed, dict):
+            cache_outreach_prep(cache_key, fallback)
             return fallback
 
         result = fallback.copy()
@@ -289,7 +363,9 @@ def generate_outreach_prep(context):
             if isinstance(value, list) and not value:
                 continue
             result[key] = value
+        cache_outreach_prep(cache_key, result)
         return result
     except Exception as error:
         print(f"AI outreach prep failed: {error}")
+        cache_outreach_prep(cache_key, fallback)
         return fallback

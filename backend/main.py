@@ -9,12 +9,13 @@ from pathlib import Path
 import re
 import secrets
 from threading import Lock, Thread
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
 from ai import add_ai_explanations
+from ai import build_outreach_prep_fallback
 from ai import generate_outreach_prep
 from analysis import (
     calculate_average_gap,
@@ -182,8 +183,12 @@ async def preview_basic_auth(request: Request, call_next):
 
 
 @app.get("/", response_class=HTMLResponse)
-def read_root():
-    return render_home_page()
+def read_root(selected_customer: str = "", view: str = "focus", dismiss_customer: str = ""):
+    return render_home_page(
+        selected_customer=selected_customer,
+        view=view,
+        dismiss_customer=dismiss_customer,
+    )
 
 
 @app.get("/api")
@@ -421,9 +426,11 @@ def post_action_plan_dismiss(
     customer: str = Form(...),
     last_order: str = Form(""),
     reason: str = Form(""),
+    reason_preset: str = Form(""),
     return_to: str = Form("/#action-plan"),
 ):
-    dismiss_action_plan_customer(customer, last_order, reason)
+    effective_reason = str(reason or "").strip() or str(reason_preset or "").strip()
+    dismiss_action_plan_customer(customer, last_order, effective_reason)
     return RedirectResponse(url=return_to or "/#action-plan", status_code=303)
 
 
@@ -436,7 +443,7 @@ def post_action_plan_restore(
     return RedirectResponse(url=return_to or "/#action-plan", status_code=303)
 
 
-def render_home_page():
+def render_home_page(selected_customer="", view="focus", dismiss_customer=""):
     order_result = get_orders_for_analysis()
     attention_result = build_customers_needing_attention_response()
 
@@ -453,31 +460,37 @@ def render_home_page():
     orders = order_result["orders"]
     attention_customers = attention_result["late_customers"]
     grouped_orders = group_by_customer(orders)
-    customer_count = len(group_by_customer(orders))
-    recent_activity_count = count_recent_attention_activity(attention_customers)
     action_plan = build_home_action_plan(
         attention_customers,
         grouped_orders,
         attention_result.get("dismissed_customers", []),
     )
+    crm_result = fetch_crm_activities()
+    crm_activity_map = (
+        crm_result.get("activity_map", {})
+        if crm_result.get("status") == "ok" else {}
+    )
+    queue_summaries = build_home_queue_summaries(
+        action_plan.get("due_today", []),
+        grouped_orders,
+        crm_activity_map,
+    )
+    selected_customer = get_home_selected_customer_name(
+        queue_summaries,
+        selected_customer=selected_customer,
+    )
+    selected_preview = build_home_preview_payload(
+        selected_customer,
+        queue_summaries,
+        grouped_orders,
+        attention_customers,
+        crm_result,
+    )
+    home_view = "list" if str(view).strip().lower() == "list" else "focus"
 
     body = f"""
-        {render_data_availability_banner(order_result)}
-
-        {render_home_action_plan(action_plan)}
-
-        {render_recent_contact_holds(action_plan["hold_customers"])}
-
-        <details class="panel chart-panel">
-            <summary>Trend and Territory Charts</summary>
-            <div class="dashboard-grid chart-grid">
-                {render_monthly_orders_chart(orders)}
-                {render_attention_chart(attention_customers)}
-                {render_state_orders_chart(orders)}
-            </div>
-        </details>
-
-        {render_top_attention_table(attention_customers)}
+        {render_data_availability_banner(order_result, crm_result)}
+        {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, dismiss_customer=dismiss_customer)}
     """
 
     return render_page(
@@ -2590,8 +2603,20 @@ def render_outreach_prep_page(customer, context, result, data_results):
                 <p class="muted">{escape(customer)}</p>
             </div>
             <div class="outreach-links">
-                <a class="button secondary small-button" href="/#action-plan">Back to Action Plan</a>
-                <a class="button secondary small-button" href="/customer-view?customer={quote(customer)}">Open Customer Record</a>
+                <a class="button secondary small-button" href="/#action-plan">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M10 6 4 12l6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M5 12h15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                    <span>Back to Action Plan</span>
+                </a>
+                <a class="button secondary small-button" href="/customer-view?customer={quote(customer)}">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <circle cx="12" cy="8" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/>
+                        <path d="M5.5 19c1.8-3 4-4.5 6.5-4.5s4.7 1.5 6.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                    <span>Open Customer Record</span>
+                </a>
             </div>
         </div>
 
@@ -2605,7 +2630,7 @@ def render_outreach_prep_page(customer, context, result, data_results):
         </div>
 
         <div class="outreach-grid">
-            <section class="panel">
+            <section class="panel outreach-panel">
                 <h2>Recommended Next Move</h2>
                 <div class="summary compact-summary outreach-recommendation-summary">
                     <div><span class="label">Suggested Mode</span><strong>{escape(str(result.get("suggested_mode", "")) or "Not available")}</strong></div>
@@ -2613,12 +2638,12 @@ def render_outreach_prep_page(customer, context, result, data_results):
                     <div><span class="label">Confidence</span><strong>{escape(str(result.get("confidence", "")) or "Not available")}</strong></div>
                     <div><span class="label">Target Contact</span><strong>{escape(target_contact)}</strong></div>
                 </div>
-                <p class="outreach-pattern"><strong>Targeting note:</strong> {escape(str(result.get("targeting_note", "No specific targeting note available.")))}</p>
+                <p class="outreach-pattern outreach-note-box"><strong>Targeting note:</strong> {escape(str(result.get("targeting_note", "No specific targeting note available.")))}</p>
                 <h3>Why This Was Suggested</h3>
-                <ul class="outreach-rationale-list">{rationale_items}</ul>
+                <ul class="outreach-rationale-list outreach-note-box">{rationale_items}</ul>
             </section>
 
-            <section class="panel">
+            <section class="panel outreach-panel">
                 <h2>Why This Was Suggested</h2>
                 <div class="summary compact-summary outreach-evidence-summary">
                     <div><span class="label">Sales Outreach Sent</span><strong>{escape(str(result.get("sales_outreach_count", 0)))}</strong></div>
@@ -2628,12 +2653,12 @@ def render_outreach_prep_page(customer, context, result, data_results):
                     <div><span class="label">Likely Preferred Mode</span><strong>{escape(str(result.get("likely_preferred_mode", "Not available")))}</strong></div>
                     <div><span class="label">Evidence Strength</span><strong>{escape(str(result.get("evidence_strength", "Not available")))}</strong></div>
                 </div>
-                <p class="outreach-pattern"><strong>Observed pattern:</strong> {escape(str(result.get("observed_pattern", "No pattern noted.")))}</p>
-                <p class="outreach-pattern"><strong>Customer service traffic present:</strong> {"Yes" if result.get("customer_services_present") else "No"}</p>
+                <p class="outreach-pattern outreach-note-box"><strong>Observed pattern:</strong> {escape(str(result.get("observed_pattern", "No pattern noted.")))}</p>
+                <p class="outreach-pattern outreach-note-box"><strong>Customer service traffic present:</strong> {"Yes" if result.get("customer_services_present") else "No"}</p>
             </section>
         </div>
 
-        <section class="panel">
+        <section class="panel outreach-panel">
             <h2>Draft Outreach</h2>
             <div class="outreach-draft-block">
                 <span class="label">Subject</span>
@@ -2645,16 +2670,16 @@ def render_outreach_prep_page(customer, context, result, data_results):
             </div>
         </section>
 
-        <section class="panel">
+        <section class="panel outreach-panel">
             <h2>Likely Sales Contacts</h2>
             <ul class="dismissed-list">{contact_rows}</ul>
         </section>
 
         <div class="outreach-grid">
-            <section class="panel">
+            <section class="panel outreach-panel">
                 <h2>Call Version</h2>
-                <p class="outreach-pattern"><strong>Call objective:</strong> {escape(str(result.get("call_objective", "")) or "Not available")}</p>
-                <ul class="outreach-rationale-list">{call_points}</ul>
+                <p class="outreach-pattern outreach-note-box"><strong>Call objective:</strong> {escape(str(result.get("call_objective", "")) or "Not available")}</p>
+                <ul class="outreach-rationale-list outreach-note-box">{call_points}</ul>
                 <div class="outreach-draft-block">
                     <span class="label">Suggested Voicemail</span>
                     <div class="outreach-draft-body">{escape(str(result.get("voicemail_draft", "")) or "Not available")}</div>
@@ -2665,13 +2690,13 @@ def render_outreach_prep_page(customer, context, result, data_results):
                 </div>
             </section>
 
-            <section class="panel">
+            <section class="panel outreach-panel">
                 <h2>Recent Sales Outreach Context</h2>
                 <ul class="dismissed-list">{recent_sales_rows}</ul>
             </section>
         </div>
 
-        <section class="panel">
+        <section class="panel outreach-panel">
             <h2>Latest Replied Outreach</h2>
             <ul class="dismissed-list">{latest_replied_row}</ul>
         </section>
@@ -3593,6 +3618,514 @@ def render_home_action_plan(action_plan):
     """
 
 
+def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, dismiss_customer=""):
+    queue_rows = "".join(
+        render_home_queue_row(
+            summary,
+            is_selected=(
+                home_view == "focus"
+                and selected_preview
+                and str(summary.get("customer")) == str(selected_preview.get("customer"))
+            ),
+        )
+        for summary in queue_summaries
+    )
+
+    if not queue_rows:
+        queue_rows = (
+            "<tr>"
+            "<td colspan='5' class='empty'>No immediate follow-ups right now.</td>"
+            "</tr>"
+        )
+
+    return f"""
+        <section class="home-workspace">
+            {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view)}
+            {render_home_focus_preview(selected_preview, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
+
+            <section class="panel home-queue-panel" id="home-queue">
+                <div class="panel-head home-queue-head">
+                    <div>
+                        <h2>Action Plan</h2>
+                    </div>
+                </div>
+                <div class="table-wrap home-queue-wrap">
+                    <table class="queue-table">
+                        <thead>
+                            <tr>
+                                <th>Customer</th>
+                                <th>Location</th>
+                                <th>Mode</th>
+                                <th>Next Action</th>
+                                <th>Why Now</th>
+                            </tr>
+                        </thead>
+                        <tbody>{queue_rows}</tbody>
+                    </table>
+                </div>
+            </section>
+
+            {render_recent_contact_holds(action_plan["hold_customers"])}
+            {render_dismissed_action_plan_items(action_plan.get("dismissed", []), return_to="/#home-queue")}
+        </section>
+    """
+
+
+def render_home_view_toggle(selected_customer, home_view):
+    focus_href = build_home_selection_href(
+        selected_customer=selected_customer,
+        view="focus",
+        anchor="focus-preview",
+    )
+    list_href = build_home_selection_href(
+        selected_customer=selected_customer,
+        view="list",
+        anchor="home-queue",
+    )
+    focus_class = "toggle-chip active" if home_view == "focus" else "toggle-chip"
+    list_class = "toggle-chip active" if home_view == "list" else "toggle-chip"
+
+    return f"""
+        <div class="home-view-toggle">
+            <a class="{focus_class}" href="{focus_href}">Focus</a>
+            <a class="{list_class}" href="{list_href}">List</a>
+        </div>
+    """
+
+
+def build_home_selection_href(selected_customer="", view="focus", anchor=""):
+    params = {}
+
+    if selected_customer:
+        params["selected_customer"] = str(selected_customer)
+
+    if view and view != "focus":
+        params["view"] = str(view)
+
+    query = urlencode(params)
+    href = "/"
+
+    if query:
+        href += f"?{query}"
+
+    if anchor:
+        href += f"#{anchor}"
+
+    return href
+
+
+def get_home_selected_customer_name(queue_summaries, selected_customer=""):
+    if not queue_summaries:
+        return ""
+
+    selected_lookup = str(selected_customer or "").strip().lower()
+
+    if selected_lookup:
+        for summary in queue_summaries:
+            if str(summary.get("customer", "")).strip().lower() == selected_lookup:
+                return str(summary.get("customer", ""))
+
+    return str(queue_summaries[0].get("customer", ""))
+
+
+def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map):
+    summaries = []
+
+    for customer in queue_customers:
+        customer_name = str(customer.get("customer", ""))
+        customer_orders = grouped_orders.get(customer_name, [])
+        customer_primary_key = get_customer_primary_key(customer_orders)
+        crm_activities = crm_activity_map.get(customer_primary_key, [])
+        sales_activities = get_sales_outreach_activities(crm_activities)
+        outbound_sales = [
+            activity for activity in sales_activities
+            if str(activity.get("direction") or "").strip().lower() == "outbound"
+        ]
+        inbound_sales = [
+            activity for activity in sales_activities
+            if str(activity.get("direction") or "").strip().lower() == "inbound"
+        ]
+        top_contacts = build_outreach_contact_signals(sales_activities)
+        suggested_mode = determine_home_queue_mode(
+            customer,
+            outbound_count=len(outbound_sales),
+            inbound_count=len(inbound_sales),
+        )
+        summaries.append({
+            "customer": customer_name,
+            "location": extract_customer_location_label(customer_name, customer_orders),
+            "priority_score": customer.get("priority_score"),
+            "days_since_last": customer.get("days_since_last"),
+            "avg_gap": customer.get("avg_gap"),
+            "last_order": customer.get("last_order"),
+            "last_activity_date": customer.get("last_activity_date"),
+            "action": customer.get("action"),
+            "suggested_mode": suggested_mode,
+            "next_action_label": get_home_next_action_label(suggested_mode),
+            "why_now": build_home_why_now(
+                customer,
+                outbound_count=len(outbound_sales),
+                inbound_count=len(inbound_sales),
+            ),
+            "top_contact": top_contacts[0] if top_contacts else None,
+        })
+
+    return summaries
+
+
+def determine_home_queue_mode(customer, outbound_count=0, inbound_count=0):
+    if has_recent_activity(customer.get("days_since_last_activity")):
+        return "Hold"
+    if outbound_count >= 3 and inbound_count == 0:
+        return "Call"
+    return "Email"
+
+
+def get_home_next_action_label(suggested_mode):
+    normalized = str(suggested_mode or "").strip().lower()
+
+    if normalized == "call":
+        return "Prepare Call"
+    if normalized == "visit":
+        return "Prepare Visit"
+    if normalized == "hold":
+        return "Review Context"
+    return "Prepare Email"
+
+
+def build_home_why_now(customer, outbound_count=0, inbound_count=0):
+    days_since_last = customer.get("days_since_last")
+
+    if inbound_count:
+        return f"Reply history exists • {days_since_last} days since last order"
+    if outbound_count >= 3:
+        return f"Multiple outbound touches with no reply • {days_since_last} days since last order"
+    if outbound_count == 0:
+        return f"No outreach history • {days_since_last} days since last order"
+    return f"Beyond usual cycle • {days_since_last} days since last order"
+
+
+def extract_customer_location_label(customer_name, customer_orders=None):
+    customer_name = str(customer_name or "").strip()
+    match = re.search(r"\(([^()]+)\)\s*$", customer_name)
+
+    if match:
+        return match.group(1).strip()
+
+    customer_orders = customer_orders or []
+    state = get_order_state(customer_orders[-1]) if customer_orders else ""
+    territory = get_customer_territory(customer_orders) if customer_orders else ""
+
+    if state and territory:
+        return f"{territory}, {state}"
+    if state:
+        return str(state)
+    if territory:
+        return str(territory)
+    return "Location not recorded"
+
+
+def build_home_preview_payload(selected_customer, queue_summaries, grouped_orders, attention_customers, crm_result):
+    if not selected_customer:
+        return None
+
+    queue_summary = next(
+        (
+            item for item in queue_summaries
+            if str(item.get("customer", "")) == str(selected_customer)
+        ),
+        None,
+    )
+
+    if not queue_summary:
+        return None
+
+    customer_orders = grouped_orders.get(selected_customer, [])
+    if not customer_orders:
+        return None
+
+    attention_lookup = {
+        str(item.get("customer", "")): item
+        for item in attention_customers
+    }
+    attention = attention_lookup.get(selected_customer)
+    context = build_outreach_context(selected_customer, customer_orders, attention, crm_result)
+    result = build_outreach_prep_fallback(context)
+    target_contact_name = str(result.get("recommended_contact_name") or "").strip()
+    target_contact_email = str(result.get("recommended_contact_email") or "").strip()
+    primary_contact = context.get("primary_contact") or {}
+    target_role = str(primary_contact.get("role") or "").strip() or "Likely sales contact"
+    if not target_contact_name:
+        target_contact_name = str(primary_contact.get("name") or "").strip() or "Best known contact"
+    if not target_contact_email:
+        target_contact_email = str(primary_contact.get("email") or "").strip()
+    message_points = build_home_message_points(
+        context=context,
+        result=result,
+        customer_name=selected_customer,
+    )
+
+    return {
+        "customer": selected_customer,
+        "location": queue_summary.get("location") or extract_customer_location_label(selected_customer, customer_orders),
+        "queue_summary": queue_summary,
+        "context": context,
+        "result": result,
+        "target_name": target_contact_name,
+        "target_email": target_contact_email,
+        "target_role": target_role,
+        "message_points": message_points,
+        "mode": str(result.get("suggested_mode") or queue_summary.get("suggested_mode") or "Email"),
+        "mode_cta": get_home_next_action_label(
+            str(result.get("suggested_mode") or queue_summary.get("suggested_mode") or "Email")
+        ),
+    }
+
+
+def build_home_message_points(context, result, customer_name):
+    points = []
+    latest_subject = str(context.get("latest_sales_outreach_subject") or "").strip()
+    last_reply_date = str(result.get("last_reply_date") or "").strip()
+    average_cycle = context.get("average_cycle")
+    days_since_last_order = context.get("days_since_last_order")
+    primary_contact = context.get("primary_contact") or {}
+    contact_name = str(primary_contact.get("name") or "").strip()
+    target_name = str(result.get("recommended_contact_name") or "").strip() or contact_name
+
+    if latest_subject:
+        points.append(
+            f"Acknowledge the latest sales contact about {latest_subject.lower()} and reconnect it to current repair needs."
+        )
+    elif target_name:
+        points.append(
+            f"Open by referencing the last conversation with {target_name} and checking whether repair priorities have shifted."
+        )
+    else:
+        points.append(
+            f"Open with a brief check-in on whether {customer_name} has any damaged mats or repair needs coming up."
+        )
+
+    if contact_name:
+        points.append(
+            f"Ask {contact_name} whether mats are currently being set aside for repair or if a manager decision is still needed."
+        )
+    else:
+        points.append(
+            "Ask whether mats are currently being set aside for repair or whether the customer has paused the program for a specific reason."
+        )
+
+    if average_cycle and days_since_last_order:
+        points.append(
+            f"Use the gap from the usual {average_cycle}-day cycle and the current {days_since_last_order}-day pause to frame why you are checking in now."
+        )
+    else:
+        points.append(
+            "Give a simple commercial reason for the outreach and suggest an easy next step such as a quick call, update, or visit."
+        )
+
+    return points[:3]
+
+
+def render_home_focus_preview(preview, dismiss_open=False):
+    if not preview:
+        return """
+            <section class="panel home-focus-panel" id="focus-preview">
+                <p class="muted">No active action-plan item is selected.</p>
+            </section>
+        """
+
+    customer_name = str(preview.get("customer", ""))
+    queue_summary = preview.get("queue_summary", {})
+    context = preview.get("context", {})
+    result = preview.get("result", {})
+    mode = str(preview.get("mode") or "Email")
+    mode_cta = str(preview.get("mode_cta") or "Open Outreach Prep")
+    dismiss_panel_id = "home-dismiss-" + re.sub(r"[^a-z0-9]+", "-", customer_name.lower()).strip("-")
+    message_points = "".join(
+        f"<li>{escape(point)}</li>"
+        for point in preview.get("message_points", [])
+    ) or "<li>No message guidance available yet.</li>"
+    dismiss_form = f"""
+        <button
+            type="button"
+            class="button secondary home-preview-dismiss-button"
+            onclick="document.getElementById('{dismiss_panel_id}').hidden = false;"
+        >Dismiss / Not Now</button>
+    """
+    dismiss_panel = f"""
+        <section class="home-dismiss-panel" id="{dismiss_panel_id}" hidden>
+            <form method="post" action="/action-plan-dismiss" class="home-dismiss-form">
+                <input type="hidden" name="customer" value="{escape(customer_name)}">
+                <input type="hidden" name="last_order" value="{escape(str(queue_summary.get('last_order', '')))}">
+                <input type="hidden" name="return_to" value="/#home-queue">
+                <div class="home-dismiss-presets">
+                    <button type="submit" name="reason_preset" value="No damaged mats ready" class="home-dismiss-chip">No damaged mats ready</button>
+                    <button type="submit" name="reason_preset" value="Waiting on manager decision" class="home-dismiss-chip">Waiting on manager decision</button>
+                    <button type="submit" name="reason_preset" value="Customer asked us to wait" class="home-dismiss-chip">Customer asked us to wait</button>
+                    <button type="submit" name="reason_preset" value="Recent visit / no follow-up yet" class="home-dismiss-chip">Recent visit / no follow-up yet</button>
+                    <button type="submit" name="reason_preset" value="Pricing under review" class="home-dismiss-chip">Pricing under review</button>
+                </div>
+                <div class="home-dismiss-actions">
+                    <input
+                        type="text"
+                        name="reason"
+                        class="home-dismiss-input"
+                        placeholder="Add a reason for dismissing urgency"
+                    >
+                    <button type="submit" class="button home-dismiss-confirm">Confirm Dismiss</button>
+                    <button
+                        type="button"
+                        class="button secondary home-dismiss-cancel"
+                        onclick="document.getElementById('{dismiss_panel_id}').hidden = true;"
+                    >Cancel</button>
+                </div>
+            </form>
+        </section>
+    """
+
+    return f"""
+        <section class="panel home-focus-panel" id="focus-preview">
+            <div class="home-focus-head">
+                <div class="home-focus-title-block">
+                    <h2 class="home-focus-title">{escape(customer_name)}</h2>
+                    <p class="home-focus-location">{escape(str(preview.get("location") or "Location not recorded"))}</p>
+                </div>
+                {dismiss_form}
+            </div>
+            {dismiss_panel}
+
+            <div class="home-focus-grid">
+                <section class="home-focus-column">
+                    <div class="home-step-head">
+                        <span class="home-step-number">1</span>
+                        <div>
+                            <span class="home-step-title">Target</span>
+                            <span class="home-step-subtitle">Who to contact</span>
+                        </div>
+                    </div>
+                    <div class="home-focus-card">
+                        <strong>{escape(str(preview.get("target_name") or "Best known contact"))}</strong>
+                        <span class="home-focus-card-meta">{escape(str(preview.get("target_email") or "Email not recorded"))}</span>
+                        <span class="home-focus-badge">Primary</span>
+                        <span class="home-focus-card-note">{escape(str(preview.get("target_role") or "Likely sales contact"))}</span>
+                    </div>
+                </section>
+
+                <section class="home-focus-column">
+                    <div class="home-step-head">
+                        <span class="home-step-number">2</span>
+                        <div>
+                            <span class="home-step-title">Message</span>
+                            <span class="home-step-subtitle">What to say</span>
+                        </div>
+                    </div>
+                    <div class="home-focus-card">
+                        <ul class="home-message-points">{message_points}</ul>
+                        <div class="home-subject-line">
+                            <span class="label">Suggested subject</span>
+                            <strong>{escape(str(result.get("email_subject") or "Not available"))}</strong>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="home-focus-column">
+                    <div class="home-step-head">
+                        <span class="home-step-number">3</span>
+                        <div>
+                            <span class="home-step-title">Mode</span>
+                            <span class="home-step-subtitle">How to contact</span>
+                        </div>
+                    </div>
+                    <div class="home-focus-card">
+                        <strong>{escape(mode)}</strong>
+                        <span class="home-focus-card-meta">Confidence: {escape(str(result.get("confidence") or "Not available"))}</span>
+                        <a class="button home-mode-cta" href="/outreach-prep?customer={quote(customer_name)}">
+                            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
+                            </svg>
+                            <span>{escape(mode_cta)}</span>
+                        </a>
+                    </div>
+                </section>
+            </div>
+
+            <div class="home-evidence-strip">
+                <div><span class="label">Days Since Last Order</span><strong>{escape(str(context.get("days_since_last_order") or "n/a"))}</strong></div>
+                <div><span class="label">Average Cycle</span><strong>{escape(str(context.get("average_cycle") or "n/a"))}</strong></div>
+                <div><span class="label">Last Order Date</span><strong>{escape(str(context.get("last_order_date") or "n/a"))}</strong></div>
+                <div><span class="label">Sales Outreach History</span><strong>{escape(str(context.get("sales_activity_count") or 0))}</strong></div>
+                <div><span class="label">Last Reply</span><strong>{escape(str(result.get("last_reply_date") or "No reply recorded"))}</strong></div>
+                <div><span class="label">Observed Replies</span><strong>{escape(str(result.get("observed_reply_count") or 0))}</strong></div>
+                <div><span class="label">Evidence Strength</span><strong>{escape(str(result.get("evidence_strength") or "Not available"))}</strong></div>
+            </div>
+        </section>
+    """
+
+
+def render_home_queue_row(summary, is_selected=False):
+    customer_name = str(summary.get("customer", ""))
+    select_href = build_home_selection_href(
+        selected_customer=customer_name,
+        view="focus",
+        anchor="focus-preview",
+    )
+    customer_href = f"/customer-view?customer={quote(customer_name)}"
+    selected_class = " class=\"queue-selected\"" if is_selected else ""
+    mode_label = str(summary.get("suggested_mode") or "Email")
+    mode_class = f"mode-chip mode-{mode_label.strip().lower()}"
+    mode_markup = render_queue_mode_chip(mode_label)
+
+    return f"""
+        <tr{selected_class}>
+            <td>
+                <div class="queue-customer-cell">
+                    <a class="queue-focus-link" href="{select_href}"><strong>{escape(customer_name)}</strong></a>
+                    <a class="queue-secondary-link" href="{customer_href}" title="Open customer record" aria-label="Open customer record">
+                        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                            <path fill="currentColor" d="M12 12.5a4.25 4.25 0 1 1 0-8.5 4.25 4.25 0 0 1 0 8.5Zm0-1.5a2.75 2.75 0 1 0 0-5.5 2.75 2.75 0 0 0 0 5.5Zm0 3c3.78 0 6.9 1.94 7.82 4.77a.75.75 0 0 1-1.43.46C17.67 17.1 15.08 15.5 12 15.5s-5.67 1.6-6.39 3.73a.75.75 0 1 1-1.43-.46C5.1 15.94 8.22 14 12 14Z"/>
+                        </svg>
+                    </a>
+                </div>
+            </td>
+            <td>{escape(str(summary.get("location") or ""))}</td>
+            <td><span class="{mode_class}">{mode_markup}</span></td>
+            <td><a class="queue-action-link" href="/outreach-prep?customer={quote(customer_name)}">{escape(str(summary.get("next_action_label") or "Open Outreach Prep"))}</a></td>
+            <td>{escape(str(summary.get("why_now") or ""))}</td>
+        </tr>
+    """
+
+
+def render_queue_mode_chip(mode_label):
+    normalized = str(mode_label or "").strip().lower()
+
+    if normalized == "email":
+        return (
+            '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+            '<path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>'
+            '</svg>'
+        )
+    if normalized == "call":
+        return (
+            '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+            '<path fill="currentColor" d="M7.2 3.5h2.1c.5 0 .9.4 1 .8l.5 3.1c.1.4-.1.8-.4 1l-1.5 1.2a14.2 14.2 0 0 0 5.5 5.5l1.2-1.5c.2-.3.6-.5 1-.4l3.1.5c.5.1.8.5.8 1v2.1c0 .6-.5 1.1-1.1 1.1C10 19.9 4.1 14 4.1 4.6c0-.6.5-1.1 1.1-1.1Z"/>'
+            '</svg>'
+        )
+    if normalized == "visit":
+        return (
+            '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+            '<path fill="currentColor" d="M12 2.8a6.2 6.2 0 0 1 6.2 6.2c0 4.4-4.8 10.2-5.4 10.9a1 1 0 0 1-1.6 0C10.6 19.2 5.8 13.4 5.8 9A6.2 6.2 0 0 1 12 2.8Zm0 8.6A2.4 2.4 0 1 0 12 6.6a2.4 2.4 0 0 0 0 4.8Z"/>'
+            '</svg>'
+        )
+    if normalized == "hold":
+        return (
+            '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+            '<path fill="currentColor" d="M12 2.8A9.2 9.2 0 1 1 2.8 12 9.2 9.2 0 0 1 12 2.8Zm0 1.5A7.7 7.7 0 1 0 19.7 12 7.7 7.7 0 0 0 12 4.3Zm-2 3.4c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Zm4 0c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Z"/>'
+            '</svg>'
+        )
+
+    return escape(mode_label)
+
+
 def render_action_plan_item(customer):
     customer_name = str(customer.get("customer", ""))
     customer_url = f"/customer-view?customer={quote(customer_name)}"
@@ -4483,17 +5016,28 @@ def render_page(title, body, top_right="", show_title=True):
                 <style>
                     :root {{
                         color-scheme: light;
-                        --bg: #f3f6fb;
+                        --bg: #fbfdff;
                         --surface: #ffffff;
-                        --surface-soft: #f8fbff;
-                        --border: #d6e2ef;
+                        --surface-soft: #fbfdff;
+                        --surface-panel: #ffffff;
+                        --surface-card: #ffffff;
+                        --surface-inset: #f9fbfe;
+                        --border: #dde8f3;
                         --border-strong: #bfd0e0;
                         --text: #1f2933;
                         --muted: #5b6b7c;
                         --muted-soft: #7b8794;
-                        --blue: #1f5f99;
-                        --blue-dark: #174974;
-                        --shadow-soft: 0 8px 24px rgba(15, 23, 42, 0.04);
+                        --blue: #245cff;
+                        --blue-dark: #1b46c9;
+                        --shadow-soft: 0 14px 34px rgba(15, 23, 42, 0.1);
+                        --shadow-panel: 0 16px 36px rgba(15, 23, 42, 0.08);
+                        --shadow-card: 0 10px 24px rgba(15, 23, 42, 0.06);
+                        --shadow-inset: 0 6px 16px rgba(15, 23, 42, 0.03);
+                        --type-body: 13px;
+                        --type-label: 12px;
+                        --type-card-title: 16px;
+                        --type-section-title: 20px;
+                        --type-page-title: 30px;
                     }}
 
                     body {{
@@ -4511,9 +5055,13 @@ def render_page(title, body, top_right="", show_title=True):
 
                     h1 {{
                         margin: 0 0 18px;
-                        font-size: 30px;
+                        font-size: var(--type-page-title);
                         line-height: 1.1;
                         letter-spacing: 0;
+                    }}
+
+                    h2, h3 {{
+                        color: var(--blue);
                     }}
 
                     .home-page-title {{
@@ -4683,6 +5231,418 @@ def render_page(title, body, top_right="", show_title=True):
                         font-size: 14px;
                     }}
 
+                    .home-workspace {{
+                        display: grid;
+                        gap: 16px;
+                    }}
+
+                    .home-view-toggle {{
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 8px;
+                        padding: 4px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: rgba(255, 255, 255, 0.78);
+                        box-shadow: var(--shadow-soft);
+                        margin-bottom: 4px;
+                        width: fit-content;
+                    }}
+
+                    .home-view-toggle .toggle-chip {{
+                        min-height: 38px;
+                        min-width: 86px;
+                        padding: 0 16px;
+                        border-radius: 8px;
+                        border: 1px solid transparent;
+                        color: var(--muted);
+                        text-decoration: none;
+                        font-weight: 600;
+                        background: transparent;
+                    }}
+
+                    .home-view-toggle .toggle-chip.active {{
+                        border-color: #c8daf3;
+                        background: #ffffff;
+                        color: #1652d1;
+                        box-shadow: 0 6px 14px rgba(31, 95, 153, 0.08);
+                    }}
+
+                    .home-focus-panel {{
+                        padding: 20px 22px 16px;
+                        box-shadow: 0 18px 42px rgba(15, 23, 42, 0.12);
+                    }}
+
+                    .home-focus-head {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: start;
+                        gap: 16px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .panel h2.home-focus-title {{
+                        margin: 0 0 6px;
+                        color: var(--text);
+                        font-size: 44px;
+                        font-weight: 800;
+                        line-height: 1.1;
+                    }}
+
+                    .home-focus-location {{
+                        margin: 0;
+                        color: var(--muted);
+                        font-size: 16px;
+                    }}
+
+                    .home-preview-dismiss-form {{
+                        margin: 0;
+                        flex-shrink: 0;
+                    }}
+
+                    .home-preview-dismiss-button {{
+                        width: auto;
+                        min-height: 44px;
+                        min-width: 190px;
+                        font-size: 15px;
+                        padding: 10px 18px;
+                    }}
+
+                    .home-dismiss-panel {{
+                        margin: 0 0 18px;
+                        padding: 14px 16px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        background: rgba(255, 255, 255, 0.98);
+                        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+                    }}
+
+                    .home-dismiss-form {{
+                        display: grid;
+                        gap: 12px;
+                    }}
+
+                    .home-dismiss-presets {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 8px;
+                    }}
+
+                    .home-dismiss-chip {{
+                        width: auto;
+                        min-height: 32px;
+                        padding: 0 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 999px;
+                        background: #fff;
+                        color: #334e68;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }}
+
+                    .home-dismiss-actions {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr) auto auto;
+                        gap: 10px;
+                        align-items: center;
+                    }}
+
+                    .home-dismiss-input {{
+                        width: 100%;
+                        min-width: 0;
+                    }}
+
+                    .home-dismiss-confirm,
+                    .home-dismiss-cancel {{
+                        width: auto;
+                        min-width: 140px;
+                    }}
+
+                    .home-focus-grid {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.15fr) minmax(0, 0.95fr);
+                        gap: 26px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .home-focus-column {{
+                        position: relative;
+                        min-width: 0;
+                    }}
+
+                    .home-focus-column:not(:last-child)::after {{
+                        content: "";
+                        position: absolute;
+                        top: 0;
+                        right: -14px;
+                        bottom: 2px;
+                        width: 1px;
+                        background: #c0cfdf;
+                    }}
+
+                    .home-step-head {{
+                        display: flex;
+                        align-items: center;
+                        gap: 12px;
+                        margin-bottom: 8px;
+                    }}
+
+                    .home-step-number {{
+                        width: 34px;
+                        height: 34px;
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        border-radius: 999px;
+                        background: #245cff;
+                        color: #fff;
+                        font-weight: 700;
+                        flex-shrink: 0;
+                    }}
+
+                    .home-step-title {{
+                        display: block;
+                        color: #245cff;
+                        font-size: 22px;
+                        font-weight: 700;
+                        line-height: 1.1;
+                    }}
+
+                    .home-step-subtitle {{
+                        display: block;
+                        margin-top: 2px;
+                        color: var(--muted);
+                        font-size: 14px;
+                    }}
+
+                    .home-focus-card {{
+                        min-height: 196px;
+                        display: grid;
+                        align-content: start;
+                        gap: 10px;
+                        padding: 16px 18px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        background: var(--surface-card);
+                        box-shadow: var(--shadow-card);
+                    }}
+
+                    .home-focus-card strong {{
+                        font-size: 16px;
+                        line-height: 1.3;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .home-focus-card-meta {{
+                        display: block;
+                        color: var(--muted);
+                        font-size: 13px;
+                        line-height: 1.35;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .home-focus-card-note {{
+                        display: block;
+                        color: #334e68;
+                        font-size: 13px;
+                        line-height: 1.4;
+                    }}
+
+                    .home-focus-badge {{
+                        display: inline-flex;
+                        width: fit-content;
+                        align-items: center;
+                        justify-content: center;
+                        min-height: 28px;
+                        padding: 0 12px;
+                        border-radius: 999px;
+                        background: #e7f8eb;
+                        color: #1f7a45;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }}
+
+                    .home-message-points {{
+                        margin: 0;
+                        padding-left: 18px;
+                        color: #334e68;
+                        font-size: 13px;
+                        line-height: 1.4;
+                    }}
+
+                    .home-message-points li + li {{
+                        margin-top: 6px;
+                    }}
+
+                    .home-subject-line {{
+                        margin-top: auto;
+                        padding-top: 2px;
+                    }}
+
+                    .home-mode-cta {{
+                        margin-top: auto;
+                        width: 100%;
+                        min-height: 46px;
+                        justify-content: center;
+                        font-size: 14px;
+                        gap: 12px;
+                        border-color: #245cff;
+                        background: #245cff;
+                    }}
+
+                    .home-mode-cta svg {{
+                        width: 28px;
+                        height: 28px;
+                        flex-shrink: 0;
+                        display: block;
+                    }}
+
+                    .home-evidence-strip {{
+                        display: grid;
+                        grid-template-columns:
+                            minmax(110px, 0.9fr)
+                            minmax(110px, 0.9fr)
+                            minmax(120px, 0.95fr)
+                            minmax(120px, 0.95fr)
+                            minmax(120px, 0.9fr)
+                            minmax(110px, 0.9fr)
+                            minmax(200px, 1.55fr);
+                        gap: 0;
+                        border: 1px solid #dbe5f0;
+                        border-radius: 12px;
+                        overflow: hidden;
+                        background: rgba(255, 255, 255, 0.99);
+                    }}
+
+                    .home-evidence-strip div {{
+                        padding: 14px 16px;
+                        border-right: 1px solid #dbe5f0;
+                        background: #f9fbfe;
+                    }}
+
+                    .home-evidence-strip div:last-child {{
+                        border-right: 0;
+                    }}
+
+                    .home-evidence-strip div:nth-child(even) {{
+                        background: #fcfdff;
+                    }}
+
+                    .home-evidence-strip strong {{
+                        display: block;
+                        font-size: 15px;
+                        line-height: 1.3;
+                    }}
+
+                    .home-queue-panel {{
+                        margin-bottom: 0;
+                    }}
+
+                    .home-queue-head {{
+                        margin-bottom: 10px;
+                    }}
+
+                    .home-queue-wrap {{
+                        margin-bottom: 0;
+                    }}
+
+                    .queue-table {{
+                        min-width: 0;
+                    }}
+
+                    .queue-table th:nth-child(3),
+                    .queue-table td:nth-child(3),
+                    .queue-table th:nth-child(4),
+                    .queue-table td:nth-child(4) {{
+                        white-space: nowrap;
+                    }}
+
+                    .queue-selected {{
+                        background: #edf4ff;
+                    }}
+
+                    .queue-selected td {{
+                        background: #edf4ff;
+                    }}
+
+                    .queue-selected td:first-child {{
+                        box-shadow: inset 3px 0 0 #265cdb;
+                    }}
+
+                    .queue-customer-cell {{
+                        display: grid;
+                        gap: 6px;
+                    }}
+
+                    .queue-focus-link {{
+                        color: var(--text);
+                        text-decoration: none;
+                    }}
+
+                    .queue-focus-link strong {{
+                        color: var(--text);
+                    }}
+
+                    .queue-focus-link:hover strong,
+                    .queue-secondary-link:hover,
+                    .queue-action-link:hover {{
+                        color: var(--blue);
+                    }}
+
+                    .queue-secondary-link {{
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        width: 24px;
+                        height: 24px;
+                        color: #245cff;
+                        text-decoration: none;
+                    }}
+
+                    .queue-secondary-link svg {{
+                        width: 18px;
+                        height: 18px;
+                        display: block;
+                    }}
+
+                    .queue-action-link {{
+                        color: #245cff;
+                        font-weight: 600;
+                        text-decoration: none;
+                    }}
+
+                    .mode-chip {{
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        min-height: 28px;
+                        padding: 0 10px;
+                        border-radius: 999px;
+                        border: 1px solid #d3e2f3;
+                        background: #f5f9ff;
+                        color: #24527a;
+                        font-size: 13px;
+                        font-weight: 700;
+                    }}
+
+                    .mode-chip svg {{
+                        width: 16px;
+                        height: 16px;
+                        display: block;
+                    }}
+
+                    .mode-call {{
+                        background: #f7f2ff;
+                        border-color: #ddd2fb;
+                        color: #5c43a8;
+                    }}
+
+                    .mode-hold {{
+                        background: #eef5ff;
+                        border-color: #cfe0f7;
+                        color: #3a5f87;
+                    }}
+
                     .summary {{
                         display: grid;
                         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -4691,16 +5651,16 @@ def render_page(title, body, top_right="", show_title=True):
                     }}
 
                     .summary div {{
-                        background: var(--surface);
+                        background: var(--surface-card);
                         border: 1px solid var(--border);
-                        border-radius: 8px;
+                        border-radius: 12px;
                         padding: 13px 15px;
-                        box-shadow: var(--shadow-soft);
+                        box-shadow: var(--shadow-card);
                     }}
 
                     .summary strong {{
                         display: block;
-                        font-size: 17px;
+                        font-size: var(--type-card-title);
                         line-height: 1.25;
                         overflow-wrap: anywhere;
                         word-break: break-word;
@@ -4739,11 +5699,11 @@ def render_page(title, body, top_right="", show_title=True):
                         display: block;
                         margin-bottom: 4px;
                         color: var(--muted);
-                        font-size: 12px;
+                        font-size: var(--type-label);
                     }}
 
                     .path-value {{
-                        font-size: 13px;
+                        font-size: var(--type-body);
                         line-height: 1.35;
                         font-weight: 600;
                     }}
@@ -4762,12 +5722,12 @@ def render_page(title, body, top_right="", show_title=True):
                     .nav-card {{
                         display: block;
                         padding: 14px 16px;
-                        background: var(--surface);
+                        background: var(--surface-card);
                         border: 1px solid var(--border);
                         border-radius: 8px;
                         color: inherit;
                         text-decoration: none;
-                        box-shadow: var(--shadow-soft);
+                        box-shadow: var(--shadow-card);
                     }}
 
                     .nav-card strong {{
@@ -4793,15 +5753,15 @@ def render_page(title, body, top_right="", show_title=True):
                     .panel {{
                         margin-bottom: 18px;
                         padding: 18px;
-                        background: var(--surface);
+                        background: var(--surface-panel);
                         border: 1px solid var(--border);
-                        border-radius: 8px;
-                        box-shadow: var(--shadow-soft);
+                        border-radius: 12px;
+                        box-shadow: var(--shadow-panel);
                     }}
 
                     .panel h2 {{
                         margin: 0 0 6px;
-                        font-size: 20px;
+                        font-size: var(--type-section-title);
                     }}
 
                     .panel-head {{
@@ -5025,11 +5985,32 @@ def render_page(title, body, top_right="", show_title=True):
                         margin-bottom: 14px;
                     }}
 
+                    .outreach-summary div,
+                    .outreach-recommendation-summary div,
+                    .outreach-evidence-summary div {{
+                        background: var(--surface-card);
+                        box-shadow: var(--shadow-card);
+                    }}
+
                     .outreach-grid {{
                         display: grid;
                         grid-template-columns: repeat(2, minmax(0, 1fr));
                         gap: 14px;
                         margin-bottom: 14px;
+                    }}
+
+                    .outreach-grid > .panel,
+                    .outreach-head + .summary + .outreach-grid > .panel,
+                    .outreach-head + .summary + .panel,
+                    .outreach-grid + .panel {{
+                        background: var(--surface-panel);
+                        box-shadow: var(--shadow-panel);
+                    }}
+
+                    .outreach-panel {{
+                        background: var(--surface-panel);
+                        border-color: var(--border);
+                        box-shadow: var(--shadow-panel);
                     }}
 
                     .outreach-recommendation-summary,
@@ -5042,13 +6023,33 @@ def render_page(title, body, top_right="", show_title=True):
                         margin: 10px 0 0;
                         padding-left: 18px;
                         color: #334e68;
+                        font-size: var(--type-body);
                         line-height: 1.5;
                     }}
 
                     .outreach-pattern {{
                         margin: 0 0 10px;
                         color: #334e68;
+                        font-size: var(--type-body);
                         line-height: 1.45;
+                    }}
+
+                    .outreach-note-box {{
+                        margin-top: 10px;
+                        padding: 12px 14px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        background: var(--surface-inset);
+                        box-shadow: var(--shadow-inset);
+                    }}
+
+                    .outreach-note-box.outreach-pattern {{
+                        margin-bottom: 12px;
+                    }}
+
+                    .outreach-note-box.outreach-rationale-list {{
+                        margin: 10px 0 0;
+                        padding: 12px 14px 12px 32px;
                     }}
 
                     .outreach-draft-block {{
@@ -5059,15 +6060,31 @@ def render_page(title, body, top_right="", show_title=True):
                     .outreach-draft-body {{
                         white-space: pre-wrap;
                         border: 1px solid var(--border);
-                        border-radius: 8px;
-                        background: var(--surface-soft);
+                        border-radius: 12px;
+                        background: var(--surface-card);
                         padding: 12px 14px;
+                        font-size: var(--type-body);
                         line-height: 1.5;
                         color: #233142;
+                        box-shadow: var(--shadow-inset);
                     }}
 
                     .outreach-context-item {{
                         padding: 10px 12px;
+                        background: var(--surface-card);
+                        box-shadow: var(--shadow-inset);
+                        font-size: var(--type-body);
+                    }}
+
+                    .outreach-context-item strong,
+                    .outreach-panel strong {{
+                        font-size: var(--type-card-title);
+                    }}
+
+                    .outreach-panel .muted,
+                    .outreach-panel .action-meta,
+                    .outreach-panel .action-cue {{
+                        font-size: var(--type-body);
                     }}
 
                     .bars {{
@@ -5122,9 +6139,9 @@ def render_page(title, body, top_right="", show_title=True):
                         align-items: end;
                         margin-bottom: 18px;
                         padding: 16px;
-                        background: var(--surface);
+                        background: rgba(255, 255, 255, 0.98);
                         border: 1px solid var(--border);
-                        border-radius: 8px;
+                        border-radius: 12px;
                         box-shadow: var(--shadow-soft);
                     }}
 
@@ -5271,6 +6288,7 @@ def render_page(title, body, top_right="", show_title=True):
                         display: inline-flex;
                         align-items: center;
                         justify-content: center;
+                        gap: 10px;
                         box-sizing: border-box;
                         width: 100%;
                         height: 40px;
@@ -5285,15 +6303,35 @@ def render_page(title, body, top_right="", show_title=True):
                         cursor: pointer;
                     }}
 
+                    .button svg,
+                    button svg {{
+                        width: 18px;
+                        height: 18px;
+                        flex-shrink: 0;
+                        display: block;
+                    }}
+
                     .controls button,
                     .controls .button {{
                         align-self: stretch;
                     }}
 
                     .button.secondary {{
-                        border-color: var(--border-strong);
-                        background: white;
-                        color: #334e68;
+                        border-color: var(--blue);
+                        background: var(--blue);
+                        color: #ffffff;
+                    }}
+
+                    .button.home-mode-cta {{
+                        border-color: #245cff;
+                        background: #245cff;
+                        color: #ffffff;
+                    }}
+
+                    .home-focus-head .home-preview-dismiss-button {{
+                        width: auto;
+                        flex: 0 0 auto;
+                        display: inline-flex;
                     }}
 
                     .pager {{
@@ -5318,9 +6356,10 @@ def render_page(title, body, top_right="", show_title=True):
                     .note {{
                         margin-bottom: 20px;
                         padding: 16px 18px;
-                        background: #fff7ed;
-                        border: 1px solid #fed7aa;
-                        border-radius: 8px;
+                        background: rgba(255, 255, 255, 0.98);
+                        border: 1px solid #f5d8ac;
+                        border-radius: 12px;
+                        box-shadow: var(--shadow-soft);
                     }}
 
                     .note h2 {{
@@ -5384,7 +6423,7 @@ def render_page(title, body, top_right="", show_title=True):
                         border-spacing: 0;
                         background: var(--surface);
                         border: 1px solid var(--border);
-                        border-radius: 8px;
+                        border-radius: 12px;
                         font-size: 14px;
                         box-shadow: var(--shadow-soft);
                     }}
@@ -5393,7 +6432,7 @@ def render_page(title, body, top_right="", show_title=True):
                         width: 100%;
                         overflow-x: auto;
                         overflow-y: visible;
-                        border-radius: 8px;
+                        border-radius: 12px;
                     }}
 
                     .table-wrap.tall-table {{
@@ -5817,9 +6856,69 @@ def render_page(title, body, top_right="", show_title=True):
                         color: #166534;
                     }}
 
+                    @media (max-width: 1120px) {{
+                        main {{
+                            padding: 22px 18px 32px;
+                        }}
+
+                        .panel h2.home-focus-title {{
+                            font-size: 38px;
+                        }}
+
+                        .home-focus-grid {{
+                            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+                            gap: 22px;
+                        }}
+
+                        .home-focus-grid .home-focus-column:last-child {{
+                            grid-column: 1 / -1;
+                        }}
+
+                        .home-focus-column:nth-child(2)::after {{
+                            display: none;
+                        }}
+
+                        .home-focus-card {{
+                            min-height: 0;
+                        }}
+
+                        .home-evidence-strip {{
+                            grid-template-columns: repeat(3, minmax(0, 1fr));
+                        }}
+
+                        .home-evidence-strip div {{
+                            border-right: 1px solid var(--border);
+                            border-bottom: 1px solid var(--border);
+                        }}
+
+                        .home-evidence-strip div:nth-child(3n) {{
+                            border-right: 0;
+                        }}
+
+                        .home-evidence-strip div:nth-last-child(-n + 1) {{
+                            border-bottom: 0;
+                        }}
+
+                        .home-evidence-strip div:nth-last-child(-n + 2):nth-child(3n + 1),
+                        .home-evidence-strip div:nth-last-child(-n + 2):nth-child(3n + 2) {{
+                            border-bottom: 0;
+                        }}
+
+                        .queue-table th:nth-child(3),
+                        .queue-table td:nth-child(3),
+                        .queue-table th:nth-child(4),
+                        .queue-table td:nth-child(4) {{
+                            white-space: normal;
+                        }}
+                    }}
+
                     @media (max-width: 720px) {{
                         main {{
                             padding: 18px 14px 28px;
+                        }}
+
+                        .panel h2.home-focus-title {{
+                            font-size: 34px;
                         }}
 
                         h1 {{
@@ -5860,6 +6959,60 @@ def render_page(title, body, top_right="", show_title=True):
 
                         .summary div {{
                             padding: 11px 12px;
+                        }}
+
+                        .home-focus-head {{
+                            flex-direction: column;
+                            align-items: stretch;
+                        }}
+
+                        .home-preview-dismiss-form {{
+                            width: 100%;
+                        }}
+
+                        .home-preview-dismiss-button {{
+                            width: auto;
+                            min-width: 160px;
+                            align-self: start;
+                        }}
+
+                        .home-dismiss-actions {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .home-dismiss-confirm,
+                        .home-dismiss-cancel {{
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .home-focus-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .home-focus-grid .home-focus-column:last-child {{
+                            grid-column: auto;
+                        }}
+
+                        .home-focus-column:not(:last-child)::after {{
+                            display: none;
+                        }}
+
+                        .home-focus-card {{
+                            min-height: 0;
+                        }}
+
+                        .home-evidence-strip {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .home-evidence-strip div {{
+                            border-right: 0;
+                            border-bottom: 1px solid var(--border);
+                        }}
+
+                        .home-evidence-strip div:nth-last-child(-n + 2) {{
+                            border-bottom: 0;
                         }}
 
                         .panel,
