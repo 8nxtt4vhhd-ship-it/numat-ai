@@ -658,6 +658,88 @@ def get_orders_view(
     return render_page(title="Orders", body=body)
 
 
+@app.get("/insights-view", response_class=HTMLResponse)
+def get_insights_view():
+    order_result = get_orders_for_analysis()
+
+    if order_result["status"] != "ok":
+        return render_page(
+            title="Insights",
+            body=(
+                f"<p class='status error'>Could not load data from "
+                f"{escape(order_result['source'])}: "
+                f"{escape(order_result['status'])}</p>"
+            )
+        )
+
+    orders = order_result["orders"]
+    crm_result = fetch_crm_activities()
+    attention_result = build_customers_needing_attention_response()
+    attention_customers = (
+        attention_result.get("late_customers", [])
+        if attention_result["status"] == "ok"
+        else []
+    )
+    grouped_orders = group_by_customer(orders)
+    master_data_result = fetch_filemaker_master_data()
+    master_customers = (
+        master_data_result.get("customers_by_key", {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
+
+    active_customer_count = 0
+    lost_lapsed_count = 0
+    prospect_count = 0
+
+    for customer_record in master_customers.values():
+        activity_status = str(customer_record.get("activity_status") or "").strip().lower()
+
+        if activity_status == "active":
+            active_customer_count += 1
+        elif activity_status in {"l&l", "lost & lapsed", "lost and lapsed"}:
+            lost_lapsed_count += 1
+        elif activity_status == "prospect":
+            prospect_count += 1
+
+    sales_activities = []
+    inbound_sales = []
+    outbound_sales = []
+    if crm_result.get("status") == "ok":
+        for activity in crm_result.get("activities", []):
+            if get_activity_category(activity) != "sales_outreach":
+                continue
+
+            sales_activities.append(activity)
+            direction = str(activity.get("direction") or "").strip().lower()
+
+            if direction == "inbound":
+                inbound_sales.append(activity)
+            elif direction == "outbound":
+                outbound_sales.append(activity)
+
+    approx_response_rate = (
+        f"{round((len(inbound_sales) / len(outbound_sales)) * 100)}%"
+        if outbound_sales else "n/a"
+    )
+
+    body = f"""
+        {render_data_availability_banner(order_result, crm_result, attention_result)}
+
+        <div class="dashboard-grid chart-grid insights-grid">
+            <div class="insights-span-2">
+                {render_monthly_orders_chart(orders)}
+            </div>
+            {render_attention_chart(attention_customers)}
+            {render_monthly_sales_outreach_chart(sales_activities)}
+            {render_sales_response_chart(outbound_sales, inbound_sales)}
+            {render_sales_activity_type_chart(sales_activities)}
+        </div>
+    """
+
+    return render_page(title="Insights", body=body)
+
+
 @app.get("/late-customers")
 def get_late_customers():
     return build_customers_needing_attention_response()
@@ -3471,6 +3553,14 @@ def count_recent_attention_activity(customers):
 
 def render_monthly_orders_chart(orders):
     monthly_counts = defaultdict(int)
+    monthly_price_lists = defaultdict(Counter)
+    palette = {
+        "A": "#245cff",
+        "B": "#06b6d4",
+        "C": "#16a34a",
+        "D": "#f59e0b",
+        "Other": "#94a3b8",
+    }
 
     for order in orders:
         order_date = parse_iso_date(order.get("order_date"))
@@ -3478,15 +3568,43 @@ def render_monthly_orders_chart(orders):
         if not order_date:
             continue
 
-        monthly_counts[order_date.strftime("%Y-%m")] += 1
+        month_key = order_date.strftime("%Y-%m")
+        monthly_counts[month_key] += 1
+        price_list = str(get_order_price_list(order) or "").strip().upper()
+        if price_list not in {"A", "B", "C", "D"}:
+            price_list = "Other"
+        monthly_price_lists[month_key][price_list] += 1
 
-    months = sorted(monthly_counts.keys())[-8:]
+    months = sorted(monthly_counts.keys())[-12:]
     max_count = max([monthly_counts[month] for month in months], default=1)
+    ordered_buckets = ["A", "B", "C", "D", "Other"]
+
+    legend_items = []
+    for bucket in ordered_buckets:
+        if any(monthly_price_lists[month].get(bucket, 0) for month in months):
+            legend_items.append(
+                f"""
+                    <li class="stacked-legend-item">
+                        <span class="stacked-legend-swatch" style="background:{palette[bucket]}"></span>
+                        <span>{escape(bucket)}</span>
+                    </li>
+                """
+            )
+
     bars = "".join(
-        render_bar(
+        render_stacked_bar(
             label=datetime.strptime(month, "%Y-%m").strftime("%b %Y"),
-            value=monthly_counts[month],
-            max_value=max_count
+            segments=[
+                {
+                    "label": bucket,
+                    "value": monthly_price_lists[month].get(bucket, 0),
+                    "color": palette[bucket],
+                }
+                for bucket in ordered_buckets
+                if monthly_price_lists[month].get(bucket, 0)
+            ],
+            total=monthly_counts[month],
+            max_value=max_count,
         )
         for month in months
     )
@@ -3497,7 +3615,10 @@ def render_monthly_orders_chart(orders):
     return f"""
         <section class="panel">
             <h2>Order Trend</h2>
-            <p class="muted">Order count by month from the selected data source.</p>
+            <p class="muted">Order count by month, split by price list.</p>
+            <ul class="stacked-legend">
+                {''.join(legend_items)}
+            </ul>
             <div class="bars">{bars}</div>
         </section>
     """
@@ -3505,26 +3626,32 @@ def render_monthly_orders_chart(orders):
 
 def render_attention_chart(customers):
     action_counts = Counter(customer["action"] for customer in customers)
-    max_count = max(action_counts.values(), default=1)
-    bars = "".join(
-        render_bar(
-            label=action,
-            value=count,
-            max_value=max_count
-        )
-        for action, count in action_counts.most_common()
+    if not action_counts:
+        return """
+            <section class="panel">
+                <h2>Attention Breakdown</h2>
+                <p class="muted">How urgent the current follow-up queue is.</p>
+                <p class='empty'>No customers currently need attention.</p>
+            </section>
+        """
+
+    palette = ["#245cff", "#16a34a", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"]
+    items = [
+        {
+            "label": action,
+            "value": count,
+            "color": palette[index % len(palette)],
+        }
+        for index, (action, count) in enumerate(action_counts.most_common())
+    ]
+
+    return render_donut_chart(
+        title="Attention Breakdown",
+        subtitle="How urgent the current follow-up queue is.",
+        items=items,
+        center_value=str(sum(action_counts.values())),
+        center_label="Accounts",
     )
-
-    if not bars:
-        bars = "<p class='empty'>No customers currently need attention.</p>"
-
-    return f"""
-        <section class="panel">
-            <h2>Attention Breakdown</h2>
-            <p class="muted">How urgent the current follow-up queue is.</p>
-            <div class="bars">{bars}</div>
-        </section>
-    """
 
 
 def render_state_orders_chart(orders):
@@ -3551,7 +3678,8 @@ def render_state_orders_chart(orders):
         render_bar(
             label=f"{state} ({format_currency(state_values[state])})",
             value=count,
-            max_value=max_count
+            max_value=max_count,
+            color="#f97316",
         )
         for state, count in top_states
     )
@@ -3568,7 +3696,162 @@ def render_state_orders_chart(orders):
     """
 
 
-def render_bar(label, value, max_value):
+def render_monthly_sales_outreach_chart(sales_activities):
+    monthly_counts = defaultdict(int)
+
+    for activity in sales_activities:
+        if str(activity.get("direction") or "").strip().lower() != "outbound":
+            continue
+
+        activity_date = parse_crm_datetime(activity.get("date_created", ""))
+
+        if not activity_date:
+            continue
+
+        monthly_counts[activity_date.strftime("%Y-%m")] += 1
+
+    months = sorted(monthly_counts.keys())[-12:]
+    max_count = max([monthly_counts[month] for month in months], default=1)
+    bars = "".join(
+        render_bar(
+            label=datetime.strptime(month, "%Y-%m").strftime("%b %Y"),
+            value=monthly_counts[month],
+            max_value=max_count,
+            color="#06b6d4",
+        )
+        for month in months
+    )
+
+    if not bars:
+        bars = "<p class='empty'>No outbound sales outreach with usable dates yet.</p>"
+
+    return f"""
+        <section class="panel">
+            <h2>Sales Outreach Trend</h2>
+            <p class="muted">Outbound sales outreach by month across the recent history.</p>
+            <div class="bars">{bars}</div>
+        </section>
+    """
+
+
+def render_sales_response_chart(outbound_sales, inbound_sales):
+    outbound_count = len(outbound_sales)
+    inbound_count = len(inbound_sales)
+    response_rate = round((inbound_count / outbound_count) * 100) if outbound_count else 0
+    max_value = max(outbound_count, inbound_count, response_rate or 1)
+
+    bars = "".join([
+        render_bar("Outbound", outbound_count, max_value, color="#245cff"),
+        render_bar("Replies", inbound_count, max_value, color="#16a34a"),
+        render_bar("Reply Rate", response_rate, max_value, color="#8b5cf6"),
+    ])
+
+    return f"""
+        <section class="panel">
+            <h2>Sales Response Snapshot</h2>
+            <p class="muted">A quick view of outbound volume, observed replies, and approximate response rate.</p>
+            <div class="bars">{bars}</div>
+        </section>
+    """
+
+
+def render_sales_activity_type_chart(sales_activities):
+    counts = Counter()
+
+    for activity in sales_activities:
+        normalized_type = normalize_sales_activity_type(activity.get("crm_type"))
+
+        if normalized_type == "unknown":
+            continue
+
+        counts[format_sales_activity_type(normalized_type)] += 1
+
+    if not counts:
+        return """
+            <section class="panel">
+                <h2>Mode Mix</h2>
+                <p class="muted">How sales outreach has been logged across email, calls, meetings, and other activity types.</p>
+                <p class='empty'>No typed sales activity records available yet.</p>
+            </section>
+        """
+
+    palette = ["#245cff", "#06b6d4", "#8b5cf6", "#16a34a", "#f59e0b", "#ef4444", "#14b8a6"]
+    items = [
+        {
+            "label": label,
+            "value": count,
+            "color": palette[index % len(palette)],
+        }
+        for index, (label, count) in enumerate(counts.most_common())
+    ]
+
+    return render_donut_chart(
+        title="Mode Mix",
+        subtitle="How sales outreach has been logged across email, calls, meetings, and other activity types.",
+        items=items,
+        center_value=str(sum(counts.values())),
+        center_label="Touches",
+    )
+
+
+def render_donut_chart(title, subtitle, items, center_value="", center_label=""):
+    total = sum(int(item.get("value", 0) or 0) for item in items)
+
+    if total <= 0:
+        return f"""
+            <section class="panel">
+                <h2>{escape(title)}</h2>
+                <p class="muted">{escape(subtitle)}</p>
+                <p class='empty'>No data available.</p>
+            </section>
+        """
+
+    stops = []
+    legend_rows = []
+    current = 0.0
+
+    for item in items:
+        value = int(item.get("value", 0) or 0)
+        color = str(item.get("color") or "#245cff")
+        label = str(item.get("label") or "")
+        slice_size = (value / total) * 360
+        stops.append(f"{color} {current:.2f}deg {current + slice_size:.2f}deg")
+        current += slice_size
+        percentage = round((value / total) * 100)
+        legend_rows.append(
+            f"""
+                <li class="donut-legend-row">
+                    <span class="donut-legend-label">
+                        <span class="donut-swatch" style="background:{escape(color)}"></span>
+                        {escape(label)}
+                    </span>
+                    <span class="donut-legend-value">{escape(str(value))} <span class="muted-soft">({percentage}%)</span></span>
+                </li>
+            """
+        )
+
+    donut_style = f"background: conic-gradient({', '.join(stops)});"
+
+    return f"""
+        <section class="panel">
+            <h2>{escape(title)}</h2>
+            <p class="muted">{escape(subtitle)}</p>
+            <div class="donut-layout">
+                <div class="donut-chart" style="{donut_style}">
+                    <div class="donut-hole">
+                        <strong>{escape(center_value or str(total))}</strong>
+                        <span>{escape(center_label or 'Total')}</span>
+                    </div>
+                </div>
+                <ul class="donut-legend">
+                    {''.join(legend_rows)}
+                </ul>
+            </div>
+        </section>
+    """
+
+
+def render_bar(label, value, max_value, color="#245cff"):
     width = 0
 
     if max_value:
@@ -3578,9 +3861,34 @@ def render_bar(label, value, max_value):
         <div class="bar-row">
             <span>{escape(str(label))}</span>
             <div class="bar-track">
-                <div class="bar-fill" style="width: {width}%"></div>
+                <div class="bar-fill" style="width: {width}%; background: {escape(str(color))}"></div>
             </div>
             <strong>{escape(str(value))}</strong>
+        </div>
+    """
+
+
+def render_stacked_bar(label, segments, total, max_value):
+    if not total or not max_value:
+        return ""
+
+    segment_markup = []
+    for segment in segments:
+        value = segment.get("value", 0)
+        if not value:
+            continue
+        width = max(2, (value / max_value) * 100)
+        segment_markup.append(
+            f"<span class='stacked-segment' style='width:{width:.2f}%; background:{escape(str(segment.get('color') or '#245cff'))}'></span>"
+        )
+
+    return f"""
+        <div class="bar-row stacked-bar-row">
+            <span>{escape(str(label))}</span>
+            <div class="bar-track stacked-track">
+                {''.join(segment_markup)}
+            </div>
+            <strong>{escape(str(total))}</strong>
         </div>
     """
 
@@ -5201,6 +5509,7 @@ def render_select_option(value, label, selected_value):
 def render_global_nav(title):
     nav_items = [
         ("Home", "/"),
+        ("Insights", "/insights-view"),
         ("Orders", "/orders-view"),
         ("Customers Needing Attention", "/customers-needing-attention-view"),
         ("Customers", "/customers-view"),
@@ -6003,7 +6312,7 @@ def render_page(title, body, top_right="", show_title=True):
 
                     .dashboard-grid {{
                         display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
                         gap: 16px;
                         margin-bottom: 18px;
                     }}
@@ -6020,6 +6329,41 @@ def render_page(title, body, top_right="", show_title=True):
                     .panel h2 {{
                         margin: 0 0 6px;
                         font-size: var(--type-section-title);
+                    }}
+
+                    .dashboard-grid .panel h2 {{
+                        color: var(--text);
+                    }}
+
+                    .insights-grid .panel h2,
+                    .insights-grid .panel h3 {{
+                        color: #1f2937;
+                    }}
+
+                    .insights-grid {{
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        gap: 12px;
+                    }}
+
+                    .insights-span-2 {{
+                        grid-column: span 2;
+                    }}
+
+                    .insights-grid .panel {{
+                        padding: 13px 14px;
+                        border-radius: 10px;
+                    }}
+
+                    .insights-grid .panel h2 {{
+                        margin-bottom: 3px;
+                        font-size: 14px;
+                        line-height: 1.15;
+                    }}
+
+                    .insights-grid .muted {{
+                        margin-bottom: 10px;
+                        font-size: 12px;
+                        line-height: 1.35;
                     }}
 
                     .panel-head {{
@@ -6350,6 +6694,142 @@ def render_page(title, body, top_right="", show_title=True):
                         gap: 10px;
                     }}
 
+                    .donut-layout {{
+                        display: grid;
+                        grid-template-columns: minmax(150px, 190px) minmax(0, 1fr);
+                        gap: 16px;
+                        align-items: center;
+                    }}
+
+                    .donut-chart {{
+                        width: 164px;
+                        height: 164px;
+                        border-radius: 50%;
+                        display: grid;
+                        place-items: center;
+                        margin: 4px auto;
+                        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.75);
+                    }}
+
+                    .donut-hole {{
+                        width: 98px;
+                        height: 98px;
+                        border-radius: 50%;
+                        background: var(--surface);
+                        display: grid;
+                        place-items: center;
+                        text-align: center;
+                        box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+                    }}
+
+                    .donut-hole strong {{
+                        display: block;
+                        font-size: 24px;
+                        line-height: 1;
+                    }}
+
+                    .donut-hole span {{
+                        display: block;
+                        margin-top: 4px;
+                        color: var(--muted);
+                        font-size: 12px;
+                        font-weight: 600;
+                    }}
+
+                    .donut-legend {{
+                        list-style: none;
+                        margin: 0;
+                        padding: 0;
+                        display: grid;
+                        gap: 10px;
+                    }}
+
+                    .donut-legend-row {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 12px;
+                        font-size: 13px;
+                    }}
+
+                    .donut-legend-label {{
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 10px;
+                        min-width: 0;
+                    }}
+
+                    .donut-swatch {{
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 999px;
+                        flex-shrink: 0;
+                    }}
+
+                    .donut-legend-value {{
+                        font-weight: 700;
+                        white-space: nowrap;
+                    }}
+
+                    .insights-grid .bar-row {{
+                        gap: 7px;
+                        font-size: 12px;
+                    }}
+
+                    .insights-grid .bar-track {{
+                        height: 9px;
+                    }}
+
+                    .insights-grid .bars {{
+                        gap: 7px;
+                    }}
+
+                    .insights-grid .stacked-legend {{
+                        margin-bottom: 8px;
+                        gap: 8px 12px;
+                    }}
+
+                    .insights-grid .stacked-legend-item {{
+                        font-size: 11px;
+                    }}
+
+                    .insights-grid .donut-layout {{
+                        grid-template-columns: minmax(118px, 148px) minmax(0, 1fr);
+                        gap: 12px;
+                    }}
+
+                    .insights-grid .donut-chart {{
+                        width: 132px;
+                        height: 132px;
+                    }}
+
+                    .insights-grid .donut-hole {{
+                        width: 76px;
+                        height: 76px;
+                    }}
+
+                    .insights-grid .donut-hole strong {{
+                        font-size: 17px;
+                    }}
+
+                    .insights-grid .donut-hole span {{
+                        font-size: 10px;
+                    }}
+
+                    .insights-grid .donut-legend {{
+                        gap: 7px;
+                    }}
+
+                    .insights-grid .donut-legend-row {{
+                        gap: 8px;
+                        font-size: 11px;
+                    }}
+
+                    .insights-grid .donut-swatch {{
+                        width: 10px;
+                        height: 10px;
+                    }}
+
                     .chart-panel summary {{
                         cursor: pointer;
                         font-size: 18px;
@@ -6388,6 +6868,52 @@ def render_page(title, body, top_right="", show_title=True):
                         height: 100%;
                         background: var(--blue);
                         border-radius: 999px;
+                    }}
+
+                    .stacked-legend {{
+                        list-style: none;
+                        margin: 0 0 10px;
+                        padding: 0;
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 10px 14px;
+                    }}
+
+                    .stacked-legend-item {{
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 6px;
+                        font-size: 12px;
+                        color: var(--muted);
+                        font-weight: 600;
+                    }}
+
+                    .stacked-legend-swatch {{
+                        width: 10px;
+                        height: 10px;
+                        border-radius: 999px;
+                        flex-shrink: 0;
+                    }}
+
+                    .stacked-track {{
+                        display: flex;
+                        align-items: stretch;
+                        gap: 0;
+                    }}
+
+                    .stacked-segment {{
+                        height: 100%;
+                        min-width: 2px;
+                    }}
+
+                    .stacked-segment:first-child {{
+                        border-top-left-radius: 999px;
+                        border-bottom-left-radius: 999px;
+                    }}
+
+                    .stacked-segment:last-child {{
+                        border-top-right-radius: 999px;
+                        border-bottom-right-radius: 999px;
                     }}
 
                     .controls {{
@@ -7114,7 +7640,25 @@ def render_page(title, body, top_right="", show_title=True):
                         color: #166534;
                     }}
 
+                    @media (max-width: 1480px) {{
+                        .insights-grid {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .insights-span-2 {{
+                            grid-column: span 2;
+                        }}
+                    }}
+
                     @media (max-width: 1120px) {{
+                        .dashboard-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .insights-span-2 {{
+                            grid-column: auto;
+                        }}
+
                         main {{
                             padding: 22px 18px 32px;
                         }}
@@ -7167,6 +7711,10 @@ def render_page(title, body, top_right="", show_title=True):
                         .queue-table th:nth-child(4),
                         .queue-table td:nth-child(4) {{
                             white-space: normal;
+                        }}
+
+                        .donut-layout {{
+                            grid-template-columns: 1fr;
                         }}
                     }}
 
@@ -7335,6 +7883,11 @@ def render_page(title, body, top_right="", show_title=True):
 
                         .outreach-links {{
                             justify-content: stretch;
+                        }}
+
+                        .donut-chart {{
+                            width: 156px;
+                            height: 156px;
                         }}
                     }}
                 </style>
