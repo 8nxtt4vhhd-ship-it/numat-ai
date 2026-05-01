@@ -9,6 +9,34 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
+_OUTREACH_PREP_PROMPT_VERSION = "2026-05-01-cold-outreach-context-1"
+
+
+def has_stale_logistics_signal(context):
+    return bool(context.get("stale_logistics_signal"))
+
+
+def draft_looks_like_active_logistics(text):
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+
+    logistics_phrases = [
+        "mats ready",
+        "ready for repair pickup",
+        "schedule a pickup",
+        "arrange the pickup",
+        "preferred pickup",
+        "dock hours",
+        "dock times",
+        "pallet or cage count",
+        "pallet count",
+        "cage count",
+        "shipping or dock",
+        "coordinate the next step",
+        "help get things moving",
+    ]
+    return any(phrase in lowered for phrase in logistics_phrases)
 
 
 def get_outreach_context_path():
@@ -22,6 +50,27 @@ def get_outreach_context_path():
 
 def load_outreach_business_context():
     context_path = get_outreach_context_path()
+
+    try:
+        if not context_path.exists():
+            return ""
+
+        return context_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def get_cold_outreach_context_path():
+    raw_path = os.getenv("OUTREACH_COLD_CONTEXT_PATH", "").strip()
+
+    if raw_path:
+        return Path(raw_path).expanduser()
+
+    return BASE_DIR.parent / "numat-cold-outreach-context.md"
+
+
+def load_cold_outreach_context():
+    context_path = get_cold_outreach_context_path()
 
     try:
         if not context_path.exists():
@@ -54,10 +103,25 @@ def get_outreach_context_signature():
         return ("unreadable", str(context_path))
 
 
+def get_cold_outreach_context_signature():
+    context_path = get_cold_outreach_context_path()
+
+    try:
+        if not context_path.exists():
+            return ("missing", str(context_path))
+
+        stat = context_path.stat()
+        return (str(context_path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return ("unreadable", str(context_path))
+
+
 def build_outreach_prep_cache_key(context):
     return (
         os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        _OUTREACH_PREP_PROMPT_VERSION,
         get_outreach_context_signature(),
+        get_cold_outreach_context_signature() if context.get("is_cold_outreach") else None,
         json.dumps(context, sort_keys=True, default=str),
     )
 
@@ -166,8 +230,12 @@ def build_outreach_prep_fallback(context):
     inbound_count = int(context.get("sales_reply_count") or 0)
     recent_context = context.get("recent_sales_context", [])
     last_subject = recent_context[0]["subject"] if recent_context else ""
+    latest_sales_days = context.get("days_since_latest_sales_outreach")
     latest_reply_date = context.get("last_reply_date") or "No reply recorded"
     response_rate = context.get("approx_response_rate")
+    primary_activity_type = str(context.get("primary_activity_type") or "").strip()
+    activity_type_pattern = str(context.get("activity_type_pattern") or "").strip()
+    activity_type_counts = context.get("activity_type_counts") or {}
     primary_contact = context.get("primary_contact") or {}
     recommended_contact_name = str(primary_contact.get("name") or "").strip()
     recommended_contact_email = str(primary_contact.get("email") or "").strip()
@@ -189,7 +257,7 @@ def build_outreach_prep_fallback(context):
         confidence = "Low"
         evidence_strength = "Low"
 
-    likely_preferred_mode = (
+    likely_preferred_mode = str(context.get("likely_preferred_mode") or "").strip() or (
         "Email"
         if inbound_count > 0 else
         ("Call" if outbound_count >= 3 else "Email")
@@ -213,6 +281,11 @@ def build_outreach_prep_fallback(context):
             f"Sales outreach history shows {outbound_count} outbound touchpoint(s)."
         )
 
+    if primary_activity_type and primary_activity_type != "Unknown":
+        rationale_bullets.append(
+            f"The outreach history is mainly {primary_activity_type.lower()}-based."
+        )
+
     if inbound_count:
         rationale_bullets.append(
             f"{inbound_count} observed sales reply/replies suggest email engagement is possible."
@@ -228,17 +301,29 @@ def build_outreach_prep_fallback(context):
         if not last_subject else
         f"Following up on {customer_name}"
     )
-    email_body = (
-        f"Hi,\n\n"
-        f"I wanted to check in because it has been {context.get('days_since_last_order')} days since the last order, "
-        f"against a usual cycle of {context.get('average_cycle')} days. "
-        f"I wanted to see whether there is anything upcoming that we should be planning around.\n\n"
-        f"If it helps, I can also review current needs and timing with you directly.\n\n"
-        f"Best regards,"
-    )
+    if has_stale_logistics_signal(context) or (latest_sales_days is not None and latest_sales_days > 90):
+        email_body = (
+            f"Hi,\n\n"
+            f"I wanted to check in because it has been {context.get('days_since_last_order')} days since the last order, "
+            f"against a usual cycle of {context.get('average_cycle')} days. I also noticed there was previous repair-related contact in your history, "
+            f"so I wanted to ask whether there are any current damaged mats or repair needs we should be aware of now.\n\n"
+            f"If repair activity has paused or priorities have changed, that is completely fine - I just wanted to make it easy to let us know where things stand.\n\n"
+            f"Best regards,"
+        )
+    else:
+        email_body = (
+            f"Hi,\n\n"
+            f"I wanted to check in because it has been {context.get('days_since_last_order')} days since the last order, "
+            f"against a usual cycle of {context.get('average_cycle')} days. "
+            f"I wanted to see whether there is anything upcoming that we should be planning around.\n\n"
+            f"If it helps, I can also review current needs and timing with you directly.\n\n"
+            f"Best regards,"
+        )
     call_objective = (
         "Confirm whether there is a genuine operational reason for the reorder gap and agree the next follow-up step."
     )
+    if primary_activity_type == "Meeting":
+        call_objective = "Build on the existing meeting/visit history and confirm the most useful next step from that discussion."
     call_talking_points = [
         f"Acknowledge the last order date ({context.get('last_order_date')}) and usual cycle ({context.get('average_cycle')} days).",
         "Ask whether there is a current operational reason for the gap in ordering.",
@@ -272,9 +357,12 @@ def build_outreach_prep_fallback(context):
         "recommended_contact_email": recommended_contact_email,
         "targeting_note": targeting_note,
         "observed_pattern": (
-            "Replies are present in the sales history and suggest email is workable."
-            if inbound_count else
-            "There is little or no reply evidence in the sales history, so the recommendation is more cautious."
+            activity_type_pattern
+            or (
+                "Replies are present in the sales history and suggest email is workable."
+                if inbound_count else
+                "There is little or no reply evidence in the sales history, so the recommendation is more cautious."
+            )
         ),
         "evidence_strength": evidence_strength,
         "customer_services_present": bool(context.get("customer_services_present")),
@@ -284,6 +372,7 @@ def build_outreach_prep_fallback(context):
         "call_talking_points": call_talking_points,
         "voicemail_draft": voicemail_draft,
         "suggested_text_message": suggested_text_message,
+        "activity_type_counts": activity_type_counts,
     }
 
 
@@ -302,6 +391,7 @@ def generate_outreach_prep(context):
 
     fallback = build_outreach_prep_fallback(context)
     business_context = load_outreach_business_context()
+    cold_outreach_context = load_cold_outreach_context() if context.get("is_cold_outreach") else ""
 
     try:
         from openai import OpenAI
@@ -318,10 +408,18 @@ def generate_outreach_prep(context):
                         "Use the supplied business context to correctly interpret what Numat does, what damaged mats usually mean, and how repair-service outreach differs from complaint handling. "
                         "Treat the latest sales outreach item as a high-priority signal. If the most recent sales outreach is a visit note, meeting summary, or post-visit follow-up, use that as the primary anchor for the recommendation, rationale, and draft unless a newer reply clearly changes the situation. "
                         "Use the inferred contact signals to decide who the most appropriate target is, and tune the tone for their likely role and influence. "
+                        "Use CRM activity type as a real signal. Pay attention to whether the history is made up mostly of email, calls, meetings/visits, LinkedIn, or a mix. "
+                        "That should influence the recommended mode, tone, observed pattern, and whether the relationship looks meeting-led, email-led, or call-led. "
                         "Reference the latest sales outreach concretely when it is commercially relevant, rather than drifting into a generic follow-up. "
                         "Pay close attention to dates. Do not describe an activity as recent unless it happened within the last 90 days relative to the current analysis date. "
                         "If the latest relevant outreach or reply is older than 90 days, describe it as older, historical, previous, or the latest recorded activity instead. "
                         "If an older message is still important, make that clear without implying it happened recently. "
+                        "If the latest meaningful signal is an older pickup request, scheduling request, repair-logistics note, or other operational request that is older than 90 days, do not write as though the pickup or repair process is still active. "
+                        "Treat it as historical evidence of prior repair interest only. In those cases, ask whether there is any current repair need, whether mats are still being set aside, or whether priorities have changed. "
+                        "Do not assume we should arrange collection, confirm dock times, or continue logistics unless there is a genuinely recent signal showing the process is still active. "
+                        "For older logistics signals, do not thank the customer for having mats ready, do not say they currently have mats ready, and do not imply pickup is already being coordinated. "
+                        "If the outreach is clearly net-new or dormant reactivation, use the cold-outreach addendum as style and structure guidance. "
+                        "If the outreach has a live relationship, recent visit, recent operational discussion, or active thread, do not force cold-email structure onto it. "
                         "Return strict JSON with keys: suggested_mode, tone, confidence, rationale_bullets, sales_outreach_count, "
                         "observed_reply_count, approx_response_rate, last_reply_date, likely_preferred_mode, observed_pattern, "
                         "evidence_strength, customer_services_present, recommended_contact_name, recommended_contact_email, targeting_note, email_subject, email_body, call_objective, call_talking_points, voicemail_draft, suggested_text_message. "
@@ -338,6 +436,13 @@ def generate_outreach_prep(context):
                     "content": (
                         "Business context for interpreting this outreach:\n\n"
                         + (business_context or "No additional business context supplied.")
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Cold outreach addendum for use only when this outreach is net-new or dormant:\n\n"
+                        + (cold_outreach_context or "No cold outreach addendum supplied.")
                     ),
                 },
             ],
@@ -363,6 +468,14 @@ def generate_outreach_prep(context):
             if isinstance(value, list) and not value:
                 continue
             result[key] = value
+
+        if has_stale_logistics_signal(context) and draft_looks_like_active_logistics(result.get("email_body", "")):
+            result["email_body"] = fallback["email_body"]
+            result["targeting_note"] = (
+                "Previous repair logistics contact appears historical rather than active, "
+                "so the outreach should check whether there is any current repair need instead of assuming pickup is still being arranged."
+            )
+
         cache_outreach_prep(cache_key, result)
         return result
     except Exception as error:

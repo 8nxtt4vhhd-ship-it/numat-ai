@@ -2459,11 +2459,14 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
     replied_sales_context = []
     latest_replied_outreach = inbound_sales[0] if inbound_sales else None
     recent_sales_context = []
+    activity_type_summary = summarize_sales_activity_types(sales_activities)
+    activity_type_counts = activity_type_summary["counts"]
 
     for activity in sales_activities[:5]:
         recent_sales_context.append({
             "date": format_optional_datetime(activity.get("date_created", "")),
             "direction": str(activity.get("direction") or "").strip().title() or "Unknown",
+            "crm_type": format_sales_activity_type(activity.get("crm_type")),
             "subject": str(activity.get("subject") or "").strip(),
             "preview": truncate_text(clean_activity_content(activity.get("body", "")) or activity.get("subject", ""), 180),
         })
@@ -2484,6 +2487,9 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         )
         if last_sales_activity else ""
     )
+    latest_sales_combined = " ".join(
+        part for part in [latest_sales_subject, latest_sales_preview] if part
+    ).lower()
     last_reply_date = (
         format_optional_datetime(inbound_sales[0].get("date_created", ""))
         if inbound_sales else "No reply recorded"
@@ -2503,6 +2509,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         {
             "date": format_optional_datetime(latest_replied_outreach.get("date_created", "")),
             "direction": str(latest_replied_outreach.get("direction") or "").strip().title() or "Unknown",
+            "crm_type": format_sales_activity_type(latest_replied_outreach.get("crm_type")),
             "subject": latest_replied_subject,
             "preview": latest_replied_preview,
         }
@@ -2513,27 +2520,67 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         approx_response_rate = round((len(inbound_sales) / len(outbound_sales)) * 100)
 
     has_recent_sales_activity = False
+    days_since_last_sales_activity = None
     if last_sales_activity:
         recent_days = get_crm_days_since_latest_activity(last_sales_activity)
+        days_since_last_sales_activity = recent_days
         has_recent_sales_activity = recent_days is not None and recent_days <= 14
 
-    likely_preferred_mode = (
-        "Email"
-        if inbound_sales else
-        ("Call" if len(outbound_sales) >= 3 else "Email")
+    stale_logistics_signal = bool(
+        days_since_last_sales_activity is not None
+        and days_since_last_sales_activity > 90
+        and any(
+            phrase in latest_sales_combined
+            for phrase in [
+                "pickup",
+                "pick up",
+                "dock",
+                "pallet",
+                "cage",
+                "schedule",
+                "shipping",
+                "ship",
+                "repair request",
+            ]
+        )
     )
+
+    primary_activity_type = activity_type_summary["primary_type"]
+    likely_preferred_mode = "Email"
+    if primary_activity_type == "call":
+        likely_preferred_mode = "Call"
+    elif primary_activity_type == "meeting":
+        likely_preferred_mode = "Visit"
+    elif primary_activity_type == "linkedin":
+        likely_preferred_mode = "LinkedIn"
+    elif inbound_sales:
+        likely_preferred_mode = "Email"
+    elif len(outbound_sales) >= 3:
+        likely_preferred_mode = "Call"
     top_contacts = build_outreach_contact_signals(sales_activities)
     primary_contact = top_contacts[0] if top_contacts else None
+    order_count = len(customer_orders)
+    days_since_last_order = attention.get("days_since_last") if attention else ""
+
+    is_cold_outreach = bool(
+        (order_count == 0 and not sales_activities)
+        or (
+            order_count > 0
+            and isinstance(days_since_last_order, (int, float))
+            and days_since_last_order >= 180
+            and not has_recent_sales_activity
+        )
+    )
 
     return {
         "customer": customer,
         "priority_score": attention.get("priority_score") if attention else "",
         "action": attention.get("action") if attention else "",
-        "days_since_last_order": attention.get("days_since_last") if attention else "",
+        "days_since_last_order": days_since_last_order,
         "average_cycle": round(calculate_average_gap(customer_orders), 1) if calculate_average_gap(customer_orders) is not None else "Not enough orders",
         "last_order_date": max(order.get("order_date", "") for order in customer_orders),
         "first_order_date": min(order.get("order_date", "") for order in customer_orders),
-        "order_count": len(customer_orders),
+        "order_count": order_count,
         "total_value": format_currency(sum_order_amounts(customer_orders)),
         "average_value_per_order": format_currency(average_order_amount(customer_orders)),
         "territory": get_customer_territory(customer_orders),
@@ -2543,10 +2590,15 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         "approx_response_rate": f"{approx_response_rate}%" if outbound_sales else "n/a",
         "last_reply_date": last_reply_date,
         "likely_preferred_mode": likely_preferred_mode,
+        "activity_type_counts": activity_type_counts,
+        "activity_type_pattern": activity_type_summary["pattern"],
+        "primary_activity_type": format_sales_activity_type(primary_activity_type),
         "customer_services_present": bool(customer_service_activities),
         "customer_service_activity_count": len(customer_service_activities),
         "sales_activity_count": len(sales_activities),
         "latest_sales_outreach": last_sales_activity_date,
+        "days_since_latest_sales_outreach": days_since_last_sales_activity,
+        "stale_logistics_signal": stale_logistics_signal,
         "latest_sales_outreach_subject": latest_sales_subject,
         "latest_sales_outreach_preview": latest_sales_preview,
         "latest_replied_outreach_date": last_reply_date,
@@ -2554,6 +2606,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         "latest_replied_outreach_preview": latest_replied_preview,
         "latest_replied_context": latest_replied_context,
         "has_recent_sales_activity": has_recent_sales_activity,
+        "is_cold_outreach": is_cold_outreach,
         "recent_sales_context": recent_sales_context,
         "top_contacts": top_contacts,
         "primary_contact": primary_contact,
@@ -2707,12 +2760,18 @@ def render_outreach_prep_page(customer, context, result, data_results):
 def render_outreach_sales_context_row(item):
     if not item:
         return ""
+    meta_parts = [
+        str(item.get("date") or "").strip(),
+        str(item.get("direction") or "").strip(),
+        str(item.get("crm_type") or "").strip(),
+    ]
+    meta_text = " • ".join(part for part in meta_parts if part)
     return f"""
         <li>
             <div class="action-item outreach-context-item">
                 <div class="action-main">
                     <strong>{escape(str(item.get("subject") or "No subject"))}</strong>
-                    <span class="action-meta">{escape(str(item.get("date") or ""))} • {escape(str(item.get("direction") or ""))}</span>
+                    <span class="action-meta">{escape(meta_text)}</span>
                     <span class="action-cue">{escape(str(item.get("preview") or ""))}</span>
                 </div>
             </div>
@@ -2957,6 +3016,89 @@ def build_outreach_contact_signals(sales_activities):
         )
     )
     return enriched_contacts[:3]
+
+
+def normalize_sales_activity_type(value):
+    activity_type = str(value or "").strip().lower()
+
+    if not activity_type:
+        return "unknown"
+
+    if activity_type in {"email", "outlook", "mail"}:
+        return "email"
+
+    if activity_type in {"call", "phone", "telephone"}:
+        return "call"
+
+    if activity_type in {"meeting", "visit", "tour", "onsite", "on site"}:
+        return "meeting"
+
+    if activity_type == "linkedin":
+        return "linkedin"
+
+    return activity_type
+
+
+def format_sales_activity_type(value):
+    normalized = normalize_sales_activity_type(value)
+
+    labels = {
+        "email": "Email",
+        "call": "Call",
+        "meeting": "Meeting",
+        "linkedin": "LinkedIn",
+        "unknown": "Unknown",
+    }
+    return labels.get(normalized, normalized.replace("_", " ").title())
+
+
+def summarize_sales_activity_types(sales_activities):
+    normalized_types = [
+        normalize_sales_activity_type(activity.get("crm_type"))
+        for activity in sales_activities
+        if normalize_sales_activity_type(activity.get("crm_type")) != "unknown"
+    ]
+    counts = Counter(normalized_types)
+
+    if not counts:
+        return {
+            "counts": {},
+            "primary_type": "",
+            "pattern": "The outreach history does not yet show a clear contact mode pattern.",
+        }
+
+    primary_type, primary_count = counts.most_common(1)[0]
+    total_known = sum(counts.values())
+    primary_share = primary_count / total_known if total_known else 0
+
+    if primary_type == "meeting":
+        if counts.get("email", 0):
+            pattern = "The relationship looks meeting-led with email used to coordinate and follow up."
+        else:
+            pattern = "The relationship looks meeting-led rather than driven mainly by email."
+    elif primary_type == "call":
+        if counts.get("email", 0):
+            pattern = "The history shows a mix of calls and email, with calls playing the stronger role."
+        else:
+            pattern = "The history looks call-led rather than email-led."
+    elif primary_type == "linkedin":
+        pattern = "The history suggests lighter-touch outreach, including LinkedIn contact."
+    else:
+        if counts.get("meeting", 0):
+            pattern = "Email is the main channel, with some meeting or visit context in the history."
+        elif counts.get("call", 0):
+            pattern = "Email is the main channel, with some supporting call activity."
+        else:
+            pattern = "Email is the main channel in the sales history."
+
+    if primary_share < 0.5 and len(counts) > 1:
+        pattern = "The history is mixed across contact modes, without one channel dominating strongly."
+
+    return {
+        "counts": dict(counts),
+        "primary_type": primary_type,
+        "pattern": pattern,
+    }
 
 
 def looks_like_html(content):
