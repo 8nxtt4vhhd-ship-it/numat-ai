@@ -3761,9 +3761,6 @@ def render_sales_activity_type_chart(sales_activities):
     for activity in sales_activities:
         normalized_type = normalize_sales_activity_type(activity.get("crm_type"))
 
-        if normalized_type == "unknown":
-            continue
-
         counts[format_sales_activity_type(normalized_type)] += 1
 
     if not counts:
