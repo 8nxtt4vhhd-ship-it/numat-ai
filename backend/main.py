@@ -47,6 +47,7 @@ from crm import (
 )
 from filemaker import (
     check_filemaker_connection,
+    fetch_filemaker_master_data,
     fetch_order_records,
     has_filemaker_config,
 )
@@ -2439,6 +2440,22 @@ def build_last_contact_display(last_activity_content, latest_crm_activity, crm_a
 
 def build_outreach_context(customer, customer_orders, attention, crm_result):
     customer_primary_key = get_customer_primary_key(customer_orders)
+    master_data_result = fetch_filemaker_master_data()
+    customer_master = (
+        master_data_result.get("customers_by_key", {}).get(customer_primary_key, {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
+    customer_contacts = (
+        master_data_result.get("contacts_by_customer_key", {}).get(customer_primary_key, [])
+        if master_data_result.get("status") == "ok"
+        else []
+    )
+    contacts_by_email = (
+        master_data_result.get("contacts_by_email", {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
     crm_activities = (
         crm_result.get("activity_map", {}).get(customer_primary_key, [])
         if crm_result.get("status") == "ok" else []
@@ -2557,7 +2574,11 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         likely_preferred_mode = "Email"
     elif len(outbound_sales) >= 3:
         likely_preferred_mode = "Call"
-    top_contacts = build_outreach_contact_signals(sales_activities)
+    top_contacts = build_outreach_contact_signals(
+        sales_activities,
+        contacts_by_email=contacts_by_email,
+        customer_contacts=customer_contacts,
+    )
     primary_contact = top_contacts[0] if top_contacts else None
     order_count = len(customer_orders)
     days_since_last_order = attention.get("days_since_last") if attention else ""
@@ -2584,7 +2605,9 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         "total_value": format_currency(sum_order_amounts(customer_orders)),
         "average_value_per_order": format_currency(average_order_amount(customer_orders)),
         "territory": get_customer_territory(customer_orders),
-        "state": get_order_state(customer_orders[-1]) if customer_orders else "",
+        "state": get_order_state(customer_orders[-1]) if customer_orders else customer_master.get("state", ""),
+        "customer_activity_status": customer_master.get("activity_status", ""),
+        "customer_primary_key": customer_primary_key,
         "sales_outreach_sent_count": len(outbound_sales),
         "sales_reply_count": len(inbound_sales),
         "approx_response_rate": f"{approx_response_rate}%" if outbound_sales else "n/a",
@@ -2780,13 +2803,18 @@ def render_outreach_sales_context_row(item):
 
 
 def render_outreach_contact_row(contact):
+    title = str(contact.get("title") or "").strip()
+    role_label = str(contact.get("role") or "Unknown role")
+    role_text = title if title else role_label
+    if title and role_label and role_label.lower() not in title.lower():
+        role_text = f"{title} • {role_label}"
     return f"""
         <li>
             <div class="action-item outreach-context-item">
                 <div class="action-main">
                     <strong>{escape(str(contact.get("name") or "Unknown contact"))}</strong>
                     <span class="action-meta">{escape(str(contact.get("email") or ""))}</span>
-                    <span class="action-meta">{escape(str(contact.get("role") or "Unknown role"))} • Influence {escape(str(contact.get("influence") or "Low"))} • Last active {escape(str(contact.get("last_active") or "Not available"))}</span>
+                    <span class="action-meta">{escape(role_text)} • Influence {escape(str(contact.get("influence") or "Low"))} • Last active {escape(str(contact.get("last_active") or "Not available"))}</span>
                     <span class="action-cue">{escape(str(contact.get("note") or ""))}</span>
                     <span class="action-cue">Replies {escape(str(contact.get("inbound_count", 0)))} • Outbound touches {escape(str(contact.get("outbound_count", 0)))}</span>
                 </div>
@@ -2855,7 +2883,30 @@ def infer_contact_display_name(email):
     return local_part.capitalize()
 
 
+def get_master_contact_role(contact):
+    title = str(contact.get("position") or "").strip()
+    title_lower = title.lower()
+
+    if not title:
+        return "", "", ""
+
+    if any(keyword in title_lower for keyword in ["owner", "president", "general manager", "director", "vice president", "vp"]):
+        return "Decision path / blocker", "High", "Title suggests this contact may influence or make repair decisions."
+
+    if any(keyword in title_lower for keyword in ["manager", "merchandise control", "operations", "buyer", "purchasing", "plant", "production", "supervisor"]):
+        return "Operational contact", "Medium", "Title suggests a hands-on operational or plant-level contact."
+
+    if any(keyword in title_lower for keyword in ["accounts payable", "accounting", "finance", "billing", "admin", "administrator"]):
+        return "Finance / admin", "Low", "Title suggests finance or admin responsibility."
+
+    return "", "", ""
+
+
 def infer_contact_role_signal(contact):
+    title_role, title_influence, title_note = get_master_contact_role(contact)
+    if title_role:
+        return title_role, title_influence, title_note
+
     combined_text = " ".join(contact.get("context_snippets", [])).lower()
     finance_hits = sum(
         keyword in combined_text
@@ -2918,8 +2969,57 @@ def infer_contact_role_signal(contact):
     return "Unknown role", "Low", "Limited signal on role from recent sales history."
 
 
-def build_outreach_contact_signals(sales_activities):
+def build_outreach_contact_signals(sales_activities, contacts_by_email=None, customer_contacts=None):
+    contacts_by_email = contacts_by_email or {}
+    customer_contacts = customer_contacts or []
     contacts = {}
+
+    def get_contact_key(email, master_contact):
+        if email:
+            return email
+
+        primary_key = str(master_contact.get("primary_key") or "").strip()
+        if primary_key:
+            return f"contact:{primary_key}"
+
+        return f"name:{str(master_contact.get('name') or '').strip().lower()}"
+
+    def seed_contact(email="", master_contact=None):
+        master_contact = master_contact or {}
+        key = get_contact_key(email, master_contact)
+        seeded_email = str(email or master_contact.get("email") or "").strip().lower()
+        seeded_name = str(master_contact.get("name") or "").strip() or (
+            infer_contact_display_name(seeded_email) if seeded_email else "Unknown contact"
+        )
+        contact = contacts.setdefault(key, {
+            "name": seeded_name,
+            "email": seeded_email,
+            "title": str(master_contact.get("position") or "").strip(),
+            "phone": str(master_contact.get("phone") or "").strip(),
+            "cell": str(master_contact.get("cell") or "").strip(),
+            "inbound_count": 0,
+            "outbound_count": 0,
+            "unknown_count": 0,
+            "last_active_raw": "",
+            "last_active": "Not available",
+            "latest_subject": "",
+            "latest_preview": "",
+            "context_snippets": [],
+        })
+
+        if master_contact:
+            if str(master_contact.get("name") or "").strip():
+                contact["name"] = str(master_contact.get("name") or "").strip()
+            if str(master_contact.get("position") or "").strip():
+                contact["title"] = str(master_contact.get("position") or "").strip()
+            if str(master_contact.get("phone") or "").strip():
+                contact["phone"] = str(master_contact.get("phone") or "").strip()
+            if str(master_contact.get("cell") or "").strip():
+                contact["cell"] = str(master_contact.get("cell") or "").strip()
+            if seeded_email and not contact.get("email"):
+                contact["email"] = seeded_email
+
+        return contact
 
     for activity in sales_activities:
         direction = str(activity.get("direction") or "").strip().lower()
@@ -2943,18 +3043,8 @@ def build_outreach_contact_signals(sales_activities):
                     contact_emails.append(normalized_email)
 
         for email in dict.fromkeys(contact_emails):
-            contact = contacts.setdefault(email, {
-                "name": infer_contact_display_name(email),
-                "email": email,
-                "inbound_count": 0,
-                "outbound_count": 0,
-                "unknown_count": 0,
-                "last_active_raw": "",
-                "last_active": "Not available",
-                "latest_subject": "",
-                "latest_preview": "",
-                "context_snippets": [],
-            })
+            master_contact = contacts_by_email.get(email, {})
+            contact = seed_contact(email=email, master_contact=master_contact)
 
             if direction == "inbound":
                 contact["inbound_count"] += 1
@@ -2978,6 +3068,12 @@ def build_outreach_contact_signals(sales_activities):
             if snippet and len(contact["context_snippets"]) < 6:
                 contact["context_snippets"].append(snippet)
 
+    for master_contact in customer_contacts:
+        seed_contact(
+            email=str(master_contact.get("email") or "").strip().lower(),
+            master_contact=master_contact,
+        )
+
     enriched_contacts = []
     today = get_analysis_today()
 
@@ -2998,6 +3094,7 @@ def build_outreach_contact_signals(sales_activities):
         enriched_contacts.append({
             "name": contact["name"],
             "email": contact["email"],
+            "title": contact.get("title", ""),
             "role": role,
             "influence": influence,
             "note": note,
@@ -3872,6 +3969,17 @@ def get_home_selected_customer_name(queue_summaries, selected_customer=""):
 
 def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map):
     summaries = []
+    master_data_result = fetch_filemaker_master_data()
+    contacts_by_customer_key = (
+        master_data_result.get("contacts_by_customer_key", {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
+    contacts_by_email = (
+        master_data_result.get("contacts_by_email", {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
 
     for customer in queue_customers:
         customer_name = str(customer.get("customer", ""))
@@ -3887,7 +3995,11 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
             activity for activity in sales_activities
             if str(activity.get("direction") or "").strip().lower() == "inbound"
         ]
-        top_contacts = build_outreach_contact_signals(sales_activities)
+        top_contacts = build_outreach_contact_signals(
+            sales_activities,
+            contacts_by_email=contacts_by_email,
+            customer_contacts=contacts_by_customer_key.get(customer_primary_key, []),
+        )
         suggested_mode = determine_home_queue_mode(
             customer,
             outbound_count=len(outbound_sales),
@@ -3996,7 +4108,11 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
     target_contact_name = str(result.get("recommended_contact_name") or "").strip()
     target_contact_email = str(result.get("recommended_contact_email") or "").strip()
     primary_contact = context.get("primary_contact") or {}
-    target_role = str(primary_contact.get("role") or "").strip() or "Likely sales contact"
+    target_role = (
+        str(primary_contact.get("title") or "").strip()
+        or str(primary_contact.get("role") or "").strip()
+        or "Likely sales contact"
+    )
     if not target_contact_name:
         target_contact_name = str(primary_contact.get("name") or "").strip() or "Best known contact"
     if not target_contact_email:
