@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from statistics import median
 
 from dateutil import parser
 
@@ -29,20 +30,90 @@ def group_by_customer(orders):
 
 
 def calculate_average_gap(order_list):
+    cycle = analyze_order_cycle(order_list)
+    return cycle["cycle_days"]
+
+
+def analyze_order_cycle(order_list):
     dates = sorted([
         datetime.strptime(o["order_date"], "%Y-%m-%d")
         for o in order_list
+        if o.get("order_date")
     ])
 
-    if len(dates) < 2:
-        return None
+    if len(dates) < 3:
+        return {
+            "cycle_days": None,
+            "average_gap": None,
+            "median_gap": None,
+            "recent_gap": None,
+            "pattern": "insufficient",
+            "pattern_label": "Not enough orders",
+            "consistency": "unknown",
+            "consistency_ratio": 0,
+            "gap_count": 0,
+        }
 
     gaps = []
     for i in range(1, len(dates)):
         gap = (dates[i] - dates[i - 1]).days
         gaps.append(gap)
 
-    return sum(gaps) / len(gaps)
+    average_gap = sum(gaps) / len(gaps)
+    median_gap = float(median(gaps))
+    recent_gap = gaps[-1]
+    tolerance = max(7, median_gap * 0.25)
+    consistent_gaps = sum(
+        1 for gap in gaps
+        if abs(gap - median_gap) <= tolerance
+    )
+    consistency_ratio = consistent_gaps / len(gaps)
+
+    if consistency_ratio >= 0.75:
+        consistency = "high"
+    elif consistency_ratio >= 0.5:
+        consistency = "medium"
+    else:
+        consistency = "low"
+
+    cycle_days = round(median_gap, 1)
+
+    if consistency == "low":
+        pattern = "irregular"
+        pattern_label = "Irregular"
+    elif cycle_days <= 10:
+        pattern = "weekly"
+        pattern_label = "Weekly"
+    elif cycle_days <= 18:
+        pattern = "biweekly"
+        pattern_label = "Biweekly"
+    elif cycle_days <= 45:
+        pattern = "monthly"
+        pattern_label = "Monthly"
+    elif cycle_days <= 75:
+        pattern = "bimonthly"
+        pattern_label = "Every 2 months"
+    elif cycle_days <= 120:
+        pattern = "quarterly"
+        pattern_label = "Quarterly"
+    elif cycle_days <= 220:
+        pattern = "semiannual"
+        pattern_label = "Every 6 months"
+    else:
+        pattern = "occasional"
+        pattern_label = "Occasional"
+
+    return {
+        "cycle_days": cycle_days,
+        "average_gap": round(average_gap, 1),
+        "median_gap": cycle_days,
+        "recent_gap": recent_gap,
+        "pattern": pattern,
+        "pattern_label": pattern_label,
+        "consistency": consistency,
+        "consistency_ratio": round(consistency_ratio, 2),
+        "gap_count": len(gaps),
+    }
 
 
 def get_analysis_today():
@@ -118,7 +189,8 @@ def find_late_customers(customers, today=None):
         today = get_analysis_today()
 
     for name, orders in customers.items():
-        avg_gap = calculate_average_gap(orders)
+        cycle = analyze_order_cycle(orders)
+        avg_gap = cycle["cycle_days"]
 
         if not avg_gap:
             continue
@@ -147,6 +219,9 @@ def find_late_customers(customers, today=None):
             results.append({
                 "customer": name,
                 "avg_gap": round(avg_gap, 1),
+                "cycle_pattern": cycle["pattern"],
+                "cycle_pattern_label": cycle["pattern_label"],
+                "cycle_consistency": cycle["consistency"],
                 "days_since_last": days_since_last,
                 "priority_score": round(priority, 2),
                 "action": action,

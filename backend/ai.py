@@ -304,8 +304,8 @@ def build_outreach_prep_fallback(context):
     if has_stale_logistics_signal(context) or (latest_sales_days is not None and latest_sales_days > 90):
         email_body = (
             f"Hi,\n\n"
-            f"I wanted to check in because it has been {context.get('days_since_last_order')} days since the last order, "
-            f"against a usual cycle of {context.get('average_cycle')} days. I also noticed there was previous repair-related contact in your history, "
+            f"I wanted to check in because it looks as though repair activity may have gone quiet for a while. "
+            f"I also noticed there was previous repair-related contact in your history, "
             f"so I wanted to ask whether there are any current damaged mats or repair needs we should be aware of now.\n\n"
             f"If repair activity has paused or priorities have changed, that is completely fine - I just wanted to make it easy to let us know where things stand.\n\n"
             f"Best regards,"
@@ -313,8 +313,7 @@ def build_outreach_prep_fallback(context):
     else:
         email_body = (
             f"Hi,\n\n"
-            f"I wanted to check in because it has been {context.get('days_since_last_order')} days since the last order, "
-            f"against a usual cycle of {context.get('average_cycle')} days. "
+            f"I wanted to check in because it may be about the right time to see whether anything new is building up on your side. "
             f"I wanted to see whether there is anything upcoming that we should be planning around.\n\n"
             f"If it helps, I can also review current needs and timing with you directly.\n\n"
             f"Best regards,"
@@ -325,17 +324,17 @@ def build_outreach_prep_fallback(context):
     if primary_activity_type == "Meeting":
         call_objective = "Build on the existing meeting/visit history and confirm the most useful next step from that discussion."
     call_talking_points = [
-        f"Acknowledge the last order date ({context.get('last_order_date')}) and usual cycle ({context.get('average_cycle')} days).",
-        "Ask whether there is a current operational reason for the gap in ordering.",
+        f"Acknowledge the last order date ({context.get('last_order_date')}) and the customer's usual repair rhythm ({context.get('order_cycle_pattern') or context.get('average_cycle')}).",
+        "Ask whether anything has changed operationally or whether new damaged mats may be building up.",
         "Offer a simple next step: quote review, timing check, or quick visit if useful.",
     ]
     voicemail_draft = (
-        f"Hi, this is from Numat. I was just checking in because you're beyond your usual reorder timing and "
-        f"wanted to see whether there is anything upcoming we can help with. Please call me back when convenient."
+        f"Hi, this is from Numat. I was just checking in to see whether there is anything upcoming we can help with on the repair side. "
+        f"Please call me back when convenient."
     )
     suggested_text_message = (
-        f"Hi, it’s Numat checking in. You’re beyond your usual reorder timing, so I wanted to see whether "
-        f"you have any upcoming repair needs or damaged mats we should plan around. Happy to keep it brief if easier by text."
+        f"Hi, it’s Numat checking in. I wanted to see whether you have any upcoming repair needs or damaged mats we should plan around. "
+        f"Happy to keep it brief if easier by text."
     )
     targeting_note = (
         f"Start with {recommended_contact_name or 'the most active contact'}"

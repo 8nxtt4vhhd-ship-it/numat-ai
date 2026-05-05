@@ -19,6 +19,7 @@ from ai import add_ai_explanations
 from ai import build_outreach_prep_fallback
 from ai import generate_outreach_prep
 from analysis import (
+    analyze_order_cycle,
     calculate_average_gap,
     get_analysis_today,
     get_last_activity,
@@ -1050,6 +1051,7 @@ def get_customer_view(
     first_order = min(order["order_date"] for order in customer_orders)
     last_order = max(order["order_date"] for order in customer_orders)
     average_gap = calculate_average_gap(customer_orders)
+    cycle = analyze_order_cycle(customer_orders)
     average_value = average_order_amount(customer_orders)
     last_activity = get_last_activity(customer_orders)
     last_activity_info = get_last_activity_info(customer_orders)
@@ -1092,8 +1094,12 @@ def get_customer_view(
                 <strong>{escape(last_order)}</strong>
             </div>
             <div>
-                <span class="label">Average Cycle</span>
+                <span class="label">Typical Cycle</span>
                 <strong>{format_average_gap(average_gap)}</strong>
+            </div>
+            <div>
+                <span class="label">Order Rhythm</span>
+                <strong>{escape(str(cycle.get("pattern_label") or "Not enough orders"))}</strong>
             </div>
             <div>
                 <span class="label">Last Activity</span>
@@ -1430,6 +1436,7 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
     summaries = []
 
     for customer_name, customer_orders in grouped_customers.items():
+        cycle = analyze_order_cycle(customer_orders)
         state_counts = Counter(
             get_order_state(order)
             for order in customer_orders
@@ -1452,7 +1459,8 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
             "crm_count": len(crm_activities),
             "state": state_counts.most_common(1)[0][0] if state_counts else "",
             "last_order": max(order["order_date"] for order in customer_orders),
-            "avg_cycle": calculate_average_gap(customer_orders),
+            "avg_cycle": cycle["cycle_days"],
+            "cycle_pattern_label": cycle["pattern_label"],
             "total_value": sum_order_amounts(customer_orders),
             "avg_value": average_order_amount(customer_orders),
             "last_activity": last_activity,
@@ -1478,7 +1486,7 @@ def render_customer_summary_row(summary):
             <td>{summary["crm_count"]}</td>
             <td>{escape(str(summary["state"]))}</td>
             <td>{escape(str(summary["last_order"]))}</td>
-            <td>{format_average_gap(summary["avg_cycle"])}</td>
+            <td>{format_average_gap(summary["avg_cycle"])} <span class="muted-soft">({escape(str(summary.get("cycle_pattern_label") or "Not enough orders"))})</span></td>
             <td>{format_currency(summary["total_value"])}</td>
             <td>{format_currency(summary["avg_value"])}</td>
             <td>
@@ -1804,13 +1812,13 @@ def build_contact_recommendation(
     elif attention and float(attention.get("priority_score") or 0) >= 2:
         next_step = "Reach out now with a specific operational reason"
         guidance = (
-            "This account is well beyond its normal order cycle. Lead with a short,"
+            "This account looks well beyond its usual repair rhythm. Lead with a short,"
             " concrete reason for contact and reference the most recent CRM thread."
         )
     elif attention:
         next_step = "Follow up with a light check-in"
         guidance = (
-            "This customer is beyond its average cycle, but not deeply overdue."
+            "This customer looks beyond its typical repair rhythm, but not deeply overdue."
             " A short message referencing the last conversation should be enough."
         )
     elif latest_crm_activity:
@@ -1821,8 +1829,8 @@ def build_contact_recommendation(
         )
 
     draft_prompt = (
-        f"Draft angle for {customer}: mention the last order on {last_order}, note the usual cycle"
-        f" of {round(average_gap, 1) if average_gap else 'n/a'} days, and tie the"
+        f"Draft angle for {customer}: mention the last order on {last_order}, note the customer's"
+        f" typical repair rhythm of {round(average_gap, 1) if average_gap else 'n/a'} days, and tie the"
         f" message back to the latest CRM conversation."
     )
 
@@ -2607,6 +2615,7 @@ def build_last_contact_display(last_activity_content, latest_crm_activity, crm_a
 
 def build_outreach_context(customer, customer_orders, attention, crm_result):
     customer_primary_key = get_customer_primary_key(customer_orders)
+    cycle = analyze_order_cycle(customer_orders)
     master_data_result = fetch_filemaker_master_data()
     customer_master = (
         master_data_result.get("customers_by_key", {}).get(customer_primary_key, {})
@@ -2765,7 +2774,9 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         "priority_score": attention.get("priority_score") if attention else "",
         "action": attention.get("action") if attention else "",
         "days_since_last_order": days_since_last_order,
-        "average_cycle": round(calculate_average_gap(customer_orders), 1) if calculate_average_gap(customer_orders) is not None else "Not enough orders",
+        "average_cycle": cycle["cycle_days"] if cycle["cycle_days"] is not None else "Not enough orders",
+        "order_cycle_pattern": cycle["pattern_label"],
+        "order_cycle_consistency": cycle["consistency"],
         "last_order_date": max(order.get("order_date", "") for order in customer_orders),
         "first_order_date": min(order.get("order_date", "") for order in customer_orders),
         "order_count": order_count,
@@ -2866,7 +2877,7 @@ def render_outreach_prep_page(customer, context, result, data_results):
         <div class="summary outreach-summary">
             <div><span class="label">Priority</span><strong>{escape(str(context.get("priority_score", "")) or "n/a")}</strong></div>
             <div><span class="label">Days Since Last Order</span><strong>{escape(str(context.get("days_since_last_order", "")) or "n/a")}</strong></div>
-            <div><span class="label">Average Cycle</span><strong>{escape(str(context.get("average_cycle", "")) or "n/a")}</strong></div>
+            <div><span class="label">Typical Cycle</span><strong>{escape(str(context.get("average_cycle", "")) or "n/a")}</strong></div>
             <div><span class="label">Last Order</span><strong>{escape(str(context.get("last_order_date", "")) or "n/a")}</strong></div>
             <div><span class="label">Last Sales Outreach</span><strong>{escape(str(context.get("latest_sales_outreach", "")) or "n/a")}</strong></div>
             <div><span class="label">Sales Outreach History</span><strong>{escape(str(context.get("sales_activity_count", 0)))}</strong></div>
@@ -4699,7 +4710,7 @@ def render_home_focus_preview(preview, dismiss_open=False):
 
             <div class="home-evidence-strip">
                 <div><span class="label">Days Since Last Order</span><strong>{escape(str(context.get("days_since_last_order") or "n/a"))}</strong></div>
-                <div><span class="label">Average Cycle</span><strong>{escape(str(context.get("average_cycle") or "n/a"))}</strong></div>
+                <div><span class="label">Typical Cycle</span><strong>{escape(str(context.get("average_cycle") or "n/a"))}</strong></div>
                 <div><span class="label">Last Order Date</span><strong>{escape(str(context.get("last_order_date") or "n/a"))}</strong></div>
                 <div><span class="label">Sales Outreach History</span><strong>{escape(str(context.get("sales_activity_count") or 0))}</strong></div>
                 <div><span class="label">Last Reply</span><strong>{escape(str(result.get("last_reply_date") or "No reply recorded"))}</strong></div>
@@ -5479,7 +5490,7 @@ def render_customers_filter_form(customer, state, sort, direction):
         "order_count": "Order Count",
         "crm_count": "CRM Emails",
         "state": "State",
-        "avg_cycle": "Average Cycle",
+        "avg_cycle": "Typical Cycle",
         "total_value": "Total Value",
         "avg_value": "Avg Value / Order",
         "last_activity": "Last Activity",
