@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 from threading import Lock, Thread
+import time
 from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -62,6 +63,12 @@ CRM_SYNC_STATUS = {
     "status": "",
     "saved": False,
     "message": "",
+}
+
+_ATTENTION_RESPONSE_CACHE = {
+    "key": None,
+    "expires_at": 0,
+    "result": None,
 }
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -446,7 +453,11 @@ def post_action_plan_restore(
 
 def render_home_page(selected_customer="", view="focus", dismiss_customer=""):
     order_result = get_orders_for_analysis()
-    attention_result = build_customers_needing_attention_response()
+    crm_result = fetch_crm_activities()
+    attention_result = build_customers_needing_attention_response(
+        order_result=order_result,
+        crm_result=crm_result,
+    )
 
     if order_result["status"] != "ok":
         return render_page(
@@ -466,7 +477,6 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer=""):
         grouped_orders,
         attention_result.get("dismissed_customers", []),
     )
-    crm_result = fetch_crm_activities()
     crm_activity_map = (
         crm_result.get("activity_map", {})
         if crm_result.get("status") == "ok" else {}
@@ -1168,6 +1178,30 @@ def should_enable_full_crm_sync():
     }
 
 
+def get_attention_cache_seconds():
+    raw_seconds = os.getenv("ATTENTION_CACHE_SECONDS", "60").strip()
+
+    try:
+        return max(0, int(raw_seconds))
+    except ValueError:
+        return 60
+
+
+def build_attention_cache_key(order_result, crm_result):
+    return (
+        order_result.get("source"),
+        order_result.get("status"),
+        order_result.get("cache_updated_at", ""),
+        len(order_result.get("orders", [])),
+        crm_result.get("source"),
+        crm_result.get("status"),
+        crm_result.get("synced_at", ""),
+        crm_result.get("cache_updated_at", ""),
+        crm_result.get("counts", {}).get("kept_rows", 0),
+        should_add_ai_explanations(),
+    )
+
+
 def build_attention_explanation(customer):
     explanation = str(customer.get("explanation", "") or "").strip()
 
@@ -1182,8 +1216,8 @@ def build_attention_explanation(customer):
     )
 
 
-def build_customers_needing_attention_response():
-    order_result = get_orders_for_analysis()
+def build_customers_needing_attention_response(order_result=None, crm_result=None):
+    order_result = order_result or get_orders_for_analysis()
 
     if order_result["status"] != "ok":
         return {
@@ -1192,8 +1226,20 @@ def build_customers_needing_attention_response():
             "late_customers": []
         }
 
+    crm_result = crm_result or fetch_crm_activities()
+    cache_seconds = get_attention_cache_seconds()
+    cache_key = build_attention_cache_key(order_result, crm_result)
+    now = time.time()
+
+    if (
+        cache_seconds
+        and _ATTENTION_RESPONSE_CACHE["key"] == cache_key
+        and _ATTENTION_RESPONSE_CACHE["result"] is not None
+        and _ATTENTION_RESPONSE_CACHE["expires_at"] > now
+    ):
+        return _ATTENTION_RESPONSE_CACHE["result"]
+
     customers = group_by_customer(order_result["orders"])
-    crm_result = fetch_crm_activities()
     crm_activity_map = (
         crm_result.get("activity_map", {})
         if crm_result["status"] == "ok" else {}
@@ -1246,7 +1292,7 @@ def build_customers_needing_attention_response():
         if should_add_ai_explanations()
         else active_customers
     )
-    return {
+    result = {
         "source": order_result["source"],
         "status": "ok",
         "late_customers": late_with_explanations,
@@ -1256,6 +1302,13 @@ def build_customers_needing_attention_response():
             direction="desc",
         ),
     }
+
+    if cache_seconds:
+        _ATTENTION_RESPONSE_CACHE["key"] = cache_key
+        _ATTENTION_RESPONSE_CACHE["expires_at"] = now + cache_seconds
+        _ATTENTION_RESPONSE_CACHE["result"] = result
+
+    return result
 
 
 def render_late_customer_row(customer):
