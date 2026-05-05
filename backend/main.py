@@ -81,6 +81,14 @@ PREVIEW_AUTH_EXEMPT_PATHS = {
 }
 
 
+@app.on_event("startup")
+def startup_prewarm():
+    if not should_enable_startup_prewarm():
+        return
+
+    Thread(target=prewarm_app_caches, daemon=True).start()
+
+
 def get_preview_auth_credentials():
     username = os.getenv("APP_BASIC_AUTH_USERNAME", "").strip()
     password = os.getenv("APP_BASIC_AUTH_PASSWORD", "").strip()
@@ -1200,6 +1208,30 @@ def build_attention_cache_key(order_result, crm_result):
         crm_result.get("counts", {}).get("kept_rows", 0),
         should_add_ai_explanations(),
     )
+
+
+def should_enable_startup_prewarm():
+    return os.getenv("ENABLE_STARTUP_PREWARM", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def prewarm_app_caches():
+    try:
+        order_result = get_orders_for_analysis()
+        crm_result = fetch_crm_activities()
+        fetch_filemaker_master_data()
+
+        if order_result.get("status") == "ok":
+            build_customers_needing_attention_response(
+                order_result=order_result,
+                crm_result=crm_result,
+            )
+    except Exception as error:
+        print(f"Startup prewarm skipped after error: {error.__class__.__name__}")
 
 
 def build_attention_explanation(customer):
