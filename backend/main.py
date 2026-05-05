@@ -1261,6 +1261,12 @@ def build_attention_cache_key(order_result, crm_result):
     )
 
 
+def clear_attention_response_cache():
+    _ATTENTION_RESPONSE_CACHE["key"] = None
+    _ATTENTION_RESPONSE_CACHE["expires_at"] = 0
+    _ATTENTION_RESPONSE_CACHE["result"] = None
+
+
 def should_enable_startup_prewarm():
     return os.getenv("ENABLE_STARTUP_PREWARM", "true").strip().lower() in {
         "1",
@@ -4209,6 +4215,7 @@ def dismiss_action_plan_customer(customer_name, last_order, reason=""):
         "reason": str(reason or "").strip(),
     }
     write_action_plan_dismissals(dismissals)
+    clear_attention_response_cache()
 
 
 def restore_action_plan_customer(customer_name):
@@ -4217,6 +4224,7 @@ def restore_action_plan_customer(customer_name):
     if str(customer_name) in dismissals:
         dismissals.pop(str(customer_name), None)
         write_action_plan_dismissals(dismissals)
+        clear_attention_response_cache()
 
 
 def get_order_territory(order):
