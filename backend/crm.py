@@ -177,6 +177,15 @@ def get_filemaker_crm_use_sync_cache():
     }
 
 
+def get_filemaker_crm_incremental_sync_enabled():
+    return os.getenv("FILEMAKER_CRM_INCREMENTAL_SYNC", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def get_filemaker_crm_sort_field():
     return os.getenv("FILEMAKER_CRM_SORT_FIELD", "Date Created").strip()
 
@@ -411,6 +420,18 @@ def build_filemaker_crm_result():
 
 
 def sync_filemaker_crm_cache():
+    existing_sync_result = read_filemaker_crm_sync_cache()
+
+    if (
+        get_filemaker_crm_incremental_sync_enabled()
+        and existing_sync_result is not None
+        and existing_sync_result.get("activities")
+    ):
+        incremental_result = sync_filemaker_crm_cache_incremental(existing_sync_result)
+
+        if incremental_result.get("status") == "ok":
+            return incremental_result
+
     layout = get_filemaker_emails_layout()
     batch_size = get_filemaker_crm_batch_size()
     sort_field = get_filemaker_crm_sort_field()
@@ -483,19 +504,146 @@ def sync_filemaker_crm_cache():
     }
 
     if result["status"] == "ok":
-        cache_path = get_filemaker_crm_cache_path()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "synced_at": synced_at,
-            "source": result["source"],
-            "status": result["status"],
-            "path": result["path"],
-            "counts": result["counts"],
-            "activities": result["activities"],
-        }
-        cache_path.write_text(json.dumps(payload), encoding="utf-8")
-        clear_crm_cache()
+        write_filemaker_crm_sync_payload(result)
 
+    return result
+
+
+def build_crm_activity_dedupe_key(activity):
+    return "|".join([
+        str(activity.get("date_created") or "").strip(),
+        str(activity.get("customer_primary_key") or "").strip(),
+        str(activity.get("sender_email") or "").strip().lower(),
+        str(activity.get("to") or "").strip().lower(),
+        str(activity.get("subject") or "").strip(),
+        str(activity.get("body") or "").strip(),
+    ])
+
+
+def get_latest_cached_crm_activity_timestamp(existing_sync_result):
+    activities = existing_sync_result.get("activities", [])
+
+    if not activities:
+        return ""
+
+    return max(
+        (
+            str(activity.get("date_created") or "").strip()
+            for activity in activities
+            if str(activity.get("date_created") or "").strip()
+        ),
+        default="",
+    )
+
+
+def write_filemaker_crm_sync_payload(result):
+    cache_path = get_filemaker_crm_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "synced_at": result.get("synced_at", ""),
+        "source": result.get("source", "filemaker_sync_cache"),
+        "status": result.get("status", "ok"),
+        "path": result.get("path", str(cache_path)),
+        "counts": result.get("counts", {}),
+        "activities": result.get("activities", []),
+    }
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    clear_crm_cache()
+
+
+def sync_filemaker_crm_cache_incremental(existing_sync_result):
+    latest_cached_timestamp = get_latest_cached_crm_activity_timestamp(existing_sync_result)
+
+    if not latest_cached_timestamp:
+        return empty_crm_result("filemaker_sync_cache", str(get_filemaker_crm_cache_path()), "missing_incremental_timestamp")
+
+    layout = get_filemaker_emails_layout()
+    batch_size = get_filemaker_crm_batch_size()
+    sort_field = get_filemaker_crm_sort_field()
+    offset = 1
+    new_activities = []
+    new_total_rows = 0
+    new_excluded_internal_only = 0
+    new_unknown_direction_count = 0
+    reached_cached_rows = False
+
+    while True:
+        result = fetch_layout_records(
+            layout,
+            limit=batch_size,
+            offset=offset,
+            sort_fields=[
+                {
+                    "fieldName": sort_field,
+                    "sortOrder": "descend",
+                }
+            ] if sort_field else None,
+        )
+
+        if result["status"] != "ok":
+            return empty_crm_result("filemaker_sync_cache", str(get_filemaker_crm_cache_path()), result["status"])
+
+        batch_rows = [
+            record.get("fieldData", {})
+            for record in result.get("records", [])
+        ]
+
+        if not batch_rows:
+            break
+
+        for index, row in enumerate(batch_rows, start=offset):
+            activity = normalize_crm_row(row, index=index)
+            activity_timestamp = str(activity.get("date_created") or "").strip()
+
+            if activity_timestamp and activity_timestamp <= latest_cached_timestamp:
+                reached_cached_rows = True
+                break
+
+            new_total_rows += 1
+
+            if activity["exclude"]:
+                new_excluded_internal_only += 1
+                continue
+
+            if activity["direction"] == "unknown":
+                new_unknown_direction_count += 1
+
+            new_activities.append(activity)
+
+        if reached_cached_rows or len(batch_rows) < batch_size:
+            break
+
+        offset += batch_size
+
+    merged_by_key = {
+        build_crm_activity_dedupe_key(activity): activity
+        for activity in existing_sync_result.get("activities", [])
+    }
+
+    for activity in new_activities:
+        merged_by_key[build_crm_activity_dedupe_key(activity)] = activity
+
+    merged_activities = sort_crm_activities(list(merged_by_key.values()))
+    merged_activity_map = build_activity_map(merged_activities)
+    existing_counts = existing_sync_result.get("counts", {})
+    synced_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    result = {
+        "source": "filemaker_sync_cache",
+        "status": "ok",
+        "path": str(get_filemaker_crm_cache_path()),
+        "activities": merged_activities,
+        "activity_map": merged_activity_map,
+        "counts": {
+            "total_rows": existing_counts.get("total_rows", len(existing_sync_result.get("activities", []))) + new_total_rows,
+            "kept_rows": len(merged_activities),
+            "excluded_internal_only": existing_counts.get("excluded_internal_only", 0) + new_excluded_internal_only,
+            "customer_count": len(merged_activity_map),
+            "unknown_direction_count": existing_counts.get("unknown_direction_count", 0) + new_unknown_direction_count,
+        },
+        "synced_at": synced_at,
+    }
+
+    write_filemaker_crm_sync_payload(result)
     return result
 
 
