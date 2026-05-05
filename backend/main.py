@@ -461,14 +461,25 @@ def post_action_plan_restore(
 
 
 def render_home_page(selected_customer="", view="focus", dismiss_customer=""):
+    home_started_at = time.perf_counter()
+
+    stage_started_at = time.perf_counter()
     order_result = get_orders_for_analysis()
+    log_perf_metric("home.get_orders_for_analysis", stage_started_at)
+
+    stage_started_at = time.perf_counter()
     crm_result = fetch_crm_activities()
+    log_perf_metric("home.fetch_crm_activities", stage_started_at)
+
+    stage_started_at = time.perf_counter()
     attention_result = build_customers_needing_attention_response(
         order_result=order_result,
         crm_result=crm_result,
     )
+    log_perf_metric("home.build_attention_response", stage_started_at)
 
     if order_result["status"] != "ok":
+        log_perf_metric("home.total_error", home_started_at)
         return render_page(
             title="Numat AI Sales Assistant",
             body=(
@@ -480,25 +491,38 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer=""):
 
     orders = order_result["orders"]
     attention_customers = attention_result["late_customers"]
+
+    stage_started_at = time.perf_counter()
     grouped_orders = group_by_customer(orders)
+    log_perf_metric("home.group_by_customer", stage_started_at)
+
+    stage_started_at = time.perf_counter()
     action_plan = build_home_action_plan(
         attention_customers,
         grouped_orders,
         attention_result.get("dismissed_customers", []),
     )
+    log_perf_metric("home.build_action_plan", stage_started_at)
+
     crm_activity_map = (
         crm_result.get("activity_map", {})
         if crm_result.get("status") == "ok" else {}
     )
+
+    stage_started_at = time.perf_counter()
     queue_summaries = build_home_queue_summaries(
         action_plan.get("due_today", []),
         grouped_orders,
         crm_activity_map,
     )
+    log_perf_metric("home.build_queue_summaries", stage_started_at)
+
     selected_customer = get_home_selected_customer_name(
         queue_summaries,
         selected_customer=selected_customer,
     )
+
+    stage_started_at = time.perf_counter()
     selected_preview = build_home_preview_payload(
         selected_customer,
         queue_summaries,
@@ -506,12 +530,16 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer=""):
         attention_customers,
         crm_result,
     )
+    log_perf_metric("home.build_preview_payload", stage_started_at)
+
     home_view = "list" if str(view).strip().lower() == "list" else "focus"
 
     body = f"""
         {render_data_availability_banner(order_result, crm_result)}
         {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, dismiss_customer=dismiss_customer)}
     """
+
+    log_perf_metric("home.total", home_started_at)
 
     return render_page(
         title="Numat AI Sales Assistant",
@@ -1190,6 +1218,23 @@ def should_enable_full_crm_sync():
         "yes",
         "on",
     }
+
+
+def should_enable_perf_logs():
+    return os.getenv("ENABLE_PERF_LOGS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def log_perf_metric(label, started_at):
+    if not should_enable_perf_logs():
+        return
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+    print(f"PERF {label}: {elapsed_ms}ms")
 
 
 def get_attention_cache_seconds():
@@ -4369,6 +4414,7 @@ def get_home_selected_customer_name(queue_summaries, selected_customer=""):
 
 
 def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map):
+    started_at = time.perf_counter()
     summaries = []
     master_data_result = fetch_filemaker_master_data()
     contacts_by_customer_key = (
@@ -4425,6 +4471,10 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
             "top_contact": top_contacts[0] if top_contacts else None,
         })
 
+    log_perf_metric(
+        f"home.queue_summaries_inner customers={len(queue_customers)}",
+        started_at,
+    )
     return summaries
 
 
@@ -4481,6 +4531,8 @@ def extract_customer_location_label(customer_name, customer_orders=None):
 
 
 def build_home_preview_payload(selected_customer, queue_summaries, grouped_orders, attention_customers, crm_result):
+    started_at = time.perf_counter()
+
     if not selected_customer:
         return None
 
@@ -4524,7 +4576,7 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         customer_name=selected_customer,
     )
 
-    return {
+    payload = {
         "customer": selected_customer,
         "location": queue_summary.get("location") or extract_customer_location_label(selected_customer, customer_orders),
         "queue_summary": queue_summary,
@@ -4539,6 +4591,12 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
             str(result.get("suggested_mode") or queue_summary.get("suggested_mode") or "Email")
         ),
     }
+
+    log_perf_metric(
+        f"home.preview_payload_inner customer={selected_customer}",
+        started_at,
+    )
+    return payload
 
 
 def build_home_message_points(context, result, customer_name):
