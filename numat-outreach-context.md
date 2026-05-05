@@ -20,6 +20,14 @@ NuMat helps customers keep repairable mats in service longer, reduce replacement
 
 Many NuMat customers collect damaged mats during their normal operations. NuMat repairs those damaged mats and returns them to service when repair makes economic and practical sense.
 
+In practice, shipment size matters. Very small repair shipments are often not economically viable once freight is considered. As a rule of thumb, NuMat generally prefers a minimum order around:
+
+- 75 mats
+- 1 pallet
+- or about 800 lbs
+
+AI should not encourage the customer to send very small quantities just to get started unless a human specifically decides to make an exception.
+
 This matters because customer communication often includes phrases such as:
 
 - damaged mats
@@ -267,12 +275,13 @@ Recommended approach:
 - ask for pallet or cage count and weight
 - confirm shipping preferences such as dock hours and operating days
 - avoid requiring perfect counts or exact sizes unless necessary
-- reinforce that they can start with a manageable order
+- reinforce practical minimum shipment guidance where relevant
 - make the process feel simple
+- avoid suggesting that a very small quantity is enough if freight economics are unlikely to work
 
 Example approach:
 
-> If you have mats set aside, an approximate pallet or cage count is enough to get started. We can help coordinate the next step from there.
+> If you have mats set aside, an approximate pallet or cage count and weight is helpful. In most cases, NuMat is looking for roughly 75 mats, 1 pallet, or about 800 lbs so the freight and repair economics make sense.
 
 ### Customer Has Paused Repair Activity
 
@@ -441,6 +450,8 @@ Thanks - we can help with that.
 
 Please send the pallet or cage count when you have it, and we can coordinate the next step from there.
 
+If the shipment is likely to be small, it is better to ask whether the customer expects enough volume to reach a practical freight minimum rather than encouraging them to send a very small quantity immediately.
+
 Best,
 [Sender]
 
@@ -453,6 +464,7 @@ Before damaged mats are discarded, it may be worth setting aside the larger, new
 Those are often the mats where repair can make the most economic sense compared with replacement.
 
 If helpful, we can start with a small order and help your team identify what is worth sending.
+If helpful, we can help your team identify what is worth saving and whether there is enough volume to reach a practical repair shipment.
 
 Best,
 [Sender]

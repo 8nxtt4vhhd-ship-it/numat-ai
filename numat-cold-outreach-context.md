@@ -61,7 +61,7 @@ Use this pattern:
    - no contracts, no new equipment, no process change
 4. One low-friction ask:
    - review damaged mats
-   - stack a pallet
+   - see whether enough mats are building up to justify a shipment
    - send a photo
    - compare repair vs replacement
 
@@ -72,7 +72,7 @@ For net-new prospects:
 - introduce NuMat briefly
 - explain that damaged mats are often replaced too early
 - position repair as practical and low-risk
-- ask for a very small next step
+- ask for a practical next step without implying that very small shipments are always economical
 
 ## Dormant Customer Angle
 
@@ -104,7 +104,7 @@ Prefer soft CTAs:
 - Would it be worth taking a look?
 - Would this be useful at your location?
 - Would it help if I sent a simple sorting guide?
-- Would you be open to reviewing a small first pallet?
+- Would it help to review whether you have enough damaged mats building up for a practical first shipment?
 - Can I send a few examples of good repair candidates?
 
 Avoid pushy calendar asks in cold outreach unless the context strongly supports it.
@@ -119,6 +119,18 @@ When helpful, remind the customer that the best repair candidates are often:
 - mats with border damage
 
 Do not imply every damaged mat is worth repairing.
+
+## Freight and Shipment Guidance
+
+Do not encourage customers to send very small quantities simply to get started.
+
+In most cases, NuMat should anchor on a practical minimum shipment around:
+
+- 75 mats
+- 1 pallet
+- or about 800 lbs
+
+Cold outreach can ask whether damaged mats are building up toward that level, but should avoid suggesting that a very small pallet, partial cage, or minimal quantity is automatically worth sending.
 
 ## Data Use
 
