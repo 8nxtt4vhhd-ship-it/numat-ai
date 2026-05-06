@@ -1033,6 +1033,101 @@ def get_customers_view(
     return render_page(title="Customers", body=body)
 
 
+@app.get("/contacts-view", response_class=HTMLResponse)
+def get_contacts_view(
+    company: str = "",
+    name: str = "",
+    email: str = "",
+    sort: str = "company",
+    direction: str = "asc",
+):
+    master_data_result = fetch_filemaker_master_data()
+
+    if master_data_result.get("status") != "ok":
+        return render_page(
+            title="Contacts",
+            body=(
+                f"<p class='status error'>Could not load contact master data from "
+                f"FileMaker: {escape(master_data_result.get('status', 'unknown_error'))}</p>"
+            )
+        )
+
+    contact_rows = build_contact_master_rows(master_data_result)
+    filtered_contact_rows = filter_contact_master_rows(
+        contact_rows,
+        company=company,
+        name=name,
+        email=email,
+    )
+    sorted_contact_rows = sort_contact_master_rows(
+        filtered_contact_rows,
+        sort_key=sort,
+        direction=direction,
+    )
+    company_count = len({
+        row["customer_ref"]
+        for row in contact_rows
+        if row.get("customer_ref")
+    })
+
+    rows = "".join(
+        render_contact_master_row(contact)
+        for contact in sorted_contact_rows
+    )
+
+    if not rows:
+        rows = (
+            "<tr>"
+            "<td colspan='8' class='empty'>No contacts match the current filters.</td>"
+            "</tr>"
+        )
+
+    body = f"""
+        {render_data_availability_banner(master_data_result)}
+
+        <div class="summary customer-summary">
+            <div>
+                <span class="label">Source</span>
+                <strong>FileMaker master data</strong>
+            </div>
+            <div>
+                <span class="label">Contacts</span>
+                <strong>{len(contact_rows)}</strong>
+            </div>
+            <div>
+                <span class="label">Showing</span>
+                <strong>{len(sorted_contact_rows)}</strong>
+            </div>
+            <div>
+                <span class="label">Companies</span>
+                <strong>{company_count}</strong>
+            </div>
+        </div>
+
+        {render_contacts_filter_form(company, name, email, sort, direction)}
+
+        <div class="table-wrap tall-table">
+        <table class="contacts-table">
+            <thead>
+                <tr>
+                    <th>Company</th>
+                    <th>Contact</th>
+                    <th>Email</th>
+                    <th>Status</th>
+                    <th>Position</th>
+                    <th>Phone</th>
+                    <th>Cell</th>
+                    <th>State</th>
+                </tr>
+            </thead>
+            <tbody>{rows}</tbody>
+        </table>
+        </div>
+    """
+
+    return render_page(title="Contacts", body=body)
+
+
 @app.get("/customer-view", response_class=HTMLResponse)
 def get_customer_view(
     customer: str,
@@ -1567,6 +1662,42 @@ def render_customer_summary_row(summary):
                     {render_recent_activity_badge_for_date(summary.get("display_last_activity"))}
                 </div>
             </td>
+        </tr>
+    """
+
+
+def render_contact_master_row(contact):
+    company_name = str(contact.get("company") or "")
+    customer_ref = str(contact.get("customer_ref") or "")
+    customers_href = f"/customers-view?customer={quote(company_name)}" if company_name else "/customers-view"
+    company_markup = (
+        f'<a href="{customers_href}"><strong>{escape(company_name)}</strong></a>'
+        if company_name
+        else "<span class='muted'>Unknown company</span>"
+    )
+    contact_name = str(contact.get("name") or "").strip() or "Unknown contact"
+    state = str(contact.get("state") or "").strip() or "n/a"
+    position = str(contact.get("position") or "").strip() or "—"
+    email = str(contact.get("email") or "").strip() or "—"
+    phone = str(contact.get("phone") or "").strip() or "—"
+    cell = str(contact.get("cell") or "").strip() or "—"
+    active_label = str(contact.get("active") or "").strip() or "Unknown"
+    active_markup = (
+        "<span class='contact-status contact-status-active'>Active</span>"
+        if active_label.lower() == "active"
+        else f"<span class='contact-status contact-status-inactive'>{escape(active_label.title())}</span>"
+    )
+
+    return f"""
+        <tr>
+            <td>{company_markup}</td>
+            <td><strong>{escape(contact_name)}</strong></td>
+            <td>{escape(email)}</td>
+            <td>{active_markup}</td>
+            <td>{escape(position)}</td>
+            <td>{escape(phone)}</td>
+            <td>{escape(cell)}</td>
+            <td>{escape(state)}</td>
         </tr>
     """
 
@@ -2322,6 +2453,70 @@ def filter_customer_summaries(summaries, customer="", state=""):
     return filtered_summaries
 
 
+def build_contact_master_rows(master_data_result):
+    customers_by_key = master_data_result.get("customers_by_key", {})
+    rows = []
+
+    for contact in master_data_result.get("all_contacts", []):
+        customer_ref = str(contact.get("customer_ref") or "").strip()
+        customer_record = customers_by_key.get(customer_ref, {})
+
+        rows.append({
+            "company": str(customer_record.get("company") or "").strip(),
+            "state": str(customer_record.get("state") or "").strip(),
+            "customer_ref": customer_ref,
+            "name": str(contact.get("name") or "").strip(),
+            "email": str(contact.get("email") or "").strip(),
+            "position": str(contact.get("position") or "").strip(),
+            "phone": str(contact.get("phone") or "").strip(),
+            "cell": str(contact.get("cell") or "").strip(),
+            "active": str(contact.get("active") or "").strip(),
+        })
+
+    return rows
+
+
+def filter_contact_master_rows(rows, company="", name="", email=""):
+    company_filter = company.strip().lower()
+    name_filter = name.strip().lower()
+    email_filter = email.strip().lower()
+    filtered_rows = []
+
+    for row in rows:
+        if company_filter and company_filter not in str(row.get("company") or "").lower():
+            continue
+
+        if name_filter and name_filter not in str(row.get("name") or "").lower():
+            continue
+
+        if email_filter and email_filter not in str(row.get("email") or "").lower():
+            continue
+
+        filtered_rows.append(row)
+
+    return filtered_rows
+
+
+def sort_contact_master_rows(rows, sort_key="company", direction="asc"):
+    valid_sort_keys = {"company", "name", "email", "position", "state"}
+
+    if sort_key not in valid_sort_keys:
+        sort_key = "company"
+
+    reverse = direction == "desc"
+
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get(sort_key) or "").lower(),
+            str(row.get("company") or "").lower(),
+            str(row.get("name") or "").lower(),
+            str(row.get("email") or "").lower(),
+        ),
+        reverse=reverse,
+    )
+
+
 def sort_customer_summaries(summaries, sort_key="last_order", direction="desc"):
     valid_sort_keys = {
         "customer",
@@ -2937,14 +3132,18 @@ def render_outreach_prep_page(customer, context, result, data_results):
         or str(primary_contact.get("role") or "").strip()
         or "Likely sales contact"
     )
+    target_status_note = str(primary_contact.get("status_note") or "").strip()
     target_phone = (
         str(primary_contact.get("phone") or "").strip()
         or str(primary_contact.get("cell") or "").strip()
     )
-    target_contact = " - ".join(
-        part for part in [target_name, target_email]
-        if part
-    ) or "Not available"
+    if target_name and target_email and target_name.lower() == target_email.lower():
+        target_contact = target_email
+    else:
+        target_contact = " - ".join(
+            part for part in [target_name, target_email]
+            if part
+        ) or "Not available"
     suggested_mode = str(result.get("suggested_mode", "") or "Email").strip() or "Email"
     order_rhythm = str(context.get("order_cycle_pattern") or "Not enough orders")
     last_order_display = format_optional_date(context.get("last_order_date", ""))
@@ -3059,7 +3258,7 @@ def render_outreach_prep_page(customer, context, result, data_results):
                                     <path fill="currentColor" d="M12 12.5a4.25 4.25 0 1 1 0-8.5 4.25 4.25 0 0 1 0 8.5Zm0-1.5a2.75 2.75 0 1 0 0-5.5 2.75 2.75 0 0 0 0 5.5Zm0 3c3.78 0 6.9 1.94 7.82 4.77a.75.75 0 0 1-1.43.46C17.67 17.1 15.08 15.5 12 15.5s-5.67 1.6-6.39 3.73a.75.75 0 1 1-1.43-.46C5.1 15.94 8.22 14 12 14Z"/>
                                 </svg>
                             </span>
-                            <div><span class="label">Target</span><strong>{escape(target_role)}</strong></div>
+                            <div><span class="label">Target</span><strong>{escape(target_role)}</strong>{f'<span class="outreach-chip-note">{escape(target_status_note)}</span>' if target_status_note else ''}</div>
                         </div>
                         <div class="outreach-chip-card">
                             <span class="outreach-chip-icon" aria-hidden="true">
@@ -3185,12 +3384,14 @@ def render_outreach_contact_row(contact):
     role_text = title if title else role_label
     if title and role_label and role_label.lower() not in title.lower():
         role_text = f"{title} • {role_label}"
+    status_note = str(contact.get("status_note") or "").strip()
     return f"""
         <li>
             <div class="action-item outreach-context-item">
                 <div class="action-main">
                     <strong>{escape(str(contact.get("name") or "Unknown contact"))}</strong>
                     <span class="action-meta">{escape(str(contact.get("email") or ""))}</span>
+                    {f'<span class="action-meta muted-soft">{escape(status_note)}</span>' if status_note else ''}
                     <span class="action-meta">{escape(role_text)} • Influence {escape(str(contact.get("influence") or "Low"))} • Last active {escape(str(contact.get("last_active") or "Not available"))}</span>
                     <span class="action-cue">{escape(str(contact.get("note") or ""))}</span>
                     <span class="action-cue">Replies {escape(str(contact.get("inbound_count", 0)))} • Outbound touches {escape(str(contact.get("outbound_count", 0)))}</span>
@@ -3365,15 +3566,22 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
         master_contact = master_contact or {}
         key = get_contact_key(email, master_contact)
         seeded_email = str(email or master_contact.get("email") or "").strip().lower()
-        seeded_name = str(master_contact.get("name") or "").strip() or (
-            infer_contact_display_name(seeded_email) if seeded_email else "Unknown contact"
-        )
+        master_status = str(master_contact.get("active") or "").strip()
+        seeded_name = str(master_contact.get("name") or "").strip()
+
+        if not seeded_name:
+            seeded_name = infer_contact_display_name(seeded_email) if seeded_email else "Unknown contact"
+
+        if master_status and master_status.lower() != "active" and seeded_email:
+            seeded_name = seeded_email
+
         contact = contacts.setdefault(key, {
             "name": seeded_name,
             "email": seeded_email,
             "title": str(master_contact.get("position") or "").strip(),
             "phone": str(master_contact.get("phone") or "").strip(),
             "cell": str(master_contact.get("cell") or "").strip(),
+            "active": master_status,
             "inbound_count": 0,
             "outbound_count": 0,
             "unknown_count": 0,
@@ -3385,7 +3593,10 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
         })
 
         if master_contact:
-            if str(master_contact.get("name") or "").strip():
+            if (
+                str(master_contact.get("name") or "").strip()
+                and str(master_contact.get("active") or "").strip().lower() == "active"
+            ):
                 contact["name"] = str(master_contact.get("name") or "").strip()
             if str(master_contact.get("position") or "").strip():
                 contact["title"] = str(master_contact.get("position") or "").strip()
@@ -3393,6 +3604,8 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
                 contact["phone"] = str(master_contact.get("phone") or "").strip()
             if str(master_contact.get("cell") or "").strip():
                 contact["cell"] = str(master_contact.get("cell") or "").strip()
+            if str(master_contact.get("active") or "").strip():
+                contact["active"] = str(master_contact.get("active") or "").strip()
             if seeded_email and not contact.get("email"):
                 contact["email"] = seeded_email
 
@@ -3467,7 +3680,9 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
             + contact["outbound_count"] * 3
             + recency_score
             + (25 if influence == "High" else 12 if influence == "Medium" else 0)
+            - (40 if str(contact.get("active") or "").strip().lower() not in {"", "active"} else 0)
         )
+        is_inactive = str(contact.get("active") or "").strip().lower() not in {"", "active"}
         enriched_contacts.append({
             "name": contact["name"],
             "email": contact["email"],
@@ -3481,6 +3696,9 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
             "latest_subject": contact["latest_subject"],
             "latest_preview": contact["latest_preview"],
             "score": contact_score,
+            "active": contact.get("active", ""),
+            "is_inactive": is_inactive,
+            "status_note": "Inactive contact" if is_inactive else "",
         })
 
     enriched_contacts.sort(
@@ -4765,6 +4983,7 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         or str(primary_contact.get("role") or "").strip()
         or "Likely sales contact"
     )
+    target_status_note = str(primary_contact.get("status_note") or "").strip()
     if not target_contact_name:
         target_contact_name = str(primary_contact.get("name") or "").strip() or "Best known contact"
     if not target_contact_email:
@@ -4784,6 +5003,7 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         "target_name": target_contact_name,
         "target_email": target_contact_email,
         "target_role": target_role,
+        "target_status_note": target_status_note,
         "message_points": message_points,
         "mode": str(result.get("suggested_mode") or queue_summary.get("suggested_mode") or "Email"),
         "mode_cta": get_home_next_action_label(
@@ -4922,6 +5142,7 @@ def render_home_focus_preview(preview, dismiss_open=False):
                     <div class="home-focus-card">
                         <strong>{escape(str(preview.get("target_name") or "Best known contact"))}</strong>
                         <span class="home-focus-card-meta">{escape(str(preview.get("target_email") or "Email not recorded"))}</span>
+                        {f'<span class="home-focus-card-meta home-contact-status-note">{escape(str(preview.get("target_status_note") or ""))}</span>' if str(preview.get("target_status_note") or "").strip() else ''}
                         <span class="home-focus-badge">Primary</span>
                         <span class="home-focus-card-note">{escape(str(preview.get("target_role") or "Likely sales contact"))}</span>
                     </div>
@@ -5800,6 +6021,71 @@ def render_customers_filter_form(customer, state, sort, direction):
     """
 
 
+def render_contacts_filter_form(company, name, email, sort, direction):
+    sort_options = {
+        "company": "Company",
+        "name": "Contact",
+        "email": "Email",
+        "position": "Position",
+        "state": "State",
+    }
+    direction_options = {
+        "asc": "Ascending",
+        "desc": "Descending",
+    }
+
+    return f"""
+        <form class="controls" method="get" action="/contacts-view">
+            <label>
+                <span>Company</span>
+                <input
+                    type="search"
+                    name="company"
+                    value="{escape(company)}"
+                    placeholder="Search company"
+                >
+            </label>
+
+            <label>
+                <span>Contact</span>
+                <input
+                    type="search"
+                    name="name"
+                    value="{escape(name)}"
+                    placeholder="Search contact"
+                >
+            </label>
+
+            <label>
+                <span>Email</span>
+                <input
+                    type="search"
+                    name="email"
+                    value="{escape(email)}"
+                    placeholder="Search email"
+                >
+            </label>
+
+            <label>
+                <span>Sort</span>
+                <select name="sort">
+                    {render_select_options(sort_options, sort)}
+                </select>
+            </label>
+
+            <label>
+                <span>Direction</span>
+                <select name="direction">
+                    {render_select_options(direction_options, direction)}
+                </select>
+            </label>
+
+            <button type="submit">Apply</button>
+            <a class="button secondary" href="/contacts-view">Reset</a>
+        </form>
+    """
+
+
 def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category):
     sort_options = {
         "order_date": "Order Date",
@@ -5864,6 +6150,7 @@ def render_global_nav(title):
         ("Orders", "/orders-view"),
         ("Customers Needing Attention", "/customers-needing-attention-view"),
         ("Customers", "/customers-view"),
+        ("Contacts", "/contacts-view"),
     ]
     items_html = []
 
@@ -6359,6 +6646,11 @@ def render_page(title, body, top_right="", show_title=True):
                         overflow-wrap: anywhere;
                     }}
 
+                    .home-contact-status-note {{
+                        color: var(--muted-soft);
+                        font-size: 12px;
+                    }}
+
                     .home-focus-card-note {{
                         display: block;
                         color: #334e68;
@@ -6609,6 +6901,28 @@ def render_page(title, body, top_right="", show_title=True):
                     .customer-summary strong {{
                         font-size: 15px;
                         line-height: 1.2;
+                    }}
+
+                    .contact-status {{
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        min-height: 24px;
+                        padding: 0 10px;
+                        border-radius: 999px;
+                        font-size: 12px;
+                        font-weight: 700;
+                        white-space: nowrap;
+                    }}
+
+                    .contact-status-active {{
+                        background: #e7f8eb;
+                        color: #1f7a45;
+                    }}
+
+                    .contact-status-inactive {{
+                        background: #f1f4f8;
+                        color: #66788a;
                     }}
 
                     .label {{
@@ -7059,6 +7373,14 @@ def render_page(title, body, top_right="", show_title=True):
 
                     .outreach-chip-card .label {{
                         margin-bottom: 3px;
+                    }}
+
+                    .outreach-chip-note {{
+                        display: block;
+                        margin-top: 4px;
+                        color: var(--muted-soft);
+                        font-size: 12px;
+                        line-height: 1.3;
                     }}
 
                     .outreach-chip-icon {{

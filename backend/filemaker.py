@@ -411,6 +411,7 @@ def build_empty_filemaker_master_data(status):
         "connected": status == "ok",
         "status": status,
         "customers_by_key": {},
+        "all_contacts": [],
         "contacts_by_customer_key": {},
         "contacts_by_email": {},
     }
@@ -506,6 +507,7 @@ def fetch_filemaker_master_data():
         return build_empty_filemaker_master_data(contacts_result["status"])
 
     customers_by_key = {}
+    all_contacts = []
     contacts_by_customer_key = {}
     contacts_by_email = {}
 
@@ -523,16 +525,25 @@ def fetch_filemaker_master_data():
     for raw_record in contacts_result.get("records", []):
         contact = map_filemaker_contact_master_record(raw_record)
 
-        if contact["active"].lower() != "active":
-            continue
-
         if not contact["customer_ref"]:
             continue
 
-        contacts_by_customer_key.setdefault(contact["customer_ref"], []).append(contact)
+        all_contacts.append(contact)
+
+        if contact["active"].lower() == "active":
+            contacts_by_customer_key.setdefault(contact["customer_ref"], []).append(contact)
 
         if contact["email"]:
-            contacts_by_email[contact["email"]] = contact
+            existing_contact = contacts_by_email.get(contact["email"])
+
+            if (
+                existing_contact is None
+                or (
+                    str(existing_contact.get("active") or "").strip().lower() != "active"
+                    and contact["active"].lower() == "active"
+                )
+            ):
+                contacts_by_email[contact["email"]] = contact
 
     for customer_key, customer_contacts in contacts_by_customer_key.items():
         contacts_by_customer_key[customer_key] = sorted(
@@ -547,6 +558,7 @@ def fetch_filemaker_master_data():
         "connected": True,
         "status": "ok",
         "customers_by_key": customers_by_key,
+        "all_contacts": all_contacts,
         "contacts_by_customer_key": contacts_by_customer_key,
         "contacts_by_email": contacts_by_email,
     }
