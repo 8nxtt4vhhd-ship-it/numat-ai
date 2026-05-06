@@ -3041,7 +3041,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         contacts_by_email=contacts_by_email,
         customer_contacts=customer_contacts,
     )
-    primary_contact = top_contacts[0] if top_contacts else None
+    primary_contact = select_primary_outreach_contact(top_contacts)
     order_count = len(customer_orders)
     days_since_last_order = attention.get("days_since_last") if attention else ""
 
@@ -3703,11 +3703,20 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
 
     enriched_contacts.sort(
         key=lambda item: (
+            item.get("is_inactive", False),
             -item["score"],
             item["name"].lower(),
         )
     )
     return enriched_contacts[:3]
+
+
+def select_primary_outreach_contact(top_contacts):
+    for contact in top_contacts:
+        if not contact.get("is_inactive"):
+            return contact
+
+    return top_contacts[0] if top_contacts else None
 
 
 def normalize_sales_activity_type(value):
@@ -4858,6 +4867,7 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
             contacts_by_email=contacts_by_email,
             customer_contacts=contacts_by_customer_key.get(customer_primary_key, []),
         )
+        primary_contact = select_primary_outreach_contact(top_contacts)
         suggested_mode = determine_home_queue_mode(
             customer,
             outbound_count=len(outbound_sales),
@@ -4879,7 +4889,7 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
                 outbound_count=len(outbound_sales),
                 inbound_count=len(inbound_sales),
             ),
-            "top_contact": top_contacts[0] if top_contacts else None,
+            "top_contact": primary_contact,
         })
 
     log_perf_metric(
