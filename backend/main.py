@@ -72,6 +72,12 @@ _ATTENTION_RESPONSE_CACHE = {
     "result": None,
 }
 
+_HOME_QUEUE_SUMMARIES_CACHE = {
+    "key": None,
+    "expires_at": 0,
+    "result": None,
+}
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ACTION_PLAN_DISMISSALS_PATH = BASE_DIR / "data" / "action_plan_dismissals.json"
 
@@ -1246,6 +1252,15 @@ def get_attention_cache_seconds():
         return 60
 
 
+def get_home_queue_summaries_cache_seconds():
+    raw_seconds = os.getenv("HOME_QUEUE_SUMMARIES_CACHE_SECONDS", "300").strip()
+
+    try:
+        return max(0, int(raw_seconds))
+    except ValueError:
+        return 300
+
+
 def build_attention_cache_key(order_result, crm_result):
     return (
         order_result.get("source"),
@@ -1265,6 +1280,12 @@ def clear_attention_response_cache():
     _ATTENTION_RESPONSE_CACHE["key"] = None
     _ATTENTION_RESPONSE_CACHE["expires_at"] = 0
     _ATTENTION_RESPONSE_CACHE["result"] = None
+
+
+def clear_home_queue_summaries_cache():
+    _HOME_QUEUE_SUMMARIES_CACHE["key"] = None
+    _HOME_QUEUE_SUMMARIES_CACHE["expires_at"] = 0
+    _HOME_QUEUE_SUMMARIES_CACHE["result"] = None
 
 
 def should_enable_startup_prewarm():
@@ -2569,6 +2590,25 @@ def format_optional_datetime(value):
     return str(value)
 
 
+def condense_evidence_strength(value):
+    text = str(value or "").strip()
+
+    if not text:
+        return "Not available"
+
+    lowered = text.lower()
+
+    if "strong" in lowered or "high" in lowered:
+        return "Strong"
+    if "medium" in lowered or "moderate" in lowered:
+        return "Medium"
+    if "low" in lowered or "weak" in lowered:
+        return "Low"
+
+    first_word = text.split()[0].strip(" ,.;:()")
+    return first_word.title() if first_word else text
+
+
 def format_activity_summary(customer):
     activity_date = customer.get("last_activity_date")
     days_since_activity = customer.get("days_since_last_activity")
@@ -2889,15 +2929,87 @@ def render_outreach_prep_page(customer, context, result, data_results):
         render_outreach_contact_row(contact)
         for contact in context.get("top_contacts", [])
     ) or "<li class='empty-action'>No clear contact signals available yet.</li>"
-    target_contact = "Not available"
-    if result.get("recommended_contact_name") or result.get("recommended_contact_email"):
-        target_contact = " - ".join(
-            part for part in [
-                str(result.get("recommended_contact_name") or "").strip(),
-                str(result.get("recommended_contact_email") or "").strip(),
-            ]
-            if part
-        ) or "Not available"
+    target_name = str(result.get("recommended_contact_name") or "").strip()
+    target_email = str(result.get("recommended_contact_email") or "").strip()
+    primary_contact = context.get("primary_contact") or {}
+    target_role = (
+        str(primary_contact.get("title") or "").strip()
+        or str(primary_contact.get("role") or "").strip()
+        or "Likely sales contact"
+    )
+    target_phone = (
+        str(primary_contact.get("phone") or "").strip()
+        or str(primary_contact.get("cell") or "").strip()
+    )
+    target_contact = " - ".join(
+        part for part in [target_name, target_email]
+        if part
+    ) or "Not available"
+    suggested_mode = str(result.get("suggested_mode", "") or "Email").strip() or "Email"
+    order_rhythm = str(context.get("order_cycle_pattern") or "Not enough orders")
+    last_order_display = format_optional_date(context.get("last_order_date", ""))
+    last_sales_outreach_display = format_optional_date(context.get("latest_sales_outreach", ""))
+    evidence_strength_short = condense_evidence_strength(result.get("evidence_strength", ""))
+    email_subject = str(result.get("email_subject", "") or "Not available")
+    email_body = str(result.get("email_body", "") or "Not available")
+    call_objective = str(result.get("call_objective", "") or "Not available")
+    voicemail_draft = str(result.get("voicemail_draft", "") or "Not available")
+    suggested_text_message = str(result.get("suggested_text_message", "") or "Not available")
+    targeting_note = str(result.get("targeting_note", "No specific targeting note available."))
+    observed_pattern = str(result.get("observed_pattern", "No pattern noted."))
+    mode_lower = suggested_mode.lower()
+
+    cta_href = "#draft-outreach-card"
+    cta_label = "Open Draft"
+    cta_icon = """
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
+        </svg>
+    """
+
+    if mode_lower == "email":
+        cta_label = "Open Email Draft"
+        if target_email:
+            mailto_query = urlencode({
+                "subject": email_subject,
+                "body": email_body,
+            })
+            cta_href = f"mailto:{quote(target_email)}?{mailto_query}"
+    elif mode_lower == "call":
+        cta_label = "Open Call Notes"
+        cta_href = "#call-version-card"
+        cta_icon = """
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path fill="currentColor" d="M7.2 3.5h2.1c.5 0 .9.4 1 .8l.5 3.1c.1.4-.1.8-.4 1l-1.5 1.2a14.2 14.2 0 0 0 5.5 5.5l1.2-1.5c.2-.3.6-.5 1-.4l3.1.5c.5.1.8.5.8 1v2.1c0 .6-.5 1.1-1.1 1.1C10 19.9 4.1 14 4.1 4.6c0-.6.5-1.1 1.1-1.1Z"/>
+            </svg>
+        """
+    elif mode_lower == "visit":
+        cta_label = "Open Visit Plan"
+        cta_href = "#target-guidance-card"
+        cta_icon = """
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path fill="currentColor" d="M12 2.8a6.2 6.2 0 0 1 6.2 6.2c0 4.4-4.8 10.2-5.4 10.9a1 1 0 0 1-1.6 0C10.6 19.2 5.8 13.4 5.8 9A6.2 6.2 0 0 1 12 2.8Zm0 8.6A2.4 2.4 0 1 0 12 6.6a2.4 2.4 0 0 0 0 4.8Z"/>
+            </svg>
+        """
+    elif mode_lower == "hold":
+        cta_label = "Review Context"
+        cta_href = "#why-now-card"
+        cta_icon = """
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path fill="currentColor" d="M12 2.8A9.2 9.2 0 1 1 2.8 12 9.2 9.2 0 0 1 12 2.8Zm0 1.5A7.7 7.7 0 1 0 19.7 12 7.7 7.7 0 0 0 12 4.3Zm-2 3.4c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Zm4 0c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Z"/>
+            </svg>
+        """
+
+    contact_signal_rows = []
+    for contact in context.get("top_contacts", [])[:3]:
+        name = str(contact.get("name") or "Unknown contact").strip()
+        title = str(contact.get("title") or contact.get("role") or "").strip()
+        email = str(contact.get("email") or "").strip()
+        meta = " • ".join(part for part in [title, email] if part)
+        contact_signal_rows.append(
+            f"<li><strong>{escape(name)}</strong>{f'<span>{escape(meta)}</span>' if meta else ''}</li>"
+        )
+    contact_signal_markup = "".join(contact_signal_rows) or "<li>No clear contact signals available yet.</li>"
 
     body = f"""
         {render_data_availability_banner(*data_results)}
@@ -2929,82 +3041,118 @@ def render_outreach_prep_page(customer, context, result, data_results):
             <div><span class="label">Priority</span><strong>{escape(str(context.get("priority_score", "")) or "n/a")}</strong></div>
             <div><span class="label">Days Since Last Order</span><strong>{escape(str(context.get("days_since_last_order", "")) or "n/a")}</strong></div>
             <div><span class="label">Typical Cycle</span><strong>{escape(str(context.get("average_cycle", "")) or "n/a")}</strong></div>
-            <div><span class="label">Last Order</span><strong>{escape(str(context.get("last_order_date", "")) or "n/a")}</strong></div>
-            <div><span class="label">Last Sales Outreach</span><strong>{escape(str(context.get("latest_sales_outreach", "")) or "n/a")}</strong></div>
+            <div><span class="label">Order Rhythm</span><strong>{escape(order_rhythm)}</strong></div>
+            <div><span class="label">Last Order</span><strong>{escape(last_order_display)}</strong></div>
+            <div><span class="label">Last Sales Outreach</span><strong>{escape(last_sales_outreach_display)}</strong></div>
             <div><span class="label">Sales Outreach History</span><strong>{escape(str(context.get("sales_activity_count", 0)))}</strong></div>
+            <div><span class="label">Evidence Strength</span><strong>{escape(evidence_strength_short)}</strong></div>
         </div>
 
         <div class="outreach-grid">
-            <section class="panel outreach-panel">
-                <h2>Recommended Next Move</h2>
-                <div class="summary compact-summary outreach-recommendation-summary">
-                    <div><span class="label">Suggested Mode</span><strong>{escape(str(result.get("suggested_mode", "")) or "Not available")}</strong></div>
-                    <div><span class="label">Tone</span><strong>{escape(str(result.get("tone", "")) or "Not available")}</strong></div>
-                    <div><span class="label">Confidence</span><strong>{escape(str(result.get("confidence", "")) or "Not available")}</strong></div>
-                    <div><span class="label">Target Contact</span><strong>{escape(target_contact)}</strong></div>
+            <section class="panel outreach-panel outreach-primary-panel" id="draft-outreach-card">
+                <h2>Draft Outreach</h2>
+                <div class="outreach-action-head">
+                    <div class="summary compact-summary outreach-recommendation-summary outreach-chip-summary">
+                        <div class="outreach-chip-card">
+                            <span class="outreach-chip-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" focusable="false">
+                                    <path fill="currentColor" d="M12 12.5a4.25 4.25 0 1 1 0-8.5 4.25 4.25 0 0 1 0 8.5Zm0-1.5a2.75 2.75 0 1 0 0-5.5 2.75 2.75 0 0 0 0 5.5Zm0 3c3.78 0 6.9 1.94 7.82 4.77a.75.75 0 0 1-1.43.46C17.67 17.1 15.08 15.5 12 15.5s-5.67 1.6-6.39 3.73a.75.75 0 1 1-1.43-.46C5.1 15.94 8.22 14 12 14Z"/>
+                                </svg>
+                            </span>
+                            <div><span class="label">Target</span><strong>{escape(target_role)}</strong></div>
+                        </div>
+                        <div class="outreach-chip-card">
+                            <span class="outreach-chip-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" focusable="false">
+                                    <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
+                                </svg>
+                            </span>
+                            <div><span class="label">Mode</span><strong>{escape(suggested_mode)}</strong></div>
+                        </div>
+                        <div class="outreach-chip-card">
+                            <span class="outreach-chip-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" focusable="false">
+                                    <path fill="currentColor" d="M12 2.8a9.2 9.2 0 1 1-9.2 9.2A9.2 9.2 0 0 1 12 2.8Zm0 6.1a1 1 0 0 0-1 1v2.5a1 1 0 0 0 .55.9l2.2 1.1a1 1 0 1 0 .9-1.79l-1.65-.82V9.9a1 1 0 0 0-1-1Z"/>
+                                </svg>
+                            </span>
+                            <div><span class="label">Tone</span><strong>{escape(str(result.get("tone", "")) or "Not available")}</strong></div>
+                        </div>
+                    </div>
+                    <a class="button outreach-primary-cta" href="{cta_href}">
+                        {cta_icon}
+                        <span>{escape(cta_label)}</span>
+                    </a>
                 </div>
-                <p class="outreach-pattern outreach-note-box"><strong>Targeting note:</strong> {escape(str(result.get("targeting_note", "No specific targeting note available.")))}</p>
-                <h3>Why This Was Suggested</h3>
+                <div class="outreach-draft-form">
+                    <div class="outreach-draft-row">
+                        <span class="label">To</span>
+                        <div class="outreach-draft-field">{escape(target_contact)}</div>
+                    </div>
+                    <div class="outreach-draft-row">
+                        <span class="label">Subject</span>
+                        <div class="outreach-draft-field">{escape(email_subject)}</div>
+                    </div>
+                    <div class="outreach-draft-row outreach-draft-row-body">
+                        <span class="label">Body</span>
+                        <div class="outreach-draft-body">{escape(email_body)}</div>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <details class="panel outreach-panel outreach-details-panel">
+            <summary>Recommendation details</summary>
+            <section class="outreach-inline-section" id="why-now-card">
+                <h2>Why now</h2>
                 <ul class="outreach-rationale-list outreach-note-box">{rationale_items}</ul>
             </section>
 
-            <section class="panel outreach-panel">
-                <h2>Why This Was Suggested</h2>
-                <div class="summary compact-summary outreach-evidence-summary">
-                    <div><span class="label">Sales Outreach Sent</span><strong>{escape(str(result.get("sales_outreach_count", 0)))}</strong></div>
-                    <div><span class="label">Observed Replies</span><strong>{escape(str(result.get("observed_reply_count", 0)))}</strong></div>
-                    <div><span class="label">Approx. Response Rate</span><strong>{escape(str(result.get("approx_response_rate", "n/a")))}</strong></div>
-                    <div><span class="label">Last Reply</span><strong>{escape(str(result.get("last_reply_date", "Not available")))}</strong></div>
-                    <div><span class="label">Likely Preferred Mode</span><strong>{escape(str(result.get("likely_preferred_mode", "Not available")))}</strong></div>
-                    <div><span class="label">Evidence Strength</span><strong>{escape(str(result.get("evidence_strength", "Not available")))}</strong></div>
-                </div>
-                <p class="outreach-pattern outreach-note-box"><strong>Observed pattern:</strong> {escape(str(result.get("observed_pattern", "No pattern noted.")))}</p>
-                <p class="outreach-pattern outreach-note-box"><strong>Customer service traffic present:</strong> {"Yes" if result.get("customer_services_present") else "No"}</p>
-            </section>
-        </div>
+            <div class="outreach-grid outreach-support-grid">
+                <section class="panel outreach-panel" id="target-guidance-card">
+                    <h2>Target guidance</h2>
+                    <p class="outreach-pattern outreach-note-box">{escape(targeting_note)}</p>
+                    <p class="outreach-pattern outreach-note-box"><strong>Observed pattern:</strong> {escape(observed_pattern)}</p>
+                </section>
 
-        <section class="panel outreach-panel">
-            <h2>Draft Outreach</h2>
-            <div class="outreach-draft-block">
-                <span class="label">Subject</span>
-                <div class="outreach-draft-subject">{escape(str(result.get("email_subject", "")) or "Not available")}</div>
+                <section class="panel outreach-panel" id="contact-signals-card">
+                    <h2>Contact signals</h2>
+                    <ul class="outreach-contact-summary">{contact_signal_markup}</ul>
+                </section>
+
+                <section class="panel outreach-panel" id="call-version-card">
+                    <h2>Call version</h2>
+                    <p class="outreach-pattern outreach-note-box"><strong>Call objective:</strong> {escape(call_objective)}</p>
+                    <ul class="outreach-rationale-list outreach-note-box">{call_points}</ul>
+                </section>
+
+                <section class="panel outreach-panel">
+                    <h2>Alternative copy</h2>
+                    <div class="outreach-draft-block">
+                        <span class="label">Suggested Voicemail</span>
+                        <div class="outreach-draft-body">{escape(voicemail_draft)}</div>
+                    </div>
+                    <div class="outreach-draft-block">
+                        <span class="label">Suggested Text Message</span>
+                        <div class="outreach-draft-body">{escape(suggested_text_message)}</div>
+                    </div>
+                </section>
             </div>
-            <div class="outreach-draft-block">
-                <span class="label">Draft Message</span>
-                <div class="outreach-draft-body">{escape(str(result.get("email_body", "")) or "Not available")}</div>
-            </div>
-        </section>
+        </details>
 
-        <section class="panel outreach-panel">
-            <h2>Likely Sales Contacts</h2>
-            <ul class="dismissed-list">{contact_rows}</ul>
-        </section>
+        <details class="panel outreach-panel outreach-details-panel">
+            <summary>Recent sales outreach context</summary>
+            <ul class="dismissed-list">{recent_sales_rows}</ul>
+        </details>
 
-        <div class="outreach-grid">
-            <section class="panel outreach-panel">
-                <h2>Call Version</h2>
-                <p class="outreach-pattern outreach-note-box"><strong>Call objective:</strong> {escape(str(result.get("call_objective", "")) or "Not available")}</p>
-                <ul class="outreach-rationale-list outreach-note-box">{call_points}</ul>
-                <div class="outreach-draft-block">
-                    <span class="label">Suggested Voicemail</span>
-                    <div class="outreach-draft-body">{escape(str(result.get("voicemail_draft", "")) or "Not available")}</div>
-                </div>
-                <div class="outreach-draft-block">
-                    <span class="label">Suggested Text Message</span>
-                    <div class="outreach-draft-body">{escape(str(result.get("suggested_text_message", "")) or "Not available")}</div>
-                </div>
-            </section>
-
-            <section class="panel outreach-panel">
-                <h2>Recent Sales Outreach Context</h2>
-                <ul class="dismissed-list">{recent_sales_rows}</ul>
-            </section>
-        </div>
-
-        <section class="panel outreach-panel">
-            <h2>Latest Replied Outreach</h2>
+        <details class="panel outreach-panel outreach-details-panel">
+            <summary>Latest replied outreach</summary>
             <ul class="dismissed-list">{latest_replied_row}</ul>
-        </section>
+        </details>
+
+        <details class="panel outreach-panel outreach-details-panel">
+            <summary>Likely sales contacts</summary>
+            <ul class="dismissed-list">{contact_rows}</ul>
+        </details>
     """
     return body
 
@@ -4216,6 +4364,7 @@ def dismiss_action_plan_customer(customer_name, last_order, reason=""):
     }
     write_action_plan_dismissals(dismissals)
     clear_attention_response_cache()
+    clear_home_queue_summaries_cache()
 
 
 def restore_action_plan_customer(customer_name):
@@ -4225,6 +4374,7 @@ def restore_action_plan_customer(customer_name):
         dismissals.pop(str(customer_name), None)
         write_action_plan_dismissals(dismissals)
         clear_attention_response_cache()
+        clear_home_queue_summaries_cache()
 
 
 def get_order_territory(order):
@@ -4423,6 +4573,41 @@ def get_home_selected_customer_name(queue_summaries, selected_customer=""):
 
 def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map):
     started_at = time.perf_counter()
+    cache_seconds = get_home_queue_summaries_cache_seconds()
+    now = time.time()
+    cache_key_parts = []
+
+    for customer in queue_customers:
+        customer_name = str(customer.get("customer", ""))
+        customer_orders = grouped_orders.get(customer_name, [])
+        customer_primary_key = get_customer_primary_key(customer_orders)
+        crm_activities = crm_activity_map.get(customer_primary_key, [])
+        latest_activity_date = (
+            str(crm_activities[0].get("date_created") or "").strip()
+            if crm_activities else ""
+        )
+        cache_key_parts.append((
+            customer_name,
+            str(customer.get("last_order") or "").strip(),
+            str(customer.get("last_activity_date") or "").strip(),
+            str(customer.get("days_since_last") or "").strip(),
+            str(customer.get("days_since_last_activity") or "").strip(),
+            str(customer.get("priority_score") or "").strip(),
+            customer_primary_key,
+            len(crm_activities),
+            latest_activity_date,
+        ))
+
+    cache_key = tuple(cache_key_parts)
+
+    if (
+        cache_seconds
+        and _HOME_QUEUE_SUMMARIES_CACHE["key"] == cache_key
+        and _HOME_QUEUE_SUMMARIES_CACHE["result"] is not None
+        and _HOME_QUEUE_SUMMARIES_CACHE["expires_at"] > now
+    ):
+        return _HOME_QUEUE_SUMMARIES_CACHE["result"]
+
     summaries = []
     master_data_result = fetch_filemaker_master_data()
     contacts_by_customer_key = (
@@ -4483,6 +4668,12 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
         f"home.queue_summaries_inner customers={len(queue_customers)}",
         started_at,
     )
+
+    if cache_seconds:
+        _HOME_QUEUE_SUMMARIES_CACHE["key"] = cache_key
+        _HOME_QUEUE_SUMMARIES_CACHE["expires_at"] = now + cache_seconds
+        _HOME_QUEUE_SUMMARIES_CACHE["result"] = summaries
+
     return summaries
 
 
@@ -4775,13 +4966,14 @@ def render_home_focus_preview(preview, dismiss_open=False):
             </div>
 
             <div class="home-evidence-strip">
+                <div><span class="label">Priority</span><strong>{escape(str(context.get("priority_score") or "n/a"))}</strong></div>
                 <div><span class="label">Days Since Last Order</span><strong>{escape(str(context.get("days_since_last_order") or "n/a"))}</strong></div>
                 <div><span class="label">Typical Cycle</span><strong>{escape(str(context.get("average_cycle") or "n/a"))}</strong></div>
-                <div><span class="label">Last Order Date</span><strong>{escape(str(context.get("last_order_date") or "n/a"))}</strong></div>
+                <div><span class="label">Order Rhythm</span><strong>{escape(str(context.get("order_cycle_pattern") or "Not enough orders"))}</strong></div>
+                <div><span class="label">Last Order</span><strong>{escape(format_optional_date(context.get("last_order_date") or ""))}</strong></div>
+                <div><span class="label">Last Sales Outreach</span><strong>{escape(format_optional_date(context.get("latest_sales_outreach") or ""))}</strong></div>
                 <div><span class="label">Sales Outreach History</span><strong>{escape(str(context.get("sales_activity_count") or 0))}</strong></div>
-                <div><span class="label">Last Reply</span><strong>{escape(str(result.get("last_reply_date") or "No reply recorded"))}</strong></div>
-                <div><span class="label">Observed Replies</span><strong>{escape(str(result.get("observed_reply_count") or 0))}</strong></div>
-                <div><span class="label">Evidence Strength</span><strong>{escape(str(result.get("evidence_strength") or "Not available"))}</strong></div>
+                <div><span class="label">Evidence Strength</span><strong>{escape(condense_evidence_strength(result.get("evidence_strength") or "Not available"))}</strong></div>
             </div>
         </section>
     """
@@ -6225,39 +6417,37 @@ def render_page(title, body, top_right="", show_title=True):
 
                     .home-evidence-strip {{
                         display: grid;
-                        grid-template-columns:
-                            minmax(110px, 0.9fr)
-                            minmax(110px, 0.9fr)
-                            minmax(120px, 0.95fr)
-                            minmax(120px, 0.95fr)
-                            minmax(120px, 0.9fr)
-                            minmax(110px, 0.9fr)
-                            minmax(200px, 1.55fr);
+                        grid-template-columns: repeat(8, minmax(118px, 1fr));
                         gap: 0;
                         border: 1px solid #dbe5f0;
                         border-radius: 12px;
                         overflow: hidden;
-                        background: rgba(255, 255, 255, 0.99);
+                        background: var(--surface-panel);
+                        box-shadow: var(--shadow-panel);
                     }}
 
                     .home-evidence-strip div {{
-                        padding: 14px 16px;
+                        padding: 10px 12px 11px;
+                        border: 0;
                         border-right: 1px solid #dbe5f0;
-                        background: #f9fbfe;
+                        background: transparent;
                     }}
 
                     .home-evidence-strip div:last-child {{
                         border-right: 0;
                     }}
 
-                    .home-evidence-strip div:nth-child(even) {{
-                        background: #fcfdff;
+                    .home-evidence-strip .label {{
+                        font-size: 11px;
+                        margin-bottom: 3px;
+                        line-height: 1.2;
                     }}
 
                     .home-evidence-strip strong {{
                         display: block;
-                        font-size: 15px;
-                        line-height: 1.3;
+                        font-size: 14px;
+                        line-height: 1.25;
+                        word-break: break-word;
                     }}
 
                     .home-queue-panel {{
@@ -6774,6 +6964,164 @@ def render_page(title, body, top_right="", show_title=True):
                         box-shadow: var(--shadow-panel);
                     }}
 
+                    .outreach-summary {{
+                        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+                        gap: 0;
+                        margin-bottom: 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        overflow: hidden;
+                        background: var(--surface-panel);
+                        box-shadow: var(--shadow-panel);
+                    }}
+
+                    .outreach-summary div {{
+                        padding: 10px 12px 11px;
+                        border: 0;
+                        border-right: 1px solid var(--border);
+                        border-radius: 0;
+                        background: transparent;
+                        box-shadow: none;
+                        min-width: 0;
+                    }}
+
+                    .outreach-summary div:last-child {{
+                        border-right: 0;
+                    }}
+
+                    .outreach-summary .label {{
+                        font-size: 11px;
+                        margin-bottom: 3px;
+                        line-height: 1.2;
+                    }}
+
+                    .outreach-summary strong {{
+                        font-size: 14px;
+                        line-height: 1.25;
+                        word-break: break-word;
+                    }}
+
+                    .outreach-primary-panel {{
+                        grid-column: 1 / span 2;
+                    }}
+
+                    .outreach-action-head {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr) auto;
+                        gap: 16px;
+                        align-items: center;
+                        margin-bottom: 14px;
+                    }}
+
+                    .outreach-chip-summary {{
+                        margin-bottom: 0;
+                        display: grid;
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        gap: 0;
+                        padding: 0;
+                        overflow: hidden;
+                    }}
+
+                    .outreach-chip-card {{
+                        display: flex;
+                        align-items: center;
+                        gap: 10px;
+                        padding: 12px 16px;
+                        min-width: 0;
+                    }}
+
+                    .outreach-chip-card + .outreach-chip-card {{
+                        border-left: 1px solid var(--border);
+                    }}
+
+                    .outreach-chip-card > div {{
+                        min-width: 0;
+                        padding: 0;
+                        border: 0;
+                        border-radius: 0;
+                        background: transparent;
+                        box-shadow: none;
+                    }}
+
+                    .outreach-chip-summary > div {{
+                        border: 0;
+                        border-radius: 0;
+                        background: transparent;
+                        box-shadow: none;
+                    }}
+
+                    .outreach-chip-card strong {{
+                        display: block;
+                        font-size: 14px;
+                        line-height: 1.35;
+                        word-break: break-word;
+                    }}
+
+                    .outreach-chip-card .label {{
+                        margin-bottom: 3px;
+                    }}
+
+                    .outreach-chip-icon {{
+                        width: 42px;
+                        height: 42px;
+                        border-radius: 999px;
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        background: rgba(36, 92, 255, 0.08);
+                        color: var(--blue);
+                        flex-shrink: 0;
+                    }}
+
+                    .outreach-chip-icon svg {{
+                        width: 20px;
+                        height: 20px;
+                        display: block;
+                    }}
+
+                    .outreach-primary-cta {{
+                        min-width: 220px;
+                        justify-content: center;
+                        gap: 10px;
+                    }}
+
+                    .outreach-primary-cta svg {{
+                        width: 18px;
+                        height: 18px;
+                        flex-shrink: 0;
+                        display: block;
+                    }}
+
+                    .outreach-draft-form {{
+                        display: grid;
+                        gap: 10px;
+                    }}
+
+                    .outreach-draft-row {{
+                        display: grid;
+                        grid-template-columns: 64px minmax(0, 1fr);
+                        gap: 10px;
+                        align-items: start;
+                    }}
+
+                    .outreach-draft-row .label {{
+                        padding-top: 10px;
+                    }}
+
+                    .outreach-draft-field,
+                    .outreach-draft-subject,
+                    .outreach-draft-body {{
+                        white-space: pre-wrap;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: var(--surface-card);
+                        padding: 10px 12px;
+                        font-size: var(--type-body);
+                        line-height: 1.5;
+                        color: #233142;
+                        box-shadow: var(--shadow-inset);
+                    }}
+
                     .outreach-recommendation-summary,
                     .outreach-evidence-summary {{
                         grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -6819,15 +7167,59 @@ def render_page(title, body, top_right="", show_title=True):
 
                     .outreach-draft-subject,
                     .outreach-draft-body {{
-                        white-space: pre-wrap;
-                        border: 1px solid var(--border);
-                        border-radius: 12px;
-                        background: var(--surface-card);
+                        min-height: 0;
+                    }}
+
+                    .outreach-summary-evidence {{
+                        margin-top: 14px;
+                        margin-bottom: 14px;
+                    }}
+
+                    .outreach-support-grid {{
+                        margin-top: 0;
+                        gap: 14px;
+                    }}
+
+                    .outreach-details-panel .outreach-inline-section {{
+                        margin-bottom: 14px;
+                    }}
+
+                    .outreach-contact-summary {{
+                        list-style: none;
+                        margin: 0;
+                        padding: 0;
+                        display: grid;
+                        gap: 10px;
+                    }}
+
+                    .outreach-contact-summary li {{
                         padding: 12px 14px;
-                        font-size: var(--type-body);
-                        line-height: 1.5;
-                        color: #233142;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: var(--surface-inset);
                         box-shadow: var(--shadow-inset);
+                    }}
+
+                    .outreach-contact-summary strong,
+                    .outreach-contact-summary span {{
+                        display: block;
+                    }}
+
+                    .outreach-contact-summary span {{
+                        margin-top: 4px;
+                        color: var(--muted);
+                        font-size: var(--type-body);
+                    }}
+
+                    .outreach-details-panel summary {{
+                        cursor: pointer;
+                        font-size: var(--type-card-title);
+                        font-weight: 700;
+                        color: #233142;
+                    }}
+
+                    .outreach-details-panel[open] summary {{
+                        margin-bottom: 12px;
                     }}
 
                     .outreach-context-item {{
@@ -7844,7 +8236,7 @@ def render_page(title, body, top_right="", show_title=True):
                         }}
 
                         .home-evidence-strip {{
-                            grid-template-columns: repeat(3, minmax(0, 1fr));
+                            grid-template-columns: repeat(4, minmax(0, 1fr));
                         }}
 
                         .home-evidence-strip div {{
@@ -7852,16 +8244,11 @@ def render_page(title, body, top_right="", show_title=True):
                             border-bottom: 1px solid var(--border);
                         }}
 
-                        .home-evidence-strip div:nth-child(3n) {{
+                        .home-evidence-strip div:nth-child(4n) {{
                             border-right: 0;
                         }}
 
-                        .home-evidence-strip div:nth-last-child(-n + 1) {{
-                            border-bottom: 0;
-                        }}
-
-                        .home-evidence-strip div:nth-last-child(-n + 2):nth-child(3n + 1),
-                        .home-evidence-strip div:nth-last-child(-n + 2):nth-child(3n + 2) {{
+                        .home-evidence-strip div:nth-last-child(-n + 4) {{
                             border-bottom: 0;
                         }}
 
@@ -7972,8 +8359,12 @@ def render_page(title, body, top_right="", show_title=True):
                         }}
 
                         .home-evidence-strip div {{
-                            border-right: 0;
+                            border-right: 1px solid var(--border);
                             border-bottom: 1px solid var(--border);
+                        }}
+
+                        .home-evidence-strip div:nth-child(2n) {{
+                            border-right: 0;
                         }}
 
                         .home-evidence-strip div:nth-last-child(-n + 2) {{
