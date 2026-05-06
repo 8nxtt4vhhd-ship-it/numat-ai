@@ -3169,10 +3169,13 @@ def render_outreach_prep_page(customer, context, result, data_results):
     if mode_lower == "email":
         cta_label = "Open Email Draft"
         if target_email:
-            mailto_query = urlencode({
-                "subject": email_subject,
-                "body": email_body,
-            })
+            mailto_query = urlencode(
+                {
+                    "subject": email_subject,
+                    "body": email_body,
+                },
+                quote_via=quote,
+            )
             cta_href = f"mailto:{quote(target_email)}?{mailto_query}"
     elif mode_lower == "call":
         cta_label = "Open Call Notes"
