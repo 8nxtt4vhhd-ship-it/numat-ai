@@ -15,6 +15,12 @@ from urllib.parse import quote, urlencode
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
+from apollo import (
+    check_apollo_connection,
+    enrich_apollo_organization,
+    enrich_apollo_person,
+    search_apollo_people,
+)
 from ai import add_ai_explanations
 from ai import build_outreach_prep_fallback
 from ai import generate_outreach_prep
@@ -66,6 +72,14 @@ CRM_SYNC_STATUS = {
     "message": "",
 }
 
+APOLLO_BRANCH_CACHE_VERSION = "v4"
+
+COMMON_COMPANY_TOKENS = {
+    "inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation",
+    "co", "company", "group", "holdings", "services", "service", "systems",
+    "solutions", "uniforms", "uniform", "the",
+}
+
 _ATTENTION_RESPONSE_CACHE = {
     "key": None,
     "expires_at": 0,
@@ -73,6 +87,13 @@ _ATTENTION_RESPONSE_CACHE = {
 }
 
 _HOME_QUEUE_SUMMARIES_CACHE = {
+    "key": None,
+    "expires_at": 0,
+    "result": None,
+}
+
+APOLLO_BRANCH_RESULTS_CACHE_LOCK = Lock()
+APOLLO_BRANCH_RESULTS_CACHE = {
     "key": None,
     "expires_at": 0,
     "result": None,
@@ -243,6 +264,11 @@ def health_check():
 @app.get("/filemaker-health")
 def filemaker_health_check():
     return check_filemaker_connection()
+
+
+@app.get("/apollo-health")
+def apollo_health_check():
+    return check_apollo_connection()
 
 
 @app.get("/filemaker-orders")
@@ -667,7 +693,7 @@ def get_orders_view(
     body = f"""
         {render_data_availability_banner(result)}
 
-        <div class="summary customer-summary">
+        <div class="summary customer-summary apollo-summary">
             <div>
                 <span class="label">Source</span>
                 <strong>{escape(result["source"])}</strong>
@@ -1128,6 +1154,195 @@ def get_contacts_view(
     return render_page(title="Contacts", body=body)
 
 
+def render_enrichment_view(
+    domain: str = "",
+    contact_name: str = "",
+    contact_email: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    refresh: str = "",
+    customer: str = "",
+):
+    person_result = None
+    branch_candidate_payload = {"results": [], "cached": False}
+    new_branch_contact_payload = {"results": [], "cached": False, "searched_titles": [], "total_entries": 0}
+    force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on", "refresh"}
+
+    if contact_name.strip() or contact_email.strip():
+        person_result = enrich_apollo_person(
+            name=contact_name,
+            email=contact_email,
+            domain=domain,
+            organization_name=organization_name,
+            force_refresh=force_refresh,
+        )
+    elif organization_name.strip() and domain.strip():
+        branch_candidate_payload = build_apollo_branch_candidate_results(
+            domain=domain,
+            organization_name=organization_name,
+            expected_city=expected_city,
+            expected_state=expected_state,
+            force_refresh=force_refresh,
+        )
+        new_branch_contact_payload = search_apollo_new_branch_contacts(
+            domain=domain,
+            organization_name=organization_name,
+            expected_city=expected_city,
+            expected_state=expected_state,
+            force_refresh=force_refresh,
+        )
+
+    person_html = render_apollo_person_result(person_result, expected_city, expected_state)
+    branch_html = render_apollo_branch_candidates_result(
+        (branch_candidate_payload or {}).get("results", []),
+        expected_city=expected_city,
+        expected_state=expected_state,
+        cached=bool((branch_candidate_payload or {}).get("cached")),
+    )
+    new_branch_html = render_apollo_new_branch_contacts_result(
+        (new_branch_contact_payload or {}).get("results", []),
+        expected_city=expected_city,
+        expected_state=expected_state,
+        searched_titles=(new_branch_contact_payload or {}).get("searched_titles", []),
+        total_entries=(new_branch_contact_payload or {}).get("total_entries", 0),
+        cached=bool((new_branch_contact_payload or {}).get("cached")),
+        status=(new_branch_contact_payload or {}).get("status", "ok"),
+        enriched_count=(new_branch_contact_payload or {}).get("enriched_count", 0),
+        skipped_without_branch_fit=(new_branch_contact_payload or {}).get("skipped_without_branch_fit", 0),
+        raw_people_checked=(new_branch_contact_payload or {}).get("raw_people_checked", 0),
+        skipped_existing=(new_branch_contact_payload or {}).get("skipped_existing", 0),
+        skipped_low_role=(new_branch_contact_payload or {}).get("skipped_low_role", 0),
+        pages_checked=(new_branch_contact_payload or {}).get("pages_checked", 0),
+        rejected_samples=(new_branch_contact_payload or {}).get("rejected_samples", []),
+    )
+
+    body = f"""
+        <div class="summary customer-summary apollo-summary">
+            <div>
+                <span class="label">Customer</span>
+                <strong>{escape(customer.strip() or 'Not selected')}</strong>
+            </div>
+            <div>
+                <span class="label">Mode</span>
+                <strong>Existing re-check + new branch search</strong>
+            </div>
+            <div>
+                <span class="label">Domain</span>
+                <strong>{escape(domain.strip() or 'Not searched yet')}</strong>
+            </div>
+            <div>
+                <span class="label">Contact</span>
+                <strong>{escape(contact_name.strip() or contact_email.strip() or 'Not searched yet')}</strong>
+            </div>
+            <div>
+                <span class="label">Organisation</span>
+                <strong>{escape(organization_name.strip() or 'Optional')}</strong>
+            </div>
+            <div>
+                <span class="label">Expected Branch</span>
+                <strong>{escape(format_branch_expectation(expected_city, expected_state))}</strong>
+            </div>
+        </div>
+
+        {render_apollo_filter_form(customer, domain, contact_name, contact_email, organization_name, expected_city, expected_state)}
+        {render_apollo_refresh_action(customer, domain, contact_name, contact_email, organization_name, expected_city, expected_state)}
+
+        <div class="stack">
+            {person_html}
+            {branch_html}
+            {new_branch_html}
+        </div>
+    """
+
+    return render_page(title="Customer Enrichment", body=body)
+
+
+@app.get("/apollo-view", response_class=HTMLResponse)
+def get_apollo_view(
+    domain: str = "",
+    contact_name: str = "",
+    contact_email: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    refresh: str = "",
+    customer: str = "",
+):
+    return render_enrichment_view(
+        domain=domain,
+        contact_name=contact_name,
+        contact_email=contact_email,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        refresh=refresh,
+        customer=customer,
+    )
+
+
+@app.get("/enrichment-view", response_class=HTMLResponse)
+def get_enrichment_view(
+    domain: str = "",
+    contact_name: str = "",
+    contact_email: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    refresh: str = "",
+    customer: str = "",
+):
+    return render_enrichment_view(
+        domain=domain,
+        contact_name=contact_name,
+        contact_email=contact_email,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        refresh=refresh,
+        customer=customer,
+    )
+
+
+@app.get("/apollo-health-view", response_class=HTMLResponse)
+def get_apollo_health_view():
+    result = check_apollo_connection()
+
+    body = f"""
+        <div class="summary customer-summary">
+            <div>
+                <span class="label">Apollo Enabled</span>
+                <strong>{'Yes' if result.get('configured') else 'No'}</strong>
+            </div>
+            <div>
+                <span class="label">Connection</span>
+                <strong>{'Connected' if result.get('connected') else 'Not connected'}</strong>
+            </div>
+            <div>
+                <span class="label">Master API Key</span>
+                <strong>{'Yes' if result.get('has_master_api_key') else 'No / unknown'}</strong>
+            </div>
+            <div>
+                <span class="label">Status</span>
+                <strong>{escape(result.get('status', 'unknown'))}</strong>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Apollo Test Status</h2>
+            <p class="small muted">
+                This is a read-only connection check. It confirms whether the local Apollo
+                trial account is configured and whether the API key can reach Apollo successfully.
+            </p>
+            <p class="status {'ok' if result.get('connected') else 'error'}">
+                {escape(get_apollo_status_message(result))}
+            </p>
+        </div>
+    """
+
+    return render_page(title="Apollo Health", body=body)
+
+
 @app.get("/customer-view", response_class=HTMLResponse)
 def get_customer_view(
     customer: str,
@@ -1201,6 +1416,11 @@ def get_customer_view(
         latest_sales_crm_activity.get("date_created", "")
     ) if latest_sales_crm_activity else None
     display_last_activity = last_activity or latest_sales_crm_activity_date
+    enrichment_href = build_customer_enrichment_href(
+        customer,
+        customer_orders,
+        crm_activities=crm_activities,
+    )
 
     body = f"""
         {render_data_availability_banner(result, crm_result)}
@@ -1296,7 +1516,18 @@ def get_customer_view(
         </div>
     """
 
-    return render_page(title=f"Customer: {customer}", body=body)
+    top_right = (
+        f'<a class="button secondary small-button" href="{escape(enrichment_href)}">'
+        '<svg viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="M12 3v18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>'
+        '<path d="M3 12h18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>'
+        '<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/>'
+        '</svg>'
+        '<span>Enrich</span>'
+        '</a>'
+    )
+
+    return render_page(title=f"Customer: {customer}", body=body, top_right=top_right)
 
 
 def build_late_customers_response():
@@ -1330,12 +1561,36 @@ def should_enable_perf_logs():
     }
 
 
+def should_enable_apollo_logs():
+    return os.getenv("ENABLE_APOLLO_LOGS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    } or should_enable_perf_logs()
+
+
 def log_perf_metric(label, started_at):
     if not should_enable_perf_logs():
         return
 
     elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
     print(f"PERF {label}: {elapsed_ms}ms")
+
+
+def log_apollo_branch_event(event, **details):
+    if not should_enable_apollo_logs():
+        return
+
+    detail_text = " ".join(
+        f"{key}={str(value).replace(chr(10), ' ')}"
+        for key, value in details.items()
+        if str(value).strip()
+    )
+    if detail_text:
+        print(f"APOLLO {event} {detail_text}")
+    else:
+        print(f"APOLLO {event}")
 
 
 def get_attention_cache_seconds():
@@ -2474,6 +2729,115 @@ def build_contact_master_rows(master_data_result):
         })
 
     return rows
+
+
+def extract_customer_branch_parts(customer_name, customer_orders=None):
+    customer_name = str(customer_name or "").strip()
+    match = re.search(r"\(([^()]+)\)\s*$", customer_name)
+    city = ""
+    state = ""
+
+    if match:
+        location_text = match.group(1).strip()
+        if "," in location_text:
+            city_part, state_part = location_text.rsplit(",", 1)
+            city = city_part.strip()
+            state = state_part.strip()
+        else:
+            state = location_text.strip()
+
+    if not state and customer_orders:
+        state = str(get_order_state(customer_orders[-1]) or "").strip()
+
+    return {
+        "city": city,
+        "state": state,
+    }
+
+
+def get_customer_organization_label(customer_name):
+    customer_name = str(customer_name or "").strip()
+    return re.sub(r"\s*\([^()]+\)\s*$", "", customer_name).strip()
+
+
+def extract_domain_from_email(email):
+    email = str(email or "").strip().lower()
+    if "@" not in email:
+        return ""
+    return email.split("@", 1)[1].strip()
+
+
+def infer_customer_domain(customer_primary_key, crm_activities=None):
+    master_data_result = fetch_filemaker_master_data()
+    contact_domains = []
+
+    if master_data_result.get("status") == "ok":
+        for contact in master_data_result.get("contacts_by_customer_key", {}).get(customer_primary_key, []):
+            domain = extract_domain_from_email(contact.get("email"))
+            if domain:
+                contact_domains.append(domain)
+
+        if not contact_domains:
+            for contact in master_data_result.get("all_contacts", []):
+                if str(contact.get("customer_ref") or "").strip() != str(customer_primary_key or "").strip():
+                    continue
+                domain = extract_domain_from_email(contact.get("email"))
+                if domain:
+                    contact_domains.append(domain)
+
+    if not contact_domains and crm_activities:
+        for activity in crm_activities:
+            email_candidates = []
+            sender_email = str(activity.get("sender_email") or "").strip()
+            if sender_email:
+                email_candidates.append(sender_email)
+            email_candidates.extend(
+                item.strip()
+                for item in extract_emails(activity.get("to") or "")
+                if item.strip()
+            )
+            for email in email_candidates:
+                domain = extract_domain_from_email(email)
+                if domain and domain not in get_internal_email_domains():
+                    contact_domains.append(domain)
+
+    if not contact_domains:
+        return ""
+
+    return Counter(contact_domains).most_common(1)[0][0]
+
+
+def build_customer_enrichment_prefill(customer_name, customer_orders, crm_activities=None):
+    customer_primary_key = get_customer_primary_key(customer_orders)
+    branch_parts = extract_customer_branch_parts(customer_name, customer_orders=customer_orders)
+    return {
+        "customer": str(customer_name or "").strip(),
+        "domain": infer_customer_domain(customer_primary_key, crm_activities=crm_activities),
+        "organization_name": get_customer_organization_label(customer_name),
+        "expected_city": branch_parts.get("city", ""),
+        "expected_state": branch_parts.get("state", ""),
+    }
+
+
+def build_customer_enrichment_href(customer_name, customer_orders, crm_activities=None):
+    prefill = build_customer_enrichment_prefill(
+        customer_name,
+        customer_orders,
+        crm_activities=crm_activities,
+    )
+    query = {
+        "customer": prefill.get("customer", ""),
+        "domain": prefill.get("domain", ""),
+        "organization_name": prefill.get("organization_name", ""),
+        "expected_city": prefill.get("expected_city", ""),
+        "expected_state": prefill.get("expected_state", ""),
+    }
+    filtered_query = {
+        key: value
+        for key, value in query.items()
+        if str(value or "").strip()
+    }
+    return "/enrichment-view" + (f"?{urlencode(filtered_query)}" if filtered_query else "")
 
 
 def filter_contact_master_rows(rows, company="", name="", email=""):
@@ -6099,6 +6463,1440 @@ def render_contacts_filter_form(company, name, email, sort, direction):
     """
 
 
+def render_apollo_filter_form(customer, domain, contact_name, contact_email, organization_name, expected_city, expected_state):
+    return f"""
+            <form id="apollo-search-form" class="controls apollo-controls" method="get" action="/enrichment-view">
+            <input type="hidden" name="customer" value="{escape(customer)}">
+            <label>
+                <span>Company Domain</span>
+                <input
+                    type="search"
+                    name="domain"
+                    value="{escape(domain)}"
+                    placeholder="alsco.com"
+                >
+            </label>
+
+            <label>
+                <span>Contact Name</span>
+                <input
+                    type="search"
+                    name="contact_name"
+                    value="{escape(contact_name)}"
+                    placeholder="Dean Porter"
+                >
+            </label>
+
+            <label>
+                <span>Contact Email</span>
+                <input
+                    type="search"
+                    name="contact_email"
+                    value="{escape(contact_email)}"
+                    placeholder="dporter@cintas.com"
+                >
+            </label>
+
+            <label>
+                <span>Organisation Name</span>
+                <input
+                    type="search"
+                    name="organization_name"
+                    value="{escape(organization_name)}"
+                    placeholder="Cintas"
+                >
+            </label>
+
+            <label>
+                <span>Expected City</span>
+                <input
+                    type="search"
+                    name="expected_city"
+                    value="{escape(expected_city)}"
+                    placeholder="Branford"
+                >
+            </label>
+
+            <label>
+                <span>Expected State</span>
+                <input
+                    type="search"
+                    name="expected_state"
+                    value="{escape(expected_state)}"
+                    placeholder="CT"
+                >
+            </label>
+
+            <div class="apollo-action-row apollo-form-actions">
+                <button type="submit">Run Enrichment</button>
+                <a class="button secondary" href="/enrichment-view">Reset</a>
+                <a class="button secondary apollo-refresh-button" href="/enrichment-view?{urlencode({'domain': domain, 'contact_name': contact_name, 'contact_email': contact_email, 'organization_name': organization_name, 'expected_city': expected_city, 'expected_state': expected_state, 'refresh': '1'})}">
+                    Refresh Data
+                </a>
+            </div>
+        </form>
+        <p class="small muted apollo-help-text">
+            Start from a customer record when you can. This page re-checks existing contacts and looks for likely branch contacts using the expected city/state.
+        </p>
+    """
+
+
+def render_apollo_refresh_action(customer, domain, contact_name, contact_email, organization_name, expected_city, expected_state):
+    return ""
+
+
+def render_apollo_enrichment_results(organization_result, person_result, branch_candidate_payload, new_branch_contact_payload, expected_city, expected_state):
+    branch_candidate_results = (branch_candidate_payload or {}).get("results", [])
+    new_branch_contact_results = (new_branch_contact_payload or {}).get("results", [])
+
+    if organization_result is None and person_result is None and not branch_candidate_results and not new_branch_contact_results:
+        return (
+            "<div class='panel'>"
+            "<h2>Test Apollo Enrichment</h2>"
+            "<p class='small muted'>"
+            "Run an organisation lookup first, then try a known contact name or email to see how "
+            "useful Apollo's enrichment is for your current customer records. If you enter a domain, "
+            "organisation name, and expected branch without a contact, the page will also look for "
+            "new likely branch contacts using Apollo People Search."
+            "</p>"
+            "</div>"
+        )
+
+    return ""
+
+
+def render_apollo_organization_result(result):
+    if result is None:
+        return ""
+
+    status = result.get("status", "unknown")
+
+    if status != "ok":
+        return (
+            "<div class='panel'>"
+            "<h2>Organisation Enrichment</h2>"
+            f"<p class='status error'>{escape(get_apollo_enrichment_status_message(status, 'organisation'))}</p>"
+            "</div>"
+        )
+
+    organization = result.get("result") or {}
+    summary_items = [
+        ("Apollo Status", "ok"),
+        ("Name", organization.get("name") or "—"),
+        ("Domain", result.get("domain") or "—"),
+        ("Employees", format_optional_number(organization.get("estimated_num_employees"))),
+    ]
+
+    details = [
+        ("Industry", organization.get("industry")),
+        ("Website", organization.get("website_url") or organization.get("primary_domain")),
+        ("LinkedIn", organization.get("linkedin_url")),
+    ]
+    cache_note = render_apollo_cache_note(bool(result.get("cached")))
+
+    return f"""
+        <div class="panel">
+            <h2>Organisation Enrichment</h2>
+            {cache_note}
+            <div class="summary customer-summary">
+                {''.join(render_simple_summary_item(label, value) for label, value in summary_items)}
+            </div>
+            <div class="two-column-keyvals">
+                {''.join(render_key_value_row(label, value) for label, value in details if value)}
+            </div>
+        </div>
+    """
+
+
+def render_apollo_person_result(result, expected_city="", expected_state=""):
+    if result is None:
+        return ""
+
+    status = result.get("status", "unknown")
+
+    if status not in ["ok", "no_match"]:
+        return (
+            "<div class='panel'>"
+            "<h2>Contact Enrichment</h2>"
+            f"<p class='status error'>{escape(get_apollo_enrichment_status_message(status, 'contact'))}</p>"
+            "</div>"
+        )
+
+    if status == "no_match":
+        return (
+            "<div class='panel'>"
+            "<h2>Contact Enrichment</h2>"
+            "<p class='small muted'>Apollo did not find a matching person for this input.</p>"
+            "</div>"
+        )
+
+    person = result.get("result") or {}
+    name = get_apollo_person_name(person)
+    title = person.get("title") or "—"
+    organization = (
+        person.get("organization", {}).get("name")
+        or person.get("account", {}).get("name")
+        or "—"
+    )
+    location = ", ".join(
+        part
+        for part in [person.get("city"), person.get("state"), person.get("country")]
+        if part
+    ) or "—"
+    linkedin_url = person.get("linkedin_url") or ""
+    linkedin_html = (
+        f"<a href=\"{escape(linkedin_url)}\" target=\"_blank\" rel=\"noreferrer\">View profile</a>"
+        if linkedin_url
+        else "—"
+    )
+    signals = []
+    branch_fit = assess_branch_fit(
+        expected_city=expected_city,
+        expected_state=expected_state,
+        actual_city=person.get("city"),
+        actual_state=person.get("state"),
+    )
+
+    if person.get("seniority"):
+        signals.append(f"Seniority: {person.get('seniority')}")
+    if person.get("departments"):
+        signals.append(
+            "Departments: " + ", ".join(str(item) for item in person.get("departments", []))
+        )
+    if person.get("email_status"):
+        signals.append(f"Email status: {person.get('email_status')}")
+    if person.get("phone_numbers"):
+        signals.append("Has phone")
+    if person.get("employment_history"):
+        signals.append(f"Jobs listed: {len(person.get('employment_history', []))}")
+
+    summary_items = [
+        ("Apollo Status", "ok"),
+        ("Name", name),
+        ("Title", title),
+        ("Company", organization),
+        ("Branch Fit", branch_fit["label"]),
+    ]
+    details = [
+        ("Expected Branch", format_branch_expectation(expected_city, expected_state)),
+        ("Location", location),
+        ("LinkedIn", linkedin_url),
+        ("Email", person.get("email")),
+        ("Email Status", person.get("email_status")),
+        ("Seniority", person.get("seniority")),
+        ("Departments", ", ".join(str(item) for item in person.get("departments", []))),
+        ("Phone", extract_apollo_phone(person)),
+        ("Signals", "; ".join(signals) if signals else ""),
+        ("Branch Fit Notes", branch_fit["details"]),
+    ]
+    moved_status = assess_contact_moved_status(
+        person,
+        result.get("domain"),
+        expected_organization_name=(person.get("organization") or {}).get("name") or result.get("organization_name"),
+        branch_fit=branch_fit,
+    )
+    moved_html = ""
+    cache_note = render_apollo_cache_note(bool(result.get("cached")))
+    if moved_status["flag"]:
+        moved_html = (
+            "<p class=\"status error\">"
+            f"{escape(moved_status['headline'])}<br>"
+            f"{escape(moved_status['details'])}"
+            "</p>"
+        )
+
+    return f"""
+        <div class="panel">
+            <h2>Contact Enrichment</h2>
+            {cache_note}
+            {moved_html}
+            <div class="summary customer-summary">
+                {''.join(render_simple_summary_item(label, value) for label, value in summary_items)}
+            </div>
+            <div class="two-column-keyvals">
+                {''.join(render_key_value_row(label, value) for label, value in details if value and value != '—')}
+            </div>
+            <p class="small muted">{linkedin_html if linkedin_url else ''}</p>
+        </div>
+    """
+
+
+def render_apollo_branch_candidates_result(candidate_results, expected_city="", expected_state="", cached=False):
+    if not candidate_results:
+        return ""
+
+    rows = "".join(render_apollo_branch_candidate_row(item) for item in candidate_results)
+    cache_note = render_apollo_cache_note(bool(cached))
+
+    return f"""
+        <div class="panel">
+            <h2>Likely Branch Contacts</h2>
+            {cache_note}
+            <p class="small muted">
+                These are your existing customer contacts re-checked against Apollo and ranked against
+                the expected branch <strong>{escape(format_branch_expectation(expected_city, expected_state))}</strong>.
+            </p>
+            <div class="table-wrap tall-table">
+                <table class="contacts-table apollo-branch-table">
+                    <thead>
+                        <tr>
+                            <th>Current Contact</th>
+                            <th>Current Position</th>
+                            <th>Apollo Match</th>
+                            <th>Apollo Title</th>
+                            <th>Apollo Location</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+    """
+
+
+def render_apollo_new_branch_contacts_result(
+    search_results,
+    expected_city="",
+    expected_state="",
+    searched_titles=None,
+    total_entries=0,
+    cached=False,
+    status="ok",
+    enriched_count=0,
+    skipped_without_branch_fit=0,
+    raw_people_checked=0,
+    skipped_existing=0,
+    skipped_low_role=0,
+    pages_checked=0,
+    rejected_samples=None,
+):
+    cache_note = render_apollo_cache_note(bool(cached))
+    title_summary = ", ".join(str(item) for item in (searched_titles or []) if str(item).strip())
+    rejected_samples = rejected_samples or []
+    diagnostics_html = (
+        f"Apollo returned {int(total_entries)} total search matches before filtering. "
+        f"We checked {int(raw_people_checked)} raw Apollo people across {int(pages_checked)} search page(s). "
+        f"{int(skipped_existing)} were skipped because they already exist in FileMaker. "
+        f"{int(skipped_without_branch_fit)} were skipped because Apollo search did not return a confident branch location. "
+        f"{int(skipped_low_role)} were skipped because the title looked too weak or generic. "
+        f"{int(enriched_count)} candidates passed the branch-and-role gate and were enriched."
+    )
+    rejected_samples_html = ""
+    if rejected_samples:
+        rejected_rows = "".join(
+            (
+                "<tr>"
+                f"<td><strong>{escape(str(item.get('name') or 'Unknown'))}</strong></td>"
+                f"<td>{escape(str(item.get('title') or '—'))}</td>"
+                f"<td>{escape(str(item.get('location') or '—'))}</td>"
+                f"<td>{escape(str(item.get('reason') or 'Filtered out'))}</td>"
+                "</tr>"
+            )
+            for item in rejected_samples
+        )
+        rejected_samples_html = f"""
+            <details class="apollo-rejected-details">
+                <summary>Preview rejected Apollo search candidates</summary>
+                <div class="table-wrap">
+                    <table class="contacts-table apollo-branch-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Title</th>
+                                <th>Apollo Location</th>
+                                <th>Why rejected</th>
+                            </tr>
+                        </thead>
+                        <tbody>{rejected_rows}</tbody>
+                    </table>
+                </div>
+            </details>
+        """
+
+    if status != "ok":
+        return f"""
+            <div class="panel">
+                <h2>New Likely Branch Contacts</h2>
+                {cache_note}
+                <p class="status error">{escape(get_apollo_enrichment_status_message(status, 'people search'))}</p>
+            </div>
+        """
+
+    if not search_results:
+        return f"""
+            <div class="panel">
+                <h2>New Likely Branch Contacts</h2>
+                {cache_note}
+                <p class="small muted">
+                    Apollo search ran for <strong>{escape(format_branch_expectation(expected_city, expected_state))}</strong>
+                    but did not return any new branch contacts beyond the ones already in your current FileMaker list.
+                    {f" Searched titles: {escape(title_summary)}." if title_summary else ""}
+                </p>
+                <p class="small muted">{escape(diagnostics_html)}</p>
+                {rejected_samples_html}
+            </div>
+        """
+
+    rows = "".join(render_apollo_new_branch_contact_row(item) for item in search_results)
+
+    return f"""
+        <div class="panel">
+            <h2>New Likely Branch Contacts</h2>
+            {cache_note}
+            <p class="small muted">
+                These are new Apollo People Search candidates for
+                <strong>{escape(format_branch_expectation(expected_city, expected_state))}</strong>,
+                excluding contacts already present in your current FileMaker contact list.
+                Only candidates whose search result already matched the expected branch/state and the target role set
+                were enriched further for more detail.
+                {f" Searched titles: {escape(title_summary)}." if title_summary else ""}
+            </p>
+            <p class="small muted">{escape(diagnostics_html)}</p>
+            {rejected_samples_html}
+            <div class="table-wrap tall-table">
+                <table class="contacts-table apollo-branch-table">
+                    <thead>
+                        <tr>
+                            <th>Suggested Contact</th>
+                            <th>Apollo Title</th>
+                            <th>Apollo Location</th>
+                            <th>LinkedIn</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+    """
+
+
+def render_apollo_new_branch_contact_row(item):
+    person = item.get("person") or {}
+    branch_fit = item.get("branch_fit") or {"label": "Unknown", "details": ""}
+    status_label = item.get("status_label") or "New candidate"
+    status_detail = item.get("status_detail") or branch_fit.get("details", "")
+    linkedin_url = person.get("linkedin_url") or ""
+    linkedin_html = (
+        f'<a class="apollo-linkedin-link" href="{escape(linkedin_url)}" target="_blank" rel="noreferrer">LinkedIn profile</a>'
+        if linkedin_url
+        else "—"
+    )
+
+    return f"""
+        <tr>
+            <td>
+                <strong>{escape(get_apollo_person_name(person))}</strong><br>
+                <span class="small muted">{escape(person.get('email') or 'Email not returned')}</span>
+            </td>
+            <td>{escape(str(person.get('title') or '—'))}</td>
+            <td>{render_apollo_location_value(person)}</td>
+            <td>{linkedin_html}</td>
+            <td>
+                <span class="apollo-branch-status-label apollo-branch-status-branch">{escape(status_label)}</span><br>
+                <span class="apollo-branch-status-detail">{escape(status_detail)}</span>
+            </td>
+        </tr>
+    """
+
+
+def render_apollo_cache_note(is_cached):
+    if not is_cached:
+        return "<p class=\"small muted apollo-cache-note\">Fresh Apollo lookup.</p>"
+
+    return (
+        "<p class=\"small muted apollo-cache-note\">"
+        "Served from Apollo cache. This will stay in place until you explicitly refresh Apollo data."
+        "</p>"
+    )
+
+
+def render_apollo_branch_candidate_row(candidate_result):
+    contact = candidate_result.get("contact") or {}
+    result = candidate_result.get("apollo_result") or {}
+    person = result.get("result") or {}
+    branch_fit = candidate_result.get("branch_fit") or {"label": "Unknown", "details": ""}
+    moved_status = candidate_result.get("moved_status") or {"flag": False, "headline": "Current or unclear", "details": ""}
+    detail_status = assess_apollo_detail_status(person)
+    apollo_name = get_apollo_person_name(person) if person else "No match"
+    apollo_title = person.get("title") or "—"
+    apollo_location = render_apollo_location_value(person)
+    linkedin_url = person.get("linkedin_url") or ""
+    linkedin_html = (
+        f'<a class="apollo-linkedin-link" href="{escape(linkedin_url)}" target="_blank" rel="noreferrer">LinkedIn profile</a>'
+        if linkedin_url
+        else ""
+    )
+    if moved_status["flag"]:
+        status_text = moved_status["headline"]
+        status_detail = f"{detail_status['label']}. {moved_status['details']}"
+    else:
+        branch_label = str(branch_fit.get("label") or "").strip()
+        status_text = (
+            detail_status["label"]
+            if branch_label in {"", "Unknown", "Not scored"}
+            else f"{detail_status['label']} / {branch_label}"
+        )
+        status_detail = branch_fit.get("details", "") or moved_status.get("details", "")
+    moved_kind = str(moved_status.get("kind") or "")
+    if moved_kind == "moved_company":
+        status_class = "apollo-branch-status-moved"
+    elif moved_kind in ["moved_branch", "possible_branch_move"]:
+        status_class = "apollo-branch-status-branch"
+    else:
+        status_class = "apollo-branch-status-current"
+
+    return f"""
+        <tr>
+            <td>
+                <strong>{escape(contact.get('name') or contact.get('email') or 'Unknown')}</strong><br>
+                <span class="small muted">{escape(contact.get('email') or '—')}</span>
+                {f'<br>{linkedin_html}' if linkedin_html else ''}
+            </td>
+            <td>{escape(contact.get('position') or '—')}</td>
+            <td>{escape(apollo_name)}</td>
+            <td>{escape(str(apollo_title))}</td>
+            <td>{apollo_location}</td>
+            <td>
+                <span class="apollo-branch-status-label {status_class}">{escape(status_text)}</span><br>
+                <span class="apollo-branch-status-detail">{escape(status_detail)}</span>
+            </td>
+        </tr>
+    """
+
+
+def get_apollo_person_name(person):
+    first_name = str(person.get("first_name") or "").strip()
+    last_name = str(person.get("last_name") or "").strip()
+    last_name_obfuscated = str(person.get("last_name_obfuscated") or "").strip()
+    full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+    if full_name:
+        return full_name
+    obfuscated_name = " ".join(part for part in [first_name, last_name_obfuscated] if part).strip()
+    return obfuscated_name or str(person.get("name") or "Unknown")
+
+
+def render_apollo_location_value(person):
+    city = str(person.get("city") or "").strip()
+    state = str(person.get("state") or "").strip()
+    country = str(person.get("country") or "").strip()
+
+    top_line = ", ".join(part for part in [city, state] if part)
+
+    if top_line and country:
+        return f"{escape(top_line)}<br><span class=\"small muted\">{escape(country)}</span>"
+
+    if top_line:
+        return escape(top_line)
+
+    if country:
+        return escape(country)
+
+    return "—"
+
+
+def format_branch_expectation(city, state):
+    parts = [str(city or "").strip(), str(state or "").strip()]
+    formatted = ", ".join(part for part in parts if part)
+    return formatted or "Not set"
+
+
+US_STATE_ALIASES = {
+    "alabama": "al",
+    "alaska": "ak",
+    "arizona": "az",
+    "arkansas": "ar",
+    "california": "ca",
+    "colorado": "co",
+    "connecticut": "ct",
+    "delaware": "de",
+    "florida": "fl",
+    "georgia": "ga",
+    "hawaii": "hi",
+    "idaho": "id",
+    "illinois": "il",
+    "indiana": "in",
+    "iowa": "ia",
+    "kansas": "ks",
+    "kentucky": "ky",
+    "louisiana": "la",
+    "maine": "me",
+    "maryland": "md",
+    "massachusetts": "ma",
+    "michigan": "mi",
+    "minnesota": "mn",
+    "mississippi": "ms",
+    "missouri": "mo",
+    "montana": "mt",
+    "nebraska": "ne",
+    "nevada": "nv",
+    "new hampshire": "nh",
+    "new jersey": "nj",
+    "new mexico": "nm",
+    "new york": "ny",
+    "north carolina": "nc",
+    "north dakota": "nd",
+    "ohio": "oh",
+    "oklahoma": "ok",
+    "oregon": "or",
+    "pennsylvania": "pa",
+    "rhode island": "ri",
+    "south carolina": "sc",
+    "south dakota": "sd",
+    "tennessee": "tn",
+    "texas": "tx",
+    "utah": "ut",
+    "vermont": "vt",
+    "virginia": "va",
+    "washington": "wa",
+    "west virginia": "wv",
+    "wisconsin": "wi",
+    "wyoming": "wy",
+    "district of columbia": "dc",
+}
+
+
+def normalize_state_match_value(value):
+    normalized = normalize_apollo_location_value(value)
+    if not normalized:
+        return ""
+    return US_STATE_ALIASES.get(normalized, normalized)
+
+
+def assess_branch_fit(expected_city, expected_state, actual_city, actual_state):
+    expected_city_norm = normalize_apollo_location_value(expected_city)
+    expected_state_norm = normalize_state_match_value(expected_state)
+    actual_city_norm = normalize_apollo_location_value(actual_city)
+    actual_state_norm = normalize_state_match_value(actual_state)
+
+    if not expected_city_norm and not expected_state_norm:
+        return {
+            "label": "Not scored",
+            "details": "Add expected branch city/state to assess how close Apollo's location is.",
+        }
+
+    if not actual_city_norm and not actual_state_norm:
+        return {
+            "label": "Unknown",
+            "details": "Apollo did not return enough location detail for this person.",
+        }
+
+    city_matches = bool(expected_city_norm and actual_city_norm and expected_city_norm == actual_city_norm)
+    state_matches = bool(expected_state_norm and actual_state_norm and expected_state_norm == actual_state_norm)
+
+    if city_matches and (state_matches or not expected_state_norm):
+        return {
+            "label": "Strong",
+            "details": "Apollo location matches the expected branch city."
+        }
+
+    if state_matches:
+        return {
+            "label": "Possible",
+            "details": "Apollo location matches the expected state but not the exact city."
+        }
+
+    return {
+        "label": "Weak",
+        "details": "Apollo location does not line up cleanly with the expected branch."
+    }
+
+
+def normalize_apollo_location_value(value):
+    cleaned = str(value or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return " ".join(cleaned.split())
+
+
+def get_distinctive_company_tokens(value):
+    normalized = normalize_apollo_location_value(value)
+    if not normalized:
+        return set()
+    tokens = {
+        token
+        for token in normalized.split()
+        if token and token not in COMMON_COMPANY_TOKENS and len(token) > 2
+    }
+    return tokens
+
+
+def get_apollo_branch_results_cache_seconds():
+    if str(os.getenv("APOLLO_CACHE_UNTIL_REFRESH", "")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return -1
+
+    configured = str(os.getenv("APOLLO_BRANCH_CACHE_SECONDS", "")).strip()
+
+    if configured:
+        try:
+            return max(0, int(configured))
+        except ValueError:
+            pass
+
+    fallback = str(os.getenv("APOLLO_CACHE_SECONDS", "1800")).strip()
+    try:
+        return max(1800, int(fallback))
+    except ValueError:
+        return 1800
+
+
+def get_apollo_new_branch_search_titles():
+    return [
+        "branch manager",
+        "plant manager",
+        "operations manager",
+        "general manager",
+        "assistant general manager",
+        "service excellence manager",
+    ]
+
+
+def get_cached_apollo_branch_results(cache_key):
+    cache_seconds = get_apollo_branch_results_cache_seconds()
+    sticky_cache = cache_seconds < 0
+    if cache_seconds == 0:
+        return None
+
+    with APOLLO_BRANCH_RESULTS_CACHE_LOCK:
+        cached = APOLLO_BRANCH_RESULTS_CACHE
+        if cached.get("key") != cache_key:
+            log_apollo_branch_event("branch_cache_miss")
+            return None
+        if not sticky_cache and float(cached.get("expires_at") or 0) <= time.time():
+            APOLLO_BRANCH_RESULTS_CACHE.update({
+                "key": None,
+                "expires_at": 0,
+                "result": None,
+            })
+            log_apollo_branch_event("branch_cache_expired")
+            return None
+        result = cached.get("result") or {"results": []}
+        log_apollo_branch_event(
+            "branch_cache_hit",
+            rows=len(result.get("results") or []),
+        )
+        payload = dict(result)
+        payload["results"] = list(result.get("results") or [])
+        payload["cached"] = True
+        return payload
+
+
+def set_cached_apollo_branch_results(cache_key, results, extra=None):
+    cache_seconds = get_apollo_branch_results_cache_seconds()
+    sticky_cache = cache_seconds < 0
+    if cache_seconds == 0:
+        return
+
+    stored_result = {"results": list(results or [])}
+    if extra:
+        stored_result.update(extra)
+
+    with APOLLO_BRANCH_RESULTS_CACHE_LOCK:
+        APOLLO_BRANCH_RESULTS_CACHE.update({
+            "key": cache_key,
+            "expires_at": (time.time() + cache_seconds) if not sticky_cache else float("inf"),
+            "result": stored_result,
+        })
+    log_apollo_branch_event(
+        "branch_cache_store",
+        seconds=("until_refresh" if sticky_cache else cache_seconds),
+        rows=len(results or []),
+    )
+
+
+def clear_cached_apollo_branch_results(cache_key):
+    with APOLLO_BRANCH_RESULTS_CACHE_LOCK:
+        if APOLLO_BRANCH_RESULTS_CACHE.get("key") == cache_key:
+            APOLLO_BRANCH_RESULTS_CACHE.update({
+                "key": None,
+                "expires_at": 0,
+                "result": None,
+            })
+            log_apollo_branch_event("branch_cache_clear")
+
+
+def build_apollo_existing_contact_sets(rows, organization_name="", expected_state=""):
+    org_name_filter = normalize_apollo_location_value(organization_name)
+    expected_state_norm = normalize_apollo_location_value(expected_state)
+    existing_emails = set()
+    existing_names = set()
+
+    for row in rows:
+        company_norm = normalize_apollo_location_value(row.get("company"))
+        if org_name_filter and org_name_filter not in company_norm:
+            continue
+        if expected_state_norm and normalize_apollo_location_value(row.get("state")) != expected_state_norm:
+            continue
+
+        email = str(row.get("email") or "").strip().lower()
+        name = normalize_apollo_location_value(row.get("name"))
+        if email:
+            existing_emails.add(email)
+        if name:
+            existing_names.add(name)
+
+    return existing_emails, existing_names
+
+
+def merge_apollo_people(search_person, enriched_person):
+    merged = dict(search_person or {})
+    for key, value in (enriched_person or {}).items():
+        if value in (None, "", [], {}):
+            continue
+        if key == "organization":
+            merged_org = dict(merged.get("organization") or {})
+            merged_org.update(value or {})
+            merged["organization"] = merged_org
+            continue
+        merged[key] = value
+    return merged
+
+
+def build_apollo_new_branch_contacts_cache_key(domain, organization_name, expected_city, expected_state):
+    return (
+        APOLLO_BRANCH_CACHE_VERSION,
+        "new",
+        normalize_apollo_location_value(domain),
+        normalize_apollo_location_value(organization_name),
+        normalize_apollo_location_value(expected_city),
+        normalize_apollo_location_value(expected_state),
+    )
+
+
+def search_apollo_new_branch_contacts(domain, organization_name, expected_city="", expected_state="", force_refresh=False):
+    if not domain or not organization_name:
+        return {
+            "results": [],
+            "cached": False,
+            "searched_titles": [],
+            "total_entries": 0,
+            "enriched_count": 0,
+            "skipped_without_branch_fit": 0,
+            "raw_people_checked": 0,
+            "skipped_existing": 0,
+            "skipped_low_role": 0,
+            "pages_checked": 0,
+            "rejected_samples": [],
+        }
+
+    cache_key = build_apollo_new_branch_contacts_cache_key(
+        domain,
+        organization_name,
+        expected_city,
+        expected_state,
+    )
+    if force_refresh:
+        clear_cached_apollo_branch_results(cache_key)
+
+    cached = get_cached_apollo_branch_results(cache_key)
+    if cached is not None:
+        cached["searched_titles"] = get_apollo_new_branch_search_titles()
+        cached["total_entries"] = cached.get("total_entries", 0)
+        cached["enriched_count"] = cached.get("enriched_count", len(cached.get("results") or []))
+        cached["skipped_without_branch_fit"] = cached.get("skipped_without_branch_fit", 0)
+        cached["raw_people_checked"] = cached.get("raw_people_checked", 0)
+        cached["skipped_existing"] = cached.get("skipped_existing", 0)
+        cached["skipped_low_role"] = cached.get("skipped_low_role", 0)
+        cached["pages_checked"] = cached.get("pages_checked", 0)
+        cached["rejected_samples"] = cached.get("rejected_samples", [])
+        return cached
+
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") != "ok":
+        return {
+            "results": [],
+            "cached": False,
+            "searched_titles": [],
+            "total_entries": 0,
+            "enriched_count": 0,
+            "skipped_without_branch_fit": 0,
+            "raw_people_checked": 0,
+            "skipped_existing": 0,
+            "skipped_low_role": 0,
+            "pages_checked": 0,
+            "rejected_samples": [],
+        }
+
+    rows = build_contact_master_rows(master_data_result)
+    existing_emails, existing_names = build_apollo_existing_contact_sets(
+        rows,
+        organization_name=organization_name,
+        expected_state=expected_state,
+    )
+
+    locations = []
+    if str(expected_city or "").strip() and str(expected_state or "").strip():
+        locations.append(f"{str(expected_city).strip()}, {str(expected_state).strip()}")
+    if str(expected_state or "").strip():
+        locations.append(str(expected_state).strip())
+    if str(expected_city or "").strip():
+        locations.append(str(expected_city).strip())
+
+    searched_titles = get_apollo_new_branch_search_titles()
+    aggregated_people = []
+    total_entries = 0
+    pages_checked = 0
+    max_pages = 4
+    for page in range(1, max_pages + 1):
+        search_result = search_apollo_people(
+            domain=domain,
+            titles=searched_titles,
+            person_locations=locations,
+            per_page=25,
+            page=page,
+            force_refresh=force_refresh,
+        )
+
+        if search_result.get("status") != "ok":
+            return {
+                "results": [],
+                "cached": bool(search_result.get("cached")),
+                "searched_titles": searched_titles,
+                "total_entries": 0,
+                "enriched_count": 0,
+                "skipped_without_branch_fit": 0,
+                "raw_people_checked": len(aggregated_people),
+                "skipped_existing": 0,
+                "skipped_low_role": 0,
+                "pages_checked": pages_checked,
+                "rejected_samples": [],
+                "status": search_result.get("status", "unknown"),
+            }
+
+        page_people = list(search_result.get("results", []))
+        total_entries = max(total_entries, int(search_result.get("total_entries", 0) or 0))
+        pages_checked += 1
+        if not page_people:
+            break
+        aggregated_people.extend(page_people)
+        if len(aggregated_people) >= 60:
+            break
+
+    if not aggregated_people:
+        return {
+            "results": [],
+            "cached": False,
+            "searched_titles": searched_titles,
+            "total_entries": 0,
+            "enriched_count": 0,
+            "skipped_without_branch_fit": 0,
+            "raw_people_checked": 0,
+            "skipped_existing": 0,
+            "skipped_low_role": 0,
+            "pages_checked": pages_checked,
+            "rejected_samples": [],
+            "status": "ok",
+        }
+
+    results = []
+    skipped_without_branch_fit = 0
+    skipped_existing = 0
+    skipped_low_role = 0
+    rejected_samples = []
+    enrichment_candidates_checked = 0
+    max_enrichment_candidates = 10
+    seen_people = set()
+    for person in aggregated_people:
+        person_key = (
+            str(person.get("id") or "").strip(),
+            str(person.get("email") or "").strip().lower(),
+            normalize_apollo_location_value(get_apollo_person_name(person)),
+        )
+        if person_key in seen_people:
+            continue
+        seen_people.add(person_key)
+
+        email = str(person.get("email") or "").strip().lower()
+        name_norm = normalize_apollo_location_value(get_apollo_person_name(person))
+
+        if email and email in existing_emails:
+            skipped_existing += 1
+            if len(rejected_samples) < 5:
+                rejected_samples.append({
+                    "name": get_apollo_person_name(person),
+                    "title": person.get("title") or "—",
+                    "location": ", ".join(
+                        part for part in [person.get("city"), person.get("state"), person.get("country")] if part
+                    ) or "—",
+                    "reason": "Already exists in FileMaker",
+                })
+            continue
+        if name_norm and name_norm in existing_names:
+            skipped_existing += 1
+            if len(rejected_samples) < 5:
+                rejected_samples.append({
+                    "name": get_apollo_person_name(person),
+                    "title": person.get("title") or "—",
+                    "location": ", ".join(
+                        part for part in [person.get("city"), person.get("state"), person.get("country")] if part
+                    ) or "—",
+                    "reason": "Already exists in FileMaker",
+                })
+            continue
+
+        branch_fit = assess_branch_fit(
+            expected_city=expected_city,
+            expected_state=expected_state,
+            actual_city=person.get("city"),
+            actual_state=person.get("state"),
+        )
+
+        if rank_contact_position(person.get("title", "")) < 3:
+            skipped_low_role += 1
+            if len(rejected_samples) < 5:
+                rejected_samples.append({
+                    "name": get_apollo_person_name(person),
+                    "title": person.get("title") or "—",
+                    "location": ", ".join(
+                        part for part in [person.get("city"), person.get("state"), person.get("country")] if part
+                    ) or "—",
+                    "reason": "Title looked too weak or generic",
+                })
+            continue
+
+        if enrichment_candidates_checked >= max_enrichment_candidates:
+            if branch_fit.get("label") not in {"Strong", "Possible"}:
+                skipped_without_branch_fit += 1
+                if len(rejected_samples) < 5:
+                    rejected_samples.append({
+                        "name": get_apollo_person_name(person),
+                        "title": person.get("title") or "—",
+                        "location": ", ".join(
+                            part for part in [person.get("city"), person.get("state"), person.get("country")] if part
+                        ) or "—",
+                        "reason": "Skipped deeper enrichment because the role-qualified candidate cap was reached.",
+                    })
+                continue
+
+        enrichment_candidates_checked += 1
+        apollo_result = enrich_apollo_person(
+            name=get_apollo_person_name(person),
+            email=person.get("email", ""),
+            domain=domain,
+            organization_name=organization_name,
+            force_refresh=force_refresh,
+        )
+        enriched_person = merge_apollo_people(person, (apollo_result or {}).get("result") or {})
+        branch_fit = assess_branch_fit(
+            expected_city=expected_city,
+            expected_state=expected_state,
+            actual_city=enriched_person.get("city"),
+            actual_state=enriched_person.get("state"),
+        )
+        if branch_fit.get("label") not in {"Strong", "Possible"}:
+            skipped_without_branch_fit += 1
+            if len(rejected_samples) < 5:
+                rejection_reason = branch_fit.get("details") or "No confident branch location after enrichment"
+                if branch_fit.get("label") == "Unknown":
+                    rejection_reason = "Apollo still did not return enough location detail, even after enrichment."
+                rejected_samples.append({
+                    "name": get_apollo_person_name(enriched_person),
+                    "title": enriched_person.get("title") or person.get("title") or "—",
+                    "location": ", ".join(
+                        part for part in [
+                            enriched_person.get("city"),
+                            enriched_person.get("state"),
+                            enriched_person.get("country"),
+                        ] if part
+                    ) or "—",
+                    "reason": rejection_reason,
+                })
+            continue
+
+        detail_status = assess_apollo_detail_status(enriched_person)
+        status_label = f"New candidate / {branch_fit.get('label', 'Unknown')}"
+        status_detail = branch_fit.get("details", "")
+        if detail_status.get("label"):
+            status_detail = f"{detail_status['label']}. {status_detail}".strip()
+
+        results.append({
+            "person": enriched_person,
+            "branch_fit": branch_fit,
+            "status_label": status_label,
+            "status_detail": status_detail,
+        })
+
+    sorted_results = sorted(
+        results,
+        key=lambda item: (
+            branch_fit_rank((item.get("branch_fit") or {}).get("label")),
+            rank_contact_position((item.get("person") or {}).get("title", "")),
+            str(get_apollo_person_name((item.get("person") or {}))).lower(),
+        ),
+        reverse=True,
+    )[:8]
+
+    set_cached_apollo_branch_results(
+        cache_key,
+        sorted_results,
+        extra={
+            "enriched_count": len(sorted_results),
+            "skipped_without_branch_fit": skipped_without_branch_fit,
+            "raw_people_checked": len(seen_people),
+            "skipped_existing": skipped_existing,
+            "skipped_low_role": skipped_low_role,
+            "pages_checked": pages_checked,
+            "rejected_samples": rejected_samples,
+        },
+    )
+    return {
+        "results": sorted_results,
+        "cached": False,
+        "searched_titles": searched_titles,
+        "total_entries": total_entries,
+        "enriched_count": len(sorted_results),
+        "skipped_without_branch_fit": skipped_without_branch_fit,
+        "raw_people_checked": len(seen_people),
+        "skipped_existing": skipped_existing,
+        "skipped_low_role": skipped_low_role,
+        "pages_checked": pages_checked,
+        "rejected_samples": rejected_samples,
+        "status": "ok",
+    }
+
+
+def build_apollo_branch_candidate_results(domain, organization_name, expected_city="", expected_state="", force_refresh=False):
+    cache_key = (
+        APOLLO_BRANCH_CACHE_VERSION,
+        normalize_apollo_location_value(domain),
+        normalize_apollo_location_value(organization_name),
+        normalize_apollo_location_value(expected_city),
+        normalize_apollo_location_value(expected_state),
+    )
+    if force_refresh:
+        clear_cached_apollo_branch_results(cache_key)
+    cached = get_cached_apollo_branch_results(cache_key)
+    if cached is not None:
+        return cached
+
+    log_apollo_branch_event(
+        "branch_candidates_fresh",
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+    )
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") != "ok":
+        return {"results": [], "cached": False}
+
+    rows = build_contact_master_rows(master_data_result)
+    org_name_filter = normalize_apollo_location_value(organization_name)
+    expected_state_norm = normalize_apollo_location_value(expected_state)
+    candidate_rows = []
+
+    for row in rows:
+        company_norm = normalize_apollo_location_value(row.get("company"))
+        if org_name_filter and org_name_filter not in company_norm:
+            continue
+        if expected_state_norm and normalize_apollo_location_value(row.get("state")) != expected_state_norm:
+            continue
+        if str(row.get("active") or "").strip().lower() != "active":
+            continue
+        if not row.get("email"):
+            continue
+        candidate_rows.append(row)
+
+    candidate_rows = prioritize_branch_candidate_rows(candidate_rows, expected_city, expected_state)[:8]
+    results = []
+
+    for row in candidate_rows:
+        apollo_result = enrich_apollo_person(
+            name=row.get("name", ""),
+            email=row.get("email", ""),
+            domain=domain,
+            organization_name=organization_name,
+            force_refresh=force_refresh,
+        )
+        person = apollo_result.get("result") or {}
+        branch_fit = assess_branch_fit(
+            expected_city=expected_city,
+            expected_state=expected_state,
+            actual_city=person.get("city"),
+            actual_state=person.get("state"),
+        )
+        moved_status = assess_contact_moved_status(
+            person,
+            domain,
+            expected_organization_name=organization_name,
+            branch_fit=branch_fit,
+        )
+        results.append({
+            "contact": row,
+            "apollo_result": apollo_result,
+            "branch_fit": branch_fit,
+            "moved_status": moved_status,
+        })
+
+    sorted_results = sorted(
+        results,
+        key=lambda item: (
+            branch_fit_rank((item.get("branch_fit") or {}).get("label")),
+            1 if not (item.get("moved_status") or {}).get("flag") else 0,
+            str((item.get("contact") or {}).get("name") or "").lower(),
+        ),
+        reverse=True,
+    )
+    set_cached_apollo_branch_results(cache_key, sorted_results)
+    return {
+        "results": sorted_results,
+        "cached": False,
+    }
+
+
+def prioritize_branch_candidate_rows(rows, expected_city="", expected_state=""):
+    expected_city_norm = normalize_apollo_location_value(expected_city)
+    expected_state_norm = normalize_apollo_location_value(expected_state)
+
+    def row_rank(row):
+        row_state_norm = normalize_apollo_location_value(row.get("state"))
+        role_rank = rank_contact_position(row.get("position", ""))
+        state_match = 1 if expected_state_norm and row_state_norm == expected_state_norm else 0
+        active_rank = 1 if str(row.get("active") or "").strip().lower() == "active" else 0
+        city_hint = 1 if expected_city_norm and expected_city_norm in normalize_apollo_location_value(row.get("company")) else 0
+        return (state_match, city_hint, active_rank, role_rank)
+
+    return sorted(rows, key=row_rank, reverse=True)
+
+
+def rank_contact_position(position):
+    normalized = normalize_apollo_location_value(position)
+    if "branch manager" in normalized:
+        return 6
+    if "plant manager" in normalized:
+        return 5
+    if "operations manager" in normalized or "operations" in normalized:
+        return 4
+    if "general manager" in normalized:
+        return 4
+    if "manager" in normalized:
+        return 3
+    if "supervisor" in normalized:
+        return 2
+    return 1
+
+
+def branch_fit_rank(label):
+    return {
+        "Strong": 4,
+        "Possible": 3,
+        "Unknown": 2,
+        "Weak": 1,
+        "Not scored": 0,
+    }.get(str(label or ""), 0)
+
+
+def assess_contact_moved_status(person, expected_domain, expected_organization_name="", branch_fit=None):
+    if not person:
+        return {
+            "flag": False,
+            "kind": "none",
+            "headline": "No Apollo match",
+            "details": "Apollo did not return a matched person for this contact.",
+        }
+
+    actual_domain = normalize_apollo_location_value(
+        (person.get("organization") or {}).get("primary_domain")
+        or ""
+    )
+    person_email_domain = normalize_apollo_location_value(
+        str((person.get("email") or "")).split("@", 1)[-1] if "@" in str(person.get("email") or "") else ""
+    )
+    expected_domain_norm = normalize_apollo_location_value(expected_domain)
+    organization_name = (person.get("organization") or {}).get("name") or ""
+    expected_org_norm = normalize_apollo_location_value(expected_organization_name)
+    actual_org_norm = normalize_apollo_location_value(organization_name)
+    display_organization_name = organization_name or expected_organization_name or "the same organisation"
+
+    org_name_matches = False
+    if expected_org_norm and actual_org_norm:
+        if expected_org_norm in actual_org_norm or actual_org_norm in expected_org_norm:
+            org_name_matches = True
+        else:
+            expected_tokens = get_distinctive_company_tokens(expected_organization_name)
+            actual_tokens = get_distinctive_company_tokens(organization_name)
+            if expected_tokens and actual_tokens and expected_tokens.intersection(actual_tokens):
+                org_name_matches = True
+
+    domain_matches = bool(expected_domain_norm and actual_domain == expected_domain_norm)
+
+    # Email domain is only a weak fallback when Apollo did not give a usable organisation/domain.
+    email_domain_matches = bool(
+        expected_domain_norm
+        and person_email_domain == expected_domain_norm
+        and not actual_domain
+        and not actual_org_norm
+    )
+
+    same_company_signal = org_name_matches or domain_matches or email_domain_matches
+
+    different_company_signal = False
+    if expected_domain_norm and actual_domain and actual_domain != expected_domain_norm and not same_company_signal:
+        different_company_signal = True
+    if expected_org_norm and actual_org_norm and not org_name_matches:
+        different_company_signal = True
+
+    if different_company_signal:
+        return {
+            "flag": True,
+            "kind": "moved_company",
+            "headline": "Looks like this contact has moved on",
+            "details": f"Apollo now places them at {display_organization_name}.",
+        }
+
+    branch_label = str((branch_fit or {}).get("label") or "").strip()
+    if branch_label == "Weak":
+        location = ", ".join(
+            part
+            for part in [person.get("city"), person.get("state")]
+            if part
+        ) or "another branch"
+        return {
+            "flag": True,
+            "kind": "moved_branch",
+            "headline": "Looks like this contact is now at another branch",
+            "details": f"Apollo still places them at {display_organization_name}, but now in {location}.",
+        }
+
+    if branch_label == "Possible":
+        location = ", ".join(
+            part
+            for part in [person.get("city"), person.get("state")]
+            if part
+        ) or "a nearby branch"
+        return {
+            "flag": True,
+            "kind": "possible_branch_move",
+            "headline": "Possible move to another branch",
+            "details": f"Apollo still places them at {display_organization_name}, likely around {location}.",
+        }
+
+    return {
+        "flag": False,
+        "kind": "current_or_unclear",
+        "headline": "Current or unclear",
+        "details": "Apollo still places this person at the expected organisation, or it could not tell.",
+    }
+
+
+def assess_apollo_detail_status(person):
+    if not person:
+        return {
+            "label": "No match",
+            "score": 0,
+        }
+
+    details_count = 0
+
+    if person.get("title"):
+        details_count += 1
+    if person.get("city") or person.get("state") or person.get("formatted_address"):
+        details_count += 1
+    if person.get("linkedin_url"):
+        details_count += 1
+    if person.get("email_status"):
+        details_count += 1
+
+    if details_count >= 3:
+        return {
+            "label": "Matched, strong detail",
+            "score": details_count,
+        }
+
+    if details_count >= 1:
+        return {
+            "label": "Matched, limited detail",
+            "score": details_count,
+        }
+
+    return {
+        "label": "Matched, minimal detail",
+        "score": details_count,
+    }
+
+
+def get_apollo_status_message(result):
+    status = result.get("status", "unknown")
+
+    if status == "connected":
+        return "Apollo is configured and the API key is working."
+    if status == "connected_no_master_key":
+        return (
+            "Apollo is reachable, but this API key does not have master-key access, "
+            "so some API search endpoints may stay blocked."
+        )
+    if status == "apollo_disabled":
+        return "Apollo is disabled in the local environment."
+    if status == "missing_api_key":
+        return "Apollo is enabled, but the API key is missing."
+    if status == "auth_failed":
+        return "Apollo responded, but the login check did not pass."
+
+    return f"Apollo connection check failed: {status}."
+
+
+def get_apollo_enrichment_status_message(status, label):
+    if status == "missing_domain":
+        return "Add a company domain to run organisation enrichment."
+    if status == "missing_person_inputs":
+        return "Add a contact name or email to run contact enrichment."
+    if status == "apollo_disabled":
+        return "Apollo is disabled in the local environment."
+    if status == "missing_api_key":
+        return "Apollo is enabled, but the API key is missing."
+    if status == "http_401":
+        return f"Apollo {label} enrichment was rejected by the current key."
+    if status == "http_403":
+        return f"Apollo {label} enrichment is blocked by the current plan or permissions."
+    return f"Apollo {label} enrichment failed: {status}."
+
+
+def render_simple_summary_item(label, value):
+    return (
+        "<div>"
+        f"<span class=\"label\">{escape(str(label))}</span>"
+        f"<strong>{escape(str(value or '—'))}</strong>"
+        "</div>"
+    )
+
+
+def render_key_value_row(label, value):
+    if str(value).startswith("http"):
+        value_html = (
+            f"<a href=\"{escape(str(value))}\" target=\"_blank\" rel=\"noreferrer\">"
+            f"{escape(str(value))}</a>"
+        )
+    else:
+        value_html = escape(str(value))
+
+    return (
+        "<div class=\"keyval-row\">"
+        f"<span class=\"label\">{escape(str(label))}</span>"
+        f"<strong>{value_html}</strong>"
+        "</div>"
+    )
+
+
+def format_optional_number(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{number:,}"
+
+
+def extract_apollo_phone(person):
+    phones = person.get("phone_numbers") or []
+    if not phones:
+        return ""
+    first_phone = phones[0]
+    if isinstance(first_phone, dict):
+        return first_phone.get("sanitized_number") or first_phone.get("raw_number") or ""
+    return str(first_phone)
+
+
 def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category):
     sort_options = {
         "order_date": "Order Date",
@@ -6182,6 +7980,8 @@ def render_global_nav(title):
         <details class="nav-admin-menu">
             <summary>Admin</summary>
             <div class="nav-admin-dropdown">
+                <a href="/apollo-health-view">Apollo Health</a>
+                <a href="/enrichment-view">Customer Enrichment</a>
                 <a href="/filemaker-health">FileMaker Health</a>
                 <a href="/crm-activities-view">CRM Activities</a>
                 <a href="/crm-data">CRM Data</a>
@@ -6887,6 +8687,31 @@ def render_page(title, body, top_right="", show_title=True):
                         word-break: break-word;
                     }}
 
+                    .stack {{
+                        display: grid;
+                        gap: 16px;
+                    }}
+
+                    .two-column-keyvals {{
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                        gap: 12px;
+                    }}
+
+                    .keyval-row {{
+                        display: grid;
+                        gap: 4px;
+                        padding: 12px 14px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: var(--surface-card);
+                    }}
+
+                    .keyval-row a {{
+                        overflow-wrap: anywhere;
+                        word-break: break-word;
+                    }}
+
                     .home-summary {{
                         grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
                         gap: 12px;
@@ -6914,6 +8739,29 @@ def render_page(title, body, top_right="", show_title=True):
                     .customer-summary strong {{
                         font-size: 15px;
                         line-height: 1.2;
+                    }}
+
+                    .apollo-summary {{
+                        grid-template-columns: repeat(5, minmax(0, 1fr));
+                        gap: 6px;
+                        margin-bottom: 8px;
+                    }}
+
+                    .apollo-summary div {{
+                        padding: 6px 8px;
+                    }}
+
+                    .apollo-summary .label {{
+                        margin-bottom: 2px;
+                        font-size: 10px;
+                        line-height: 1.15;
+                    }}
+
+                    .apollo-summary strong {{
+                        font-size: 10px;
+                        line-height: 1.15;
+                        overflow-wrap: anywhere;
+                        word-break: break-word;
                     }}
 
                     .contact-status {{
@@ -7842,6 +9690,72 @@ def render_page(title, body, top_right="", show_title=True):
                         grid-template-columns: repeat(auto-fit, minmax(180px, 240px));
                     }}
 
+                    .apollo-controls {{
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        gap: 8px;
+                        margin-bottom: 4px;
+                        padding: 10px;
+                    }}
+
+                    .apollo-controls label {{
+                        gap: 4px;
+                    }}
+
+                    .apollo-controls span {{
+                        font-size: 11px;
+                    }}
+
+                    .apollo-controls input {{
+                        padding: 7px 9px;
+                        font-size: 12px;
+                    }}
+
+                    .apollo-controls button,
+                    .apollo-controls .button {{
+                        height: 34px;
+                        padding: 7px 10px;
+                        font-size: 12px;
+                    }}
+
+                    .apollo-help-text {{
+                        margin: 0 0 10px;
+                        max-width: 1100px;
+                        font-size: 11px;
+                        line-height: 1.3;
+                    }}
+
+                    .apollo-action-row {{
+                        display: grid;
+                        gap: 8px;
+                        align-items: center;
+                        margin: 0 0 8px;
+                    }}
+
+                    .apollo-form-actions {{
+                        grid-column: 1 / -1;
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        margin-bottom: 0;
+                    }}
+
+                    .apollo-form-actions .button,
+                    .apollo-form-actions button {{
+                        width: 100%;
+                    }}
+
+                    .apollo-refresh-button {{
+                        width: 100%;
+                        min-width: 0;
+                        height: 34px;
+                        padding: 7px 10px;
+                        font-size: 12px;
+                    }}
+
+                    .apollo-refresh-note {{
+                        font-size: 11px;
+                        line-height: 1.25;
+                    }}
+
+
                     .crm-filter-grid {{
                         grid-template-columns: repeat(4, minmax(0, 1fr));
                         grid-template-areas:
@@ -8171,6 +10085,101 @@ def render_page(title, body, top_right="", show_title=True):
                         min-width: 420px;
                         white-space: normal;
                         overflow-wrap: anywhere;
+                    }}
+
+                    .apollo-branch-table {{
+                        table-layout: fixed;
+                        min-width: 1060px;
+                    }}
+
+                    .apollo-branch-table th,
+                    .apollo-branch-table td {{
+                        white-space: normal;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .apollo-branch-table th:nth-child(1),
+                    .apollo-branch-table td:nth-child(1) {{
+                        width: 16%;
+                        min-width: 210px;
+                    }}
+
+                    .apollo-branch-table th:nth-child(2),
+                    .apollo-branch-table td:nth-child(2) {{
+                        width: 10%;
+                        min-width: 160px;
+                    }}
+
+                    .apollo-branch-table th:nth-child(3),
+                    .apollo-branch-table td:nth-child(3) {{
+                        width: 13%;
+                        min-width: 180px;
+                        white-space: normal;
+                    }}
+
+                    .apollo-branch-table th:nth-child(4),
+                    .apollo-branch-table td:nth-child(4) {{
+                        width: 12%;
+                        min-width: 170px;
+                        white-space: normal;
+                    }}
+
+                    .apollo-branch-table th:nth-child(5),
+                    .apollo-branch-table td:nth-child(5) {{
+                        width: 16%;
+                        min-width: 180px;
+                        white-space: normal;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .apollo-branch-table th:nth-child(6),
+                    .apollo-branch-table td:nth-child(6) {{
+                        width: 33%;
+                        min-width: 300px;
+                    }}
+
+                    .apollo-branch-status-label {{
+                        display: inline-block;
+                        margin-bottom: 6px;
+                        font-size: 13px;
+                        font-weight: 700;
+                        line-height: 1.25;
+                    }}
+
+                    .apollo-branch-status-current {{
+                        color: #334e68;
+                    }}
+
+                    .apollo-branch-status-moved {{
+                        color: #b42318;
+                    }}
+
+                    .apollo-branch-status-branch {{
+                        color: #9a6700;
+                    }}
+
+                    .apollo-branch-table .small.muted {{
+                        font-size: 11px;
+                        line-height: 1.35;
+                    }}
+
+                    .apollo-branch-status-detail {{
+                        display: block;
+                        font-size: 10px;
+                        line-height: 1.3;
+                        color: #64748b;
+                    }}
+
+                    .apollo-linkedin-link {{
+                        display: inline-block;
+                        margin-top: 4px;
+                        font-size: 11px;
+                        color: var(--blue);
+                        text-decoration: none;
+                    }}
+
+                    .apollo-linkedin-link:hover {{
+                        text-decoration: underline;
                     }}
 
                     .customers-table {{
