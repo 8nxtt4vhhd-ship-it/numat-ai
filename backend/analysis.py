@@ -117,7 +117,11 @@ def analyze_order_cycle(order_list):
 
 
 def get_analysis_today():
-    today = os.getenv("ANALYSIS_TODAY", "2024-07-01")
+    today = str(os.getenv("ANALYSIS_TODAY", "") or "").strip()
+
+    if not today:
+        return datetime.now()
+
     return datetime.strptime(today, "%Y-%m-%d")
 
 

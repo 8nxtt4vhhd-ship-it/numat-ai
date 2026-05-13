@@ -481,3 +481,175 @@ def generate_outreach_prep(context):
         print(f"AI outreach prep failed: {error}")
         cache_outreach_prep(cache_key, fallback)
         return fallback
+
+
+def build_data_question_fallback(question_payload):
+    status = str(question_payload.get("status") or "").strip()
+
+    if status == "no_customer_match":
+        return (
+            "I couldn't confidently match that question to a customer yet. "
+            "Try using the customer name and location, for example `Cintas Gadsden AL`."
+        )
+
+    if status == "no_location_match":
+        return "I couldn't confidently match that question to a state or location yet. Try using a state like `Alabama` or a location like `Gadsden AL`."
+
+    if status == "missing_data":
+        return "I couldn't load enough sales data to answer that right now."
+
+    customer = str(question_payload.get("customer") or "This customer").strip()
+    intent = str(question_payload.get("intent") or "summary").strip()
+    facts = question_payload.get("facts") or {}
+    last_order_date = str(facts.get("last_order_date") or "").strip()
+    last_order_amount = str(facts.get("last_order_amount") or "").strip()
+    last_order_number = str(facts.get("last_order_number") or "").strip()
+    total_spend = str(facts.get("total_spend") or "").strip()
+    latest_crm_date = str(facts.get("latest_crm_date") or "").strip()
+    latest_crm_subject = str(facts.get("latest_crm_subject") or "").strip()
+    contacts = facts.get("active_contacts") or []
+    matched_customers = facts.get("matched_customers") or []
+    stale_customers = facts.get("stale_customers") or []
+    location_city = str(facts.get("location_city") or "").strip()
+    location_state = str(facts.get("location_state") or "").strip()
+    location_state_name = str(facts.get("location_state_name") or "").strip()
+
+    if intent in {"location", "location_count"}:
+        location_label = ", ".join(part for part in [location_city, location_state or location_state_name] if part)
+        if not matched_customers:
+            if location_label:
+                return f"I couldn't find any customers in {location_label}."
+            return "I couldn't find any customers for that location."
+        if intent == "location_count":
+            return f"We have {len(matched_customers)} customer{'s' if len(matched_customers) != 1 else ''} in {location_label}."
+        if len(matched_customers) == 1:
+            only_customer = matched_customers[0].get("customer") or "that location"
+            return f"Yes. We have 1 customer in {location_label}: {only_customer}."
+        preview = ", ".join(
+            str(item.get("customer") or "").strip()
+            for item in matched_customers[:5]
+            if str(item.get("customer") or "").strip()
+        )
+        more_count = max(0, len(matched_customers) - 5)
+        more_text = f" and {more_count} more" if more_count else ""
+        return f"Yes. We have {len(matched_customers)} customers in {location_label}: {preview}{more_text}."
+
+    if intent == "top_spend":
+        location_label = ", ".join(part for part in [location_city, location_state or location_state_name] if part)
+        if not matched_customers:
+            return f"I couldn't find any customers in {location_label}."
+        top_rows = []
+        for item in matched_customers[:5]:
+            customer_name = str(item.get("customer") or "").strip()
+            spend_value = float(item.get("total_spend") or 0)
+            top_rows.append(f"{customer_name} ({spend_value:,.2f})")
+        return f"The biggest spend customers in {location_label} are " + ", ".join(top_rows) + "."
+
+    if intent == "stale_location":
+        location_label = ", ".join(part for part in [location_city, location_state or location_state_name] if part)
+        if not stale_customers:
+            return f"I couldn't find any customers in {location_label} with no recent orders."
+        preview = []
+        for item in stale_customers[:5]:
+            customer_name = str(item.get("customer") or "").strip()
+            days_since = item.get("days_since_last_order")
+            if isinstance(days_since, int):
+                preview.append(f"{customer_name} ({days_since} days)")
+            else:
+                preview.append(customer_name)
+        more_count = max(0, len(stale_customers) - 5)
+        more_text = f" and {more_count} more" if more_count else ""
+        return f"The customers in {location_label} with no recent orders are " + ", ".join(preview) + more_text + "."
+
+    if intent == "last_order":
+        if not last_order_date:
+            return f"I couldn't find a recorded order date for {customer}."
+        detail = f" That order was {last_order_number}" if last_order_number else ""
+        if last_order_amount:
+            detail += f" for {last_order_amount}"
+        return f"{customer} last ordered from us on {last_order_date}.{detail}".strip()
+
+    if intent == "crm":
+        if not latest_crm_date:
+            return f"I couldn't find a CRM activity date for {customer}."
+        subject_text = f" The latest subject was `{latest_crm_subject}`." if latest_crm_subject else ""
+        return f"The latest CRM activity I can see for {customer} is from {latest_crm_date}.{subject_text}".strip()
+
+    if intent == "contacts":
+        if not contacts:
+            return f"I couldn't find active FileMaker contacts for {customer}."
+        top_contacts = ", ".join(
+            f"{item.get('name')} ({item.get('position') or 'contact'})"
+            for item in contacts[:3]
+            if item.get("name")
+        )
+        return f"The active contacts I can see for {customer} are {top_contacts}."
+
+    if intent == "spend":
+        if not total_spend:
+            return f"I couldn't find a total spend figure for {customer}."
+        return f"{customer} has spent {total_spend} with us across {facts.get('order_count') or 0} recorded orders."
+
+    summary_parts = []
+    if last_order_date:
+        summary_parts.append(f"last order: {last_order_date}")
+    if latest_crm_date:
+        summary_parts.append(f"latest CRM activity: {latest_crm_date}")
+    if contacts:
+        summary_parts.append(f"{len(contacts)} active contact{'s' if len(contacts) != 1 else ''} on FileMaker")
+    if total_spend:
+        summary_parts.append(f"total spend: {total_spend}")
+
+    if not summary_parts:
+        return f"I found {customer}, but I don't have enough structured detail to answer that yet."
+
+    return f"{customer}: " + ", ".join(summary_parts) + "."
+
+
+def generate_data_question_answer(question_payload):
+    fallback = build_data_question_fallback(question_payload)
+    if str(question_payload.get("status") or "").strip() != "ok":
+        return fallback
+
+    intent = str(question_payload.get("intent") or "").strip()
+    if intent in {"last_order", "crm", "contacts", "spend", "location", "location_count", "top_spend", "stale_location"}:
+        return fallback
+
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        return fallback
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a concise sales data assistant. "
+                        "Answer the user's question only from the provided JSON facts. "
+                        "Do not invent data. If the facts are incomplete, say so plainly. "
+                        "Keep the answer short and practical."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "User question:\n"
+                        + str(question_payload.get("question") or "").strip()
+                        + "\n\nStructured facts:\n"
+                        + json.dumps(question_payload, indent=2)
+                    ),
+                },
+            ],
+            max_output_tokens=180,
+        )
+        answer = response.output_text.strip()
+        return answer or fallback
+    except Exception as error:
+        print(f"AI data question failed: {error}")
+        return fallback
