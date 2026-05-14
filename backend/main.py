@@ -614,33 +614,176 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer=""):
     )
 
 
-def match_customer_from_question(question, customer_names):
+def build_customer_lookup_entries(grouped_orders, master_data_result=None):
+    grouped_orders = grouped_orders or {}
+    master_data_result = master_data_result or {}
+    entries_by_key = {}
+
+    def add_entry(customer_name="", customer_primary_key="", location_label="", orders=None, state_hint=""):
+        customer_text = str(customer_name or "").strip()
+        if not customer_text:
+            return
+
+        normalized_name = normalize_apollo_location_value(customer_text)
+        normalized_key = str(customer_primary_key or "").strip()
+        dedupe_key = normalized_key or normalized_name
+        if not dedupe_key:
+            return
+
+        city, state = extract_city_state_from_location_label(location_label)
+        state = state or str(state_hint or "").strip().upper()
+        existing = entries_by_key.get(dedupe_key)
+        order_count = len(orders or [])
+
+        candidate = {
+            "customer": customer_text,
+            "customer_primary_key": normalized_key,
+            "orders": list(orders or []),
+            "location": str(location_label or "").strip(),
+            "city": str(city or "").strip(),
+            "state": str(state or "").strip().upper(),
+            "order_count": order_count,
+        }
+
+        if not existing:
+            entries_by_key[dedupe_key] = candidate
+            return
+
+        if candidate["order_count"] > existing.get("order_count", 0):
+            existing["orders"] = candidate["orders"]
+            existing["order_count"] = candidate["order_count"]
+        if not existing.get("customer_primary_key") and candidate["customer_primary_key"]:
+            existing["customer_primary_key"] = candidate["customer_primary_key"]
+        if not existing.get("location") and candidate["location"]:
+            existing["location"] = candidate["location"]
+        if not existing.get("city") and candidate["city"]:
+            existing["city"] = candidate["city"]
+        if not existing.get("state") and candidate["state"]:
+            existing["state"] = candidate["state"]
+
+    for customer_name, orders in grouped_orders.items():
+        customer_orders = list(orders or [])
+        add_entry(
+            customer_name=customer_name,
+            customer_primary_key=get_customer_primary_key(customer_orders),
+            location_label=extract_customer_location_label(customer_name, customer_orders),
+            orders=customer_orders,
+            state_hint=get_order_state(customer_orders[-1]) if customer_orders else "",
+        )
+
+    customers_by_key = (
+        master_data_result.get("customers_by_key", {})
+        if isinstance(master_data_result, dict) and master_data_result.get("status") == "ok"
+        else {}
+    )
+    for customer_key, customer_record in customers_by_key.items():
+        customer_name = str((customer_record or {}).get("company") or "").strip()
+        add_entry(
+            customer_name=customer_name,
+            customer_primary_key=customer_key,
+            location_label=extract_customer_location_label(customer_name, []),
+            orders=grouped_orders.get(customer_name, []),
+            state_hint=(customer_record or {}).get("state", ""),
+        )
+
+    return sorted(
+        entries_by_key.values(),
+        key=lambda item: str(item.get("customer") or "").lower(),
+    )
+
+
+def get_location_component_tokens(city="", state="", state_name=""):
+    tokens = set()
+
+    normalized_city = normalize_apollo_location_value(city)
+    if normalized_city:
+        tokens.update(token for token in normalized_city.split() if token)
+
+    normalized_state = normalize_apollo_location_value(state)
+    if normalized_state:
+        tokens.update(token for token in normalized_state.split() if token)
+
+    normalized_state_name = normalize_apollo_location_value(state_name)
+    if normalized_state_name:
+        tokens.update(token for token in normalized_state_name.split() if token)
+
+    return tokens
+
+
+def get_customer_identity_tokens(customer_name, city="", state=""):
+    customer_tokens = get_alias_aware_company_tokens(customer_name)
+    state_name = US_STATE_ABBR_TO_NAME.get(str(state or "").strip().upper(), "")
+    location_tokens = get_location_component_tokens(city=city, state=state, state_name=state_name)
+    return {token for token in customer_tokens if token not in location_tokens}
+
+
+def match_customer_from_question(question, customer_entries):
     question_norm = normalize_apollo_location_value(question)
     if not question_norm:
-        return ""
+        return {}
 
-    best_name = ""
+    location_query = extract_location_query(question, customer_entries)
+    requested_city_norm = normalize_apollo_location_value(location_query.get("city"))
+    requested_state_norm = normalize_state_match_value(location_query.get("state"))
+    requested_state_name = str(location_query.get("state_name") or "").strip()
+    question_tokens = get_distinctive_question_tokens(question)
+    question_company_tokens = {
+        token for token in question_tokens
+        if token not in get_location_component_tokens(
+            city=location_query.get("city"),
+            state=requested_state_norm,
+            state_name=requested_state_name,
+        )
+    }
+
+    best_entry = {}
     best_score = 0.0
 
-    for customer_name in customer_names:
+    for entry in customer_entries:
+        customer_name = str(entry.get("customer") or "").strip()
+        if not customer_name:
+            continue
+
+        entry_city_norm = normalize_apollo_location_value(entry.get("city"))
+        entry_state_norm = normalize_state_match_value(entry.get("state"))
+        if requested_state_norm and entry_state_norm and entry_state_norm != requested_state_norm:
+            continue
+        if requested_city_norm and not entry_city_norm:
+            continue
+        if requested_city_norm and entry_city_norm and entry_city_norm != requested_city_norm:
+            continue
+
         name_norm = normalize_apollo_location_value(customer_name)
         if not name_norm:
             continue
 
-        tokens = [token for token in name_norm.split() if len(token) > 1]
-        overlap = sum(1 for token in tokens if token in question_norm)
-        contains_bonus = 4 if name_norm in question_norm else 0
+        company_tokens = get_customer_identity_tokens(
+            customer_name,
+            city=entry.get("city"),
+            state=entry.get("state"),
+        )
+        token_overlap = question_company_tokens.intersection(company_tokens)
+        contains_bonus = 6 if name_norm and name_norm in question_norm else 0
         ratio = SequenceMatcher(None, name_norm, question_norm).ratio()
-        score = (overlap * 3) + contains_bonus + ratio
+        city_bonus = 3 if requested_city_norm and entry_city_norm == requested_city_norm else 0
+        state_bonus = 1 if requested_state_norm and entry_state_norm == requested_state_norm else 0
+        exact_company_bonus = 5 if token_overlap and question_company_tokens and token_overlap == question_company_tokens else 0
+        score = (len(token_overlap) * 4) + contains_bonus + city_bonus + state_bonus + exact_company_bonus + ratio
+
+        if question_company_tokens and not token_overlap:
+            if contains_bonus == 0 and ratio < 0.82:
+                continue
+        elif not token_overlap and contains_bonus == 0 and ratio < 0.55:
+            continue
 
         if score > best_score:
             best_score = score
-            best_name = customer_name
+            best_entry = entry
 
-    if best_score < 3:
-        return ""
+    if best_score < 4:
+        return {}
 
-    return best_name
+    return best_entry
 
 
 US_STATE_NAME_TO_ABBR = {
@@ -712,7 +855,7 @@ def extract_city_state_from_location_label(label):
     return (raw_label, "")
 
 
-def extract_location_query(question, grouped_orders):
+def extract_location_query(question, customer_entries):
     normalized = normalize_apollo_location_value(question)
     if not normalized:
         return {"city": "", "state": "", "state_name": ""}
@@ -736,23 +879,23 @@ def extract_location_query(question, grouped_orders):
                 break
 
     requested_city = ""
-    if state_abbr:
-        seen_cities = set()
-        city_candidates = []
-        for customer_name, orders in grouped_orders.items():
-            city, state = extract_city_state_from_location_label(
-                extract_customer_location_label(customer_name, orders)
-            )
-            normalized_city = normalize_apollo_location_value(city)
-            if not normalized_city or normalized_city in seen_cities:
-                continue
-            seen_cities.add(normalized_city)
-            city_candidates.append((normalized_city, city))
+    seen_cities = set()
+    city_candidates = []
+    for entry in customer_entries:
+        city = str(entry.get("city") or "").strip()
+        state = str(entry.get("state") or "").strip().upper()
+        if state_abbr and state and state != state_abbr:
+            continue
+        normalized_city = normalize_apollo_location_value(city)
+        if not normalized_city or normalized_city in seen_cities:
+            continue
+        seen_cities.add(normalized_city)
+        city_candidates.append((normalized_city, city))
 
-        for normalized_city, original_city in sorted(city_candidates, key=lambda item: len(item[0]), reverse=True):
-            if f" {normalized_city} " in f" {normalized} ":
-                requested_city = original_city
-                break
+    for normalized_city, original_city in sorted(city_candidates, key=lambda item: len(item[0]), reverse=True):
+        if f" {normalized_city} " in f" {normalized} ":
+            requested_city = original_city
+            break
 
     return {
         "city": requested_city,
@@ -795,9 +938,11 @@ def build_customer_data_question_payload(question):
         }
 
     grouped_orders = group_by_customer(order_result.get("orders", []))
+    master_data_result = fetch_filemaker_master_data()
+    customer_entries = build_customer_lookup_entries(grouped_orders, master_data_result)
 
     if intent in {"location", "location_count", "top_spend", "stale_location"}:
-        location_query = extract_location_query(question, grouped_orders)
+        location_query = extract_location_query(question, customer_entries)
         requested_city = str(location_query.get("city") or "").strip()
         requested_state = str(location_query.get("state") or "").strip().upper()
         requested_state_name = str(location_query.get("state_name") or "").strip()
@@ -810,10 +955,11 @@ def build_customer_data_question_payload(question):
             }
 
         matched_customers = []
-        for customer_name, orders in grouped_orders.items():
-            city, state = extract_city_state_from_location_label(
-                extract_customer_location_label(customer_name, orders)
-            )
+        for entry in customer_entries:
+            customer_name = str(entry.get("customer") or "").strip()
+            orders = list(entry.get("orders") or [])
+            city = str(entry.get("city") or "").strip()
+            state = str(entry.get("state") or "").strip().upper()
             if state != requested_state:
                 continue
             if requested_city and normalize_apollo_location_value(city) != normalize_apollo_location_value(requested_city):
@@ -834,6 +980,7 @@ def build_customer_data_question_payload(question):
                 "customer": customer_name,
                 "city": city,
                 "state": state,
+                "customer_primary_key": str(entry.get("customer_primary_key") or "").strip(),
                 "last_order_date": str((sorted_orders[0] or {}).get("order_date") or "").strip() if sorted_orders else "",
                 "total_spend": total_spend_value,
             })
@@ -874,15 +1021,20 @@ def build_customer_data_question_payload(question):
             },
         }
 
-    customer_name = match_customer_from_question(question, grouped_orders.keys())
-    if not customer_name:
+    matched_entry = match_customer_from_question(question, customer_entries)
+    if not matched_entry:
         return {
             "status": "no_customer_match",
             "question": question,
         }
 
+    customer_name = str(matched_entry.get("customer") or "").strip()
     customer_orders = grouped_orders.get(customer_name, [])
-    customer_primary_key = get_customer_primary_key(customer_orders)
+    customer_primary_key = str(
+        matched_entry.get("customer_primary_key")
+        or get_customer_primary_key(customer_orders)
+        or ""
+    ).strip()
 
     sorted_orders = sorted(
         customer_orders,
@@ -914,7 +1066,6 @@ def build_customer_data_question_payload(question):
         latest_crm_activity = crm_activities[0] if crm_activities else None
 
     if intent in {"contacts", "summary"}:
-        master_data_result = fetch_filemaker_master_data()
         customer_contacts = (
             master_data_result.get("contacts_by_customer_key", {}).get(customer_primary_key, [])
             if master_data_result.get("status") == "ok"
@@ -934,7 +1085,7 @@ def build_customer_data_question_payload(question):
         "customer": customer_name,
         "customer_primary_key": customer_primary_key,
         "facts": {
-            "location": extract_customer_location_label(customer_name, customer_orders),
+            "location": str(matched_entry.get("location") or extract_customer_location_label(customer_name, customer_orders)).strip(),
             "last_order_date": last_order_date,
             "last_order_amount": last_order_amount if last_order_amount != "—" else "",
             "last_order_number": last_order_number,
@@ -8125,6 +8276,19 @@ COMPANY_FAMILY_ALIASES = (
     {"vestis", "aramark"},
 )
 
+COMPANY_VARIANT_ALIASES = (
+    {"vestis", "aramark"},
+    {"unifirst", "uni first"},
+)
+
+ASK_DATA_NOISE_TOKENS = {
+    "who", "what", "when", "where", "why", "how", "did", "does", "do", "is", "are",
+    "the", "a", "an", "at", "in", "on", "from", "for", "of", "to", "we", "our",
+    "have", "has", "had", "last", "latest", "customer", "customers", "contact",
+    "contacts", "active", "crm", "activity", "order", "ordered", "spend", "spent",
+    "worth", "total", "any", "there", "i", "me", "us", "should",
+}
+
 
 def is_excluded_business_unit_text(value):
     normalized = normalize_apollo_location_value(value)
@@ -8178,9 +8342,54 @@ def get_distinctive_company_tokens(value):
     return tokens
 
 
+def get_alias_aware_company_tokens(value):
+    normalized = normalize_apollo_location_value(value)
+    if not normalized:
+        return set()
+
+    tokens = set(get_distinctive_company_tokens(value))
+
+    for variants in COMPANY_VARIANT_ALIASES:
+        normalized_variants = [
+            normalize_apollo_location_value(variant)
+            for variant in variants
+            if normalize_apollo_location_value(variant)
+        ]
+        if not normalized_variants:
+            continue
+
+        if not any(
+            f" {variant} " in f" {normalized} "
+            or variant == normalized
+            or variant.replace(" ", "") == normalized.replace(" ", "")
+            for variant in normalized_variants
+        ):
+            continue
+
+        for variant in normalized_variants:
+            compact_variant = variant.replace(" ", "")
+            if compact_variant:
+                tokens.add(compact_variant)
+            for token in variant.split():
+                if token and token not in COMMON_COMPANY_TOKENS and len(token) > 2:
+                    tokens.add(token)
+
+    return tokens
+
+
+def get_distinctive_question_tokens(value):
+    tokens = get_alias_aware_company_tokens(value)
+    return {
+        token for token in tokens
+        if token not in ASK_DATA_NOISE_TOKENS
+           and token not in US_STATE_NAME_TO_ABBR
+           and token not in {abbr.lower() for abbr in US_STATE_ABBR_TO_NAME}
+    }
+
+
 def company_family_matches(expected_name, actual_name):
-    expected_tokens = get_distinctive_company_tokens(expected_name)
-    actual_tokens = get_distinctive_company_tokens(actual_name)
+    expected_tokens = get_alias_aware_company_tokens(expected_name)
+    actual_tokens = get_alias_aware_company_tokens(actual_name)
 
     if not expected_tokens or not actual_tokens:
         return False
@@ -8198,11 +8407,20 @@ def get_company_search_aliases(value):
         return []
 
     aliases = {str(value or "").strip()}
-    normalized_tokens = get_distinctive_company_tokens(value)
+    normalized_tokens = get_alias_aware_company_tokens(value)
 
     for family in COMPANY_FAMILY_ALIASES:
         if normalized_tokens.intersection(family):
             aliases.update(family)
+
+    for variants in COMPANY_VARIANT_ALIASES:
+        normalized_variants = {
+            normalize_apollo_location_value(variant).replace(" ", "")
+            for variant in variants
+            if normalize_apollo_location_value(variant)
+        }
+        if normalized_tokens.intersection(normalized_variants):
+            aliases.update(variants)
 
     cleaned_aliases = []
     seen = set()
