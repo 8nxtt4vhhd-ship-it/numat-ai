@@ -14535,7 +14535,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             gap: 14px;
                         }}
 
-                        .home-side-panel {{
+                        .panel.home-side-panel {{
                             position: static;
                             min-height: 0;
                             padding: 6px 0 2px;
@@ -14621,8 +14621,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             gap: 10px;
                         }}
 
-                        .home-side-panel {{
+                        .panel.home-side-panel {{
                             padding: 0;
+                            min-height: 0;
+                            position: static;
                         }}
 
                         .home-side-nav,
