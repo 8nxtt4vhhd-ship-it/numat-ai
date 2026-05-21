@@ -165,6 +165,46 @@ def fallback_explanation(customer):
     )
 
 
+def get_contact_first_name(name):
+    raw_name = str(name or "").strip()
+    if not raw_name:
+        return ""
+    first_part = raw_name.split()[0].strip()
+    if not first_part or "@" in first_part or first_part.lower() in {"unknown", "contact"}:
+        return ""
+    return first_part.title()
+
+
+def build_text_tone_email_body(context, recommended_contact_name="", is_stale=False):
+    greeting_name = get_contact_first_name(recommended_contact_name)
+    greeting = f"Hi {greeting_name}," if greeting_name else "Hi,"
+
+    if is_stale:
+        paragraphs = [
+            (
+                "Just wanted to check in because it’s been quiet on the repair side for a while, "
+                "and I wanted to see whether anything has started building up again."
+            ),
+            (
+                "If you do have damaged mats or anything you want us to look at, I’m happy to keep it simple "
+                "and work around whatever timing suits you."
+            ),
+            "If not, no problem at all — I just wanted to make it easy to let us know where things stand.",
+        ]
+    else:
+        paragraphs = [
+            (
+                "Just wanted to check in and see whether anything is building up on your side that we should be planning around."
+            ),
+            (
+                "If it helps, I’m happy to keep it brief and work around whatever timing is easiest for you."
+            ),
+            "No pressure either way — I just wanted to put it on your radar.",
+        ]
+
+    return "\n\n".join([greeting, *paragraphs, "Thanks,"])
+
+
 def generate_customer_explanation(customer):
     api_key = os.getenv("OPENAI_API_KEY")
 
@@ -301,23 +341,12 @@ def build_outreach_prep_fallback(context):
         if not last_subject else
         f"Following up on {customer_name}"
     )
-    if has_stale_logistics_signal(context) or (latest_sales_days is not None and latest_sales_days > 90):
-        email_body = (
-            f"Hi,\n\n"
-            f"I wanted to check in because it looks as though repair activity may have gone quiet for a while. "
-            f"I also noticed there was previous repair-related contact in your history, "
-            f"so I wanted to ask whether there are any current damaged mats or repair needs we should be aware of now.\n\n"
-            f"If repair activity has paused or priorities have changed, that is completely fine - I just wanted to make it easy to let us know where things stand.\n\n"
-            f"Best regards,"
-        )
-    else:
-        email_body = (
-            f"Hi,\n\n"
-            f"I wanted to check in because it may be about the right time to see whether anything new is building up on your side. "
-            f"I wanted to see whether there is anything upcoming that we should be planning around.\n\n"
-            f"If it helps, I can also review current needs and timing with you directly.\n\n"
-            f"Best regards,"
-        )
+    is_stale = has_stale_logistics_signal(context) or (latest_sales_days is not None and latest_sales_days > 90)
+    email_body = build_text_tone_email_body(
+        context,
+        recommended_contact_name=recommended_contact_name,
+        is_stale=is_stale,
+    )
     call_objective = (
         "Confirm whether there is a genuine operational reason for the reorder gap and agree the next follow-up step."
     )
@@ -332,9 +361,12 @@ def build_outreach_prep_fallback(context):
         f"Hi, this is from Numat. I was just checking in to see whether there is anything upcoming we can help with on the repair side. "
         f"Please call me back when convenient."
     )
+    text_greeting_name = get_contact_first_name(recommended_contact_name)
     suggested_text_message = (
-        f"Hi, it’s Numat checking in. I wanted to see whether you have any upcoming repair needs or damaged mats we should plan around. "
-        f"Happy to keep it brief if easier by text."
+        f"Hi {text_greeting_name}, it’s Numat checking in. " if text_greeting_name else "Hi, it’s Numat checking in. "
+    ) + (
+        "Just wanted to see whether you have any damaged mats or upcoming repair needs we should plan around. "
+        "Happy to keep it brief if that’s easier."
     )
     targeting_note = (
         f"Start with {recommended_contact_name or 'the most active contact'}"
@@ -409,6 +441,7 @@ def generate_outreach_prep(context):
                         "Use the inferred contact signals to decide who the most appropriate target is, and tune the tone for their likely role and influence. "
                         "Use CRM activity type as a real signal. Pay attention to whether the history is made up mostly of email, calls, meetings/visits, LinkedIn, or a mix. "
                         "That should influence the recommended mode, tone, observed pattern, and whether the relationship looks meeting-led, email-led, or call-led. "
+                        "When writing the email draft, keep the tone closer to a good business text than a formal sales letter: practical, conversational, lower-pressure, and easy to reply to. "
                         "Reference the latest sales outreach concretely when it is commercially relevant, rather than drifting into a generic follow-up. "
                         "Pay close attention to dates. Do not describe an activity as recent unless it happened within the last 90 days relative to the current analysis date. "
                         "If the latest relevant outreach or reply is older than 90 days, describe it as older, historical, previous, or the latest recorded activity instead. "
