@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+import base64
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from html import escape
