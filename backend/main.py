@@ -1,7 +1,9 @@
 from collections import Counter, defaultdict
 import base64
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
+import hashlib
 from html import escape
 from html.parser import HTMLParser
 import json
@@ -12,10 +14,12 @@ import secrets
 from threading import Lock, Thread
 import time
 import traceback
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
+import itsdangerous
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 
 from apollo import (
     check_apollo_connection,
@@ -64,6 +68,18 @@ from filemaker import (
     fetch_order_records,
     has_filemaker_config,
 )
+from m365 import (
+    build_m365_authorize_url,
+    delete_m365_token_record,
+    ensure_valid_access_token,
+    exchange_m365_code_for_tokens,
+    fetch_m365_profile,
+    get_m365_config,
+    get_m365_token_record,
+    has_m365_config,
+    send_m365_mail,
+    set_m365_token_record,
+)
 from pdl import (
     check_pdl_connection,
     enrich_pdl_person,
@@ -71,7 +87,15 @@ from pdl import (
     search_pdl_people,
 )
 
+APP_SESSION_COOKIE_NAME = "numat_session"
 app = FastAPI()
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("APP_SESSION_SECRET", "change-this-session-secret"),
+    session_cookie=APP_SESSION_COOKIE_NAME,
+    same_site="lax",
+    https_only=False,
+)
 
 CRM_SYNC_STATUS_LOCK = Lock()
 CRM_SYNC_STATUS = {
@@ -124,11 +148,24 @@ APOLLO_BRANCH_RESULTS_CACHE = {
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ACTION_PLAN_DISMISSALS_PATH = BASE_DIR / "data" / "action_plan_dismissals.json"
+DEFAULT_APP_USERS_PATH = BASE_DIR / "data" / "app_users.json"
+DEFAULT_RECENT_SENT_EMAILS_PATH = BASE_DIR / "data" / "recent_sent_emails.json"
+APP_USERS_LOCK = Lock()
+RECENT_SENT_EMAILS_LOCK = Lock()
+CURRENT_SESSION_USER = ContextVar("CURRENT_SESSION_USER", default=None)
 
 
 PREVIEW_AUTH_EXEMPT_PATHS = {
     "/health",
     "/filemaker-health",
+}
+APP_LOGIN_EXEMPT_PATHS = {
+    "/health",
+    "/filemaker-health",
+    "/login",
+    "/logout",
+    "/home-logo.png",
+    "/m365/callback",
 }
 
 
@@ -169,33 +206,346 @@ def unauthorized_preview_response():
 
 
 def get_app_login_enabled():
-    return False
+    return os.getenv("APP_LOGIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def get_current_session_user():
+def get_app_session_secret():
+    return os.getenv("APP_SESSION_SECRET", "change-this-session-secret")
+
+
+def get_app_users_path():
+    configured = os.getenv("APP_USERS_PATH", "").strip()
+    return Path(configured) if configured else DEFAULT_APP_USERS_PATH
+
+
+def ensure_app_users_file():
+    path = get_app_users_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("[]\n", encoding="utf-8")
+    return path
+
+
+def load_app_users():
+    path = ensure_app_users_file()
+    try:
+        with APP_USERS_LOCK:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return payload
+    except Exception:
+        pass
+    return []
+
+
+def save_app_users(users):
+    path = ensure_app_users_file()
+    with APP_USERS_LOCK:
+        path.write_text(json.dumps(users, indent=2), encoding="utf-8")
+
+
+def normalize_username(username):
+    return re.sub(r"[^a-z0-9._-]", "", str(username or "").strip().lower())
+
+
+def hash_user_password(password, salt=None):
+    password_text = str(password or "")
+    salt_text = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password_text.encode("utf-8"),
+        salt_text.encode("utf-8"),
+        200000,
+    ).hex()
+    return {"salt": salt_text, "hash": digest}
+
+
+def verify_user_password(password, salt, expected_hash):
+    derived = hash_user_password(password, salt=salt)
+    return secrets.compare_digest(derived["hash"], str(expected_hash or ""))
+
+
+def sanitize_user_record(user):
+    return {
+        "username": str(user.get("username") or "").strip(),
+        "display_name": str(user.get("display_name") or "").strip(),
+        "m365_email": str(user.get("m365_email") or "").strip(),
+        "role": str(user.get("role") or "user").strip() or "user",
+        "active": bool(user.get("active", True)),
+    }
+
+
+def find_app_user(username):
+    normalized = normalize_username(username)
+    for user in load_app_users():
+        if normalize_username(user.get("username")) == normalized:
+            return user
     return None
 
 
-def can_manage_user_accounts(user):
-    return False
+def get_current_session_user():
+    return CURRENT_SESSION_USER.get()
+
+
+def get_session_username_from_cookie(request: Request):
+    cookie = str(request.cookies.get(APP_SESSION_COOKIE_NAME) or "").strip()
+    if not cookie:
+        return ""
+    try:
+        signer = itsdangerous.TimestampSigner(get_app_session_secret())
+        unsigned = signer.unsign(cookie.encode("utf-8"), max_age=14 * 24 * 60 * 60)
+        payload = json.loads(base64.b64decode(unsigned))
+    except Exception:
+        return ""
+    return str(payload.get("app_username") or "").strip()
 
 
 def has_any_active_users():
-    return False
+    return any(bool(user.get("active", True)) for user in load_app_users())
+
+
+def is_app_login_exempt(path):
+    if path in APP_LOGIN_EXEMPT_PATHS:
+        return True
+    return path.startswith("/docs") or path.startswith("/openapi")
+
+
+def can_manage_user_accounts(user):
+    if not get_app_login_enabled():
+        return True
+    if not user:
+        return not has_any_active_users()
+    return str(user.get("role") or "").lower() == "admin"
+
+
+def get_recent_sent_emails_path():
+    raw_path = os.getenv("RECENT_SENT_EMAILS_PATH", "").strip()
+
+    if raw_path:
+        return Path(raw_path).expanduser()
+
+    return DEFAULT_RECENT_SENT_EMAILS_PATH
+
+
+def ensure_recent_sent_emails_file():
+    path = get_recent_sent_emails_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("[]\n", encoding="utf-8")
+    return path
+
+
+def read_recent_sent_emails():
+    path = ensure_recent_sent_emails_file()
+
+    try:
+        with RECENT_SENT_EMAILS_LOCK:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+
+    normalized = []
+    changed = False
+    cutoff = datetime.now() - timedelta(days=45)
+
+    for item in payload:
+        if not isinstance(item, dict):
+            changed = True
+            continue
+
+        sent_at = str(item.get("sent_at") or "").strip()
+        sent_dt = parse_display_datetime(sent_at)
+        if sent_dt and sent_dt < cutoff:
+            changed = True
+            continue
+
+        normalized.append(
+            {
+                "customer": str(item.get("customer") or "").strip(),
+                "sender_username": str(item.get("sender_username") or "").strip(),
+                "sender_email": str(item.get("sender_email") or "").strip().lower(),
+                "recipient": str(item.get("recipient") or "").strip().lower(),
+                "subject": str(item.get("subject") or "").strip(),
+                "body_preview": str(item.get("body_preview") or "").strip(),
+                "sent_at": sent_at,
+                "mode": str(item.get("mode") or "email").strip().lower() or "email",
+            }
+        )
+
+    if changed:
+        write_recent_sent_emails(normalized)
+
+    return normalized
+
+
+def write_recent_sent_emails(items):
+    path = ensure_recent_sent_emails_file()
+    with RECENT_SENT_EMAILS_LOCK:
+        path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def record_recent_sent_email(customer, sender_username, sender_email, recipient, subject, body):
+    items = read_recent_sent_emails()
+    normalized_customer = str(customer or "").strip()
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    items.append(
+        {
+            "customer": normalized_customer,
+            "sender_username": str(sender_username or "").strip(),
+            "sender_email": str(sender_email or "").strip().lower(),
+            "recipient": str(recipient or "").strip().lower(),
+            "subject": str(subject or "").strip(),
+            "body_preview": truncate_text(str(body or "").strip(), 220),
+            "sent_at": now_text,
+            "mode": "email",
+        }
+    )
+    write_recent_sent_emails(items)
+
+
+def build_recent_sent_email_activity(item):
+    sent_at = str(item.get("sent_at") or "").strip()
+    recipient = str(item.get("recipient") or "").strip()
+    subject = str(item.get("subject") or "").strip()
+    body_preview = str(item.get("body_preview") or "").strip()
+    sender = str(item.get("sender_email") or "").strip()
+
+    return {
+        "date_created": sent_at,
+        "direction": "Outbound",
+        "crm_type": "Email",
+        "subject": subject,
+        "body": body_preview or "Email sent via Microsoft 365 from Sales Focus.",
+        "to": recipient,
+        "sender_email": sender,
+        "sender_company": "",
+        "activity_category": "sales_outreach",
+        "synthetic_source": "m365_local_send",
+    }
 
 
 def merge_recent_sent_emails_with_crm(customer_name, crm_activities):
-    return list(crm_activities or [])
+    customer_lookup = str(customer_name or "").strip().lower()
+    merged = list(crm_activities or [])
+    if not customer_lookup:
+        return merged
+
+    matching_items = [
+        item
+        for item in read_recent_sent_emails()
+        if str(item.get("customer") or "").strip().lower() == customer_lookup
+    ]
+
+    if not matching_items:
+        return merged
+
+    latest_crm_outbound = None
+    for activity in get_sales_outreach_activities(merged):
+        if str(activity.get("direction") or "").strip().lower() != "outbound":
+            continue
+        activity_dt = parse_crm_datetime(activity.get("date_created", ""))
+        if activity_dt and (latest_crm_outbound is None or activity_dt > latest_crm_outbound):
+            latest_crm_outbound = activity_dt
+
+    synthetic = []
+    kept_items = []
+
+    for item in matching_items:
+        sent_dt = parse_display_datetime(item.get("sent_at", ""))
+        if (
+            sent_dt
+            and latest_crm_outbound
+            and latest_crm_outbound >= (sent_dt - timedelta(minutes=5))
+        ):
+            continue
+        kept_items.append(item)
+        synthetic.append(build_recent_sent_email_activity(item))
+
+    if len(kept_items) != len(matching_items):
+        surviving = [
+            item for item in read_recent_sent_emails()
+            if str(item.get("customer") or "").strip().lower() != customer_lookup
+        ] + kept_items
+        write_recent_sent_emails(surviving)
+
+    merged.extend(synthetic)
+    return sort_sales_activities_by_date(merged)
 
 
 def get_m365_connection_state(user):
+    if not user:
+        return {
+            "enabled": has_m365_config(),
+            "connected": False,
+            "status_label": "Not signed in",
+            "mailbox": "",
+        }
+
+    expected_email = str(user.get("m365_email") or "").strip().lower()
+    config_enabled = has_m365_config()
+    record = get_m365_token_record(user.get("username"))
+    connected_email = str(record.get("connected_email") or "").strip().lower()
+    connected = bool(config_enabled and connected_email and connected_email == expected_email)
+
+    status_label = "Not connected"
+    if not config_enabled:
+        status_label = "Microsoft 365 is disabled"
+    elif connected:
+        status_label = "Connected"
+    elif record:
+        status_label = "Connected mailbox mismatch"
+
     return {
-        "enabled": False,
-        "connected": False,
-        "status_label": "Microsoft 365 is disabled",
-        "mailbox": "",
-        "expected_email": "",
+        "enabled": config_enabled,
+        "connected": connected,
+        "status_label": status_label,
+        "mailbox": connected_email or expected_email,
+        "expected_email": expected_email,
     }
+
+
+def build_m365_state(username, return_to=""):
+    serializer = itsdangerous.URLSafeTimedSerializer(
+        get_app_session_secret(),
+        salt="m365-oauth-state",
+    )
+    payload = {
+        "username": str(username or "").strip(),
+        "return_to": str(return_to or "").strip(),
+    }
+    return serializer.dumps(payload)
+
+
+def parse_m365_state(state):
+    serializer = itsdangerous.URLSafeTimedSerializer(
+        get_app_session_secret(),
+        salt="m365-oauth-state",
+    )
+    try:
+        payload = serializer.loads(str(state or ""), max_age=15 * 60)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def append_message_to_url(target_url, message="", error=""):
+    url_text = str(target_url or "").strip() or "/action-plan-view"
+    parts = urlsplit(url_text)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if message:
+        query["message"] = str(message)
+    if error:
+        query["error"] = str(error)
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(query, doseq=True, quote_via=quote),
+        parts.fragment,
+    ))
 
 
 def get_crm_sync_status():
@@ -257,10 +607,9 @@ def auto_crm_sync_worker():
     while True:
         try:
             if should_run_auto_crm_sync_now():
-                print("AUTO CRM SYNC: scheduled run starting")
                 run_crm_sync_in_background(trigger="auto")
         except Exception as error:
-            print(f"AUTO CRM SYNC: scheduled run skipped after error: {error.__class__.__name__}")
+            print(f"Automatic CRM sync skipped after error: {error.__class__.__name__}")
 
         time.sleep(min(300, get_auto_crm_sync_interval_seconds()))
 
@@ -277,15 +626,9 @@ def ensure_auto_crm_sync_worker_started():
 
         Thread(target=auto_crm_sync_worker, daemon=True).start()
         AUTO_CRM_SYNC_THREAD_STARTED = True
-        print(
-            "AUTO CRM SYNC: worker started "
-            f"(interval={get_auto_crm_sync_interval_seconds()}s)"
-        )
 
 
 def run_crm_sync_in_background(trigger="manual"):
-    trigger_label = "scheduled" if str(trigger).strip().lower() == "auto" else "manual"
-    print(f"CRM SYNC: {trigger_label} sync started")
     started_at = format_optional_datetime(datetime.now())
     update_crm_sync_status(
         running=True,
@@ -305,7 +648,6 @@ def run_crm_sync_in_background(trigger="manual"):
         finished_at = format_optional_datetime(datetime.now())
 
         if result.get("status") == "ok":
-            print(f"CRM SYNC: {trigger_label} sync completed successfully")
             update_crm_sync_status(
                 running=False,
                 finished_at=finished_at,
@@ -318,10 +660,6 @@ def run_crm_sync_in_background(trigger="manual"):
                 ),
             )
         else:
-            print(
-                "CRM SYNC: "
-                f"{trigger_label} sync finished with status={result.get('status', 'error')}"
-            )
             update_crm_sync_status(
                 running=False,
                 finished_at=finished_at,
@@ -338,7 +676,6 @@ def run_crm_sync_in_background(trigger="manual"):
                 ),
             )
     except Exception as exc:
-        print(f"CRM SYNC: {trigger_label} sync failed: {exc}")
         finished_at = format_optional_datetime(datetime.now())
         update_crm_sync_status(
             running=False,
@@ -381,6 +718,45 @@ async def preview_basic_auth(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def app_login_auth(request: Request, call_next):
+    session_username = ""
+    try:
+        session_username = str(request.session.get("app_username") or "").strip()
+    except Exception:
+        session_username = ""
+    if not session_username:
+        session_username = get_session_username_from_cookie(request)
+
+    current_user = find_app_user(session_username) if session_username else None
+    if current_user and not bool(current_user.get("active", True)):
+        current_user = None
+
+    token = CURRENT_SESSION_USER.set(current_user)
+    try:
+        if not get_app_login_enabled():
+            return await call_next(request)
+
+        if is_app_login_exempt(request.url.path):
+            return await call_next(request)
+
+        if not has_any_active_users():
+            if request.url.path != "/user-accounts":
+                return RedirectResponse(url="/user-accounts?setup=1", status_code=303)
+            return await call_next(request)
+
+        if current_user:
+            return await call_next(request)
+
+        next_path = request.url.path
+        if request.url.query:
+            next_path = f"{next_path}?{request.url.query}"
+        login_url = f"/login?next={quote(next_path)}"
+        return RedirectResponse(url=login_url, status_code=303)
+    finally:
+        CURRENT_SESSION_USER.reset(token)
+
+
 @app.get("/", response_class=HTMLResponse)
 def read_root(ask: str = "", ask_run: str = ""):
     return render_dashboard_home(
@@ -389,6 +765,469 @@ def read_root(ask: str = "", ask_run: str = ""):
     )
 
 
+@app.get("/login", response_class=HTMLResponse)
+def get_login_page(next: str = "/", error: str = ""):
+    next_target = next or "/"
+    error_markup = (
+        f"<p class='status error'>{escape(error)}</p>"
+        if error
+        else "<p class='subtle'>Sign in with your Sales Focus account to access the app.</p>"
+    )
+    body = f"""
+        <section class="panel login-panel">
+            <h2>Sign in</h2>
+            {error_markup}
+            <form method="post" action="/login" class="login-form">
+                <input type="hidden" name="next" value="{escape(next_target)}" />
+                <label>
+                    <span class="label">Username</span>
+                    <input type="text" name="username" autocomplete="username" required />
+                </label>
+                <label>
+                    <span class="label">Password</span>
+                    <input type="password" name="password" autocomplete="current-password" required />
+                </label>
+                <button class="button" type="submit">Sign in</button>
+            </form>
+        </section>
+    """
+    return render_page(title="Login", body=body, show_nav=False)
+
+
+@app.post("/login", response_class=HTMLResponse)
+def post_login(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/")):
+    user = find_app_user(username)
+    if not user or not bool(user.get("active", True)):
+        return RedirectResponse(
+            url=f"/login?next={quote(next or '/')}&error={quote('Username or password not recognised.')}",
+            status_code=303,
+        )
+
+    if not verify_user_password(password, user.get("password_salt"), user.get("password_hash")):
+        return RedirectResponse(
+            url=f"/login?next={quote(next or '/')}&error={quote('Username or password not recognised.')}",
+            status_code=303,
+        )
+
+    request.session["app_username"] = str(user.get("username") or "")
+    return RedirectResponse(url=next or "/", status_code=303)
+
+
+@app.get("/logout")
+def logout(request: Request):
+    request.session.pop("app_username", None)
+    return RedirectResponse(url="/login", status_code=303)
+
+
+@app.get("/user-accounts", response_class=HTMLResponse)
+def get_user_accounts_page(setup: str = "", message: str = "", error: str = "", edit: str = ""):
+    current_user = get_current_session_user()
+    can_manage = can_manage_user_accounts(current_user)
+    if not current_user and not can_manage:
+        return render_page(
+            title="User Accounts",
+            body="<p class='status error'>You do not have permission to manage user accounts.</p>",
+        )
+
+    users = [sanitize_user_record(user) for user in load_app_users()] if can_manage else []
+    editing_user = None
+    if can_manage and edit:
+        editing_user = find_app_user(edit)
+    rows = []
+    for user in users:
+        status = "Active" if user["active"] else "Inactive"
+        m365_state = get_m365_connection_state(user)
+        m365_status = m365_state["status_label"]
+        display_label = escape(user['display_name'] or user['username'])
+        if can_manage:
+            display_markup = f"<a class='user-account-edit-link' href='/user-accounts?edit={quote(user['username'])}'>{display_label}</a>"
+        else:
+            display_markup = display_label
+        rows.append(
+            "<tr>"
+            f"<td>{display_markup}</td>"
+            f"<td>{escape(user['username'])}</td>"
+            f"<td>{escape(user['m365_email'] or 'Not set')}</td>"
+            f"<td>{escape(user['role'])}</td>"
+            f"<td>{escape(status)}</td>"
+            f"<td>{escape(m365_status)}</td>"
+            "</tr>"
+        )
+    rows_markup = "".join(rows) or "<tr><td colspan='6'>No users added yet.</td></tr>"
+
+    if can_manage:
+        intro = "Create the first admin account for Sales Focus." if setup and not users else "Manage app users and map them to their Microsoft 365 email address."
+    else:
+        intro = "Manage your own Microsoft 365 connection for Sales Focus."
+    status_markup = ""
+    if message:
+        status_markup = f"<p class='status ok'>{escape(message)}</p>"
+    elif error:
+        status_markup = f"<p class='status error'>{escape(error)}</p>"
+    current_m365_state = get_m365_connection_state(current_user)
+    expected_mailbox = str((current_user or {}).get("m365_email") or "").strip()
+    connected_mailbox = str(current_m365_state.get("mailbox") or "").strip()
+    connect_controls = ""
+    if current_user:
+        if current_m365_state.get("connected"):
+            connect_controls = f"""
+                <form method="post" action="/m365/disconnect" class="m365-status-actions">
+                    <button class="button secondary" type="submit">Disconnect Microsoft 365</button>
+                </form>
+            """
+        else:
+            connect_controls = f"""
+                <div class="m365-status-actions">
+                    <a class="button" href="/m365/connect?return_to=%2Fuser-accounts">Connect Microsoft 365</a>
+                </div>
+            """
+
+    management_markup = ""
+    if can_manage:
+        form_title = "Edit user" if editing_user else "Add user"
+        form_action = "/user-accounts/update" if editing_user else "/user-accounts"
+        submit_label = "Save changes" if editing_user else "Create user"
+        display_name_value = str((editing_user or {}).get("display_name") or "")
+        username_value = str((editing_user or {}).get("username") or "")
+        m365_email_value = str((editing_user or {}).get("m365_email") or "")
+        role_value = "admin" if str((editing_user or {}).get("role") or "").strip().lower() == "admin" else "user"
+        active_value = "active" if bool((editing_user or {}).get("active", True)) else "inactive"
+        cancel_link = (
+            "<p><a class='button secondary small-button' href='/user-accounts'>Cancel edit</a></p>"
+            if editing_user else ""
+        )
+        management_markup = f"""
+            <div class="action-columns user-account-columns">
+                <div class="action-column">
+                    <h3>{form_title}</h3>
+                    <form method="post" action="{form_action}" class="login-form">
+                        {f'<input type="hidden" name="original_username" value="{escape(username_value)}" />' if editing_user else ''}
+                        <label>
+                            <span class="label">Display name</span>
+                            <input type="text" name="display_name" value="{escape(display_name_value)}" required />
+                        </label>
+                        <label>
+                            <span class="label">Username</span>
+                            <input type="text" name="username" value="{escape(username_value)}" required />
+                        </label>
+                        <label>
+                            <span class="label">Microsoft 365 email</span>
+                            <input type="email" name="m365_email" value="{escape(m365_email_value)}" placeholder="name@company.com" required />
+                        </label>
+                        <label>
+                            <span class="label">Role</span>
+                            <select name="role">
+                                <option value="user" {"selected" if role_value == "user" else ""}>User</option>
+                                <option value="admin" {"selected" if role_value == "admin" else ""}>Admin</option>
+                            </select>
+                        </label>
+                        <label>
+                            <span class="label">{'New password (leave blank to keep current)' if editing_user else 'Temporary password'}</span>
+                            <input type="password" name="password" {"required" if not editing_user else ""} />
+                        </label>
+                        <label>
+                            <span class="label">Status</span>
+                            <select name="active">
+                                <option value="active" {"selected" if active_value == "active" else ""}>Active</option>
+                                <option value="inactive" {"selected" if active_value == "inactive" else ""}>Inactive</option>
+                            </select>
+                        </label>
+                        <button class="button" type="submit">{submit_label}</button>
+                    </form>
+                    {cancel_link}
+                </div>
+                <div class="action-column">
+                    <h3>Current users</h3>
+                    <div class="table-wrap">
+                        <table class="user-accounts-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Username</th>
+                                    <th>M365 email</th>
+                                    <th>Role</th>
+                                    <th>Status</th>
+                                    <th>M365</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {rows_markup}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        """
+
+    body = f"""
+        <section class="panel user-accounts-panel">
+            <h2>User accounts</h2>
+            <p class="subtle">{escape(intro)}</p>
+            {status_markup}
+            {management_markup}
+            <div class="action-columns user-account-columns m365-account-columns">
+                <div class="action-column">
+                    <h3>My Microsoft 365 connection</h3>
+                    <div class="summary compact-summary">
+                        <div>
+                            <span class="label">Signed-in user</span>
+                            <strong>{escape(str((current_user or {}).get("display_name") or (current_user or {}).get("username") or "Not signed in"))}</strong>
+                        </div>
+                        <div>
+                            <span class="label">Mapped mailbox</span>
+                            <strong>{escape(expected_mailbox or "Not set")}</strong>
+                        </div>
+                        <div>
+                            <span class="label">Connection</span>
+                            <strong>{escape(str(current_m365_state.get("status_label") or "Unknown"))}</strong>
+                        </div>
+                        <div>
+                            <span class="label">Connected mailbox</span>
+                            <strong>{escape(connected_mailbox or "Not connected")}</strong>
+                        </div>
+                    </div>
+                    <p class="subtle">Connect your own Microsoft 365 account so Sales Focus can send email from the right mailbox.</p>
+                    {connect_controls}
+                </div>
+            </div>
+        </section>
+    """
+    return render_page(title="User Accounts", body=body)
+
+
+@app.post("/user-accounts", response_class=HTMLResponse)
+def post_user_account(
+    display_name: str = Form(""),
+    username: str = Form(""),
+    m365_email: str = Form(""),
+    role: str = Form("user"),
+    password: str = Form(""),
+    active: str = Form("active"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return render_page(
+            title="User Accounts",
+            body="<p class='status error'>You do not have permission to manage user accounts.</p>",
+        )
+
+    display_name = str(display_name or "").strip()
+    username = normalize_username(username)
+    m365_email = str(m365_email or "").strip().lower()
+    role = "admin" if str(role or "").strip().lower() == "admin" else "user"
+    password = str(password or "")
+
+    if not display_name or not username or not m365_email or not password:
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote('Please complete every field.')}",
+            status_code=303,
+        )
+
+    users = load_app_users()
+    if any(normalize_username(user.get("username")) == username for user in users):
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote('That username already exists.')}",
+            status_code=303,
+        )
+
+    password_payload = hash_user_password(password)
+    users.append(
+        {
+            "username": username,
+            "display_name": display_name,
+            "m365_email": m365_email,
+            "role": role,
+            "active": str(active or "").strip().lower() != "inactive",
+            "password_salt": password_payload["salt"],
+            "password_hash": password_payload["hash"],
+        }
+    )
+    save_app_users(users)
+    return RedirectResponse(
+        url=f"/user-accounts?message={quote('User created successfully.')}",
+        status_code=303,
+    )
+
+
+@app.post("/user-accounts/update", response_class=HTMLResponse)
+def post_user_account_update(
+    request: Request,
+    original_username: str = Form(""),
+    display_name: str = Form(""),
+    username: str = Form(""),
+    m365_email: str = Form(""),
+    role: str = Form("user"),
+    password: str = Form(""),
+    active: str = Form("active"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return render_page(
+            title="User Accounts",
+            body="<p class='status error'>You do not have permission to manage user accounts.</p>",
+        )
+
+    original_username = normalize_username(original_username)
+    display_name = str(display_name or "").strip()
+    username = normalize_username(username)
+    m365_email = str(m365_email or "").strip().lower()
+    role = "admin" if str(role or "").strip().lower() == "admin" else "user"
+    password = str(password or "")
+    is_active = str(active or "").strip().lower() != "inactive"
+
+    if not original_username:
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote('Could not identify the user to edit.')}",
+            status_code=303,
+        )
+
+    if not display_name or not username or not m365_email:
+        return RedirectResponse(
+            url=f"/user-accounts?edit={quote(original_username)}&error={quote('Please complete every required field.')}",
+            status_code=303,
+        )
+
+    users = load_app_users()
+    match_index = next(
+        (index for index, user in enumerate(users) if normalize_username(user.get('username')) == original_username),
+        None,
+    )
+    if match_index is None:
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote('That user no longer exists.')}",
+            status_code=303,
+        )
+
+    if any(
+        normalize_username(user.get("username")) == username
+        for index, user in enumerate(users)
+        if index != match_index
+    ):
+        return RedirectResponse(
+            url=f"/user-accounts?edit={quote(original_username)}&error={quote('That username already exists.')}",
+            status_code=303,
+        )
+
+    user_record = dict(users[match_index])
+    old_username = normalize_username(user_record.get("username"))
+    old_m365_email = str(user_record.get("m365_email") or "").strip().lower()
+    user_record["display_name"] = display_name
+    user_record["username"] = username
+    user_record["m365_email"] = m365_email
+    user_record["role"] = role
+    user_record["active"] = is_active
+
+    if password.strip():
+        password_payload = hash_user_password(password)
+        user_record["password_salt"] = password_payload["salt"]
+        user_record["password_hash"] = password_payload["hash"]
+
+    users[match_index] = user_record
+    save_app_users(users)
+
+    existing_token = get_m365_token_record(old_username)
+    if old_username != username and existing_token:
+        set_m365_token_record(username, existing_token)
+        delete_m365_token_record(old_username)
+
+    token_record = get_m365_token_record(username)
+    token_cleared = False
+    if token_record:
+        connected_email = str(token_record.get("connected_email") or "").strip().lower()
+        if old_m365_email != m365_email and connected_email and connected_email != m365_email:
+            delete_m365_token_record(username)
+            token_cleared = True
+
+    if current_user and normalize_username(current_user.get("username")) == old_username:
+        request.session["app_username"] = username
+
+    message = "User updated successfully."
+    if token_cleared:
+        message += " Microsoft 365 connection was cleared because the mailbox changed."
+
+    return RedirectResponse(
+        url=f"/user-accounts?message={quote(message)}",
+        status_code=303,
+    )
+
+
+@app.get("/m365/connect")
+def get_m365_connect(return_to: str = "/user-accounts"):
+    current_user = get_current_session_user()
+    if not current_user:
+        return RedirectResponse(url="/login?next=%2Fm365%2Fconnect", status_code=303)
+    if not has_m365_config():
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote('Microsoft 365 is not configured in the environment.')}",
+            status_code=303,
+        )
+    state = build_m365_state(current_user.get("username"), return_to=return_to)
+    return RedirectResponse(url=build_m365_authorize_url(state), status_code=303)
+
+
+@app.get("/m365/callback")
+def get_m365_callback(code: str = "", state: str = "", error: str = "", error_description: str = ""):
+    if error:
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote(error_description or error or 'Microsoft 365 sign-in was cancelled.')}",
+            status_code=303,
+        )
+
+    state_payload = parse_m365_state(state)
+    username = str(state_payload.get("username") or "").strip()
+    return_to = str(state_payload.get("return_to") or "/user-accounts").strip() or "/user-accounts"
+    user = find_app_user(username)
+
+    if not user or not bool(user.get("active", True)):
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote('Could not match this Microsoft 365 sign-in to an active app user.')}",
+            status_code=303,
+        )
+
+    token_result = exchange_m365_code_for_tokens(code)
+    if token_result.get("status") != "ok":
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote(token_result.get('error_message') or token_result.get('status') or 'Microsoft 365 sign-in failed.')}",
+            status_code=303,
+        )
+
+    token_data = dict(token_result.get("token_data") or {})
+    profile_result = fetch_m365_profile(token_data.get("access_token"))
+    if profile_result.get("status") != "ok":
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote(profile_result.get('error_message') or profile_result.get('status') or 'Could not read the Microsoft 365 profile.')}",
+            status_code=303,
+        )
+
+    expected_email = str(user.get("m365_email") or "").strip().lower()
+    mailbox = str(profile_result.get("mailbox") or "").strip().lower()
+    if expected_email and mailbox and mailbox != expected_email:
+        return RedirectResponse(
+            url=f"/user-accounts?error={quote(f'This Microsoft 365 account is {mailbox}, but Sales Focus expects {expected_email}.')}",
+            status_code=303,
+        )
+
+    token_data["connected_email"] = mailbox or expected_email
+    token_data["profile_display_name"] = str(
+        (profile_result.get("profile") or {}).get("displayName") or ""
+    ).strip()
+    set_m365_token_record(username, token_data)
+    return RedirectResponse(
+        url=append_message_to_url(return_to, message="Microsoft 365 connected successfully."),
+        status_code=303,
+    )
+
+
+@app.post("/m365/disconnect")
+def post_m365_disconnect():
+    current_user = get_current_session_user()
+    if not current_user:
+        return RedirectResponse(url="/login?next=%2Fuser-accounts", status_code=303)
+    delete_m365_token_record(current_user.get("username"))
+    return RedirectResponse(
+        url="/user-accounts?message=Microsoft%20365%20disconnected.",
+        status_code=303,
+    )
 
 
 @app.get("/action-plan-view", response_class=HTMLResponse)
@@ -705,6 +1544,7 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer="", me
     stage_started_at = time.perf_counter()
     grouped_orders = group_by_customer(orders)
     log_perf_metric("home.group_by_customer", stage_started_at)
+    customer_options = sorted(grouped_orders.keys(), key=lambda item: str(item or "").lower())
 
     stage_started_at = time.perf_counter()
     crm_activity_map = (
@@ -732,6 +1572,7 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer="", me
     selected_customer = get_home_selected_customer_name(
         queue_summaries,
         selected_customer=selected_customer,
+        customer_options=customer_options,
     )
 
     stage_started_at = time.perf_counter()
@@ -755,7 +1596,7 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer="", me
     body = f"""
         {render_data_availability_banner(order_result, crm_result)}
         {status_markup}
-        {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, dismiss_customer=dismiss_customer)}
+        {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, customer_options=customer_options, dismiss_customer=dismiss_customer)}
     """
 
     log_perf_metric("home.total", home_started_at)
@@ -907,8 +1748,6 @@ def match_customer_from_question(question, customer_entries):
             continue
 
         name_norm = normalize_apollo_location_value(customer_name)
-        if not name_norm:
-            continue
         company_tokens = get_customer_identity_tokens(
             customer_name,
             city=entry.get("city"),
@@ -1343,6 +2182,14 @@ def render_dashboard_home(ask="", ask_run=""):
 
 def render_home_dashboard_sidebar():
     current_user = get_current_session_user()
+    current_display_name = ""
+    if current_user:
+        current_display_name = str(
+            current_user.get("display_name")
+            or current_user.get("username")
+            or ""
+        ).strip()
+
     primary_items = [
         ("Home", "/", "home"),
         ("Action Plan", "/action-plan-view", "plan"),
@@ -1353,6 +2200,7 @@ def render_home_dashboard_sidebar():
         ("Insights", "/insights-view", "chart"),
     ]
     admin_items = [
+        ("User Accounts", "/user-accounts", "key"),
         ("Dismissed Customers", "/dismissed-customers-view", "archive"),
         ("PDL Enrichment Test", "/pdl-branch-view", "search"),
         ("CRM Activities", "/crm-activities-view", "clock"),
@@ -1374,6 +2222,14 @@ def render_home_dashboard_sidebar():
         for label, href, icon in primary_items
     )
     admin_html = "".join(render_item(label, href, icon) for label, href, icon in admin_items)
+    account_html = ""
+    if current_display_name:
+        account_html = (
+            "<div class=\"home-side-account\">"
+            f"<span class=\"home-side-account-name\">{escape(current_display_name)}</span>"
+            f"{render_item('Log out', '/logout', 'logout')}"
+            "</div>"
+        )
 
     return f"""
         <aside class="panel home-side-panel">
@@ -1384,6 +2240,7 @@ def render_home_dashboard_sidebar():
                 <div class="home-side-group">
                     {admin_html}
                 </div>
+                {account_html}
             </nav>
         </aside>
     """
@@ -1473,6 +2330,7 @@ def get_outreach_prep(customer: str, return_to: str = ""):
     attention = build_customers_needing_attention_response_map().get(customer)
     outreach_context = build_outreach_context(customer, customer_orders, attention, crm_result)
     outreach_result = generate_outreach_prep(outreach_context)
+    outreach_result = apply_test_customer_outreach_mode_overrides(outreach_result, customer)
     if (
         is_email_first_corporate_customer(customer)
         and str(outreach_result.get("suggested_mode") or "").strip().lower() not in {"", "hold"}
@@ -1496,8 +2354,86 @@ def post_m365_send_email(
     subject: str = Form(""),
     body: str = Form(""),
 ):
+    current_user = get_current_session_user()
+    if not current_user:
+        return RedirectResponse(url="/login?next=%2Faction-plan-view", status_code=303)
+
+    if not has_m365_config():
+        return render_page(
+            title="Send Email",
+            body=(
+                "<p class='status error'>Microsoft 365 sending is not configured in this environment.</p>"
+                "<p><a class='button secondary' href='javascript:history.back()'>Back</a></p>"
+            ),
+        )
+
+    customer_name = str(customer or "").strip()
+    recipient = str(to or "").strip()
+    subject_text = str(subject or "").strip()
+    body_text = str(body or "")
+
+    if not customer_name or not recipient or not subject_text or not body_text.strip():
+        return render_page(
+            title="Send Email",
+            body=(
+                "<p class='status error'>Recipient, subject, and body are all required before sending.</p>"
+                "<p><a class='button secondary' href='javascript:history.back()'>Back</a></p>"
+            ),
+        )
+
+    connection_state = get_m365_connection_state(current_user)
+    if not connection_state.get("connected"):
+        return render_page(
+            title="Send Email",
+            body=(
+                "<p class='status error'>This user is not connected to Microsoft 365 yet.</p>"
+                "<p><a class='button secondary' href='/user-accounts'>Open User Accounts</a></p>"
+            ),
+        )
+
+    token_result = ensure_valid_access_token(current_user.get("username"))
+    if token_result.get("status") != "ok":
+        error_text = token_result.get("error_message") or token_result.get("status") or "Could not refresh the Microsoft 365 connection."
+        return render_page(
+            title="Send Email",
+            body=(
+                f"<p class='status error'>{escape(str(error_text))}</p>"
+                "<p><a class='button secondary' href='javascript:history.back()'>Back</a></p>"
+            ),
+        )
+
+    send_result = send_m365_mail(
+        token_result.get("access_token"),
+        recipient=recipient,
+        subject=subject_text,
+        body=body_text,
+    )
+    if send_result.get("status") != "ok":
+        error_text = send_result.get("error_message") or send_result.get("status") or "Microsoft 365 could not send the email."
+        return render_page(
+            title="Send Email",
+            body=(
+                f"<p class='status error'>{escape(str(error_text))}</p>"
+                "<p><a class='button secondary' href='javascript:history.back()'>Back</a></p>"
+            ),
+        )
+
+    record_recent_sent_email(
+        customer=customer_name,
+        sender_username=current_user.get("username"),
+        sender_email=connection_state.get("mailbox") or current_user.get("m365_email"),
+        recipient=recipient,
+        subject=subject_text,
+        body=body_text,
+    )
+    clear_attention_response_cache()
+    clear_home_queue_summaries_cache()
+    clear_customer_summaries_cache()
     return RedirectResponse(
-        url=(return_to or "/action-plan-view"),
+        url=append_message_to_url(
+            return_to or "/action-plan-view",
+            message="Email sent.",
+        ),
         status_code=303,
     )
 
@@ -2779,6 +3715,26 @@ def build_customers_needing_attention_response(order_result=None, crm_result=Non
         if crm_result["status"] == "ok" else {}
     )
     late = find_late_customers(customers)
+    late_customer_names = {
+        str(item.get("customer") or "").strip().lower()
+        for item in late
+    }
+    for forced_customer_name in get_forced_action_plan_customers():
+        forced_customer_orders = customers.get(forced_customer_name, [])
+        if not forced_customer_orders:
+            continue
+        if str(forced_customer_name).strip().lower() in late_customer_names:
+            continue
+        forced_customer_primary_key = get_customer_primary_key(forced_customer_orders)
+        forced_crm_matches = crm_activity_map.get(forced_customer_primary_key, [])
+        forced_customer = build_forced_action_plan_customer(
+            forced_customer_name,
+            forced_customer_orders,
+            crm_matches=forced_crm_matches,
+        )
+        if forced_customer:
+            late.append(forced_customer)
+            late_customer_names.add(str(forced_customer_name).strip().lower())
     dismissals = read_action_plan_dismissals()
     dismissed_customers = []
     active_customers = []
@@ -4718,6 +5674,11 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
     targeting_note = str(result.get("targeting_note", "No specific targeting note available."))
     observed_pattern = str(result.get("observed_pattern", "No pattern noted."))
     mode_lower = suggested_mode.lower()
+    current_user = get_current_session_user()
+    m365_state = get_m365_connection_state(current_user)
+    sender_mailbox = str(m365_state.get("mailbox") or "").strip()
+    connect_return_to = f"/outreach-prep?{urlencode({'customer': customer, 'return_to': return_to}, quote_via=quote)}"
+    m365_connect_href = f"/m365/connect?return_to={quote(connect_return_to)}"
 
     cta_href = "#draft-outreach-card"
     cta_label = "Open Draft"
@@ -4777,18 +5738,37 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
                 </div>
     """
     if mode_lower == "email":
-        send_status_note = "<p class='outreach-m365-note'>Edit the draft here, then open it in your usual email app.</p>"
-        send_button_markup = """
-                        <button type="button" class="button outreach-primary-cta" onclick="openOutreachMailto()">
+        send_status_note = (
+            f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}</p>"
+            if m365_state.get("connected") and sender_mailbox
+            else (
+                "<p class='outreach-m365-note'>Connect your Microsoft 365 account to send from Sales Focus, or use the manual email fallback.</p>"
+            )
+        )
+        send_button_markup = (
+            """
+                        <button type="button" class="button outreach-primary-cta" onclick="showM365SendConfirm()">
                             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                                 <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
                             </svg>
-                            <span>Open Email App</span>
+                            <span>Send Email</span>
                         </button>
-        """
+            """
+            if m365_state.get("connected")
+            else f"""
+                        <a class="button outreach-primary-cta" href="{escape(m365_connect_href)}">
+                            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                <path fill="currentColor" d="M12 2.8a9.2 9.2 0 1 1-9.2 9.2A9.2 9.2 0 0 1 12 2.8Zm0 4.2a1 1 0 0 0-1 1v3.2a1 1 0 0 0 .29.71l1.96 1.96a1 1 0 1 0 1.42-1.42L13 10.79V8a1 1 0 0 0-1-1Z"/>
+                            </svg>
+            <span>Connect Microsoft 365</span>
+        </a>
+            """
+        )
         cta_markup = ""
         email_draft_markup = f"""
-                <div class="outreach-draft-form" id="outreach-send-form">
+                <form method="post" action="/m365/send-email" class="outreach-draft-form" id="outreach-send-form">
+                    <input type="hidden" name="customer" value="{escape(customer)}">
+                    <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
                     <p class="outreach-edit-note">You can tweak the recipient, subject, or email draft before sending.</p>
                     {send_status_note}
                     <div class="outreach-draft-row">
@@ -4828,16 +5808,45 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
                     <div class="outreach-draft-actions">
                         {send_button_markup}
                     </div>
-                </div>
+                    <div class="outreach-confirm-overlay" id="m365-send-confirm" hidden>
+                        <div class="outreach-confirm-card" role="dialog" aria-modal="true" aria-labelledby="m365-send-confirm-title">
+                            <h3 id="m365-send-confirm-title">Send this email now?</h3>
+                            <p class="muted">Please check the mailbox, recipient, and subject before sending.</p>
+                            <div class="outreach-confirm-details">
+                                <div><span class="label">From</span><strong id="m365-confirm-from">{escape(sender_mailbox or (current_user or {}).get('m365_email') or '')}</strong></div>
+                                <div><span class="label">To</span><strong id="m365-confirm-to">{escape(target_email)}</strong></div>
+                                <div><span class="label">Subject</span><strong id="m365-confirm-subject">{escape(email_subject)}</strong></div>
+                            </div>
+                            <div class="outreach-confirm-preview" id="m365-confirm-body">{escape(email_body)}</div>
+                            <div class="outreach-confirm-actions">
+                                <button type="button" class="button secondary" onclick="hideM365SendConfirm()">Cancel</button>
+                                <button type="submit" class="button">Send Email</button>
+                            </div>
+                        </div>
+                    </div>
+                </form>
                 <script>
-                    function openOutreachMailto() {{
+                    function showM365SendConfirm() {{
+                        const overlay = document.getElementById('m365-send-confirm');
+                        if (!overlay) return;
                         const to = document.getElementById('outreach-email-to')?.value?.trim() || '';
                         const subject = document.getElementById('outreach-email-subject')?.value || '';
                         const body = document.getElementById('outreach-email-body')?.value || '';
-                        if (!to) return;
-                        const mailtoUrl = 'mailto:' + encodeURIComponent(to) + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
-                        window.location.href = mailtoUrl;
+                        const toField = document.getElementById('m365-confirm-to');
+                        const subjectField = document.getElementById('m365-confirm-subject');
+                        const bodyField = document.getElementById('m365-confirm-body');
+                        if (toField) toField.textContent = to || 'Not set';
+                        if (subjectField) subjectField.textContent = subject || 'Not set';
+                        if (bodyField) bodyField.textContent = body || 'No body text';
+                        overlay.hidden = false;
                     }}
+                    function hideM365SendConfirm() {{
+                        const overlay = document.getElementById('m365-send-confirm');
+                        if (overlay) overlay.hidden = true;
+                    }}
+                    document.addEventListener('DOMContentLoaded', function () {{
+                        hideM365SendConfirm();
+                    }});
                 </script>
     """
 
@@ -5315,6 +6324,8 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
             "name": contact["name"],
             "email": contact["email"],
             "title": contact.get("title", ""),
+            "phone": contact.get("phone", ""),
+            "cell": contact.get("cell", ""),
             "role": role,
             "influence": influence,
             "note": note,
@@ -6294,6 +7305,7 @@ def build_action_plan_contact_policy(outbound_sales, customer_name=""):
     latest_call_days = None
     latest_direct_touch_days = None
     email_first_customer = is_email_first_corporate_customer(customer_name)
+    ignore_recent_contact_hold = should_ignore_action_plan_recent_contact_hold(customer_name)
 
     for activity in sorted_outbound:
         activity_days = get_crm_days_since_latest_activity(activity)
@@ -6323,12 +7335,19 @@ def build_action_plan_contact_policy(outbound_sales, customer_name=""):
         and 0 <= latest_direct_touch_days < 30
     )
 
-    exclude_from_action_plan = recent_contact_hold or direct_touch_cooloff_hold
+    exclude_from_action_plan = (
+        False
+        if ignore_recent_contact_hold
+        else (recent_contact_hold or direct_touch_cooloff_hold)
+    )
     hold_reason = ""
     mode_override = ""
     why_override = ""
 
-    if direct_touch_cooloff_hold:
+    if ignore_recent_contact_hold:
+        mode_override = "Email"
+        why_override = "Testing override enabled for this customer • recent contact hold ignored"
+    elif direct_touch_cooloff_hold:
         hold_reason = "Recent email and direct follow-up already logged"
         mode_override = "Hold"
         why_override = "Email and call/text already logged • wait until 30 days since the latest direct follow-up"
@@ -6403,7 +7422,36 @@ def render_home_action_plan(action_plan):
     """
 
 
-def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, dismiss_customer=""):
+def render_home_add_customer_form(customer_options, selected_customer="", home_view="focus"):
+    options_markup = "".join(
+        f"<option value=\"{escape(str(customer_name or ''))}\"></option>"
+        for customer_name in customer_options
+        if str(customer_name or "").strip()
+    )
+    return f"""
+        <form class="home-add-customer-form" method="get" action="/action-plan-view">
+            <input type="hidden" name="view" value="{escape(str(home_view or 'focus'))}">
+            <label class="sr-only" for="home-add-customer">Add customer</label>
+            <input
+                id="home-add-customer"
+                class="home-add-customer-input"
+                type="search"
+                name="selected_customer"
+                list="home-customer-options"
+                value=""
+                placeholder="Add customer to focus…"
+                autocomplete="off"
+            >
+            <datalist id="home-customer-options">
+                {options_markup}
+            </datalist>
+            <button type="submit" class="button home-add-customer-button">Add</button>
+        </form>
+    """
+
+
+def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, customer_options=None, dismiss_customer=""):
+    customer_options = customer_options or []
     queue_rows = "".join(
         render_home_queue_row(
             summary,
@@ -6425,7 +7473,10 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
 
     return f"""
         <section class="home-workspace">
-            {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view)}
+            <div class="home-workspace-topbar">
+                {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view)}
+                {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view)}
+            </div>
             {render_home_focus_preview(selected_preview, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
 
             <section class="panel home-queue-panel" id="home-queue">
@@ -6504,8 +7555,9 @@ def build_outreach_prep_href(customer_name="", return_to=""):
     return f"/outreach-prep?{urlencode(params, quote_via=quote)}"
 
 
-def get_home_selected_customer_name(queue_summaries, selected_customer=""):
-    if not queue_summaries:
+def get_home_selected_customer_name(queue_summaries, selected_customer="", customer_options=None):
+    customer_options = customer_options or []
+    if not queue_summaries and not customer_options:
         return ""
 
     selected_lookup = str(selected_customer or "").strip().lower()
@@ -6514,7 +7566,12 @@ def get_home_selected_customer_name(queue_summaries, selected_customer=""):
         for summary in queue_summaries:
             if str(summary.get("customer", "")).strip().lower() == selected_lookup:
                 return str(summary.get("customer", ""))
+        for customer_name in customer_options:
+            if str(customer_name or "").strip().lower() == selected_lookup:
+                return str(customer_name or "").strip()
 
+    if not queue_summaries:
+        return ""
     return str(queue_summaries[0].get("customer", ""))
 
 
@@ -6697,6 +7754,171 @@ def extract_customer_location_label(customer_name, customer_orders=None):
     return "Location not recorded"
 
 
+def get_forced_action_plan_customers():
+    raw_value = str(os.getenv("ACTION_PLAN_FORCE_CUSTOMERS", "") or "").strip()
+    if not raw_value:
+        return []
+    return [
+        item.strip()
+        for item in raw_value.split(",")
+        if item.strip()
+    ]
+
+
+def get_action_plan_recent_contact_hold_override_customers():
+    raw_value = str(os.getenv("ACTION_PLAN_IGNORE_RECENT_CONTACT_HOLD_CUSTOMERS", "") or "").strip()
+    if not raw_value:
+        return []
+    return [
+        item.strip().casefold()
+        for item in raw_value.split(",")
+        if item.strip()
+    ]
+
+
+def should_ignore_action_plan_recent_contact_hold(customer_name):
+    customer_name = str(customer_name or "").strip()
+    if not customer_name:
+        return False
+    return customer_name.casefold() in set(get_action_plan_recent_contact_hold_override_customers())
+
+
+def apply_test_customer_outreach_mode_overrides(outreach_result, customer_name):
+    outreach_result = dict(outreach_result or {})
+    customer_name = str(customer_name or "").strip()
+
+    if not customer_name:
+        return outreach_result
+
+    if should_ignore_action_plan_recent_contact_hold(customer_name):
+        current_mode = str(outreach_result.get("suggested_mode") or "").strip().lower()
+        if current_mode == "hold":
+            outreach_result["suggested_mode"] = "Email"
+            rationale = list(outreach_result.get("rationale_bullets") or [])
+            rationale.insert(0, "Testing override enabled for this customer, so recent-contact hold has been ignored.")
+            outreach_result["rationale_bullets"] = rationale[:5]
+
+    return outreach_result
+
+
+def build_forced_action_plan_customer(customer_name, customer_orders, crm_matches=None):
+    customer_name = str(customer_name or "").strip()
+    customer_orders = customer_orders or []
+    crm_matches = crm_matches or []
+
+    if not customer_name or not customer_orders:
+        return None
+
+    order_dates = sorted(
+        [
+            datetime.strptime(str(order.get("order_date") or "").strip(), "%Y-%m-%d")
+            for order in customer_orders
+            if str(order.get("order_date") or "").strip()
+        ]
+    )
+    if not order_dates:
+        return None
+
+    last_order_dt = order_dates[-1]
+    last_order_text = last_order_dt.strftime("%Y-%m-%d")
+    today = get_analysis_today()
+    days_since_last = max((today - last_order_dt).days, 0)
+
+    sales_crm_matches = get_sales_outreach_activities(crm_matches)
+    latest_crm_activity = crm_matches[0] if crm_matches else None
+    latest_sales_crm_activity = sales_crm_matches[0] if sales_crm_matches else None
+    crm_recent_days = get_crm_days_since_latest_activity(latest_sales_crm_activity)
+    display_last_contact, _last_contact_source = build_last_contact_display(
+        "",
+        latest_crm_activity,
+        crm_activities=crm_matches,
+    )
+
+    return {
+        "customer": customer_name,
+        "avg_gap": 30.0,
+        "cycle_pattern": "testing_override",
+        "cycle_pattern_label": "Testing override",
+        "cycle_consistency": "unknown",
+        "days_since_last": days_since_last,
+        "priority_score": round(max(1.75, (days_since_last / 30) if days_since_last else 1.75), 2),
+        "action": "Testing override",
+        "last_activity_date": (
+            latest_sales_crm_activity.get("date_created", "")[:10]
+            if latest_sales_crm_activity else None
+        ),
+        "last_activity_content": "",
+        "days_since_last_activity": crm_recent_days,
+        "status": "needs_attention",
+        "last_order": last_order_text,
+        "display_last_contact": display_last_contact,
+        "force_test_override": True,
+    }
+
+
+def build_manual_action_plan_customer(customer_name, customer_orders, crm_matches=None):
+    customer_name = str(customer_name or "").strip()
+    customer_orders = customer_orders or []
+    crm_matches = crm_matches or []
+
+    if not customer_name or not customer_orders:
+        return None
+
+    order_dates = sorted(
+        [
+            datetime.strptime(str(order.get("order_date") or "").strip(), "%Y-%m-%d")
+            for order in customer_orders
+            if str(order.get("order_date") or "").strip()
+        ]
+    )
+    if not order_dates:
+        return None
+
+    last_order_dt = order_dates[-1]
+    last_order_text = last_order_dt.strftime("%Y-%m-%d")
+    today = get_analysis_today()
+    days_since_last = max((today - last_order_dt).days, 0)
+    cycle = analyze_order_cycle(customer_orders)
+    avg_gap = cycle.get("cycle_days")
+    if not avg_gap:
+        avg_gap = 30.0
+    try:
+        priority_score = round(max(1.1, days_since_last / float(avg_gap or 30.0)), 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        priority_score = 1.1
+
+    sales_crm_matches = get_sales_outreach_activities(crm_matches)
+    latest_crm_activity = crm_matches[0] if crm_matches else None
+    latest_sales_crm_activity = sales_crm_matches[0] if sales_crm_matches else None
+    crm_recent_days = get_crm_days_since_latest_activity(latest_sales_crm_activity)
+    display_last_contact, _last_contact_source = build_last_contact_display(
+        "",
+        latest_crm_activity,
+        crm_activities=crm_matches,
+    )
+
+    return {
+        "customer": customer_name,
+        "avg_gap": avg_gap,
+        "cycle_pattern": cycle.get("pattern", "manual"),
+        "cycle_pattern_label": cycle.get("pattern_label", "Manual add"),
+        "cycle_consistency": cycle.get("consistency", "unknown"),
+        "days_since_last": days_since_last,
+        "priority_score": priority_score,
+        "action": "Manual add",
+        "last_activity_date": (
+            latest_sales_crm_activity.get("date_created", "")[:10]
+            if latest_sales_crm_activity else None
+        ),
+        "last_activity_content": "",
+        "days_since_last_activity": crm_recent_days,
+        "status": "needs_attention",
+        "last_order": last_order_text,
+        "display_last_contact": display_last_contact,
+        "manually_added": True,
+    }
+
+
 def build_home_preview_payload(selected_customer, queue_summaries, grouped_orders, attention_customers, crm_result):
     started_at = time.perf_counter()
 
@@ -6711,20 +7933,44 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         None,
     )
 
-    if not queue_summary:
-        return None
-
     customer_orders = grouped_orders.get(selected_customer, [])
     if not customer_orders:
         return None
+
+    crm_activity_map = (
+        crm_result.get("activity_map", {})
+        if crm_result.get("status") == "ok" else {}
+    )
+    customer_primary_key = get_customer_primary_key(customer_orders)
+    crm_activities = crm_activity_map.get(customer_primary_key, [])
+    crm_activities = merge_recent_sent_emails_with_crm(selected_customer, crm_activities)
 
     attention_lookup = {
         str(item.get("customer", "")): item
         for item in attention_customers
     }
     attention = attention_lookup.get(selected_customer)
+    if not queue_summary:
+        manual_customer = attention or build_manual_action_plan_customer(
+            selected_customer,
+            customer_orders,
+            crm_matches=crm_activities,
+        )
+        if not manual_customer:
+            return None
+        manual_summaries = build_home_queue_summaries(
+            [manual_customer],
+            grouped_orders,
+            crm_activity_map,
+        )
+        queue_summary = manual_summaries[0] if manual_summaries else None
+        if not queue_summary:
+            return None
+        if not attention:
+            attention = manual_customer
     context = build_outreach_context(selected_customer, customer_orders, attention, crm_result)
     result = build_outreach_prep_fallback(context)
+    result = apply_test_customer_outreach_mode_overrides(result, selected_customer)
     target_contact_name = str(result.get("recommended_contact_name") or "").strip()
     target_contact_email = str(result.get("recommended_contact_email") or "").strip()
     primary_contact = context.get("primary_contact") or {}
@@ -6871,6 +8117,11 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
             label = " • ".join(bit for bit in [name, title] if bit)
             options.append({
                 "email": email,
+                "name": name,
+                "title": title,
+                "phone": str(row.get("phone") or "").strip(),
+                "cell": str(row.get("cell") or "").strip(),
+                "status_note": "Inactive contact" if str(row.get("active") or "").strip().lower() not in {"", "active"} else "",
                 "label": label,
             })
 
@@ -6891,6 +8142,11 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
         label = " • ".join(label_bits)
         options.append({
             "email": email,
+            "name": name,
+            "title": title,
+            "phone": str(contact.get("phone") or "").strip(),
+            "cell": str(contact.get("cell") or "").strip(),
+            "status_note": "Inactive contact" if active and active != "active" else "",
             "label": label,
         })
 
@@ -6907,12 +8163,25 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
         label = " • ".join(bit for bit in [name, title] if bit)
         options.append({
             "email": email,
+            "name": name,
+            "title": title,
+            "phone": str(contact.get("phone") or "").strip(),
+            "cell": str(contact.get("cell") or "").strip(),
+            "status_note": str(contact.get("status_note") or "").strip(),
             "label": label,
         })
 
     target_key = str(target_email or "").strip().lower()
     if target_key and target_key not in seen:
-        options.insert(0, {"email": str(target_email).strip(), "label": "Suggested recipient"})
+        options.insert(0, {
+            "email": str(target_email).strip(),
+            "name": "",
+            "title": "",
+            "phone": "",
+            "cell": "",
+            "status_note": "",
+            "label": "Suggested recipient",
+        })
 
     return options
 
@@ -6933,10 +8202,19 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     )
     mode = str(preview.get("mode") or "Email").strip() or "Email"
     mode_lower = mode.lower()
+    current_user = get_current_session_user()
+    m365_state = get_m365_connection_state(current_user)
+    sender_mailbox = str(m365_state.get("mailbox") or "").strip()
+    connect_return_to = f"/outreach-prep?{urlencode({'customer': customer_name, 'return_to': return_to}, quote_via=quote)}"
+    m365_connect_href = f"/m365/connect?return_to={quote(connect_return_to)}"
     slug = re.sub(r"[^a-z0-9]+", "-", customer_name.lower()).strip("-") or "focus"
+    overlay_id = f"home-focus-send-confirm-{slug}"
     to_input_id = f"home-focus-email-to-{slug}"
     subject_input_id = f"home-focus-email-subject-{slug}"
     body_input_id = f"home-focus-email-body-{slug}"
+    confirm_to_id = f"home-focus-confirm-to-{slug}"
+    confirm_subject_id = f"home-focus-confirm-subject-{slug}"
+    confirm_body_id = f"home-focus-confirm-body-{slug}"
     overview_text = build_home_focus_account_overview(context, queue_summary)
     evidence_strength = condense_evidence_strength(result.get("evidence_strength") or "Not available")
     email_subject = str(result.get("email_subject") or "").strip() or "Not available"
@@ -6948,6 +8226,12 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
         target_email=target_email,
     )
     recipient_select_id = f"home-focus-email-select-{slug}"
+    call_select_id = f"home-focus-call-select-{slug}"
+    call_name_id = f"home-focus-call-name-{slug}"
+    call_role_id = f"home-focus-call-role-{slug}"
+    call_phone_id = f"home-focus-call-phone-{slug}"
+    call_status_id = f"home-focus-call-status-{slug}"
+    call_button_id = f"home-focus-call-button-{slug}"
     latest_outreach_subject = str(context.get("latest_sales_outreach_subject") or "").strip()
     latest_outreach_preview = str(context.get("latest_sales_outreach_preview") or "").strip()
     latest_outreach_date = format_optional_datetime(context.get("latest_sales_outreach") or "")
@@ -6971,6 +8255,21 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     phone_markup = (
         f'<div class="home-focus-inline-row"><span class="label">Phone</span><strong>{escape(target_phone)}</strong></div>'
         if target_phone else ""
+    )
+    current_call_phone = target_phone
+    current_call_name = target_name
+    current_call_role = target_role
+    current_call_status = target_status_note
+    recipient_options_markup = "".join(
+        f'<option value="{escape(item["email"])}"'
+        f' data-name="{escape(item.get("name") or "")}"'
+        f' data-title="{escape(item.get("title") or "")}"'
+        f' data-phone="{escape(item.get("phone") or "")}"'
+        f' data-cell="{escape(item.get("cell") or "")}"'
+        f' data-status="{escape(item.get("status_note") or "")}"'
+        f'{" selected" if str(item.get("email") or "").strip().lower() == str(target_email or "").strip().lower() else ""}>'
+        f'{escape(item["label"] or item["email"])}{" — " if item["label"] else ""}{escape(item["email"])}</option>'
+        for item in recipient_options
     )
 
     latest_history_markup = ""
@@ -7071,29 +8370,33 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
             <p class="home-focus-mode-note" id="{mode_note_id}">Recommended: {escape(recommended_mode_label)}</p>
         """
         send_status_note = (
-            "<p class='outreach-m365-note'>Edit the draft here, then open it in your usual email app without leaving the queue.</p>"
+            f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}</p>"
+            if m365_state.get("connected") and sender_mailbox
+            else "<p class='outreach-m365-note'>Connect Microsoft 365 to send from Sales Focus, or use the full prep page while we keep testing.</p>"
         )
-        primary_action = f"""
-            <button type="button" class="button home-focus-send-button" onclick="openHomeFocusMailto('{slug}')">
+        primary_action = (
+            f"""
+            <button type="button" class="button home-focus-send-button" onclick="showHomeFocusM365SendConfirm('{slug}')">
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                     <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
                 </svg>
-                <span>Open Email App</span>
+                <span>Send Email</span>
             </button>
-        """
+            """
+            if m365_state.get("connected")
+            else f"""
+            <a class="button home-focus-send-button" href="{escape(m365_connect_href)}">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path fill="currentColor" d="M12 2.8a9.2 9.2 0 1 1-9.2 9.2A9.2 9.2 0 0 1 12 2.8Zm0 4.2a1 1 0 0 0-1 1v3.2a1 1 0 0 0 .29.71l1.96 1.96a1 1 0 1 0 1.42-1.42L13 10.79V8a1 1 0 0 0-1-1Z"/>
+                </svg>
+                <span>Connect Microsoft 365</span>
+            </a>
+            """
+        )
         call_action = (
             f'<a class="button home-focus-send-button" href="tel:{escape(target_phone)}"><span>Call {escape(target_name)}</span></a>'
             if target_phone
             else '<button type="button" class="button home-focus-send-button" disabled>No phone number available</button>'
-        )
-        text_tone_hint = (
-            f"""
-            <p class="home-focus-tone-note">
-                Text-style tone cue: {escape(suggested_text_message)}
-            </p>
-            """
-            if suggested_text_message and suggested_text_message != "Not available"
-            else ""
         )
         return f"""
             <section class="home-focus-work-card">
@@ -7112,10 +8415,11 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         data-home-focus-slug="{slug}"
                         {'hidden' if initial_mode != 'email' else ''}
                     >
-                        <div class="outreach-draft-form home-focus-draft-form" id="home-focus-send-form-{slug}">
+                        <form method="post" action="/m365/send-email" class="outreach-draft-form home-focus-draft-form" id="home-focus-send-form-{slug}">
+                            <input type="hidden" name="customer" value="{escape(customer_name)}">
+                            <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
                             <p class="outreach-edit-note">Edit the draft here, then send without leaving the queue.</p>
                             {send_status_note}
-                            {text_tone_hint}
                             <div class="outreach-draft-row">
                                 <label class="label" for="{to_input_id}">To</label>
                                 <div class="home-focus-recipient-row">
@@ -7126,7 +8430,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                                         </svg>
                                         <select id="{recipient_select_id}" class="home-focus-recipient-select" onchange="syncHomeFocusRecipient('{slug}')">
                                             <option value="">Select branch contact…</option>
-                                            {''.join(f'<option value="{escape(item["email"])}">{escape(item["label"] or item["email"])}{" — " if item["label"] else ""}{escape(item["email"])}</option>' for item in recipient_options)}
+                                            {recipient_options_markup}
                                         </select>
                                     </label>
                                 </div>
@@ -7142,7 +8446,23 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             <div class="outreach-draft-actions home-focus-draft-actions">
                                 {primary_action}
                             </div>
-                        </div>
+                            <div class="outreach-confirm-overlay" id="{overlay_id}" hidden>
+                                <div class="outreach-confirm-card" role="dialog" aria-modal="true" aria-labelledby="{overlay_id}-title">
+                                    <h3 id="{overlay_id}-title">Send this email now?</h3>
+                                    <p class="muted">Please check the mailbox, recipient, and subject before sending.</p>
+                                    <div class="outreach-confirm-details">
+                                        <div><span class="label">From</span><strong>{escape(sender_mailbox or (current_user or {}).get('m365_email') or '')}</strong></div>
+                                        <div><span class="label">To</span><strong id="{confirm_to_id}">{escape(target_email)}</strong></div>
+                                        <div><span class="label">Subject</span><strong id="{confirm_subject_id}">{escape(email_subject)}</strong></div>
+                                    </div>
+                                    <div class="outreach-confirm-preview" id="{confirm_body_id}">{escape(email_body)}</div>
+                                    <div class="outreach-confirm-actions">
+                                        <button type="button" class="button secondary" onclick="hideHomeFocusM365SendConfirm('{slug}')">Cancel</button>
+                                        <button type="submit" class="button">Send Email</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </form>
                     </div>
                     <div
                         class="home-focus-mode-panel"
@@ -7153,14 +8473,32 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         <p class="home-focus-call-note">Use this quick script in the same window, then move on to the next account.</p>
                         <div class="home-focus-call-card">
                             <div class="home-focus-inline-contact">
-                                <strong>{escape(target_name)}</strong>
-                                <span class="home-focus-inline-meta">{escape(target_role)}</span>
-                                {f'<span class="home-focus-inline-meta">{escape(target_phone)}</span>' if target_phone else '<span class="home-focus-inline-meta">Phone not recorded</span>'}
+                                <div class="home-focus-call-contact-head">
+                                    <strong id="{call_name_id}">{escape(current_call_name)}</strong>
+                                    <label class="home-focus-recipient-picker home-focus-call-picker" title="Choose branch contact" aria-label="Choose branch contact">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                            <path fill="currentColor" d="M12 12.5a4.25 4.25 0 1 1 0-8.5 4.25 4.25 0 0 1 0 8.5Zm0-1.5a2.75 2.75 0 1 0 0-5.5 2.75 2.75 0 0 0 0 5.5Zm0 3c3.78 0 6.9 1.94 7.82 4.77a.75.75 0 0 1-1.43.46C17.67 17.1 15.08 15.5 12 15.5s-5.67 1.6-6.39 3.73a.75.75 0 1 1-1.43-.46C5.1 15.94 8.22 14 12 14Z"/>
+                                        </svg>
+                                        <select id="{call_select_id}" class="home-focus-recipient-select" onchange="syncHomeFocusCallContact('{slug}')">
+                                            <option value="">Select branch contact…</option>
+                                            {recipient_options_markup}
+                                        </select>
+                                    </label>
+                                </div>
+                                <span class="home-focus-inline-meta" id="{call_role_id}">{escape(current_call_role)}</span>
+                                <span class="home-focus-inline-meta" id="{call_phone_id}">{escape(current_call_phone) if current_call_phone else 'Phone not recorded'}</span>
+                                <span class="home-focus-inline-meta" id="{call_status_id}" {'hidden' if not current_call_status else ''}>{escape(current_call_status)}</span>
                             </div>
                             <ul class="home-focus-call-points">{call_points_markup}</ul>
                         </div>
                         <div class="home-focus-draft-actions">
-                            {call_action}
+                            <a
+                                class="button home-focus-send-button"
+                                id="{call_button_id}"
+                                href="tel:{escape(current_call_phone)}"
+                                {'hidden' if not current_call_phone else ''}
+                            ><span>Call {escape(current_call_name)}{f' ({escape(current_call_phone)})' if current_call_phone else ''}</span></a>
+                            <p class="home-focus-call-missing" id="{call_button_id}-missing" {'hidden' if current_call_phone else ''}>No phone number available</p>
                         </div>
                     </div>
                 </div>
@@ -7194,13 +8532,23 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             }}
                         }}
                     }}
-                    function openHomeFocusMailto(slug) {{
+                    function showHomeFocusM365SendConfirm(slug) {{
+                        const overlay = document.getElementById(`home-focus-send-confirm-${{slug}}`);
+                        if (!overlay) return;
                         const to = document.getElementById(`home-focus-email-to-${{slug}}`)?.value?.trim() || '';
                         const subject = document.getElementById(`home-focus-email-subject-${{slug}}`)?.value || '';
                         const body = document.getElementById(`home-focus-email-body-${{slug}}`)?.value || '';
-                        if (!to) return;
-                        const mailtoUrl = 'mailto:' + encodeURIComponent(to) + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
-                        window.location.href = mailtoUrl;
+                        const toField = document.getElementById(`home-focus-confirm-to-${{slug}}`);
+                        const subjectField = document.getElementById(`home-focus-confirm-subject-${{slug}}`);
+                        const bodyField = document.getElementById(`home-focus-confirm-body-${{slug}}`);
+                        if (toField) toField.textContent = to || 'Not set';
+                        if (subjectField) subjectField.textContent = subject || 'Not set';
+                        if (bodyField) bodyField.textContent = body || 'No body text';
+                        overlay.hidden = false;
+                    }}
+                    function hideHomeFocusM365SendConfirm(slug) {{
+                        const overlay = document.getElementById(`home-focus-send-confirm-${{slug}}`);
+                        if (overlay) overlay.hidden = true;
                     }}
                     function syncHomeFocusRecipient(slug) {{
                         const picker = document.getElementById(`home-focus-email-select-${{slug}}`);
@@ -7208,8 +8556,40 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         if (!picker || !input) return;
                         if (picker.value) input.value = picker.value;
                     }}
+                    function syncHomeFocusCallContact(slug) {{
+                        const picker = document.getElementById(`home-focus-call-select-${{slug}}`);
+                        if (!picker) return;
+                        const selected = picker.options[picker.selectedIndex];
+                        if (!selected) return;
+                        const nameField = document.getElementById(`home-focus-call-name-${{slug}}`);
+                        const roleField = document.getElementById(`home-focus-call-role-${{slug}}`);
+                        const phoneField = document.getElementById(`home-focus-call-phone-${{slug}}`);
+                        const statusField = document.getElementById(`home-focus-call-status-${{slug}}`);
+                        const callButton = document.getElementById(`home-focus-call-button-${{slug}}`);
+                        const missingState = document.getElementById(`home-focus-call-button-${{slug}}-missing`);
+                        const name = selected.dataset.name || selected.value || 'Best known contact';
+                        const title = selected.dataset.title || 'Likely sales contact';
+                        const phone = selected.dataset.phone || selected.dataset.cell || '';
+                        const status = selected.dataset.status || '';
+                        if (nameField) nameField.textContent = name;
+                        if (roleField) roleField.textContent = title;
+                        if (phoneField) phoneField.textContent = phone || 'Phone not recorded';
+                        if (statusField) {{
+                            statusField.textContent = status;
+                            statusField.hidden = !status;
+                        }}
+                        if (callButton) {{
+                            callButton.hidden = !phone;
+                            callButton.href = phone ? `tel:${{phone}}` : '#';
+                            const span = callButton.querySelector('span');
+                            if (span) span.textContent = phone ? `Call ${{name}} (${{phone}})` : `Call ${{name}}`;
+                        }}
+                        if (missingState) missingState.hidden = !!phone;
+                    }}
                     document.addEventListener('DOMContentLoaded', function () {{
+                        hideHomeFocusM365SendConfirm('{slug}');
                         setHomeFocusMode('{slug}', '{initial_mode}');
+                        syncHomeFocusCallContact('{slug}');
                     }});
                 </script>
             </section>
@@ -8958,6 +10338,7 @@ EMAIL_FIRST_COMPANY_ALIASES = (
     {"alsco"},
     {"unifirst", "uni first"},
 )
+
 ASK_DATA_NOISE_TOKENS = {
     "who", "what", "when", "where", "why", "how", "did", "does", "do", "is", "are",
     "the", "a", "an", "at", "in", "on", "from", "for", "of", "to", "we", "our",
@@ -9071,6 +10452,7 @@ def is_email_first_corporate_customer(value):
             return True
 
     return False
+
 
 def get_distinctive_question_tokens(value):
     tokens = get_alias_aware_company_tokens(value)
@@ -10917,6 +12299,7 @@ def render_global_nav(title):
             <div class="nav-admin-dropdown">
                 <a href="/enrichment-view">Customer Enrichment</a>
                 <a href="/pdl-branch-view">PDL Enrichment Test</a>
+                <a href="/user-accounts">User Accounts</a>
                 <a href="/dismissed-customers-view">Dismissed Customers</a>
                 <a href="/filemaker-health">FileMaker Health</a>
                 <a href="/crm-activities-view">CRM Activities</a>
@@ -10928,6 +12311,13 @@ def render_global_nav(title):
     """
 
     user_shell = ""
+    if current_display_name:
+        user_shell = (
+            "<div class=\"nav-user-shell\">"
+            f"<span class=\"nav-user-name\">{escape(current_display_name)}</span>"
+            "<a class=\"nav-logout\" href=\"/logout\">Log out</a>"
+            "</div>"
+        )
 
     return (
         "<div class=\"nav-shell\">"
@@ -11251,6 +12641,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         gap: 16px;
                     }}
 
+                    .home-workspace-topbar {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 12px;
+                    }}
+
                     .home-view-toggle {{
                         display: inline-flex;
                         align-items: center;
@@ -11262,6 +12660,31 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: var(--shadow-soft);
                         margin-bottom: 4px;
                         width: fit-content;
+                    }}
+
+                    .home-add-customer-form {{
+                        display: flex;
+                        align-items: center;
+                        gap: 8px;
+                        margin-bottom: 4px;
+                    }}
+
+                    .home-add-customer-input {{
+                        width: min(360px, 100%);
+                        min-width: 220px;
+                        min-height: 38px;
+                        padding: 0 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: #ffffff;
+                        color: var(--text);
+                        font-size: 13px;
+                    }}
+
+                    .home-add-customer-button {{
+                        min-height: 38px;
+                        padding: 0 14px;
+                        font-size: 13px;
                     }}
 
                     .home-view-toggle .toggle-chip {{
@@ -11617,13 +13040,6 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-height: 240px;
                     }}
 
-                    .home-focus-tone-note {{
-                        margin: -2px 0 2px;
-                        color: #5c7088;
-                        font-size: 12px;
-                        line-height: 1.4;
-                    }}
-
                     .home-focus-mode-panels {{
                         display: grid;
                         gap: 12px;
@@ -11663,6 +13079,17 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         background: #fbfdff;
                     }}
 
+                    .home-focus-call-contact-head {{
+                        display: flex;
+                        align-items: center;
+                        gap: 10px;
+                        flex-wrap: wrap;
+                    }}
+
+                    .home-focus-call-picker {{
+                        flex: 0 0 32px;
+                    }}
+
                     .home-focus-call-points {{
                         margin: 0;
                         padding-left: 18px;
@@ -11673,6 +13100,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .home-focus-call-points li + li {{
                         margin-top: 8px;
+                    }}
+
+                    .home-focus-call-missing {{
+                        margin: 0;
+                        color: #5c7088;
+                        font-size: 13px;
+                        line-height: 1.4;
                     }}
 
                     .home-focus-history-stack {{
@@ -14181,6 +15615,74 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-width: 0;
                     }}
 
+                    .user-account-columns {{
+                        grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+                        align-items: start;
+                    }}
+
+                    .m365-account-columns {{
+                        grid-template-columns: 1fr;
+                    }}
+
+                    .user-accounts-table {{
+                        table-layout: fixed;
+                        min-width: 980px;
+                        font-size: 12px;
+                    }}
+
+                    .user-accounts-table th,
+                    .user-accounts-table td {{
+                        white-space: nowrap;
+                        overflow-wrap: normal;
+                        word-break: normal;
+                    }}
+
+                    .user-accounts-table th {{
+                        font-size: 11px;
+                    }}
+
+                    .user-accounts-table th:nth-child(1),
+                    .user-accounts-table td:nth-child(1) {{
+                        width: 14%;
+                    }}
+
+                    .user-accounts-table th:nth-child(2),
+                    .user-accounts-table td:nth-child(2) {{
+                        width: 14%;
+                    }}
+
+                    .user-accounts-table th:nth-child(3),
+                    .user-accounts-table td:nth-child(3) {{
+                        width: 28%;
+                    }}
+
+                    .user-accounts-table th:nth-child(4),
+                    .user-accounts-table td:nth-child(4) {{
+                        width: 8%;
+                    }}
+
+                    .user-accounts-table th:nth-child(5),
+                    .user-accounts-table td:nth-child(5) {{
+                        width: 10%;
+                    }}
+
+                    .user-accounts-table th:nth-child(6),
+                    .user-accounts-table td:nth-child(6) {{
+                        width: 16%;
+                        text-align: center;
+                    }}
+
+                    .user-account-edit-link {{
+                        color: var(--text);
+                        font-weight: 700;
+                        text-decoration: none;
+                    }}
+
+                    .user-account-edit-link:hover {{
+                        color: var(--blue);
+                        text-decoration: underline;
+                    }}
+
                     .attention-table {{
                         table-layout: fixed;
                     }}
@@ -14530,6 +16032,19 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 1120px) {{
+                        .user-account-columns {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .user-accounts-table {{
+                            min-width: 980px;
+                        }}
+
+                        .user-accounts-table th,
+                        .user-accounts-table td {{
+                            white-space: nowrap;
+                        }}
+
                         .home-dashboard-shell {{
                             grid-template-columns: 1fr;
                             gap: 14px;
@@ -14613,6 +16128,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 720px) {{
+                        .user-accounts-table {{
+                            font-size: 12px;
+                            min-width: 860px;
+                        }}
+
                         main.home-shell-main {{
                             padding: 14px 12px 24px;
                         }}
@@ -14777,6 +16297,25 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             align-items: stretch;
                             gap: 12px;
                             margin-bottom: 14px;
+                        }}
+
+                        .home-workspace-topbar {{
+                            align-items: stretch;
+                        }}
+
+                        .home-add-customer-form {{
+                            width: 100%;
+                            flex-direction: column;
+                            align-items: stretch;
+                        }}
+
+                        .home-add-customer-input {{
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .home-add-customer-button {{
+                            width: 100%;
                         }}
 
                         .home-preview-dismiss-form {{
