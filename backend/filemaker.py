@@ -37,7 +37,9 @@ def get_filemaker_config():
         "customers_layout": os.getenv("FILEMAKER_CUSTOMERS_LAYOUT", "").strip(),
         "customers_key_field": os.getenv("FILEMAKER_CUSTOMERS_KEY_FIELD", "PrimaryKey").strip(),
         "customers_name_field": os.getenv("FILEMAKER_CUSTOMERS_NAME_FIELD", "Company").strip(),
+        "customers_city_field": os.getenv("FILEMAKER_CUSTOMERS_CITY_FIELD", "City").strip(),
         "customers_state_field": os.getenv("FILEMAKER_CUSTOMERS_STATE_FIELD", "State").strip(),
+        "customers_country_field": os.getenv("FILEMAKER_CUSTOMERS_COUNTRY_FIELD", "Country").strip(),
         "customers_zip_field": os.getenv("FILEMAKER_CUSTOMERS_ZIP_FIELD", "ZIP Code").strip(),
         "customers_activity_status_field": os.getenv(
             "FILEMAKER_CUSTOMERS_ACTIVITY_STATUS_FIELD", "Activity Status"
@@ -112,6 +114,13 @@ def get_database_path(config):
     return f"{config['url']}/fmi/data/vLatest/databases/{database}"
 
 
+def format_request_error(error):
+    detail = str(error or "").strip()
+    if detail:
+        return f"{error.__class__.__name__}: {detail}"
+    return error.__class__.__name__
+
+
 def get_session_token():
     config = get_filemaker_config()
 
@@ -152,7 +161,7 @@ def close_session(token):
             verify=config["verify_ssl"]
         )
     except requests.RequestException as error:
-        print(f"FileMaker logout error: {error.__class__.__name__}")
+        print(f"FileMaker logout error: {format_request_error(error)}")
 
 
 def check_filemaker_connection():
@@ -168,7 +177,7 @@ def check_filemaker_connection():
     try:
         token = get_session_token()
     except requests.RequestException as error:
-        print(f"FileMaker connection error: {error.__class__.__name__}")
+        print(f"FileMaker connection error: {format_request_error(error)}")
         return {
             "configured": True,
             "connected": False,
@@ -247,7 +256,7 @@ def fetch_layout_records(layout, limit=100, offset=1, sort_fields=None):
             "records": records
         }
     except requests.RequestException as error:
-        print(f"FileMaker records connection error: {error.__class__.__name__}")
+        print(f"FileMaker records connection error: {format_request_error(error)}")
         return {
             "connected": False,
             "status": get_request_error_status(error),
@@ -390,7 +399,9 @@ def build_filemaker_master_data_cache_key():
         config["customers_layout"],
         config["customers_key_field"],
         config["customers_name_field"],
+        config["customers_city_field"],
         config["customers_state_field"],
+        config["customers_country_field"],
         config["customers_zip_field"],
         config["customers_activity_status_field"],
         config["customers_type_field"],
@@ -427,8 +438,14 @@ def map_filemaker_customer_master_record(record):
         "company": normalize_text_value(
             get_field_value(field_data, config["customers_name_field"])
         ),
+        "city": normalize_text_value(
+            get_field_value(field_data, config["customers_city_field"])
+        ),
         "state": normalize_text_value(
             get_field_value(field_data, config["customers_state_field"])
+        ),
+        "country": normalize_text_value(
+            get_field_value(field_data, config["customers_country_field"])
         ),
         "zip_code": normalize_text_value(
             get_field_value(field_data, config["customers_zip_field"])

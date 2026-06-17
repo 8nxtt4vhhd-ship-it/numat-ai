@@ -85,15 +85,21 @@ def log_pdl_credit_headers(response):
     if not should_log_pdl() or response is None:
         return
 
-    interesting_headers = {
-        "x-call-credits-spent": response.headers.get("X-Call-Credits-Spent", ""),
-        "x-totallimit-remaining": response.headers.get("X-TotalLimit-Remaining", ""),
-        "x-lifetime-used": response.headers.get("X-Lifetime-Used", ""),
-        "x-ratelimit-remaining": response.headers.get("X-RateLimit-Remaining", ""),
-    }
+    interesting_headers = extract_pdl_credit_headers(response)
     populated = {key: value for key, value in interesting_headers.items() if str(value).strip()}
     if populated:
         log_pdl_event("credit_headers", **populated)
+
+
+def extract_pdl_credit_headers(response):
+    if response is None:
+        return {}
+    return {
+        "x-call-credits-spent": str(response.headers.get("X-Call-Credits-Spent", "")).strip(),
+        "x-totallimit-remaining": str(response.headers.get("X-TotalLimit-Remaining", "")).strip(),
+        "x-lifetime-used": str(response.headers.get("X-Lifetime-Used", "")).strip(),
+        "x-ratelimit-remaining": str(response.headers.get("X-RateLimit-Remaining", "")).strip(),
+    }
 
 
 def get_cached_pdl_result(cache_key):
@@ -229,7 +235,7 @@ def search_pdl_people(sql_query, size=10, force_refresh=False):
         }
 
     normalized_sql = str(sql_query or "").strip()
-    result_size = max(1, min(int(size or 10), 10))
+    result_size = max(1, min(int(size or 10), 25))
 
     if not normalized_sql:
         return {
@@ -285,6 +291,7 @@ def search_pdl_people(sql_query, size=10, force_refresh=False):
         return {
             "status": f"http_{response.status_code}",
             "error_message": error_message,
+            "credit_headers": extract_pdl_credit_headers(response),
             "results": [],
             "total": 0,
         }
@@ -306,6 +313,7 @@ def search_pdl_people(sql_query, size=10, force_refresh=False):
         "results": results,
         "total": int(total or 0),
         "sql": normalized_sql,
+        "credit_headers": extract_pdl_credit_headers(response),
         "cached": False,
     }
     set_cached_pdl_result(cache_key, result)
@@ -414,6 +422,7 @@ def enrich_pdl_person(email="", full_name="", organization_name="", locality="",
             return {
                 "status": f"http_{response.status_code}",
                 "error_message": error_message,
+                "credit_headers": extract_pdl_credit_headers(response),
                 "result": None,
             }
 
@@ -429,6 +438,7 @@ def enrich_pdl_person(email="", full_name="", organization_name="", locality="",
         return {
             "status": "ok",
             "result": payload.get("data") or payload,
+            "credit_headers": extract_pdl_credit_headers(response),
             "cached": False,
             "fallback_used": fallback_used,
         }

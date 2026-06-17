@@ -150,8 +150,12 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ACTION_PLAN_DISMISSALS_PATH = BASE_DIR / "data" / "action_plan_dismissals.json"
 DEFAULT_APP_USERS_PATH = BASE_DIR / "data" / "app_users.json"
 DEFAULT_RECENT_SENT_EMAILS_PATH = BASE_DIR / "data" / "recent_sent_emails.json"
+DEFAULT_STRATEGIC_CONTACTS_PATH = BASE_DIR / "data" / "strategic_contacts.json"
+DEFAULT_LOGIN_MFA_CHALLENGES_PATH = BASE_DIR / "data" / "login_mfa_challenges.json"
 APP_USERS_LOCK = Lock()
 RECENT_SENT_EMAILS_LOCK = Lock()
+STRATEGIC_CONTACTS_LOCK = Lock()
+LOGIN_MFA_CHALLENGES_LOCK = Lock()
 CURRENT_SESSION_USER = ContextVar("CURRENT_SESSION_USER", default=None)
 
 
@@ -163,6 +167,8 @@ APP_LOGIN_EXEMPT_PATHS = {
     "/health",
     "/filemaker-health",
     "/login",
+    "/login/mfa",
+    "/login/mfa/resend",
     "/logout",
     "/home-logo.png",
     "/m365/callback",
@@ -186,6 +192,9 @@ def get_preview_auth_credentials():
 
 
 def is_preview_auth_enabled():
+    enabled_flag = os.getenv("APP_BASIC_AUTH_ENABLED", "").strip().lower()
+    if enabled_flag not in {"1", "true", "yes", "on"}:
+        return False
     username, password = get_preview_auth_credentials()
     return bool(username and password)
 
@@ -216,6 +225,42 @@ def get_app_session_secret():
 def get_app_users_path():
     configured = os.getenv("APP_USERS_PATH", "").strip()
     return Path(configured) if configured else DEFAULT_APP_USERS_PATH
+
+
+def get_login_mfa_enabled():
+    value = os.getenv("APP_EMAIL_MFA_ENABLED", "true").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def get_login_mfa_challenges_path():
+    configured = os.getenv("LOGIN_MFA_CHALLENGES_PATH", "").strip()
+    return Path(configured) if configured else DEFAULT_LOGIN_MFA_CHALLENGES_PATH
+
+
+def ensure_login_mfa_challenges_file():
+    path = get_login_mfa_challenges_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("{}\n", encoding="utf-8")
+    return path
+
+
+def load_login_mfa_challenges():
+    path = ensure_login_mfa_challenges_file()
+    try:
+        with LOGIN_MFA_CHALLENGES_LOCK:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return {}
+
+
+def save_login_mfa_challenges(challenges):
+    path = ensure_login_mfa_challenges_file()
+    with LOGIN_MFA_CHALLENGES_LOCK:
+        path.write_text(json.dumps(challenges, indent=2), encoding="utf-8")
 
 
 def ensure_app_users_file():
@@ -263,6 +308,136 @@ def hash_user_password(password, salt=None):
 def verify_user_password(password, salt, expected_hash):
     derived = hash_user_password(password, salt=salt)
     return secrets.compare_digest(derived["hash"], str(expected_hash or ""))
+
+
+def clear_login_mfa_challenge(username):
+    normalized = normalize_username(username)
+    if not normalized:
+        return
+    challenges = load_login_mfa_challenges()
+    if normalized in challenges:
+        challenges.pop(normalized, None)
+        save_login_mfa_challenges(challenges)
+
+
+def mask_email_address(email):
+    email_text = str(email or "").strip()
+    if "@" not in email_text:
+        return email_text
+    local, domain = email_text.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[:1] + "*"
+    else:
+        masked_local = local[:2] + ("*" * max(2, len(local) - 2))
+    return f"{masked_local}@{domain}"
+
+
+def create_login_mfa_challenge(username):
+    normalized = normalize_username(username)
+    if not normalized:
+        return {}
+    code = f"{secrets.randbelow(1000000):06d}"
+    password_payload = hash_user_password(code)
+    now = int(time.time())
+    challenge = {
+        "username": normalized,
+        "code_salt": password_payload["salt"],
+        "code_hash": password_payload["hash"],
+        "created_at": now,
+        "expires_at": now + (10 * 60),
+        "attempts": 0,
+        "last_sent_at": now,
+    }
+    challenges = load_login_mfa_challenges()
+    challenges[normalized] = challenge
+    save_login_mfa_challenges(challenges)
+    challenge["plain_code"] = code
+    return challenge
+
+
+def get_login_mfa_challenge(username):
+    normalized = normalize_username(username)
+    if not normalized:
+        return {}
+    challenges = load_login_mfa_challenges()
+    challenge = challenges.get(normalized) or {}
+    if not isinstance(challenge, dict):
+        return {}
+    expires_at = int(challenge.get("expires_at") or 0)
+    if expires_at and expires_at < int(time.time()):
+        clear_login_mfa_challenge(normalized)
+        return {}
+    return challenge
+
+
+def verify_login_mfa_code(username, code):
+    normalized = normalize_username(username)
+    challenge = get_login_mfa_challenge(normalized)
+    if not challenge:
+        return {"status": "missing_challenge"}
+    if int(challenge.get("attempts") or 0) >= 5:
+        clear_login_mfa_challenge(normalized)
+        return {"status": "too_many_attempts"}
+
+    challenges = load_login_mfa_challenges()
+    stored = challenges.get(normalized) or {}
+    stored["attempts"] = int(stored.get("attempts") or 0) + 1
+    challenges[normalized] = stored
+    save_login_mfa_challenges(challenges)
+
+    if not verify_user_password(code, stored.get("code_salt"), stored.get("code_hash")):
+        if int(stored.get("attempts") or 0) >= 5:
+            clear_login_mfa_challenge(normalized)
+            return {"status": "too_many_attempts"}
+        return {"status": "invalid_code"}
+
+    clear_login_mfa_challenge(normalized)
+    return {"status": "ok"}
+
+
+def user_requires_email_mfa(user):
+    if not get_login_mfa_enabled():
+        return False
+    if not user or not bool(user.get("active", True)):
+        return False
+    connection_state = get_m365_connection_state(user)
+    return bool(connection_state.get("connected"))
+
+
+def send_login_mfa_code(user):
+    if not user:
+        return {"status": "missing_user"}
+
+    username = str(user.get("username") or "").strip()
+    recipient = str(user.get("m365_email") or "").strip().lower()
+    if not username or not recipient:
+        return {"status": "missing_recipient"}
+
+    token_result = ensure_valid_access_token(username)
+    if token_result.get("status") != "ok":
+        return token_result
+
+    challenge = create_login_mfa_challenge(username)
+    code = str(challenge.get("plain_code") or "").strip()
+    if not code:
+        return {"status": "challenge_error"}
+
+    display_name = str(user.get("display_name") or user.get("username") or "there").strip()
+    send_result = send_m365_mail(
+        token_result.get("access_token"),
+        recipient=recipient,
+        subject="Your Sales Focus sign-in code",
+        body=(
+            f"Hi {display_name},\n\n"
+            f"Your Sales Focus verification code is {code}.\n\n"
+            "It will expire in 10 minutes.\n\n"
+            "If you did not try to sign in, you can ignore this email."
+        ),
+    )
+    if send_result.get("status") != "ok":
+        return send_result
+
+    return {"status": "ok", "masked_email": mask_email_address(recipient)}
 
 
 def sanitize_user_record(user):
@@ -325,6 +500,1338 @@ def get_recent_sent_emails_path():
         return Path(raw_path).expanduser()
 
     return DEFAULT_RECENT_SENT_EMAILS_PATH
+
+
+def get_strategic_contacts_path():
+    raw_path = os.getenv("STRATEGIC_CONTACTS_PATH", "").strip()
+
+    if raw_path:
+        return Path(raw_path).expanduser()
+
+    return DEFAULT_STRATEGIC_CONTACTS_PATH
+
+
+def ensure_strategic_contacts_file():
+    path = get_strategic_contacts_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("[]\n", encoding="utf-8")
+    return path
+
+
+def load_strategic_contacts():
+    path = ensure_strategic_contacts_file()
+
+    try:
+        with STRATEGIC_CONTACTS_LOCK:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+
+    normalized = []
+    changed = False
+    for item in payload:
+        if not isinstance(item, dict):
+            changed = True
+            continue
+        normalized_item = normalize_strategic_contact_record(item)
+        if normalized_item["id"]:
+            normalized.append(normalized_item)
+        else:
+            changed = True
+
+    if changed:
+        save_strategic_contacts(normalized)
+
+    return normalized
+
+
+def save_strategic_contacts(items):
+    path = ensure_strategic_contacts_file()
+    with STRATEGIC_CONTACTS_LOCK:
+        path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def normalize_strategic_contact_record(item):
+    updated_at = str(item.get("updated_at") or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    created_at = str(item.get("created_at") or "").strip() or updated_at
+    return {
+        "id": str(item.get("id") or "").strip(),
+        "organization": str(item.get("organization") or "").strip(),
+        "company_record_label": str(item.get("company_record_label") or "").strip(),
+        "name": str(item.get("name") or "").strip(),
+        "position": str(item.get("position") or "").strip(),
+        "email": str(item.get("email") or "").strip(),
+        "phone": str(item.get("phone") or "").strip(),
+        "cell": str(item.get("cell") or "").strip(),
+        "scope_type": str(item.get("scope_type") or "").strip(),
+        "region": str(item.get("region") or "").strip(),
+        "function": str(item.get("function") or "").strip(),
+        "influence_level": str(item.get("influence_level") or "").strip(),
+        "seniority": str(item.get("seniority") or "").strip(),
+        "preferred_contact_method": str(item.get("preferred_contact_method") or "").strip(),
+        "outreach_angle": str(item.get("outreach_angle") or "").strip(),
+        "coverage_notes": str(item.get("coverage_notes") or "").strip(),
+        "relationship_notes": str(item.get("relationship_notes") or "").strip(),
+        "active": bool(item.get("active", True)),
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def find_strategic_contact(contact_id):
+    normalized_id = str(contact_id or "").strip()
+    if not normalized_id:
+        return None
+    for item in load_strategic_contacts():
+        if str(item.get("id") or "").strip() == normalized_id:
+            return item
+    return None
+
+
+STRATEGIC_CONTACT_SCOPE_OPTIONS = [
+    "Corporate",
+    "Regional",
+    "Division",
+    "National Account",
+]
+
+STRATEGIC_CONTACT_FUNCTION_OPTIONS = [
+    "Executive",
+    "Operations",
+    "Procurement",
+    "Facilities",
+    "Finance",
+    "Sales",
+    "Service",
+    "Other",
+]
+
+STRATEGIC_CONTACT_INFLUENCE_OPTIONS = [
+    "Decision Maker",
+    "Influencer",
+    "Recommender",
+    "Gatekeeper",
+]
+
+STRATEGIC_CONTACT_SENIORITY_OPTIONS = [
+    "C-Suite",
+    "VP",
+    "Director",
+    "Manager",
+    "Senior IC",
+    "Other",
+]
+
+STRATEGIC_CONTACT_METHOD_OPTIONS = [
+    "Email",
+    "Phone",
+    "Text",
+    "Assistant / Gatekeeper",
+]
+
+
+def can_manage_strategic_contacts(user):
+    return can_manage_user_accounts(user)
+
+
+def render_textarea_field(label, name, value, placeholder="", rows=4):
+    return f"""
+        <label>
+            <span class="label">{escape(label)}</span>
+            <textarea name="{escape(name)}" rows="{int(rows)}" placeholder="{escape(placeholder)}">{escape(str(value or ""))}</textarea>
+        </label>
+    """
+
+
+def render_strategic_contact_grouped_view(items):
+    if not items:
+        return "<p class='subtle'>No strategic contacts added yet.</p>"
+
+    current_user = get_current_session_user()
+    grouped = defaultdict(list)
+    for item in items:
+        organization = str(item.get("organization") or "Unassigned organisation").strip() or "Unassigned organisation"
+        grouped[organization].append(item)
+
+    sections = []
+    for organization in sorted(grouped.keys(), key=lambda value: value.lower()):
+        contacts = sorted(
+            grouped[organization],
+            key=lambda item: (
+                str(item.get("region") or "").strip().lower(),
+                str(item.get("influence_level") or "").strip().lower(),
+                str(item.get("name") or "").strip().lower(),
+            ),
+        )
+        cards = []
+        for item in contacts:
+            scope_bits = [
+                str(item.get("scope_type") or "").strip(),
+                str(item.get("region") or "").strip(),
+                str(item.get("function") or "").strip(),
+            ]
+            scope_text = " | ".join(bit for bit in scope_bits if bit)
+            meta_bits = []
+            influence = str(item.get("influence_level") or "").strip()
+            if influence:
+                meta_bits.append(influence)
+            preferred_method = str(item.get("preferred_contact_method") or "").strip()
+            if preferred_method:
+                meta_bits.append(f"Preferred: {preferred_method}")
+            phone_values = [
+                str(item.get("phone") or "").strip(),
+                str(item.get("cell") or "").strip(),
+            ]
+            phone_text = " / ".join(value for value in phone_values if value)
+            if phone_text:
+                meta_bits.append(phone_text)
+
+            edit_link = ""
+            if can_manage_strategic_contacts(current_user):
+                edit_link = (
+                    f"<a class='button secondary small-button' href='/strategic-contacts-view?edit={quote(str(item.get('id') or ''))}'>Edit</a>"
+                )
+
+            cards.append(
+                f"""
+                    <article class="panel strategic-contact-card">
+                        <div class="strategic-contact-card-head">
+                            <div>
+                                <h4>{escape(str(item.get("name") or "Unnamed contact"))}</h4>
+                                <p class="small muted">{escape(str(item.get("position") or "Unknown role"))}</p>
+                            </div>
+                            {edit_link}
+                        </div>
+                        {f"<p class='small muted'>{escape(scope_text)}</p>" if scope_text else ""}
+                        <div class="summary compact-summary strategic-contact-summary">
+                            <div>
+                                <span class="label">Email</span>
+                                <strong>{escape(str(item.get("email") or "Not set"))}</strong>
+                            </div>
+                            <div>
+                                <span class="label">Contact</span>
+                                <strong>{escape(' | '.join(meta_bits) if meta_bits else 'No contact details yet')}</strong>
+                            </div>
+                        </div>
+                        {f"<p><strong>Outreach angle:</strong> {escape(str(item.get('outreach_angle') or '').strip())}</p>" if str(item.get('outreach_angle') or '').strip() else ""}
+                        {f"<p class='small muted'><strong>Coverage:</strong> {escape(str(item.get('coverage_notes') or '').strip())}</p>" if str(item.get('coverage_notes') or '').strip() else ""}
+                        {f"<p class='small muted'><strong>Relationship notes:</strong> {escape(str(item.get('relationship_notes') or '').strip())}</p>" if str(item.get('relationship_notes') or '').strip() else ""}
+                    </article>
+                """
+            )
+
+        sections.append(
+            f"""
+                <section class="panel strategic-organization-panel">
+                    <div class="strategic-organization-head">
+                        <div>
+                            <h3>{escape(organization)}</h3>
+                            <p class="small muted">{len(contacts)} strategic contact{'s' if len(contacts) != 1 else ''}</p>
+                        </div>
+                    </div>
+                    <div class="strategic-contact-grid">
+                        {''.join(cards)}
+                    </div>
+                </section>
+            """
+        )
+
+    return "".join(sections)
+
+
+def infer_strategic_scope_type(title, region=""):
+    normalized_title = normalize_apollo_location_value(title)
+    normalized_region = normalize_apollo_location_value(region)
+
+    if any(token in normalized_title for token in ["chief", "president", "cfo", "coo", "ceo", "cio", "cto"]):
+        return "Corporate"
+    if "national" in normalized_title:
+        return "National Account"
+    if any(token in normalized_title for token in ["regional", "region", "district", "territory", "area"]):
+        return "Regional"
+    if normalized_region and normalized_region not in {"national", "corporate"}:
+        return "Regional"
+    if any(token in normalized_title for token in ["division", "divisional"]):
+        return "Division"
+    return "Corporate"
+
+
+def infer_strategic_function(title):
+    normalized = normalize_apollo_location_value(title)
+    if any(token in normalized for token in ["procurement", "sourcing", "purchasing", "buyer"]):
+        return "Procurement"
+    if any(token in normalized for token in ["facilities", "facility"]):
+        return "Facilities"
+    if any(token in normalized for token in ["finance", "financial", "controller", "accounting"]):
+        return "Finance"
+    if any(token in normalized for token in ["operations", "operational", "service", "production", "plant"]):
+        return "Operations"
+    if any(token in normalized for token in ["sales", "commercial", "account"]):
+        return "Sales"
+    if any(token in normalized for token in ["executive", "chief", "president", "vp", "vice president"]):
+        return "Executive"
+    return "Other"
+
+
+def infer_strategic_influence_level(title):
+    normalized = normalize_apollo_location_value(title)
+    if any(token in normalized for token in ["chief", "president", "vp", "vice president", "director", "head"]):
+        return "Decision Maker"
+    if any(token in normalized for token in ["regional", "district", "manager", "lead"]):
+        return "Influencer"
+    return "Recommender"
+
+
+def infer_strategic_seniority(title):
+    normalized = normalize_apollo_location_value(title)
+    if any(token in normalized for token in ["chief", "ceo", "cfo", "coo", "cio", "cto", "president"]):
+        return "C-Suite"
+    if "vp" in normalized or "vice president" in normalized:
+        return "VP"
+    if "director" in normalized or "head" in normalized:
+        return "Director"
+    if "manager" in normalized or "regional" in normalized or "district" in normalized:
+        return "Manager"
+    return "Other"
+
+
+def build_pdl_strategic_search_query(organization_name, region="", function=""):
+    organization_aliases = get_company_search_aliases(organization_name) or [organization_name]
+    organization_clauses = [
+        f"job_company_name LIKE '%{escape_sql_like(alias)}%'"
+        for alias in organization_aliases
+        if escape_sql_like(alias)
+    ]
+
+    region_terms = get_state_search_terms(region) if len(str(region or "").strip()) <= 3 else [str(region or "").strip()]
+    region_clauses = [
+        f"location_region LIKE '%{escape_sql_like(term)}%'"
+        for term in region_terms
+        if escape_sql_like(term)
+    ]
+
+    function_title_terms = {
+        "Executive": ["chief", "president", "vice president"],
+        "Operations": ["operations", "production", "service"],
+        "Procurement": ["procurement", "sourcing", "purchasing"],
+        "Facilities": ["facilities", "facility"],
+        "Finance": ["finance", "controller", "financial"],
+        "Sales": ["sales", "commercial", "account manager"],
+        "Service": ["service"],
+        "Other": ["director", "manager", "regional"],
+    }
+    selected_terms = function_title_terms.get(str(function or "").strip(), [])
+    if not selected_terms:
+        selected_terms = [
+            "vice president",
+            "director",
+            "regional",
+            "operations",
+            "procurement",
+            "facilities",
+        ]
+
+    title_clauses = [
+        f"job_title LIKE '%{escape_sql_like(term)}%'"
+        for term in selected_terms
+        if escape_sql_like(term)
+    ]
+
+    lines = [
+        "SELECT * FROM person",
+        "WHERE (" + " OR ".join(organization_clauses) + ")",
+    ]
+    if region_clauses:
+        lines.append("AND (" + " OR ".join(region_clauses) + ")")
+    if title_clauses:
+        lines.append("AND (" + " OR ".join(title_clauses) + ")")
+    return "\n".join(lines)
+
+
+def parse_credit_count(value):
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def estimate_pdl_credit_cost(credits_spent):
+    try:
+        cost_per_credit = float(str(os.getenv("PDL_COST_PER_CREDIT", "0.32")).strip())
+    except ValueError:
+        cost_per_credit = 0.32
+    if credits_spent <= 0:
+        return 0.0
+    return round(credits_spent * cost_per_credit, 2)
+
+
+def get_pdl_strategic_status_message(status):
+    if status == "pdl_disabled":
+        return "PDL is not enabled for this environment."
+    if status == "missing_api_key":
+        return "PDL API key is missing."
+    if status == "missing_organization":
+        return "Please enter an organisation to search."
+    if status == "missing_sql":
+        return "The PDL search query could not be built."
+    if status == "no_results":
+        return "PDL did not return any likely strategic contacts for that search."
+    if status == "ok":
+        return "PDL search completed."
+    return get_pdl_status_message(status)
+
+
+def assess_filemaker_contact_presence(email, name, existing_emails, existing_names, existing_initial_last):
+    email_norm = str(email or "").strip().lower()
+    name_norm = normalize_apollo_location_value(name)
+    initial_last = build_name_initial_last_key(name_norm)
+
+    email_exists = bool(email_norm and email_norm in existing_emails)
+    name_exists = bool(
+        (name_norm and name_norm in existing_names)
+        or (initial_last and initial_last in existing_initial_last)
+    )
+
+    if email_exists and name_exists:
+        return {
+            "exists": True,
+            "kind": "email_and_name",
+            "label": "Already in FileMaker",
+            "details": "Name and email both match an existing FileMaker contact.",
+        }
+    if email_exists:
+        return {
+            "exists": True,
+            "kind": "email",
+            "label": "Email already in FileMaker",
+            "details": "This email already exists on a FileMaker contact.",
+        }
+    if name_exists:
+        return {
+            "exists": True,
+            "kind": "name",
+            "label": "Name already in FileMaker",
+            "details": "This name looks like an existing FileMaker contact.",
+        }
+    return {
+        "exists": False,
+        "kind": "new",
+        "label": "Not found in FileMaker",
+        "details": "No matching name or email found in the current FileMaker contacts.",
+    }
+
+
+def search_pdl_strategic_contacts(organization_name, region="", function="", force_refresh=False):
+    organization_name = str(organization_name or "").strip()
+    if not organization_name:
+        return {"status": "missing_organization", "results": [], "diagnostics": {}, "sql": ""}
+
+    if not has_pdl_config():
+        return {"status": "pdl_disabled", "results": [], "diagnostics": {}, "sql": ""}
+
+    sql_query = build_pdl_strategic_search_query(
+        organization_name=organization_name,
+        region=region,
+        function=function,
+    )
+    if not sql_query:
+        return {"status": "missing_sql", "results": [], "diagnostics": {}, "sql": ""}
+
+    search_limit = 8
+    enrich_limit = 2
+    pdl_result = search_pdl_people(sql_query, size=search_limit, force_refresh=force_refresh)
+    if pdl_result.get("status") != "ok":
+        return {
+            "status": pdl_result.get("status", "error"),
+            "error_message": pdl_result.get("error_message", ""),
+            "results": [],
+            "diagnostics": {},
+            "sql": sql_query,
+            "credit_headers": pdl_result.get("credit_headers") or {},
+            "cached": bool(pdl_result.get("cached")),
+        }
+
+    existing_contacts = load_strategic_contacts()
+    existing_keys = {
+        (
+            str(item.get("email") or "").strip().lower(),
+            normalize_apollo_location_value(item.get("name")),
+        )
+        for item in existing_contacts
+    }
+    existing_emails = set()
+    existing_names = set()
+    existing_initial_last = set()
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") == "ok":
+        contact_rows = build_contact_master_rows(master_data_result)
+        existing_emails, existing_names, existing_initial_last = build_pdl_existing_contact_sets(
+            contact_rows,
+            organization_name=organization_name,
+            expected_city="",
+            expected_state="",
+        )
+
+    raw_results = sorted(
+        list(pdl_result.get("results", []) or []),
+        key=lambda person: (
+            rank_contact_position(str(person.get("job_title") or "")),
+            1 if get_pdl_person_email(person) else 0,
+            1 if get_pdl_person_phone(person) else 0,
+            1 if str(person.get("linkedin_url") or "").strip() else 0,
+            str(person.get("full_name") or person.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )
+    shortlisted = []
+    enrich_attempts = 0
+    enrich_credit_spent = 0.0
+    search_credit_spent = parse_credit_count((pdl_result.get("credit_headers") or {}).get("x-call-credits-spent"))
+    preview_only_count = 0
+    enriched_count = 0
+
+    for person in raw_results:
+        if is_excluded_pdl_person(person):
+            continue
+
+        title = str(person.get("job_title") or "").strip()
+        if not title:
+            continue
+
+        name = get_pdl_person_name(person)
+        company_name = get_pdl_company_name(person) or organization_name
+        email = str(get_pdl_person_email(person) or "").strip().lower()
+        phone = str(get_pdl_person_phone(person) or "").strip()
+        linkedin_url = normalize_external_url(person.get("linkedin_url") or "")
+        city, state, country = get_pdl_location_parts(person)
+
+        detail_status = assess_pdl_detail_status(person)
+        effective_person = person
+        enriched = False
+
+        enrich_priority = (
+            rank_contact_position(title) >= 2
+            and (
+                not email
+                or not linkedin_url
+                or detail_status.get("score", 0) < 2
+            )
+        )
+        if enrich_attempts < enrich_limit and enrich_priority:
+            enrich_attempts += 1
+            enrich_result = enrich_pdl_person(
+                email=email,
+                full_name=name,
+                organization_name=company_name,
+                locality=city,
+                region=state or region,
+                force_refresh=force_refresh,
+            )
+            enrich_credit_spent += parse_credit_count((enrich_result.get("credit_headers") or {}).get("x-call-credits-spent"))
+            enriched_person = enrich_result.get("result") or {}
+            if enriched_person:
+                effective_person = enriched_person
+                enriched = True
+                enriched_count += 1
+                email = str(get_pdl_person_email(effective_person) or email).strip().lower()
+                phone = str(get_pdl_person_phone(effective_person) or phone).strip()
+                linkedin_url = normalize_external_url(effective_person.get("linkedin_url") or linkedin_url)
+                city, state, country = get_pdl_location_parts(effective_person)
+                company_name = get_pdl_company_name(effective_person) or company_name
+                detail_status = assess_pdl_detail_status(effective_person)
+
+        if not enriched:
+            preview_only_count += 1
+
+        already_saved = (email, normalize_apollo_location_value(name)) in existing_keys if email else False
+        filemaker_presence = assess_filemaker_contact_presence(
+            email=email,
+            name=name,
+            existing_emails=existing_emails,
+            existing_names=existing_names,
+            existing_initial_last=existing_initial_last,
+        )
+        shortlisted.append(
+            {
+                "name": name,
+                "email": email,
+                "phone": phone,
+                "title": title,
+                "linkedin_url": linkedin_url,
+                "organization_name": company_name,
+                "organization_domain": normalize_external_url(str((effective_person.get("job_company_website") or "")).strip()),
+                "region": state or str(region or "").strip(),
+                "city": city,
+                "country": country,
+                "scope_type": infer_strategic_scope_type(title, region=state or str(region or "").strip()),
+                "function": infer_strategic_function(title),
+                "influence_level": infer_strategic_influence_level(title),
+                "seniority": infer_strategic_seniority(title),
+                "detail_status": detail_status,
+                "already_saved": already_saved,
+                "filemaker_presence": filemaker_presence,
+                "preview_only": not enriched,
+            }
+        )
+
+    shortlisted = sorted(
+        shortlisted,
+        key=lambda item: (
+            0 if item.get("already_saved") else 1,
+            1 if item.get("email") else 0,
+            1 if item.get("phone") else 0,
+            1 if item.get("linkedin_url") else 0,
+            rank_contact_position(item.get("title") or ""),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )[:24]
+
+    total_credit_spent = search_credit_spent + enrich_credit_spent
+    diagnostics = {
+        "raw_people": len(raw_results),
+        "returned": len(shortlisted),
+        "with_email": sum(1 for item in shortlisted if item.get("email")),
+        "with_phone": sum(1 for item in shortlisted if item.get("phone")),
+        "with_linkedin": sum(1 for item in shortlisted if item.get("linkedin_url")),
+        "without_contact_detail": sum(1 for item in shortlisted if not item.get("email") and not item.get("phone")),
+        "preview_only_returned": sum(1 for item in shortlisted if item.get("preview_only")),
+        "enriched_count": enriched_count,
+        "enrich_attempts": enrich_attempts,
+        "search_limit": search_limit,
+        "enrich_limit": enrich_limit,
+        "search_credit_spent": search_credit_spent,
+        "enrich_credit_spent": enrich_credit_spent,
+        "total_credit_spent": total_credit_spent,
+        "estimated_cost": estimate_pdl_credit_cost(total_credit_spent),
+        "already_saved": sum(1 for item in shortlisted if item.get("already_saved")),
+        "already_in_filemaker": sum(1 for item in shortlisted if (item.get("filemaker_presence") or {}).get("exists")),
+    }
+
+    return {
+        "status": "ok" if shortlisted else "no_results",
+        "results": shortlisted,
+        "diagnostics": diagnostics,
+        "sql": sql_query,
+        "search_total": int(pdl_result.get("total", 0) or 0),
+        "credit_headers": pdl_result.get("credit_headers") or {},
+        "cached": bool(pdl_result.get("cached")),
+    }
+
+
+def render_strategic_pdl_results(payload, organization_name="", region="", function=""):
+    if not organization_name or not payload:
+        return ""
+
+    status = str(payload.get("status") or "")
+    diagnostics = payload.get("diagnostics") or {}
+    sql_query = str(payload.get("sql") or "").strip()
+    credit_headers = payload.get("credit_headers") or {}
+    search_credit = float(diagnostics.get("search_credit_spent") or 0.0)
+    enrich_credit = float(diagnostics.get("enrich_credit_spent") or 0.0)
+    total_credit = float(diagnostics.get("total_credit_spent") or 0.0)
+    estimated_cost = float(diagnostics.get("estimated_cost") or 0.0)
+
+    credit_markup = f"""
+        <div class="summary compact-summary strategic-contact-summary">
+            {render_simple_summary_item("Raw search", diagnostics.get("raw_people", 0))}
+            {render_simple_summary_item("Shortlist", diagnostics.get("returned", 0))}
+            {render_simple_summary_item("Search credits", f"{search_credit:.1f}")}
+            {render_simple_summary_item("Enrich credits", f"{enrich_credit:.1f}")}
+            {render_simple_summary_item("Total credits", f"{total_credit:.1f}")}
+            {render_simple_summary_item("Est. cost", f"${estimated_cost:.2f}")}
+        </div>
+        <p class="small muted">
+            Credit headers:
+            spent={escape(str(credit_headers.get("x-call-credits-spent") or "0"))},
+            remaining={escape(str(credit_headers.get("x-totallimit-remaining") or "unknown"))},
+            lifetime_used={escape(str(credit_headers.get("x-lifetime-used") or "unknown"))},
+            rate_remaining={escape(str(credit_headers.get("x-ratelimit-remaining") or "unknown"))}.
+            {escape("Used cached PDL search result." if payload.get("cached") else "Fresh PDL search result.")}
+        </p>
+    """
+
+    if status != "ok":
+        return f"""
+            <section class="panel strategic-pdl-panel">
+                <h3>PDL candidates</h3>
+                <p class="status error">{escape(get_pdl_strategic_status_message(status))}</p>
+                {credit_markup if diagnostics else ""}
+                {f"<details class='apollo-rejected-details'><summary>View PDL SQL</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
+            </section>
+        """
+
+    rows = []
+    for item in payload.get("results") or []:
+        location_bits = [
+            str(item.get("city") or "").strip(),
+            str(item.get("region") or "").strip(),
+            str(item.get("country") or "").strip(),
+        ]
+        location = ", ".join(bit for bit in location_bits if bit) or "Location not returned"
+        status_badge = "<span class='status-pill ok'>Saved</span>" if item.get("already_saved") else "<span class='status-pill'>New</span>"
+        filemaker_presence = item.get("filemaker_presence") or {}
+        filemaker_badge = (
+            f"<span class='status-pill warning'>{escape(str(filemaker_presence.get('label') or 'Already in FileMaker'))}</span>"
+            if filemaker_presence.get("exists")
+            else "<span class='status-pill'>Not in FileMaker</span>"
+        )
+        linkedin_url = str(item.get("linkedin_url") or "").strip()
+        linkedin_html = (
+            f"<a href=\"{escape(linkedin_url)}\" target=\"_blank\" rel=\"noreferrer\">LinkedIn</a>"
+            if linkedin_url else ""
+        )
+        save_button = ""
+        if not item.get("already_saved"):
+            save_button = f"""
+                <form method="post" action="/strategic-contacts/import-pdl" class="inline-form strategic-save-form">
+                    <input type="hidden" name="organization" value="{escape(organization_name)}" />
+                    <input type="hidden" name="company_record_label" value="{escape(organization_name)}" />
+                    <input type="hidden" name="name" value="{escape(str(item.get("name") or ""))}" />
+                    <input type="hidden" name="position" value="{escape(str(item.get("title") or ""))}" />
+                    <input type="hidden" name="email" value="{escape(str(item.get("email") or ""))}" />
+                    <input type="hidden" name="phone" value="{escape(str(item.get("phone") or ""))}" />
+                    <input type="hidden" name="scope_type" value="{escape(str(item.get("scope_type") or ""))}" />
+                    <input type="hidden" name="region" value="{escape(str(item.get("region") or region or ""))}" />
+                    <input type="hidden" name="function" value="{escape(str(item.get("function") or function or ""))}" />
+                    <input type="hidden" name="influence_level" value="{escape(str(item.get("influence_level") or ""))}" />
+                    <input type="hidden" name="seniority" value="{escape(str(item.get("seniority") or ""))}" />
+                    <input type="hidden" name="preferred_contact_method" value="Email" />
+                    <button class="button secondary small-button strategic-save-button" type="submit">Save to Strategic Contacts</button>
+                </form>
+            """
+        rows.append(
+            f"""
+                <article class="panel strategic-pdl-card">
+                    <div class="strategic-contact-card-head">
+                        <div>
+                            <h4>{escape(str(item.get("name") or "Unknown"))}</h4>
+                            <p class="small muted">{escape(str(item.get("title") or "Unknown title"))}</p>
+                        </div>
+                        <div class="status-pill-stack">{status_badge}{filemaker_badge}</div>
+                    </div>
+                    <p class="small muted"><strong>{escape(str(item.get("organization_name") or organization_name))}</strong></p>
+                    <p class="small muted">{escape(location)}</p>
+                    <div class="summary compact-summary strategic-contact-summary">
+                        <div>
+                            <span class="label">Email</span>
+                            <strong>{escape(str(item.get("email") or "Not returned"))}</strong>
+                        </div>
+                        <div>
+                            <span class="label">Phone</span>
+                            <strong>{escape(str(item.get("phone") or "Not returned"))}</strong>
+                        </div>
+                    </div>
+                    <p class="small muted">{escape(str(filemaker_presence.get("details") or ""))}</p>
+                    <p class="small muted">{escape(str(item.get("scope_type") or ""))} | {escape(str(item.get("function") or ""))} | {escape(str(item.get("influence_level") or ""))}</p>
+                    <p class="small muted">{escape(str((item.get("detail_status") or {}).get("label") or "Matched, limited detail"))}</p>
+                    <div class="strategic-pdl-actions">
+                        {linkedin_html}
+                        {save_button}
+                    </div>
+                </article>
+            """
+        )
+
+    return f"""
+        <section class="panel strategic-pdl-panel">
+            <h3>PDL candidates</h3>
+            <p class="small muted">
+                Checked <strong>{escape(organization_name)}</strong>
+                {f" in {escape(region)}" if region else ""}
+                {f" for {escape(function)} roles" if function else ""}.
+                PDL search saw {int(payload.get("search_total", 0))} total candidate(s),
+                fetched {int(diagnostics.get("raw_people", 0))},
+                shortlisted {int(diagnostics.get("returned", 0))},
+                with {int(diagnostics.get("with_email", 0))} email(s),
+                {int(diagnostics.get("with_phone", 0))} phone number(s),
+                and {int(diagnostics.get("with_linkedin", 0))} LinkedIn link(s).
+                {f" {int(diagnostics.get('already_in_filemaker', 0))} appear to already exist in FileMaker." if int(diagnostics.get('already_in_filemaker', 0)) else ""}
+                {f" {int(diagnostics.get('preview_only_returned', 0))} still need fuller enrichment." if int(diagnostics.get('preview_only_returned', 0)) else ""}
+            </p>
+            {credit_markup}
+            {f"<details class='apollo-rejected-details'><summary>View PDL SQL</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
+            <div class="strategic-contact-grid">{''.join(rows)}</div>
+        </section>
+    """
+
+
+def get_apollo_strategic_search_titles(function=""):
+    selected = str(function or "").strip().lower()
+    mapping = {
+        "executive": ["chief executive officer", "chief operating officer", "president", "vice president", "vp", "director", "general manager"],
+        "operations": ["vice president operations", "director operations", "regional operations", "operations director", "operations manager", "general manager", "district manager", "regional manager"],
+        "procurement": ["procurement", "strategic sourcing", "sourcing", "purchasing", "supply chain", "procurement manager", "purchasing manager"],
+        "facilities": ["facilities", "facility", "maintenance director", "asset manager", "facilities manager"],
+        "finance": ["finance", "controller", "financial", "treasury", "finance manager"],
+        "sales": ["sales director", "regional sales manager", "vp sales", "commercial director", "national accounts", "strategic accounts", "account manager"],
+        "service": ["service director", "service manager", "retention manager", "operations", "regional manager", "district manager"],
+        "other": ["director", "vice president", "vp", "head of", "regional manager", "district manager", "general manager", "manager"],
+    }
+    if selected in mapping:
+        return mapping[selected]
+    return [
+        "vice president",
+        "vp",
+        "director",
+        "head of",
+        "regional manager",
+        "district manager",
+        "general manager",
+        "manager",
+        "operations",
+        "procurement",
+        "sourcing",
+        "facilities",
+        "finance",
+    ]
+
+
+def get_apollo_strategic_seniorities(function=""):
+    selected = str(function or "").strip().lower()
+    if selected == "sales":
+        return ["vp", "head", "director", "partner", "manager"]
+    return ["c_suite", "vp", "head", "director", "partner", "manager"]
+
+
+def is_excluded_apollo_strategic_title(title, function=""):
+    normalized = normalize_apollo_location_value(title)
+    if not normalized:
+        return True
+
+    always_exclude = (
+        "recruit",
+        "talent",
+        "human resources",
+        "marketing",
+        "intern",
+        "student",
+        "assistant",
+    )
+    if any(term in normalized for term in always_exclude):
+        return True
+
+    if str(function or "").strip().lower() != "sales":
+        if any(term in normalized for term in ("sales representative", "account executive", "business development", "inside sales")):
+            return True
+
+    return False
+
+
+def get_apollo_strategic_status_message(status):
+    if status == "no_known_domains":
+        return "We could not find a trusted company domain for that organisation from your existing data."
+    if status == "no_usable_results":
+        return "Apollo did not return any likely strategic contacts for that search."
+    if status == "ok":
+        return "Apollo search completed."
+    return get_apollo_enrichment_status_message(status, "person")
+
+
+def search_apollo_strategic_contacts(organization_name, region="", function="", force_refresh=False):
+    organization_name = str(organization_name or "").strip()
+    if not organization_name:
+        return {"status": "missing_organization", "results": [], "diagnostics": {}, "domains": []}
+
+    allowed_domains = sorted(get_known_company_domains(organization_name))
+    if not allowed_domains:
+        return {"status": "no_known_domains", "results": [], "diagnostics": {}, "domains": []}
+
+    organization_ids = []
+    organization_lookups = []
+    canonical_organization_names = []
+    for domain in allowed_domains[:4]:
+        organization_result = enrich_apollo_organization(domain, force_refresh=force_refresh)
+        organization_payload = organization_result.get("result") or {}
+        canonical_name = str(
+            organization_payload.get("name")
+            or organization_payload.get("organization_name")
+            or organization_payload.get("account_name")
+            or ""
+        ).strip()
+        canonical_domain = (
+            extract_domain_from_url(organization_payload.get("website_url") or "")
+            or extract_domain_from_url(organization_payload.get("primary_domain") or "")
+            or str(organization_payload.get("domain") or "").strip().lower()
+            or domain
+        )
+        organization_lookups.append(
+            {
+                "searched_domain": domain,
+                "status": str(organization_result.get("status") or "unknown"),
+                "name": canonical_name,
+                "organization_id": str(
+                    organization_payload.get("id")
+                    or organization_payload.get("organization_id")
+                    or ""
+                ).strip(),
+                "domain": canonical_domain,
+                "website_url": str(organization_payload.get("website_url") or "").strip(),
+                "employee_count": str(
+                    organization_payload.get("estimated_num_employees")
+                    or organization_payload.get("employees")
+                    or ""
+                ).strip(),
+                "industry": str(organization_payload.get("industry") or "").strip(),
+            }
+        )
+        if canonical_name and canonical_name.lower() not in {
+            item.lower() for item in canonical_organization_names
+        }:
+            canonical_organization_names.append(canonical_name)
+        organization_id = str(
+            organization_payload.get("id")
+            or organization_payload.get("organization_id")
+            or ""
+        ).strip()
+        if organization_id and organization_id not in organization_ids:
+            organization_ids.append(organization_id)
+
+    existing_contacts = load_strategic_contacts()
+    existing_keys = {
+        (
+            str(item.get("email") or "").strip().lower(),
+            normalize_apollo_location_value(item.get("name")),
+        )
+        for item in existing_contacts
+    }
+
+    searched_titles = get_apollo_strategic_search_titles(function=function)
+    searched_seniorities = get_apollo_strategic_seniorities(function=function)
+    location_filters = [str(region or "").strip()] if str(region or "").strip() else []
+    organization_aliases = get_company_search_aliases(organization_name)
+    for canonical_name in canonical_organization_names:
+        if canonical_name and canonical_name.lower() not in {
+            item.lower() for item in organization_aliases
+        }:
+            organization_aliases.append(canonical_name)
+
+    aggregated_people = []
+    pages_checked = 0
+    search_statuses = []
+    max_raw_people = 150
+    for domain in allowed_domains[:4]:
+        for page in range(1, 7):
+            search_result = search_apollo_people(
+                domain=domain,
+                titles=searched_titles if str(function or "").strip() else [],
+                organization_locations=location_filters,
+                person_locations=location_filters,
+                organization_ids=organization_ids,
+                organization_names=organization_aliases,
+                person_seniorities=searched_seniorities,
+                keywords=organization_name,
+                per_page=25,
+                page=page,
+                force_refresh=force_refresh,
+            )
+            search_statuses.append(
+                {
+                    "domain": domain,
+                    "page": page,
+                    "status": search_result.get("status", "unknown"),
+                    "results": len(search_result.get("results", []) or []),
+                    "total_entries": int(search_result.get("total_entries", 0) or 0),
+                }
+            )
+            if search_result.get("status") != "ok":
+                if not aggregated_people:
+                    return {
+                        "status": search_result.get("status", "unknown"),
+                        "results": [],
+                    "diagnostics": {},
+                    "domains": allowed_domains,
+                    "search_statuses": search_statuses,
+                    "organization_lookups": organization_lookups,
+                }
+                break
+            page_people = list(search_result.get("results", []))
+            pages_checked += 1
+            if not page_people:
+                break
+            aggregated_people.extend(page_people)
+            if len(aggregated_people) >= max_raw_people:
+                break
+        if len(aggregated_people) >= max_raw_people:
+            break
+
+    candidates = []
+    preview_candidates = []
+    raw_preview_candidates = []
+    seen = set()
+    enrich_attempts = 0
+    max_enrichments = 12
+    skipped_excluded_person = 0
+    skipped_excluded_title = 0
+    skipped_company_mismatch = 0
+    skipped_duplicate = 0
+    for person in aggregated_people:
+        raw_name = get_apollo_person_name(person)
+        raw_title = str(person.get("title") or "").strip()
+        raw_org = str((person.get("organization") or {}).get("name") or organization_name).strip()
+        raw_preview_candidates.append(
+            {
+                "name": raw_name,
+                "email": str(person.get("email") or "").strip().lower(),
+                "phone": str(extract_apollo_phone(person) or "").strip(),
+                "title": raw_title,
+                "linkedin_url": normalize_external_url(person.get("linkedin_url") or ""),
+                "organization_name": raw_org,
+                "organization_domain": extract_domain_from_url((person.get("organization") or {}).get("primary_domain") or ""),
+                "region": str(person.get("state") or region or "").strip(),
+                "city": str(person.get("city") or "").strip(),
+                "country": str(person.get("country") or "").strip(),
+                "scope_type": infer_strategic_scope_type(raw_title, region=str(person.get("state") or region or "").strip()),
+                "function": infer_strategic_function(raw_title),
+                "influence_level": infer_strategic_influence_level(raw_title),
+                "seniority": infer_strategic_seniority(raw_title),
+                "detail_status": assess_apollo_detail_status(person),
+                "already_saved": False,
+                "preview_only": True,
+            }
+        )
+
+        if is_excluded_apollo_person(person):
+            skipped_excluded_person += 1
+            continue
+
+        title = raw_title
+        person_org = (person.get("organization") or {}).get("name") or organization_name
+        person_domain = extract_domain_from_url((person.get("organization") or {}).get("primary_domain") or "")
+        base_email = str(person.get("email") or "").strip().lower()
+        base_email_domain = extract_domain_from_email(base_email)
+
+        if allowed_domains and not (
+            (person_domain and person_domain in allowed_domains)
+            or (base_email_domain and base_email_domain in allowed_domains)
+            or company_family_matches(organization_name, person_org)
+        ):
+            skipped_company_mismatch += 1
+            continue
+
+        name = get_apollo_person_name(person)
+        key = (
+            normalize_apollo_location_value(name),
+            normalize_apollo_location_value(title),
+            person_domain or base_email_domain,
+        )
+        if key in seen:
+            skipped_duplicate += 1
+            continue
+        seen.add(key)
+
+        preview_candidates.append(
+            {
+                "name": name,
+                "email": base_email,
+                "phone": str(extract_apollo_phone(person) or "").strip(),
+                "title": title,
+                "linkedin_url": normalize_external_url(person.get("linkedin_url") or ""),
+                "organization_name": str(person_org or organization_name).strip(),
+                "organization_domain": person_domain,
+                "region": str(person.get("state") or region or "").strip(),
+                "city": str(person.get("city") or "").strip(),
+                "country": str(person.get("country") or "").strip(),
+                "scope_type": infer_strategic_scope_type(title, region=str(person.get("state") or region or "").strip()),
+                "function": infer_strategic_function(title),
+                "influence_level": infer_strategic_influence_level(title),
+                "seniority": infer_strategic_seniority(title),
+                "detail_status": assess_apollo_detail_status(person),
+                "already_saved": (base_email, normalize_apollo_location_value(name)) in existing_keys if base_email else False,
+                "preview_only": True,
+            }
+        )
+
+        if is_excluded_apollo_strategic_title(title, function=function):
+            skipped_excluded_title += 1
+            continue
+
+        effective_person = person
+        if enrich_attempts < max_enrichments:
+            enrich_attempts += 1
+            enrich_result = enrich_apollo_person(
+                name=name,
+                email=base_email,
+                domain=person_domain or base_email_domain,
+                organization_name=person_org or organization_name,
+                force_refresh=force_refresh,
+            )
+            enriched_person = (enrich_result or {}).get("result") or {}
+            if enriched_person:
+                effective_person = merge_apollo_people(person, enriched_person)
+
+        effective_email = str(effective_person.get("email") or base_email).strip().lower()
+        effective_phone = str(extract_apollo_phone(effective_person) or "").strip()
+        effective_org = str(((effective_person.get("organization") or {}).get("name")) or person_org or organization_name).strip()
+        effective_domain = extract_domain_from_url((effective_person.get("organization") or {}).get("primary_domain") or "") or person_domain
+        effective_email_domain = extract_domain_from_email(effective_email)
+
+        if allowed_domains and not (
+            (effective_domain and effective_domain in allowed_domains)
+            or (effective_email_domain and effective_email_domain in allowed_domains)
+            or company_family_matches(organization_name, effective_org)
+        ):
+            continue
+
+        already_saved = (effective_email, normalize_apollo_location_value(name)) in existing_keys if effective_email else False
+        candidates.append(
+            {
+                "name": name,
+                "email": effective_email,
+                "phone": effective_phone,
+                "title": title,
+                "linkedin_url": normalize_external_url(effective_person.get("linkedin_url") or ""),
+                "organization_name": effective_org or organization_name,
+                "organization_domain": effective_domain,
+                "region": str(effective_person.get("state") or region or "").strip(),
+                "city": str(effective_person.get("city") or "").strip(),
+                "country": str(effective_person.get("country") or "").strip(),
+                "scope_type": infer_strategic_scope_type(title, region=str(effective_person.get("state") or region or "").strip()),
+                "function": infer_strategic_function(title),
+                "influence_level": infer_strategic_influence_level(title),
+                "seniority": infer_strategic_seniority(title),
+                "detail_status": assess_apollo_detail_status(effective_person),
+                "already_saved": already_saved,
+                "preview_only": False,
+            }
+        )
+
+    candidates = sorted(
+        candidates,
+        key=lambda item: (
+            0 if item.get("already_saved") else 1,
+            1 if item.get("email") else 0,
+            1 if item.get("phone") else 0,
+            rank_contact_position(item.get("title") or ""),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )[:48]
+
+    preview_candidates = sorted(
+        preview_candidates,
+        key=lambda item: (
+            0 if item.get("already_saved") else 1,
+            rank_contact_position(item.get("title") or ""),
+            1 if item.get("email") else 0,
+            1 if item.get("phone") else 0,
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )[:48]
+
+    raw_preview_candidates = sorted(
+        raw_preview_candidates,
+        key=lambda item: (
+            rank_contact_position(item.get("title") or ""),
+            1 if item.get("email") else 0,
+            1 if item.get("phone") else 0,
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )[:48]
+
+    if not candidates and preview_candidates:
+        candidates = preview_candidates
+    elif not candidates and raw_preview_candidates:
+        candidates = raw_preview_candidates
+
+    diagnostics = {
+        "raw_people": len(aggregated_people),
+        "returned": len(candidates),
+        "preview_only_returned": sum(1 for item in candidates if item.get("preview_only")),
+        "with_email": sum(1 for item in candidates if item.get("email")),
+        "with_phone": sum(1 for item in candidates if item.get("phone")),
+        "without_contact_detail": sum(1 for item in candidates if not item.get("email") and not item.get("phone")),
+        "already_saved": sum(1 for item in candidates if item.get("already_saved")),
+        "pages_checked": pages_checked,
+        "domains_checked": len(allowed_domains[:4]),
+        "organization_ids": len(organization_ids),
+        "skipped_excluded_person": skipped_excluded_person,
+        "skipped_excluded_title": skipped_excluded_title,
+        "skipped_company_mismatch": skipped_company_mismatch,
+        "skipped_duplicate": skipped_duplicate,
+    }
+
+    return {
+        "status": "ok" if candidates else "no_usable_results",
+        "results": candidates,
+        "diagnostics": diagnostics,
+        "domains": allowed_domains,
+        "titles": searched_titles,
+        "seniorities": searched_seniorities,
+        "organization_aliases": organization_aliases,
+        "organization_lookups": organization_lookups,
+        "search_statuses": search_statuses,
+        "cached": False,
+    }
+
+
+def render_strategic_apollo_results(payload, organization_name="", region="", function=""):
+    if not organization_name or not payload:
+        return ""
+
+    status = str(payload.get("status") or "")
+    if status != "ok":
+        diagnostics = payload.get("diagnostics") or {}
+        search_statuses = payload.get("search_statuses") or []
+        organization_lookups = payload.get("organization_lookups") or []
+        debug_rows = ""
+        if search_statuses:
+            debug_rows = "".join(
+                f"<li>{escape(str(item.get('domain') or ''))} page {int(item.get('page') or 0)}: {escape(str(item.get('status') or 'unknown'))}, {int(item.get('results') or 0)} result(s), total {int(item.get('total_entries') or 0)}</li>"
+                for item in search_statuses
+            )
+        lookup_rows = ""
+        if organization_lookups:
+            lookup_rows = "".join(
+                f"""
+                    <article class="panel strategic-pdl-card">
+                        <div class="strategic-contact-card-head">
+                            <div>
+                                <h4>{escape(str(item.get('name') or 'No organisation match returned'))}</h4>
+                                <p class="small muted">{escape(str(item.get('searched_domain') or ''))}</p>
+                            </div>
+                            <span class="status-pill">{escape(str(item.get('status') or 'unknown'))}</span>
+                        </div>
+                        <p class="small muted"><strong>Domain:</strong> {escape(str(item.get('domain') or 'Not returned'))}</p>
+                        <p class="small muted"><strong>Org ID:</strong> {escape(str(item.get('organization_id') or 'Not returned'))}</p>
+                        <p class="small muted"><strong>Industry:</strong> {escape(str(item.get('industry') or 'Not returned'))}</p>
+                        <p class="small muted"><strong>Employees:</strong> {escape(str(item.get('employee_count') or 'Not returned'))}</p>
+                    </article>
+                """
+                for item in organization_lookups
+            )
+        diagnostics_html = (
+            f"<details class='apollo-rejected-details'><summary>Search diagnostics</summary><ul class='small muted'>{debug_rows}</ul></details>"
+            if debug_rows else ""
+        )
+        return f"""
+            <section class="panel strategic-pdl-panel">
+                <h3>Apollo candidates</h3>
+                <p class="status error">{escape(get_apollo_strategic_status_message(status))}</p>
+                {f"<p class='small muted'>Checked domains: {escape(', '.join(payload.get('domains') or []))}</p>" if payload.get('domains') else ""}
+                {f"<p class='small muted'>Raw Apollo people checked: {int(diagnostics.get('raw_people', 0))}</p>" if diagnostics else ""}
+                {f"<div class='strategic-contact-grid'>{lookup_rows}</div>" if lookup_rows else ""}
+                {diagnostics_html}
+            </section>
+        """
+
+    results = payload.get("results") or []
+    diagnostics = payload.get("diagnostics") or {}
+    organization_lookups = payload.get("organization_lookups") or []
+    rows = []
+    for item in results:
+        location_bits = [str(item.get("city") or "").strip(), str(item.get("region") or "").strip(), str(item.get("country") or "").strip()]
+        location = ", ".join(bit for bit in location_bits if bit) or "Location not returned"
+        status_badge = "<span class='status-pill ok'>Saved</span>" if item.get("already_saved") else "<span class='status-pill'>New</span>"
+        save_button = ""
+        if not item.get("already_saved"):
+            save_button = f"""
+                <form method="post" action="/strategic-contacts/import-apollo" class="inline-form">
+                    <input type="hidden" name="organization" value="{escape(organization_name)}" />
+                    <input type="hidden" name="company_record_label" value="{escape(organization_name)}" />
+                    <input type="hidden" name="name" value="{escape(str(item.get("name") or ""))}" />
+                    <input type="hidden" name="position" value="{escape(str(item.get("title") or ""))}" />
+                    <input type="hidden" name="email" value="{escape(str(item.get("email") or ""))}" />
+                    <input type="hidden" name="phone" value="{escape(str(item.get("phone") or ""))}" />
+                    <input type="hidden" name="scope_type" value="{escape(str(item.get("scope_type") or ""))}" />
+                    <input type="hidden" name="region" value="{escape(str(item.get("region") or region or ""))}" />
+                    <input type="hidden" name="function" value="{escape(str(item.get("function") or function or ""))}" />
+                    <input type="hidden" name="influence_level" value="{escape(str(item.get("influence_level") or ""))}" />
+                    <input type="hidden" name="seniority" value="{escape(str(item.get("seniority") or ""))}" />
+                    <input type="hidden" name="preferred_contact_method" value="Email" />
+                    <button class="button secondary small-button" type="submit">Save to Strategic Contacts</button>
+                </form>
+            """
+        linkedin_html = ""
+        if str(item.get("linkedin_url") or "").strip():
+            linkedin_html = f"<a href=\"{escape(str(item.get('linkedin_url') or ''))}\" target=\"_blank\" rel=\"noreferrer\">LinkedIn</a>"
+        rows.append(
+            f"""
+                <article class="panel strategic-pdl-card">
+                    <div class="strategic-contact-card-head">
+                        <div>
+                            <h4>{escape(str(item.get("name") or "Unknown"))}</h4>
+                            <p class="small muted">{escape(str(item.get("title") or "Unknown title"))}</p>
+                        </div>
+                        {status_badge}
+                    </div>
+                    <p class="small muted"><strong>{escape(str(item.get("organization_name") or "Unknown organisation"))}</strong>{f" · {escape(str(item.get('organization_domain') or ''))}" if str(item.get('organization_domain') or '').strip() else ""}</p>
+                    <p class="small muted">{escape(location)}</p>
+                    <div class="summary compact-summary strategic-contact-summary">
+                        <div>
+                            <span class="label">Email</span>
+                            <strong>{escape(str(item.get("email") or "Not returned"))}</strong>
+                        </div>
+                        <div>
+                            <span class="label">Phone</span>
+                            <strong>{escape(str(item.get("phone") or "Not returned"))}</strong>
+                        </div>
+                    </div>
+                    <p class="small muted">{escape(str(item.get("scope_type") or ""))} | {escape(str(item.get("function") or ""))} | {escape(str(item.get("influence_level") or ""))}</p>
+                    <p class="small muted">{escape(str((item.get("detail_status") or {}).get("label") or "Matched, minimal detail"))}</p>
+                    <div class="strategic-pdl-actions">
+                        {linkedin_html}
+                        {save_button}
+                    </div>
+                </article>
+            """
+        )
+
+    rows_markup = f"<div class='strategic-contact-grid'>{''.join(rows)}</div>" if rows else "<p class='subtle'>Apollo did not return any likely strategic contacts for that search.</p>"
+    checked_domains = ", ".join(payload.get("domains") or [])
+    searched_titles = ", ".join(payload.get("titles") or [])
+    searched_seniorities = ", ".join(payload.get("seniorities") or [])
+    organization_aliases = ", ".join(payload.get("organization_aliases") or [])
+    lookup_rows = ""
+    if organization_lookups:
+        lookup_rows = "".join(
+            f"""
+                <article class="panel strategic-pdl-card">
+                    <div class="strategic-contact-card-head">
+                        <div>
+                            <h4>{escape(str(item.get('name') or 'No organisation match returned'))}</h4>
+                            <p class="small muted">{escape(str(item.get('searched_domain') or ''))}</p>
+                        </div>
+                        <span class="status-pill">{escape(str(item.get('status') or 'unknown'))}</span>
+                    </div>
+                    <p class="small muted"><strong>Domain:</strong> {escape(str(item.get('domain') or 'Not returned'))}</p>
+                    <p class="small muted"><strong>Org ID:</strong> {escape(str(item.get('organization_id') or 'Not returned'))}</p>
+                    <p class="small muted"><strong>Industry:</strong> {escape(str(item.get('industry') or 'Not returned'))}</p>
+                    <p class="small muted"><strong>Employees:</strong> {escape(str(item.get('employee_count') or 'Not returned'))}</p>
+                </article>
+            """
+            for item in organization_lookups
+        )
+    return f"""
+        <section class="panel strategic-pdl-panel">
+            <h3>Apollo candidates</h3>
+            <p class="small muted">
+                Checked <strong>{escape(organization_name)}</strong>
+                {f" in {escape(region)}" if region else ""}
+                {f" for {escape(function)} roles" if function else ""}.
+                Returned {int(diagnostics.get("returned", 0))} candidate(s),
+                with {int(diagnostics.get("with_email", 0))} email(s) and
+                {int(diagnostics.get("with_phone", 0))} phone number(s).
+                {f" {int(diagnostics.get('without_contact_detail', 0))} had no contact details returned." if int(diagnostics.get("without_contact_detail", 0)) else ""}
+                {f" Showing raw Apollo preview matches because no stronger strategic shortlist made it through our stricter filter." if int(diagnostics.get('preview_only_returned', 0)) else ""}
+            </p>
+            {f"<p class='small muted'>Domains checked: {escape(checked_domains)}</p>" if checked_domains else ""}
+            {f"<p class='small muted'>Organisation aliases: {escape(organization_aliases)}</p>" if organization_aliases else ""}
+            {f"<p class='small muted'>Seniority filters: {escape(searched_seniorities)}</p>" if searched_seniorities else ""}
+            {f"<p class='small muted'>Title filters: {escape(searched_titles)}</p>" if searched_titles else ""}
+            {f"<details class='apollo-rejected-details'><summary>Apollo organisation matches</summary><div class='strategic-contact-grid'>{lookup_rows}</div></details>" if lookup_rows else ""}
+            {rows_markup}
+        </section>
+    """
 
 
 def ensure_recent_sent_emails_file():
@@ -794,6 +2301,46 @@ def get_login_page(next: str = "/", error: str = ""):
     return render_page(title="Login", body=body, show_nav=False)
 
 
+@app.get("/login/mfa", response_class=HTMLResponse)
+def get_login_mfa_page(request: Request, error: str = "", message: str = ""):
+    pending_username = str(request.session.get("pending_mfa_username") or "").strip()
+    if not pending_username:
+        return RedirectResponse(url="/login", status_code=303)
+
+    user = find_app_user(pending_username)
+    if not user:
+        request.session.pop("pending_mfa_username", None)
+        request.session.pop("pending_mfa_next", None)
+        return RedirectResponse(url="/login", status_code=303)
+
+    status_markup = ""
+    if error:
+        status_markup = f"<p class='status error'>{escape(error)}</p>"
+    elif message:
+        status_markup = f"<p class='status ok'>{escape(message)}</p>"
+    else:
+        status_markup = f"<p class='subtle'>Enter the 6-digit code we emailed to {escape(mask_email_address(user.get('m365_email')))}.</p>"
+
+    body = f"""
+        <section class="panel login-panel">
+            <h2>Verify sign-in</h2>
+            {status_markup}
+            <form method="post" action="/login/mfa" class="login-form">
+                <label>
+                    <span class="label">Verification code</span>
+                    <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required />
+                </label>
+                <button class="button" type="submit">Verify code</button>
+            </form>
+            <form method="post" action="/login/mfa/resend" class="m365-status-actions">
+                <button class="button secondary small-button" type="submit">Resend code</button>
+                <a class="button secondary small-button" href="/login">Back to sign in</a>
+            </form>
+        </section>
+    """
+    return render_page(title="Verify sign-in", body=body, show_nav=False)
+
+
 @app.post("/login", response_class=HTMLResponse)
 def post_login(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/")):
     user = find_app_user(username)
@@ -809,13 +2356,91 @@ def post_login(request: Request, username: str = Form(""), password: str = Form(
             status_code=303,
         )
 
+    if user_requires_email_mfa(user):
+        send_result = send_login_mfa_code(user)
+        if send_result.get("status") == "ok":
+            request.session.pop("app_username", None)
+            request.session["pending_mfa_username"] = str(user.get("username") or "")
+            request.session["pending_mfa_next"] = str(next or "/") or "/"
+            masked_destination = str(send_result.get("masked_email") or user.get("m365_email") or "").strip()
+            return RedirectResponse(
+                url=f"/login/mfa?message={quote(f'We emailed a sign-in code to {masked_destination}.')}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            url=f"/login?next={quote(next or '/')}&error={quote('We could not send the sign-in code. Please connect Microsoft 365 first or ask an admin for help.')}",
+            status_code=303,
+        )
+
     request.session["app_username"] = str(user.get("username") or "")
+    request.session.pop("pending_mfa_username", None)
+    request.session.pop("pending_mfa_next", None)
     return RedirectResponse(url=next or "/", status_code=303)
+
+
+@app.post("/login/mfa", response_class=HTMLResponse)
+def post_login_mfa(request: Request, code: str = Form("")):
+    pending_username = str(request.session.get("pending_mfa_username") or "").strip()
+    pending_next = str(request.session.get("pending_mfa_next") or "/").strip() or "/"
+    if not pending_username:
+        return RedirectResponse(url="/login", status_code=303)
+
+    verify_result = verify_login_mfa_code(pending_username, str(code or "").strip())
+    if verify_result.get("status") != "ok":
+        error_map = {
+            "missing_challenge": "Your sign-in code has expired. Please sign in again.",
+            "too_many_attempts": "Too many incorrect attempts. Please sign in again to get a fresh code.",
+            "invalid_code": "That verification code was not recognised.",
+        }
+        return RedirectResponse(
+            url=f"/login/mfa?error={quote(error_map.get(verify_result.get('status'), 'Could not verify that code.'))}",
+            status_code=303,
+        )
+
+    request.session["app_username"] = pending_username
+    request.session.pop("pending_mfa_username", None)
+    request.session.pop("pending_mfa_next", None)
+    return RedirectResponse(url=pending_next, status_code=303)
+
+
+@app.post("/login/mfa/resend", response_class=HTMLResponse)
+def post_login_mfa_resend(request: Request):
+    pending_username = str(request.session.get("pending_mfa_username") or "").strip()
+    if not pending_username:
+        return RedirectResponse(url="/login", status_code=303)
+
+    user = find_app_user(pending_username)
+    if not user:
+        request.session.pop("pending_mfa_username", None)
+        request.session.pop("pending_mfa_next", None)
+        return RedirectResponse(url="/login", status_code=303)
+
+    current_challenge = get_login_mfa_challenge(pending_username)
+    last_sent_at = int(current_challenge.get("last_sent_at") or 0)
+    if last_sent_at and (int(time.time()) - last_sent_at) < 30:
+        return RedirectResponse(
+            url="/login/mfa?error=" + quote("Please wait a few moments before requesting another code."),
+            status_code=303,
+        )
+
+    send_result = send_login_mfa_code(user)
+    if send_result.get("status") != "ok":
+        return RedirectResponse(
+            url="/login/mfa?error=" + quote("We could not resend the sign-in code right now."),
+            status_code=303,
+        )
+
+    return RedirectResponse(
+        url="/login/mfa?message=" + quote(f"We sent a fresh sign-in code to {send_result.get('masked_email') or user.get('m365_email') or ''}."),
+        status_code=303,
+    )
 
 
 @app.get("/logout")
 def logout(request: Request):
     request.session.pop("app_username", None)
+    request.session.pop("pending_mfa_username", None)
+    request.session.pop("pending_mfa_next", None)
     return RedirectResponse(url="/login", status_code=303)
 
 
@@ -1147,6 +2772,310 @@ def post_user_account_update(
 
     return RedirectResponse(
         url=f"/user-accounts?message={quote(message)}",
+        status_code=303,
+    )
+
+
+@app.get("/strategic-contacts-view", response_class=HTMLResponse)
+def get_strategic_contacts_page(
+    message: str = "",
+    error: str = "",
+    edit: str = "",
+    discover_org: str = "",
+    discover_region: str = "",
+    discover_function: str = "",
+    discover_run: str = "",
+    discover_refresh: str = "",
+):
+    pdl_payload = None
+    discover_org = str(discover_org or "").strip()
+    discover_region = str(discover_region or "").strip()
+    discover_function = str(discover_function or "").strip()
+
+    if discover_org and str(discover_run or "").strip().lower() in {"1", "true", "yes", "on", "run"}:
+        pdl_payload = search_pdl_strategic_contacts(
+            organization_name=discover_org,
+            region=discover_region,
+            function=discover_function,
+            force_refresh=str(discover_refresh or "").strip().lower() in {"1", "true", "yes", "on", "refresh"},
+        )
+
+    status_markup = ""
+    if message:
+        status_markup = f"<p class='status ok'>{escape(message)}</p>"
+    elif error:
+        status_markup = f"<p class='status error'>{escape(error)}</p>"
+
+    discovery_markup = f"""
+        <section class="panel strategic-pdl-discovery">
+            <h3>Find with PDL</h3>
+            <form method="get" action="/strategic-contacts-view" class="login-form">
+                <input type="hidden" name="discover_run" value="1" />
+                <label>
+                    <span class="label">Organisation</span>
+                    <input type="text" name="discover_org" value="{escape(discover_org)}" placeholder="Cintas / Vestis / UniFirst" required />
+                </label>
+                <div class="strategic-contact-form-row">
+                    <label>
+                        <span class="label">Region</span>
+                        <input type="text" name="discover_region" value="{escape(discover_region)}" placeholder="Optional" />
+                    </label>
+                    <label>
+                        <span class="label">Function</span>
+                        <select name="discover_function">
+                            <option value="">Any likely function</option>
+                            {render_select_options({value: value for value in STRATEGIC_CONTACT_FUNCTION_OPTIONS}, discover_function)}
+                        </select>
+                    </label>
+                </div>
+                <div class="m365-status-actions strategic-discovery-actions">
+                    <button class="button secondary strategic-discovery-submit" type="submit">Find strategic contacts</button>
+                    <a class="button secondary small-button" href="/strategic-contacts-view">Clear</a>
+                    {f'<a class="button secondary small-button" href="/strategic-contacts-view?discover_run=1&discover_org={quote(discover_org)}&discover_region={quote(discover_region)}&discover_function={quote(discover_function)}&discover_refresh=1">Refresh PDL</a>' if discover_org else ''}
+                </div>
+            </form>
+            <p class="small muted">During testing we show search credits and estimated cost here so we can tune the workflow. Once we are happy with it, we can hide that from the wider team.</p>
+        </section>
+    """
+
+    body = f"""
+        {status_markup}
+        {discovery_markup}
+        {render_strategic_pdl_results(pdl_payload, organization_name=discover_org, region=discover_region, function=discover_function) if pdl_payload else ''}
+    """
+    return render_page(title="Strategic Contacts", body=body)
+
+
+@app.post("/strategic-contacts", response_class=HTMLResponse)
+def post_strategic_contact(
+    organization: str = Form(""),
+    company_record_label: str = Form(""),
+    name: str = Form(""),
+    position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    cell: str = Form(""),
+    scope_type: str = Form(""),
+    region: str = Form(""),
+    function: str = Form(""),
+    influence_level: str = Form(""),
+    seniority: str = Form(""),
+    preferred_contact_method: str = Form(""),
+    outreach_angle: str = Form(""),
+    coverage_notes: str = Form(""),
+    relationship_notes: str = Form(""),
+    active: str = Form("active"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+        )
+
+    organization = str(organization or "").strip()
+    name = str(name or "").strip()
+    position = str(position or "").strip()
+    email = str(email or "").strip().lower()
+    if not organization or not name or not position or not email:
+        return RedirectResponse(
+            url=f"/strategic-contacts-view?error={quote('Please complete organisation, contact name, role, and email.')}",
+            status_code=303,
+        )
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    items = load_strategic_contacts()
+    items.append(
+        normalize_strategic_contact_record(
+            {
+                "id": secrets.token_hex(8),
+                "organization": organization,
+                "company_record_label": company_record_label,
+                "name": name,
+                "position": position,
+                "email": email,
+                "phone": phone,
+                "cell": cell,
+                "scope_type": scope_type,
+                "region": region,
+                "function": function,
+                "influence_level": influence_level,
+                "seniority": seniority,
+                "preferred_contact_method": preferred_contact_method,
+                "outreach_angle": outreach_angle,
+                "coverage_notes": coverage_notes,
+                "relationship_notes": relationship_notes,
+                "active": str(active or "").strip().lower() != "inactive",
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+    )
+    save_strategic_contacts(items)
+    return RedirectResponse(
+        url=f"/strategic-contacts-view?message={quote('Strategic contact added.')}",
+        status_code=303,
+    )
+
+
+@app.post("/strategic-contacts/update", response_class=HTMLResponse)
+def post_strategic_contact_update(
+    contact_id: str = Form(""),
+    organization: str = Form(""),
+    company_record_label: str = Form(""),
+    name: str = Form(""),
+    position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    cell: str = Form(""),
+    scope_type: str = Form(""),
+    region: str = Form(""),
+    function: str = Form(""),
+    influence_level: str = Form(""),
+    seniority: str = Form(""),
+    preferred_contact_method: str = Form(""),
+    outreach_angle: str = Form(""),
+    coverage_notes: str = Form(""),
+    relationship_notes: str = Form(""),
+    active: str = Form("active"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+        )
+
+    original = find_strategic_contact(contact_id)
+    if not original:
+        return RedirectResponse(
+            url=f"/strategic-contacts-view?error={quote('Strategic contact not found.')}",
+            status_code=303,
+        )
+
+    organization = str(organization or "").strip()
+    name = str(name or "").strip()
+    position = str(position or "").strip()
+    email = str(email or "").strip().lower()
+    if not organization or not name or not position or not email:
+        return RedirectResponse(
+            url=f"/strategic-contacts-view?edit={quote(contact_id)}&error={quote('Please complete organisation, contact name, role, and email.')}",
+            status_code=303,
+        )
+
+    updated_items = []
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for item in load_strategic_contacts():
+        if str(item.get("id") or "").strip() != str(contact_id or "").strip():
+            updated_items.append(item)
+            continue
+        updated_items.append(
+            normalize_strategic_contact_record(
+                {
+                    **item,
+                    "organization": organization,
+                    "company_record_label": company_record_label,
+                    "name": name,
+                    "position": position,
+                    "email": email,
+                    "phone": phone,
+                    "cell": cell,
+                    "scope_type": scope_type,
+                    "region": region,
+                    "function": function,
+                    "influence_level": influence_level,
+                    "seniority": seniority,
+                    "preferred_contact_method": preferred_contact_method,
+                    "outreach_angle": outreach_angle,
+                    "coverage_notes": coverage_notes,
+                    "relationship_notes": relationship_notes,
+                    "active": str(active or "").strip().lower() != "inactive",
+                    "updated_at": timestamp,
+                }
+            )
+        )
+    save_strategic_contacts(updated_items)
+    return RedirectResponse(
+        url=f"/strategic-contacts-view?message={quote('Strategic contact updated.')}",
+        status_code=303,
+    )
+
+
+@app.post("/strategic-contacts/import-pdl", response_class=HTMLResponse)
+def post_strategic_contact_import_pdl(
+    organization: str = Form(""),
+    company_record_label: str = Form(""),
+    name: str = Form(""),
+    position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    scope_type: str = Form(""),
+    region: str = Form(""),
+    function: str = Form(""),
+    influence_level: str = Form(""),
+    seniority: str = Form(""),
+    preferred_contact_method: str = Form("Email"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+        )
+
+    organization = str(organization or "").strip()
+    name = str(name or "").strip()
+    position = str(position or "").strip()
+    email = str(email or "").strip().lower()
+    phone = str(phone or "").strip()
+    if not organization or not name or not position:
+        return RedirectResponse(
+            url=f"/strategic-contacts-view?error={quote('PDL result was missing key contact details.')}",
+            status_code=303,
+        )
+
+    existing = load_strategic_contacts()
+    for item in existing:
+        existing_email = str(item.get("email") or "").strip().lower()
+        if (
+            ((email and existing_email == email) or (phone and str(item.get("phone") or "").strip() == phone))
+            or (
+                normalize_apollo_location_value(item.get("name")) == normalize_apollo_location_value(name)
+                and normalize_apollo_location_value(item.get("organization")) == normalize_apollo_location_value(organization)
+                and normalize_apollo_location_value(item.get("position")) == normalize_apollo_location_value(position)
+            )
+        ):
+            return RedirectResponse(
+                url=f"/strategic-contacts-view?message={quote('That PDL contact is already saved.')}",
+                status_code=303,
+            )
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    existing.append(
+        normalize_strategic_contact_record(
+            {
+                "id": secrets.token_hex(8),
+                "organization": organization,
+                "company_record_label": company_record_label or organization,
+                "name": name,
+                "position": position,
+                "email": email,
+                "phone": phone,
+                "scope_type": scope_type,
+                "region": region,
+                "function": function,
+                "influence_level": influence_level,
+                "seniority": seniority,
+                "preferred_contact_method": preferred_contact_method,
+                "active": True,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+    )
+    save_strategic_contacts(existing)
+    return RedirectResponse(
+        url=f"/strategic-contacts-view?message={quote('PDL contact saved to Strategic Contacts.')}",
         status_code=303,
     )
 
@@ -1833,6 +3762,113 @@ US_STATE_NAME_TO_ABBR = {
 
 US_STATE_ABBR_TO_NAME = {abbr: name.title() for name, abbr in US_STATE_NAME_TO_ABBR.items()}
 
+CANADA_PROVINCE_NAME_TO_ABBR = {
+    "alberta": "AB",
+    "british columbia": "BC",
+    "manitoba": "MB",
+    "new brunswick": "NB",
+    "newfoundland and labrador": "NL",
+    "nova scotia": "NS",
+    "ontario": "ON",
+    "prince edward island": "PE",
+    "quebec": "QC",
+    "saskatchewan": "SK",
+    "northwest territories": "NT",
+    "nunavut": "NU",
+    "yukon": "YT",
+}
+
+CANADA_PROVINCE_ABBR_TO_NAME = {
+    abbr: name.title() for name, abbr in CANADA_PROVINCE_NAME_TO_ABBR.items()
+}
+
+STATE_CENTER_COORDS = {
+    "AB": (54.5, -114.0),
+    "AK": (64.0, -150.0),
+    "AL": (32.8, -86.8),
+    "AR": (34.8, -92.2),
+    "AZ": (34.2, -111.7),
+    "BC": (53.7, -124.7),
+    "CA": (37.2, -119.7),
+    "CO": (39.0, -105.5),
+    "CT": (41.6, -72.7),
+    "DC": (38.9, -77.0),
+    "DE": (39.0, -75.5),
+    "FL": (27.8, -81.7),
+    "GA": (32.6, -83.4),
+    "HI": (20.8, -156.3),
+    "IA": (42.0, -93.5),
+    "ID": (44.2, -114.6),
+    "IL": (40.0, -89.2),
+    "IN": (40.0, -86.1),
+    "KS": (38.5, -98.0),
+    "KY": (37.8, -84.3),
+    "LA": (31.2, -92.3),
+    "MA": (42.3, -71.8),
+    "MB": (53.8, -98.8),
+    "MD": (39.0, -76.7),
+    "ME": (45.3, -69.2),
+    "MI": (44.3, -85.6),
+    "MN": (46.1, -94.3),
+    "MO": (38.5, -92.5),
+    "MS": (32.7, -89.7),
+    "MT": (46.9, -110.4),
+    "NB": (46.5, -66.3),
+    "NC": (35.5, -79.4),
+    "ND": (47.5, -100.5),
+    "NE": (41.5, -99.8),
+    "NH": (43.9, -71.6),
+    "NJ": (40.1, -74.5),
+    "NL": (53.1, -57.7),
+    "NM": (34.4, -106.1),
+    "NS": (45.2, -62.9),
+    "NT": (64.8, -124.8),
+    "NU": (70.3, -83.1),
+    "NV": (39.3, -116.6),
+    "NY": (42.9, -75.5),
+    "OH": (40.3, -82.8),
+    "OK": (35.6, -97.5),
+    "ON": (50.0, -85.0),
+    "OR": (43.9, -120.6),
+    "PA": (41.2, -77.2),
+    "PE": (46.3, -63.1),
+    "QC": (52.9, -71.8),
+    "RI": (41.7, -71.5),
+    "SC": (33.8, -80.9),
+    "SD": (44.4, -100.2),
+    "SK": (54.5, -106.0),
+    "TN": (35.8, -86.4),
+    "TX": (31.5, -99.3),
+    "UT": (39.3, -111.7),
+    "VA": (37.5, -78.8),
+    "VT": (44.0, -72.7),
+    "WA": (47.4, -120.7),
+    "WI": (44.5, -89.5),
+    "WV": (38.6, -80.6),
+    "WY": (43.0, -107.6),
+    "YT": (64.3, -135.0),
+}
+
+CUSTOMER_GROUP_META = {
+    "A": {"label": "A - Vestis / Aramark", "color": "#1d4ed8"},
+    "B": {"label": "B - Independents / Other", "color": "#2563eb"},
+    "C": {"label": "C - Cintas & UniFirst", "color": "#0f766e"},
+    "D": {"label": "D - CSC Customers", "color": "#7c3aed"},
+}
+
+NON_CITY_LOCATION_WORDS = {
+    "east",
+    "west",
+    "north",
+    "south",
+    "central",
+    "northeast",
+    "northwest",
+    "southeast",
+    "southwest",
+    "midwest",
+}
+
 
 def extract_city_state_from_location_label(label):
     raw_label = str(label or "").strip()
@@ -2165,7 +4201,15 @@ def render_dashboard_home(ask="", ask_run=""):
                         </span>
                         <strong>Route Planner</strong>
                     </a>
-                    <div class="home-launch-card home-launch-card-placeholder" aria-hidden="true"></div>
+                    <a class="home-launch-card" href="/customer-map-view">
+                        <span class="home-launch-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <path d="M4.5 6.5l5-2 5 2 5-2v13l-5 2-5-2-5 2z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                                <path d="M9.5 4.5v13M14.5 6.5v13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                        </span>
+                        <strong>Customer Map</strong>
+                    </a>
                 </div>
             </section>
         </div>
@@ -2198,6 +4242,8 @@ def render_home_dashboard_sidebar():
         ("Contacts", "/contacts-view", "contact"),
         ("Orders", "/orders-view", "cart"),
         ("Insights", "/insights-view", "chart"),
+        ("Customer Map", "/customer-map-view", "map"),
+        ("Strategic Contacts", "/strategic-contacts-view", "org"),
     ]
     admin_items = [
         ("User Accounts", "/user-accounts", "key"),
@@ -2255,6 +4301,8 @@ def render_home_dashboard_icon(name):
         "contact": '<svg viewBox="0 0 24 24" focusable="false"><path d="M5 5h14v14H5zM8 9h8M8 13h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
         "cart": '<svg viewBox="0 0 24 24" focusable="false"><circle cx="9" cy="19" r="1.5" fill="currentColor"/><circle cx="17" cy="19" r="1.5" fill="currentColor"/><path d="M4 5h2l2.2 9h8.9l2.1-7H7.2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
         "chart": '<svg viewBox="0 0 24 24" focusable="false"><path d="M5 19V9M12 19V5M19 19v-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M4 19h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+        "map": '<svg viewBox="0 0 24 24" focusable="false"><path d="M4.5 6.5l5-2 5 2 5-2v13l-5 2-5-2-5 2z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9.5 4.5v13M14.5 6.5v13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+        "org": '<svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="5.5" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="6" cy="16.5" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="18" cy="16.5" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7.8v3.7M8 12h8M6 14.3v-1.9M18 14.3v-1.9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
         "pulse": '<svg viewBox="0 0 24 24" focusable="false"><path d="M3 12h4l2-4 4 8 2-4h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
         "search": '<svg viewBox="0 0 24 24" focusable="false"><circle cx="11" cy="11" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M20 20l-4.2-4.2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
         "archive": '<svg viewBox="0 0 24 24" focusable="false"><path d="M4 7.5h16v3H4zM6.5 10.5h11V19h-11zM10 13h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -2557,6 +4605,697 @@ def get_orders_view(
     return render_page(title="Orders", body=body)
 
 
+def render_customer_map_page(rows):
+    total_customers = len(rows)
+    city_count = sum(1 for row in rows if row.get("city"))
+    state_count = len({str(row.get("state") or "").strip().upper() for row in rows if str(row.get("state") or "").strip()})
+    group_counts = Counter(str(row.get("group_code") or "B").strip().upper() for row in rows)
+    map_rows_json = json.dumps(rows)
+    group_meta_json = json.dumps(CUSTOMER_GROUP_META)
+
+    return f"""
+        <link
+            rel="stylesheet"
+            href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+            integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+            crossorigin=""
+        />
+        <style>
+            .customer-map-page {{
+                display: grid;
+                gap: 10px;
+            }}
+
+            .customer-map-intro {{
+                display: grid;
+                grid-template-columns: minmax(0, 1fr);
+                gap: 8px;
+            }}
+
+            .customer-map-intro h2 {{
+                margin: 0;
+                font-size: 1.35rem;
+            }}
+
+            .customer-map-intro p {{
+                margin: 2px 0 0;
+                max-width: 980px;
+                color: #526581;
+                line-height: 1.4;
+                font-size: 0.92rem;
+            }}
+
+            .customer-map-summary {{
+                display: grid;
+                grid-template-columns: repeat(4, minmax(110px, 150px));
+                justify-content: start;
+                gap: 8px;
+            }}
+
+            .customer-map-summary-item {{
+                border: 1px solid #d6e3f7;
+                border-radius: 8px;
+                background: #fff;
+                padding: 7px 10px;
+            }}
+
+            .customer-map-summary-item .label {{
+                display: block;
+                font-size: 0.72rem;
+                font-weight: 700;
+                color: #526581;
+                text-transform: uppercase;
+                letter-spacing: 0.03em;
+            }}
+
+            .customer-map-summary-item .value {{
+                display: block;
+                margin-top: 3px;
+                font-size: 0.92rem;
+                font-weight: 700;
+                color: #1d2a3b;
+            }}
+
+            .customer-map-shell {{
+                display: grid;
+                gap: 10px;
+            }}
+
+            .customer-map-controls {{
+                display: flex;
+                justify-content: space-between;
+                gap: 10px 16px;
+                align-items: end;
+                flex-wrap: wrap;
+            }}
+
+            .customer-map-control-group {{
+                display: grid;
+                gap: 5px;
+            }}
+
+            .customer-map-control-label {{
+                font-size: 0.8rem;
+                font-weight: 700;
+                color: #526581;
+                text-transform: uppercase;
+                letter-spacing: 0.03em;
+            }}
+
+            .customer-map-toggle-row {{
+                display: flex;
+                gap: 6px;
+                flex-wrap: nowrap;
+                align-items: center;
+            }}
+
+            .customer-map-toggle {{
+                border: 1px solid #c9dbf4;
+                border-radius: 999px;
+                background: #fff;
+                color: #35506f;
+                font-weight: 700;
+                padding: 6px 14px;
+                min-width: 0;
+                width: auto;
+                flex: 0 0 auto;
+                font-size: 0.88rem;
+                line-height: 1.2;
+                cursor: pointer;
+            }}
+
+            .customer-map-toggle.is-active {{
+                border-color: #2f5cf1;
+                background: #eef4ff;
+                color: #2f5cf1;
+            }}
+
+            .customer-map-select {{
+                min-width: 190px;
+                border: 1px solid #c9dbf4;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font: inherit;
+                color: #1d2a3b;
+                background: #fff;
+            }}
+
+            .customer-map-note {{
+                margin: 0;
+                color: #667993;
+                max-width: 920px;
+                font-size: 0.82rem;
+                line-height: 1.4;
+            }}
+
+            .customer-map-main {{
+                display: grid;
+                grid-template-columns: minmax(0, 2.8fr) minmax(235px, 0.62fr);
+                gap: 10px;
+                align-items: start;
+            }}
+
+            .customer-map-canvas {{
+                border: 1px solid #d6e3f7;
+                border-radius: 8px;
+                overflow: hidden;
+                background: #f8fbff;
+                min-height: 700px;
+            }}
+
+            #customer-map-canvas {{
+                width: 100%;
+                height: 700px;
+            }}
+
+            .customer-map-sidebar {{
+                display: grid;
+                gap: 10px;
+            }}
+
+            .customer-map-panel {{
+                border: 1px solid #d6e3f7;
+                border-radius: 8px;
+                background: #fff;
+                padding: 10px 12px;
+            }}
+
+            .customer-map-panel h3 {{
+                margin: 0 0 10px;
+                font-size: 0.9rem;
+            }}
+
+            .customer-map-legend {{
+                display: grid;
+                gap: 10px;
+            }}
+
+            .customer-map-legend-item {{
+                display: grid;
+                grid-template-columns: auto 1fr auto;
+                gap: 10px;
+                align-items: center;
+            }}
+
+            .customer-map-swatch {{
+                width: 12px;
+                height: 12px;
+                border-radius: 999px;
+            }}
+
+            .customer-map-stats {{
+                display: grid;
+                gap: 10px;
+            }}
+
+            .customer-map-stat-line {{
+                display: flex;
+                justify-content: space-between;
+                gap: 16px;
+                color: #35506f;
+            }}
+
+            .customer-map-list {{
+                display: grid;
+                gap: 10px;
+            }}
+
+            .customer-map-list-item {{
+                display: grid;
+                gap: 4px;
+                padding-top: 10px;
+                border-top: 1px solid #e5edf9;
+            }}
+
+            .customer-map-list-item:first-child {{
+                padding-top: 0;
+                border-top: 0;
+            }}
+
+            .customer-map-list-item strong {{
+                color: #1d2a3b;
+            }}
+
+            .customer-map-list-item span {{
+                color: #667993;
+                font-size: 0.88rem;
+            }}
+
+            .customer-map-status {{
+                margin: 0;
+                color: #667993;
+                font-size: 0.95rem;
+            }}
+
+            .customer-map-status strong {{
+                color: #1d2a3b;
+            }}
+
+            .customer-map-popup strong {{
+                display: block;
+                margin-bottom: 4px;
+                color: #1d2a3b;
+            }}
+
+            .customer-map-popup .meta {{
+                color: #526581;
+                font-size: 0.92rem;
+                line-height: 1.45;
+            }}
+
+            @media (max-width: 980px) {{
+                .customer-map-controls {{
+                    display: grid;
+                    grid-template-columns: 1fr;
+                }}
+
+                .customer-map-main {{
+                    grid-template-columns: 1fr;
+                }}
+
+                .customer-map-summary {{
+                    grid-template-columns: repeat(2, minmax(110px, 1fr));
+                }}
+            }}
+
+            @media (max-width: 640px) {{
+                .customer-map-intro h2 {{
+                    font-size: 1.55rem;
+                }}
+
+                .customer-map-summary {{
+                    grid-template-columns: 1fr 1fr;
+                }}
+
+                .customer-map-toggle-row {{
+                    flex-wrap: wrap;
+                }}
+
+                .customer-map-canvas,
+                #customer-map-canvas {{
+                    min-height: 480px;
+                    height: 480px;
+                }}
+            }}
+        </style>
+
+        <section class="customer-map-page">
+            <div class="customer-map-intro">
+                <div>
+                    <h2>Customer Heat Map</h2>
+                    <p>See where customers are concentrated across the United States and Canada, then switch between city, state, and customer-group views to spot clusters quickly.</p>
+                </div>
+                <div class="customer-map-summary">
+                    <div class="customer-map-summary-item">
+                        <span class="label">Customers</span>
+                        <span class="value">{total_customers}</span>
+                    </div>
+                    <div class="customer-map-summary-item">
+                        <span class="label">Cities</span>
+                        <span class="value">{city_count}</span>
+                    </div>
+                    <div class="customer-map-summary-item">
+                        <span class="label">States / Provinces</span>
+                        <span class="value">{state_count}</span>
+                    </div>
+                    <div class="customer-map-summary-item">
+                        <span class="label">Groups</span>
+                        <span class="value">{len(group_counts)}</span>
+                    </div>
+                </div>
+            </div>
+
+            <section class="customer-map-shell">
+                <div class="customer-map-controls">
+                    <div class="customer-map-control-group">
+                        <span class="customer-map-control-label">Show By</span>
+                        <div class="customer-map-toggle-row" id="customer-map-view-toggles">
+                            <button class="customer-map-toggle is-active" type="button" data-view-mode="city">City</button>
+                            <button class="customer-map-toggle" type="button" data-view-mode="state">State</button>
+                            <button class="customer-map-toggle" type="button" data-view-mode="group">Customer Group</button>
+                        </div>
+                    </div>
+                    <div class="customer-map-control-group">
+                        <span class="customer-map-control-label">Group Filter</span>
+                        <select class="customer-map-select" id="customer-map-group-filter">
+                            <option value="all">All groups</option>
+                            <option value="A">A - Vestis / Aramark</option>
+                            <option value="B">B - Independents / Other</option>
+                            <option value="C">C - Cintas & UniFirst</option>
+                            <option value="D">D - CSC Customers</option>
+                        </select>
+                    </div>
+                </div>
+                <p class="customer-map-note">City and group views use saved browser location lookups when available and fall back to state-level placement while the map learns the location. The first pass may look a little rougher; after that it settles down quickly.</p>
+
+                <div class="customer-map-main">
+                    <div class="customer-map-canvas">
+                        <div id="customer-map-canvas"></div>
+                    </div>
+                    <aside class="customer-map-sidebar">
+                        <section class="customer-map-panel">
+                            <h3>Customer Groups</h3>
+                            <div class="customer-map-legend" id="customer-map-legend"></div>
+                        </section>
+                        <section class="customer-map-panel">
+                            <h3>Visible Summary</h3>
+                            <div class="customer-map-stats" id="customer-map-stats"></div>
+                            <p class="customer-map-status" id="customer-map-status"></p>
+                        </section>
+                        <section class="customer-map-panel">
+                            <h3>Top Locations</h3>
+                            <div class="customer-map-list" id="customer-map-top-list"></div>
+                        </section>
+                    </aside>
+                </div>
+            </section>
+        </section>
+
+        <script
+            src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""
+        ></script>
+        <script>
+            (function () {{
+                const rows = {map_rows_json};
+                const groupMeta = {group_meta_json};
+                const geocodeCacheKey = "customer-map-geo-cache-v1";
+                const geocodeQueueLimit = 20;
+                const defaultCenter = [39.8, -98.6];
+                const defaultZoom = 4;
+                let currentViewMode = "city";
+                let currentGroupFilter = "all";
+                let renderToken = 0;
+
+                const map = L.map("customer-map-canvas", {{
+                    zoomControl: true,
+                    scrollWheelZoom: true,
+                }}).setView(defaultCenter, defaultZoom);
+
+                L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+                    maxZoom: 18,
+                    attribution: "&copy; OpenStreetMap contributors",
+                }}).addTo(map);
+
+                const markerLayer = L.layerGroup().addTo(map);
+                const legendElement = document.getElementById("customer-map-legend");
+                const statsElement = document.getElementById("customer-map-stats");
+                const statusElement = document.getElementById("customer-map-status");
+                const topListElement = document.getElementById("customer-map-top-list");
+                const viewButtons = Array.from(document.querySelectorAll("[data-view-mode]"));
+                const groupFilterSelect = document.getElementById("customer-map-group-filter");
+
+                function loadGeocodeCache() {{
+                    try {{
+                        return JSON.parse(window.localStorage.getItem(geocodeCacheKey) || "{{}}");
+                    }} catch (error) {{
+                        return {{}};
+                    }}
+                }}
+
+                let geocodeCache = loadGeocodeCache();
+
+                function saveGeocodeCache() {{
+                    try {{
+                        window.localStorage.setItem(geocodeCacheKey, JSON.stringify(geocodeCache));
+                    }} catch (error) {{
+                        // local storage can fail quietly on private browsing or low space.
+                    }}
+                }}
+
+                function getGroupMeta(code) {{
+                    return groupMeta[code] || groupMeta.B;
+                }}
+
+                function buildLegend() {{
+                    legendElement.innerHTML = Object.entries(groupMeta).map(([code, meta]) => `
+                        <div class="customer-map-legend-item">
+                            <span class="customer-map-swatch" style="background:${{meta.color}}"></span>
+                            <span>${{meta.label}}</span>
+                            <strong>${{code}}</strong>
+                        </div>
+                    `).join("");
+                }}
+
+                function normalizeText(value) {{
+                    return String(value || "").trim().toLowerCase();
+                }}
+
+                function buildAggregateItems() {{
+                    const filteredRows = rows.filter((row) => currentGroupFilter === "all" || row.group_code === currentGroupFilter);
+                    const grouped = new Map();
+
+                    for (const row of filteredRows) {{
+                        let key = "";
+                        let label = "";
+                        let queryLabel = "";
+                        let color = currentGroupFilter === "all" ? "#2f5cf1" : getGroupMeta(row.group_code).color;
+                        let breakdownKey = row.group_code;
+
+                        if (currentViewMode === "state") {{
+                            key = `state|${{row.state}}`;
+                            label = `${{row.state_label || row.state}}, ${{row.country}}`;
+                            queryLabel = label;
+                        }} else if (currentViewMode === "group") {{
+                            const locationKey = row.city ? `${{row.city}}|${{row.state}}` : `stateonly|${{row.state}}`;
+                            key = `group|${{row.group_code}}|${{locationKey}}`;
+                            label = row.city
+                                ? `${{row.city}}, ${{row.state}}`
+                                : `${{row.state_label || row.state}} (state-level placement)`;
+                            queryLabel = row.query_label || `${{row.state_label || row.state}}, ${{row.country}}`;
+                            color = getGroupMeta(row.group_code).color;
+                        }} else {{
+                            key = row.city
+                                ? `city|${{row.city}}|${{row.state}}`
+                                : `city|stateonly|${{row.state}}`;
+                            label = row.city
+                                ? `${{row.city}}, ${{row.state}}`
+                                : `${{row.state_label || row.state}} (state-level placement)`;
+                            queryLabel = row.query_label || `${{row.state_label || row.state}}, ${{row.country}}`;
+                        }}
+
+                        if (!grouped.has(key)) {{
+                            grouped.set(key, {{
+                                key,
+                                label,
+                                queryLabel,
+                                state: row.state,
+                                stateLabel: row.state_label,
+                                country: row.country,
+                                city: row.city,
+                                groupCode: row.group_code,
+                                groupLabel: getGroupMeta(row.group_code).label,
+                                color,
+                                fallbackLat: row.fallback_lat,
+                                fallbackLng: row.fallback_lng,
+                                count: 0,
+                                customers: [],
+                                groups: {{}},
+                            }});
+                        }}
+
+                        const item = grouped.get(key);
+                        item.count += 1;
+                        item.customers.push(row.customer);
+                        item.groups[breakdownKey] = (item.groups[breakdownKey] || 0) + 1;
+                    }}
+
+                    return Array.from(grouped.values()).sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+                }}
+
+                function formatBreakdown(groups) {{
+                    const parts = Object.entries(groups)
+                        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+                        .map(([code, count]) => `${{code}}: ${{count}}`);
+                    return parts.join(" • ");
+                }}
+
+                function renderStats(items) {{
+                    const visibleCustomers = items.reduce((sum, item) => sum + item.count, 0);
+                    const geocodedItems = items.filter((item) => geocodeCache[item.queryLabel]).length;
+                    const approximateItems = items.filter((item) => !geocodeCache[item.queryLabel]).length;
+                    statsElement.innerHTML = `
+                        <div class="customer-map-stat-line"><span>Markers</span><strong>${{items.length}}</strong></div>
+                        <div class="customer-map-stat-line"><span>Customers shown</span><strong>${{visibleCustomers}}</strong></div>
+                        <div class="customer-map-stat-line"><span>Saved locations</span><strong>${{geocodedItems}}</strong></div>
+                        <div class="customer-map-stat-line"><span>Approximate placements</span><strong>${{approximateItems}}</strong></div>
+                    `;
+                    statusElement.innerHTML = currentViewMode === "state"
+                        ? "State view is fully placed from built-in state and province centres."
+                        : "<strong>Note:</strong> city and group markers settle into better positions as saved locations build up in the browser.";
+                }}
+
+                function renderTopList(items) {{
+                    if (!items.length) {{
+                        topListElement.innerHTML = "<p class='customer-map-status'>No customers match the current filter.</p>";
+                        return;
+                    }}
+                    topListElement.innerHTML = items.slice(0, 8).map((item) => `
+                        <div class="customer-map-list-item">
+                            <strong>${{item.label}}</strong>
+                            <span>${{item.count}} customer${{item.count === 1 ? "" : "s"}}${{item.groups ? " • " + formatBreakdown(item.groups) : ""}}</span>
+                        </div>
+                    `).join("");
+                }}
+
+                function getMarkerRadius(count) {{
+                    return Math.max(8, Math.min(26, 8 + Math.sqrt(count) * 3.2));
+                }}
+
+                function buildPopupHtml(item) {{
+                    const title = currentViewMode === "group"
+                        ? `${{item.groupLabel}} • ${{item.label}}`
+                        : item.label;
+                    const sampleCustomers = item.customers.slice(0, 5).join(", ");
+                    const extraCount = item.customers.length > 5 ? ` +${{item.customers.length - 5}} more` : "";
+                    return `
+                        <div class="customer-map-popup">
+                            <strong>${{title}}</strong>
+                            <div class="meta">
+                                ${{item.count}} customer${{item.count === 1 ? "" : "s"}}<br>
+                                ${{formatBreakdown(item.groups)}}<br>
+                                ${{sampleCustomers}}${{extraCount}}
+                            </div>
+                        </div>
+                    `;
+                }}
+
+                async function geocodeQuery(queryLabel) {{
+                    const existing = geocodeCache[queryLabel];
+                    if (existing && typeof existing.lat === "number" && typeof existing.lng === "number") {{
+                        return existing;
+                    }}
+
+                    const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${{encodeURIComponent(queryLabel)}}`);
+                    if (!response.ok) {{
+                        return null;
+                    }}
+                    const payload = await response.json();
+                    const first = Array.isArray(payload) ? payload[0] : null;
+                    if (!first) {{
+                        geocodeCache[queryLabel] = null;
+                        saveGeocodeCache();
+                        return null;
+                    }}
+
+                    const point = {{
+                        lat: Number(first.lat),
+                        lng: Number(first.lon),
+                    }};
+                    geocodeCache[queryLabel] = point;
+                    saveGeocodeCache();
+                    return point;
+                }}
+
+                async function enrichVisibleMarkers(token, jobs) {{
+                    const limitedJobs = jobs.slice(0, geocodeQueueLimit);
+                    for (const job of limitedJobs) {{
+                        if (token !== renderToken) {{
+                            return;
+                        }}
+                        if (!job.item.queryLabel) {{
+                            continue;
+                        }}
+                        try {{
+                            const point = await geocodeQuery(job.item.queryLabel);
+                            if (!point || token !== renderToken) {{
+                                continue;
+                            }}
+                            job.marker.setLatLng([point.lat, point.lng]);
+                        }} catch (error) {{
+                            // leave the fallback marker in place if a lookup fails.
+                        }}
+                    }}
+                }}
+
+                function fitMapToLayer() {{
+                    const bounds = [];
+                    markerLayer.eachLayer((layer) => {{
+                        if (layer.getLatLng) {{
+                            const latLng = layer.getLatLng();
+                            if (Number.isFinite(latLng.lat) && Number.isFinite(latLng.lng)) {{
+                                bounds.push(latLng);
+                            }}
+                        }}
+                    }});
+
+                    if (!bounds.length) {{
+                        map.setView(defaultCenter, defaultZoom);
+                        return;
+                    }}
+
+                    if (bounds.length === 1) {{
+                        map.setView(bounds[0], 5);
+                        return;
+                    }}
+
+                    map.fitBounds(L.latLngBounds(bounds), {{ padding: [24, 24] }});
+                }}
+
+                function renderMap() {{
+                    renderToken += 1;
+                    const token = renderToken;
+                    markerLayer.clearLayers();
+
+                    const items = buildAggregateItems();
+                    renderStats(items);
+                    renderTopList(items);
+
+                    const geocodeJobs = [];
+                    for (const item of items) {{
+                        const cachedPoint = item.queryLabel ? geocodeCache[item.queryLabel] : null;
+                        const lat = cachedPoint && Number.isFinite(cachedPoint.lat)
+                            ? cachedPoint.lat
+                            : item.fallbackLat;
+                        const lng = cachedPoint && Number.isFinite(cachedPoint.lng)
+                            ? cachedPoint.lng
+                            : item.fallbackLng;
+
+                        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {{
+                            continue;
+                        }}
+
+                        const marker = L.circleMarker([lat, lng], {{
+                            radius: getMarkerRadius(item.count),
+                            fillColor: item.color,
+                            color: "#ffffff",
+                            weight: 1.5,
+                            opacity: 1,
+                            fillOpacity: cachedPoint ? 0.78 : 0.48,
+                        }});
+                        marker.bindPopup(buildPopupHtml(item));
+                        marker.addTo(markerLayer);
+
+                        if (!cachedPoint && currentViewMode !== "state" && item.queryLabel) {{
+                            geocodeJobs.push({{ item, marker }});
+                        }}
+                    }}
+
+                    fitMapToLayer();
+                    enrichVisibleMarkers(token, geocodeJobs);
+                }}
+
+                buildLegend();
+                viewButtons.forEach((button) => {{
+                    button.addEventListener("click", () => {{
+                        currentViewMode = button.getAttribute("data-view-mode") || "city";
+                        viewButtons.forEach((item) => item.classList.toggle("is-active", item === button));
+                        renderMap();
+                    }});
+                }});
+
+                groupFilterSelect.addEventListener("change", () => {{
+                    currentGroupFilter = groupFilterSelect.value || "all";
+                    renderMap();
+                }});
+
+                renderMap();
+            }})();
+        </script>
+    """
+
+
 @app.get("/insights-view", response_class=HTMLResponse)
 def get_insights_view():
     order_result = get_orders_for_analysis()
@@ -2637,6 +5376,38 @@ def get_insights_view():
     """
 
     return render_page(title="Insights", body=body)
+
+
+@app.get("/customer-map-view", response_class=HTMLResponse)
+def get_customer_map_view():
+    order_result = get_orders_for_analysis()
+    master_data_result = fetch_filemaker_master_data()
+
+    if order_result.get("status") != "ok":
+        return render_page(
+            title="Customer Map",
+            body=(
+                f"<p class='status error'>Could not load data from "
+                f"{escape(order_result.get('source', 'orders'))}: "
+                f"{escape(order_result.get('status', 'unknown'))}</p>"
+            ),
+        )
+
+    map_rows = build_customer_map_rows(
+        order_result=order_result,
+        master_data_result=master_data_result,
+    )
+
+    if not map_rows:
+        return render_page(
+            title="Customer Map",
+            body="<p class='status'>No United States or Canada customer locations are available yet.</p>",
+        )
+
+    return render_page(
+        title="Customer Map",
+        body=render_customer_map_page(map_rows),
+    )
 
 
 @app.get("/late-customers")
@@ -3927,6 +6698,167 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
     return summaries
 
 
+def normalize_state_or_province(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    upper = text.upper()
+    if upper in US_STATE_ABBR_TO_NAME or upper in CANADA_PROVINCE_ABBR_TO_NAME:
+        return upper
+
+    normalized = normalize_apollo_location_value(text)
+    if normalized in US_STATE_NAME_TO_ABBR:
+        return US_STATE_NAME_TO_ABBR[normalized]
+    if normalized in CANADA_PROVINCE_NAME_TO_ABBR:
+        return CANADA_PROVINCE_NAME_TO_ABBR[normalized]
+
+    return upper
+
+
+def looks_like_non_city_label(value):
+    normalized = normalize_apollo_location_value(value)
+    return normalized in NON_CITY_LOCATION_WORDS
+
+
+def infer_country_from_location_parts(state="", zip_code="", country_hint="", company_name=""):
+    country_text = str(country_hint or "").strip()
+    if country_text:
+        normalized_country = normalize_apollo_location_value(country_text)
+        if normalized_country in {"united states", "usa", "us"}:
+            return "United States"
+        if normalized_country in {"canada", "ca"}:
+            return "Canada"
+        return country_text
+
+    normalized_state = normalize_state_or_province(state)
+    if normalized_state in US_STATE_ABBR_TO_NAME:
+        return "United States"
+    if normalized_state in CANADA_PROVINCE_ABBR_TO_NAME:
+        return "Canada"
+
+    zip_text = str(zip_code or "").strip().upper()
+    if re.match(r"^\d{5}(?:-\d{4})?$", zip_text):
+        return "United States"
+    if re.match(r"^[A-Z]\d[A-Z][ -]?\d[A-Z]\d$", zip_text):
+        return "Canada"
+
+    company_text = normalize_apollo_location_value(company_name)
+    if " canada " in f" {company_text} ":
+        return "Canada"
+
+    return ""
+
+
+def get_customer_latest_price_list(customer_orders):
+    for order in reversed(list(customer_orders or [])):
+        price_list = str(get_order_price_list(order) or "").strip().upper()
+        if price_list:
+            return price_list
+    return ""
+
+
+def infer_customer_group_code(customer_name, customer_orders=None, customer_record=None):
+    price_list = get_customer_latest_price_list(customer_orders)
+    if price_list in CUSTOMER_GROUP_META:
+        return price_list
+
+    customer_text = normalize_apollo_location_value(customer_name)
+    customer_type = normalize_apollo_location_value(
+        (customer_record or {}).get("type", "")
+    )
+
+    if "vestis" in customer_text or "aramark" in customer_text:
+        return "A"
+    if "cintas" in customer_text or "unifirst" in customer_text or "uni first" in customer_text:
+        return "C"
+    if "csc" in customer_text or "csc" in customer_type:
+        return "D"
+
+    return "B"
+
+
+def build_customer_map_rows(order_result=None, master_data_result=None):
+    order_result = order_result or get_orders_for_analysis()
+    master_data_result = master_data_result or fetch_filemaker_master_data()
+    if order_result.get("status") != "ok":
+        return []
+
+    grouped_orders = group_by_customer(order_result.get("orders", []))
+    customer_entries = build_customer_lookup_entries(grouped_orders, master_data_result)
+    customers_by_key = (
+        master_data_result.get("customers_by_key", {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
+
+    rows = []
+    for entry in customer_entries:
+        customer_name = str(entry.get("customer") or "").strip()
+        customer_orders = list(entry.get("orders") or [])
+        customer_key = str(entry.get("customer_primary_key") or "").strip()
+        customer_record = customers_by_key.get(customer_key, {})
+        branch_parts = extract_customer_branch_parts(customer_name, customer_orders=customer_orders)
+
+        city = branch_parts.get("city") or str(customer_record.get("city") or "").strip()
+        if looks_like_non_city_label(city):
+            city = ""
+
+        state = normalize_state_or_province(
+            branch_parts.get("state")
+            or customer_record.get("state")
+            or (get_order_state(customer_orders[-1]) if customer_orders else "")
+        )
+        zip_code = str(
+            customer_record.get("zip_code")
+            or (customer_orders[-1].get("extra", {}).get("Companies 4::ZIP Code") if customer_orders else "")
+            or (customer_orders[-1].get("extra", {}).get("ai_Zip") if customer_orders else "")
+            or ""
+        ).strip()
+        country = infer_country_from_location_parts(
+            state=state,
+            zip_code=zip_code,
+            country_hint=customer_record.get("country"),
+            company_name=customer_name,
+        )
+
+        if country not in {"United States", "Canada"}:
+            continue
+
+        group_code = infer_customer_group_code(
+            customer_name,
+            customer_orders=customer_orders,
+            customer_record=customer_record,
+        )
+        group_meta = CUSTOMER_GROUP_META.get(group_code, CUSTOMER_GROUP_META["B"])
+        fallback_coords = STATE_CENTER_COORDS.get(state)
+        query_label = ", ".join(part for part in [city, state, country] if part)
+        state_label = (
+            US_STATE_ABBR_TO_NAME.get(state)
+            or CANADA_PROVINCE_ABBR_TO_NAME.get(state)
+            or state
+        )
+
+        rows.append({
+            "customer": customer_name,
+            "customer_primary_key": customer_key,
+            "city": city,
+            "state": state,
+            "state_label": state_label,
+            "country": country,
+            "zip_code": zip_code,
+            "group_code": group_code,
+            "group_label": group_meta["label"],
+            "group_color": group_meta["color"],
+            "price_list": get_customer_latest_price_list(customer_orders),
+            "query_label": query_label,
+            "fallback_lat": fallback_coords[0] if fallback_coords else None,
+            "fallback_lng": fallback_coords[1] if fallback_coords else None,
+        })
+
+    return rows
+
+
 def build_cached_customer_summaries(order_result, crm_result, attention_result=None):
     started_at = time.perf_counter()
     cache_seconds = get_customer_summaries_cache_seconds()
@@ -4886,6 +7818,92 @@ def extract_domain_from_email(email):
     if "@" not in email:
         return ""
     return email.split("@", 1)[1].strip()
+
+
+def extract_domain_from_url(url):
+    text = str(url or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^https?://", "", text)
+    text = re.sub(r"^www\.", "", text)
+    text = text.split("/", 1)[0].strip()
+    return text
+
+
+def is_trusted_company_domain_for_org(domain, organization_name):
+    normalized_domain = extract_domain_from_url(domain)
+    if not normalized_domain or "." not in normalized_domain:
+        return False
+
+    if any(term in normalized_domain for term in ("freshdesk", "unknown", "cdn", "services.")):
+        return False
+
+    alias_tokens = set()
+    for alias in get_company_search_aliases(organization_name):
+        normalized_alias = normalize_apollo_location_value(alias)
+        if not normalized_alias:
+            continue
+        compact_alias = normalized_alias.replace(" ", "")
+        if compact_alias:
+            alias_tokens.add(compact_alias)
+        alias_tokens.update(
+            token
+            for token in normalized_alias.split()
+            if token and len(token) > 2
+        )
+
+    if "vestis" in alias_tokens or "aramark" in alias_tokens:
+        alias_tokens.update({"ameripride"})
+
+    domain_compact = normalized_domain.replace("-", "").replace(".", "")
+    for token in alias_tokens:
+        if token and token in domain_compact:
+            return True
+
+    return False
+
+
+def get_known_company_domains(organization_name):
+    organization_name = str(organization_name or "").strip()
+    if not organization_name:
+        return set()
+
+    override_domains = set()
+    for alias in get_company_search_aliases(organization_name) + [organization_name]:
+        normalized_alias = normalize_apollo_location_value(alias)
+        if not normalized_alias:
+            continue
+        override_domains.update(
+            extract_domain_from_url(domain)
+            for key, domains in STRATEGIC_CONTACT_DOMAIN_OVERRIDES.items()
+            if normalize_apollo_location_value(key) == normalized_alias
+            for domain in domains
+            if extract_domain_from_url(domain)
+        )
+
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") != "ok":
+        return override_domains
+
+    rows = build_contact_master_rows(master_data_result)
+    domain_counts = {}
+    for row in rows:
+        company = str(row.get("company") or "").strip()
+        if not company_family_matches(organization_name, company):
+            continue
+        domain = extract_domain_from_email(row.get("email"))
+        if not is_trusted_company_domain_for_org(domain, organization_name):
+            continue
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+
+    sorted_domains = [
+        domain
+        for domain, _count in sorted(
+            domain_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+    return override_domains.union(sorted_domains[:5])
 
 
 def infer_customer_domain(customer_primary_key, crm_activities=None):
@@ -10339,6 +13357,16 @@ EMAIL_FIRST_COMPANY_ALIASES = (
     {"unifirst", "uni first"},
 )
 
+STRATEGIC_CONTACT_DOMAIN_OVERRIDES = {
+    "vestis": ["vestis.com", "aramark.com", "ameripride.com"],
+    "aramark": ["aramark.com", "vestis.com", "ameripride.com"],
+    "cintas": ["cintas.com"],
+    "alsco": ["alsco.com"],
+    "unifirst": ["unifirst.com"],
+    "uni first": ["unifirst.com"],
+    "csc": ["cscserviceworks.com"],
+}
+
 ASK_DATA_NOISE_TOKENS = {
     "who", "what", "when", "where", "why", "how", "did", "does", "do", "is", "are",
     "the", "a", "an", "at", "in", "on", "from", "for", "of", "to", "we", "our",
@@ -12276,6 +15304,8 @@ def render_global_nav(title):
         ("Home", "/"),
         ("Action Plan", "/action-plan-view"),
         ("Insights", "/insights-view"),
+        ("Customer Map", "/customer-map-view"),
+        ("Strategic Contacts", "/strategic-contacts-view"),
         ("Orders", "/orders-view"),
         ("Customers", "/customers-view"),
         ("Contacts", "/contacts-view"),
@@ -14147,6 +17177,232 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         border-radius: 8px;
                         background: var(--surface-soft);
                         padding: 14px;
+                    }}
+
+                    .strategic-contact-columns {{
+                        margin-top: 12px;
+                    }}
+
+                    .strategic-contact-form-row {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px;
+                    }}
+
+                    .strategic-organization-panel {{
+                        margin-top: 16px;
+                    }}
+
+                    .strategic-organization-head {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        gap: 12px;
+                        margin-bottom: 12px;
+                    }}
+
+                    .strategic-contact-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 12px;
+                    }}
+
+                    .strategic-contact-card {{
+                        border: 1px solid var(--border);
+                        box-shadow: none;
+                    }}
+
+                    .strategic-contact-card h4 {{
+                        margin: 0;
+                        font-size: 22px;
+                        line-height: 1.15;
+                    }}
+
+                    .strategic-contact-card-head {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: start;
+                        gap: 12px;
+                        margin-bottom: 8px;
+                    }}
+
+                    .strategic-contact-summary {{
+                        margin: 8px 0;
+                    }}
+
+                    .strategic-pdl-discovery {{
+                        padding: 18px 20px;
+                    }}
+
+                    .strategic-pdl-discovery h3,
+                    .strategic-pdl-panel h3 {{
+                        margin-bottom: 10px;
+                    }}
+
+                    .strategic-pdl-discovery .login-form {{
+                        gap: 10px;
+                        margin: 0;
+                    }}
+
+                    .strategic-pdl-discovery .label {{
+                        margin-bottom: 4px;
+                    }}
+
+                    .strategic-discovery-actions {{
+                        align-items: center;
+                        gap: 8px;
+                        margin-top: 8px;
+                    }}
+
+                    .strategic-discovery-submit {{
+                        min-width: 220px;
+                        width: auto;
+                        flex: 0 0 auto;
+                    }}
+
+                    .strategic-pdl-panel {{
+                        margin-top: 12px;
+                        padding: 18px 20px;
+                    }}
+
+                    .strategic-pdl-card {{
+                        border: 1px solid var(--border);
+                        box-shadow: none;
+                        padding: 16px;
+                        font-size: 15px;
+                    }}
+
+                    .strategic-pdl-card h4 {{
+                        margin: 0;
+                        font-size: 16px;
+                        line-height: 1.2;
+                        font-weight: 500;
+                    }}
+
+                    .strategic-pdl-card p {{
+                        margin: 0 0 8px;
+                        font-size: 14px;
+                        font-weight: 400;
+                    }}
+
+                    .strategic-pdl-card strong {{
+                        font-weight: 500;
+                    }}
+
+                    .strategic-pdl-card .small.muted:last-of-type {{
+                        margin-bottom: 0;
+                    }}
+
+                    .strategic-pdl-card .small.muted {{
+                        font-size: 13px;
+                        line-height: 1.35;
+                    }}
+
+                    .strategic-pdl-actions {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 8px;
+                        align-items: center;
+                        margin-top: 10px;
+                        justify-content: space-between;
+                    }}
+
+                    .status-pill-stack {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        justify-content: flex-end;
+                        gap: 6px;
+                    }}
+
+                    .strategic-pdl-panel .compact-summary {{
+                        grid-template-columns: repeat(6, minmax(0, 1fr));
+                        gap: 8px;
+                        margin: 10px 0 8px;
+                    }}
+
+                    .strategic-pdl-panel .compact-summary div {{
+                        padding: 10px 12px;
+                        min-height: auto;
+                    }}
+
+                    .strategic-pdl-panel .compact-summary .label {{
+                        font-size: 11px;
+                        margin-bottom: 2px;
+                    }}
+
+                    .strategic-pdl-panel .compact-summary strong {{
+                        font-size: 16px;
+                        line-height: 1.1;
+                    }}
+
+                    .strategic-pdl-panel pre {{
+                        margin: 8px 0 0;
+                        padding: 12px;
+                        font-size: 12px;
+                        line-height: 1.35;
+                        white-space: pre-wrap;
+                        word-break: break-word;
+                    }}
+
+                    .strategic-pdl-panel > .small.muted:first-of-type {{
+                        margin-bottom: 8px;
+                    }}
+
+                    .inline-form {{
+                        margin: 0;
+                    }}
+
+                    .strategic-pdl-card .strategic-contact-summary {{
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px;
+                        margin: 10px 0 12px;
+                    }}
+
+                    .strategic-pdl-card .strategic-contact-summary div {{
+                        min-width: 0;
+                        padding: 12px 14px;
+                    }}
+
+                    .strategic-pdl-card .strategic-contact-summary strong {{
+                        display: block;
+                        font-size: 14px;
+                        line-height: 1.25;
+                        font-weight: 500;
+                        overflow-wrap: anywhere;
+                        word-break: break-word;
+                    }}
+
+                    .strategic-save-form {{
+                        display: inline-flex;
+                        justify-content: flex-end;
+                        margin-left: auto;
+                    }}
+
+                    .strategic-save-button {{
+                        min-width: 0;
+                        padding: 8px 14px;
+                        font-size: 14px;
+                        line-height: 1.2;
+                    }}
+
+                    .status-pill {{
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        min-height: 28px;
+                        padding: 0 10px;
+                        border-radius: 999px;
+                        background: #eef3ff;
+                        color: var(--brand);
+                        font-size: 12px;
+                        font-weight: 700;
+                        line-height: 1;
+                        white-space: nowrap;
+                    }}
+
+                    .status-pill.ok {{
+                        background: #e7f6ee;
+                        color: #18794e;
                     }}
 
                     .m365-status-actions {{
@@ -16034,6 +19290,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     @media (max-width: 1120px) {{
                         .user-account-columns {{
                             grid-template-columns: 1fr;
+                        }}
+
+                        .strategic-contact-grid,
+                        .strategic-contact-form-row,
+                        .strategic-contact-columns {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .strategic-pdl-panel .compact-summary {{
+                            grid-template-columns: repeat(3, minmax(0, 1fr));
                         }}
 
                         .user-accounts-table {{
