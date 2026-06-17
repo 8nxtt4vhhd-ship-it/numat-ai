@@ -232,6 +232,29 @@ def get_login_mfa_enabled():
     return value in {"1", "true", "yes", "on"}
 
 
+def get_login_mfa_sender_username():
+    configured = normalize_username(os.getenv("APP_MFA_SENDER_USERNAME", "").strip())
+    return configured or "trudy"
+
+
+def format_login_mfa_error(send_result):
+    status = str((send_result or {}).get("status") or "").strip()
+    error_message = str((send_result or {}).get("error_message") or "").strip()
+    if error_message:
+        return error_message
+    if status == "missing_recipient":
+        return "This user account does not have an email address."
+    if status == "missing_sender":
+        return "The shared MFA sender account is not configured."
+    if status == "missing_refresh_token":
+        return "The shared Microsoft 365 sender needs reconnecting."
+    if status in {"connection_error", "request_error", "timeout"}:
+        return f"Microsoft 365 send failed: {status}."
+    if status and status != "ok":
+        return f"Microsoft 365 send failed: {status}."
+    return "We could not send the sign-in code right now."
+
+
 def get_login_mfa_challenges_path():
     configured = os.getenv("LOGIN_MFA_CHALLENGES_PATH", "").strip()
     return Path(configured) if configured else DEFAULT_LOGIN_MFA_CHALLENGES_PATH
@@ -400,24 +423,34 @@ def user_requires_email_mfa(user):
         return False
     if not user or not bool(user.get("active", True)):
         return False
-    connection_state = get_m365_connection_state(user)
-    return bool(connection_state.get("connected"))
+    if normalize_username(user.get("username")) == get_login_mfa_sender_username():
+        return False
+    return True
 
 
 def send_login_mfa_code(user):
     if not user:
         return {"status": "missing_user"}
 
-    username = str(user.get("username") or "").strip()
     recipient = str(user.get("m365_email") or "").strip().lower()
-    if not username or not recipient:
+    sender_username = get_login_mfa_sender_username()
+    if not recipient:
         return {"status": "missing_recipient"}
+    if not sender_username:
+        return {"status": "missing_sender"}
 
-    token_result = ensure_valid_access_token(username)
+    token_result = ensure_valid_access_token(sender_username)
     if token_result.get("status") != "ok":
+        print(
+            "Login MFA send failed:",
+            f"sender={sender_username}",
+            f"recipient={recipient}",
+            f"status={token_result.get('status')}",
+            f"error={token_result.get('error_message') or ''}",
+        )
         return token_result
 
-    challenge = create_login_mfa_challenge(username)
+    challenge = create_login_mfa_challenge(user.get("username"))
     code = str(challenge.get("plain_code") or "").strip()
     if not code:
         return {"status": "challenge_error"}
@@ -435,6 +468,13 @@ def send_login_mfa_code(user):
         ),
     )
     if send_result.get("status") != "ok":
+        print(
+            "Login MFA send failed:",
+            f"sender={sender_username}",
+            f"recipient={recipient}",
+            f"status={send_result.get('status')}",
+            f"error={send_result.get('error_message') or ''}",
+        )
         return send_result
 
     return {"status": "ok", "masked_email": mask_email_address(recipient)}
@@ -2368,7 +2408,7 @@ def post_login(request: Request, username: str = Form(""), password: str = Form(
                 status_code=303,
             )
         return RedirectResponse(
-            url=f"/login?next={quote(next or '/')}&error={quote('We could not send the sign-in code. Please connect Microsoft 365 first or ask an admin for help.')}",
+            url=f"/login?next={quote(next or '/')}&error={quote(format_login_mfa_error(send_result))}",
             status_code=303,
         )
 
@@ -2426,7 +2466,7 @@ def post_login_mfa_resend(request: Request):
     send_result = send_login_mfa_code(user)
     if send_result.get("status") != "ok":
         return RedirectResponse(
-            url="/login/mfa?error=" + quote("We could not resend the sign-in code right now."),
+            url="/login/mfa?error=" + quote(format_login_mfa_error(send_result)),
             status_code=303,
         )
 
