@@ -37,6 +37,7 @@ def get_filemaker_config():
         "customers_layout": os.getenv("FILEMAKER_CUSTOMERS_LAYOUT", "").strip(),
         "customers_key_field": os.getenv("FILEMAKER_CUSTOMERS_KEY_FIELD", "PrimaryKey").strip(),
         "customers_name_field": os.getenv("FILEMAKER_CUSTOMERS_NAME_FIELD", "Company").strip(),
+        "customers_parent_org_field": os.getenv("FILEMAKER_CUSTOMERS_PARENT_ORG_FIELD", "ai_parentOrg").strip(),
         "customers_city_field": os.getenv("FILEMAKER_CUSTOMERS_CITY_FIELD", "City").strip(),
         "customers_state_field": os.getenv("FILEMAKER_CUSTOMERS_STATE_FIELD", "State").strip(),
         "customers_country_field": os.getenv("FILEMAKER_CUSTOMERS_COUNTRY_FIELD", "Country").strip(),
@@ -60,6 +61,30 @@ def get_filemaker_config():
         "contacts_phone_field": os.getenv("FILEMAKER_CONTACTS_PHONE_FIELD", "Phone").strip(),
         "contacts_cell_field": os.getenv("FILEMAKER_CONTACTS_CELL_FIELD", "Cell").strip(),
         "contacts_active_field": os.getenv("FILEMAKER_CONTACTS_ACTIVE_FIELD", "Active").strip(),
+        "contacts_unsubscribe_field": os.getenv(
+            "FILEMAKER_CONTACTS_UNSUBSCRIBE_FIELD", "Unsubscribed"
+        ).strip(),
+        "contacts_scope_type_field": os.getenv(
+            "FILEMAKER_CONTACTS_SCOPE_TYPE_FIELD", "ai_contactScope"
+        ).strip(),
+        "contacts_region_field": os.getenv("FILEMAKER_CONTACTS_REGION_FIELD", "ai_region").strip(),
+        "contacts_function_field": os.getenv("FILEMAKER_CONTACTS_FUNCTION_FIELD", "ai_function").strip(),
+        "contacts_influence_level_field": os.getenv(
+            "FILEMAKER_CONTACTS_INFLUENCE_LEVEL_FIELD", "ai_influenceLevel"
+        ).strip(),
+        "contacts_seniority_field": os.getenv("FILEMAKER_CONTACTS_SENIORITY_FIELD", "ai_seniority").strip(),
+        "contacts_coverage_notes_field": os.getenv(
+            "FILEMAKER_CONTACTS_COVERAGE_NOTES_FIELD", "ai_coverageNotes"
+        ).strip(),
+        "contacts_outreach_angle_field": os.getenv(
+            "FILEMAKER_CONTACTS_OUTREACH_ANGLE_FIELD", "ai_outreachAngle"
+        ).strip(),
+        "contacts_relationship_notes_field": os.getenv(
+            "FILEMAKER_CONTACTS_RELATIONSHIP_NOTES_FIELD", "ai_notes"
+        ).strip(),
+        "contacts_preferred_contact_method_field": os.getenv(
+            "FILEMAKER_CONTACTS_PREFERRED_CONTACT_METHOD_FIELD", ""
+        ).strip(),
     }
 
 
@@ -273,6 +298,293 @@ def fetch_layout_records(layout, limit=100, offset=1, sort_fields=None):
         close_session(token)
 
 
+def fetch_layout_field_names(layout):
+    if not layout:
+        return {
+            "connected": False,
+            "status": "missing_layout",
+            "field_names": [],
+        }
+
+    token = None
+    try:
+        config = get_filemaker_config()
+        token = get_session_token()
+
+        if not token:
+            return {
+                "connected": False,
+                "status": "login_failed",
+                "field_names": [],
+            }
+
+        layout_name = quote(layout, safe="")
+        url = f"{get_database_path(config)}/layouts/{layout_name}"
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+            verify=config["verify_ssl"],
+        )
+
+        if response.status_code != 200:
+            print(
+                "FileMaker layout metadata fetch failed "
+                f"with status {response.status_code}: "
+                f"{get_filemaker_response_message(response) or 'No FileMaker error detail returned'}"
+            )
+            return {
+                "connected": True,
+                "status": f"http_{response.status_code}",
+                "field_names": [],
+            }
+
+        data = response.json()
+        response_block = data.get("response", {}) if isinstance(data, dict) else {}
+        field_meta = response_block.get("fieldMetaData", {}) or {}
+        field_names = list(field_meta.keys()) if isinstance(field_meta, dict) else []
+        return {
+            "connected": True,
+            "status": "ok",
+            "field_names": field_names,
+        }
+    except requests.RequestException as error:
+        print(f"FileMaker layout metadata connection error: {format_request_error(error)}")
+        return {
+            "connected": False,
+            "status": get_request_error_status(error),
+            "field_names": [],
+        }
+    except ValueError:
+        print("FileMaker layout metadata response was not valid JSON")
+        return {
+            "connected": True,
+            "status": "invalid_response",
+            "field_names": [],
+        }
+    finally:
+        close_session(token)
+
+
+def diagnose_missing_layout_fields(layout, requested_field_names):
+    requested = [str(name or "").strip() for name in requested_field_names if str(name or "").strip()]
+    if not requested:
+        return ""
+
+    metadata_result = fetch_layout_field_names(layout)
+    if metadata_result.get("status") != "ok":
+        return ""
+
+    layout_fields = {
+        str(name or "").strip().lower(): str(name or "").strip()
+        for name in metadata_result.get("field_names") or []
+        if str(name or "").strip()
+    }
+
+    missing = [
+        field_name
+        for field_name in requested
+        if field_name.lower() not in layout_fields
+    ]
+    if not missing:
+        return ""
+
+    return "Missing on FileMaker layout: " + ", ".join(missing)
+
+
+def create_layout_record(layout, field_data):
+    if not layout:
+        return {
+            "connected": False,
+            "status": "missing_layout",
+            "record_id": "",
+            "mod_id": "",
+            "error_message": "",
+        }
+
+    token = None
+    try:
+        config = get_filemaker_config()
+        token = get_session_token()
+
+        if not token:
+            return {
+                "connected": False,
+                "status": "login_failed",
+                "record_id": "",
+                "mod_id": "",
+                "error_message": "",
+            }
+
+        layout_name = quote(layout, safe="")
+        url = f"{get_database_path(config)}/layouts/{layout_name}/records"
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"fieldData": field_data},
+            timeout=30,
+            verify=config["verify_ssl"],
+        )
+
+        if response.status_code != 200:
+            error_message = get_filemaker_response_message(response)
+            if "102" in error_message and "field is missing" in error_message.lower():
+                field_detail = diagnose_missing_layout_fields(layout, field_data.keys())
+                if field_detail:
+                    error_message = f"{error_message}. {field_detail}"
+            print(
+                "FileMaker create record failed with status "
+                f"{response.status_code}: {error_message or 'No FileMaker error detail returned'}"
+            )
+            return {
+                "connected": True,
+                "status": f"http_{response.status_code}",
+                "record_id": "",
+                "mod_id": "",
+                "error_message": error_message,
+            }
+
+        data = response.json()
+        response_data = data.get("response", {}) if isinstance(data, dict) else {}
+        return {
+            "connected": True,
+            "status": "ok",
+            "record_id": str(response_data.get("recordId") or "").strip(),
+            "mod_id": str(response_data.get("modId") or "").strip(),
+            "error_message": "",
+        }
+    except requests.RequestException as error:
+        print(f"FileMaker create record connection error: {format_request_error(error)}")
+        return {
+            "connected": False,
+            "status": get_request_error_status(error),
+            "record_id": "",
+            "mod_id": "",
+            "error_message": "",
+        }
+    except ValueError:
+        print("FileMaker create record response was not valid JSON")
+        return {
+            "connected": True,
+            "status": "invalid_response",
+            "record_id": "",
+            "mod_id": "",
+            "error_message": "",
+        }
+    finally:
+        close_session(token)
+
+
+def update_layout_record(layout, record_id, field_data):
+    normalized_record_id = str(record_id or "").strip()
+    if not layout or not normalized_record_id:
+        return {
+            "connected": False,
+            "status": "missing_record_target",
+            "error_message": "",
+        }
+
+    token = None
+    try:
+        config = get_filemaker_config()
+        token = get_session_token()
+
+        if not token:
+            return {
+                "connected": False,
+                "status": "login_failed",
+                "error_message": "",
+            }
+
+        layout_name = quote(layout, safe="")
+        url = f"{get_database_path(config)}/layouts/{layout_name}/records/{quote(normalized_record_id, safe='')}"
+        response = requests.patch(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"fieldData": field_data},
+            timeout=30,
+            verify=config["verify_ssl"],
+        )
+
+        if response.status_code != 200:
+            error_message = get_filemaker_response_message(response)
+            if "102" in error_message and "field is missing" in error_message.lower():
+                field_detail = diagnose_missing_layout_fields(layout, field_data.keys())
+                if field_detail:
+                    error_message = f"{error_message}. {field_detail}"
+            print(
+                "FileMaker update record failed with status "
+                f"{response.status_code}: {error_message or 'No FileMaker error detail returned'}"
+            )
+            return {
+                "connected": True,
+                "status": f"http_{response.status_code}",
+                "error_message": error_message,
+            }
+
+        return {
+            "connected": True,
+            "status": "ok",
+            "error_message": "",
+        }
+    except requests.RequestException as error:
+        print(f"FileMaker update record connection error: {format_request_error(error)}")
+        return {
+            "connected": False,
+            "status": get_request_error_status(error),
+            "error_message": "",
+        }
+    except ValueError:
+        print("FileMaker update record response was not valid JSON")
+        return {
+            "connected": True,
+            "status": "invalid_response",
+            "error_message": "",
+        }
+    finally:
+        close_session(token)
+
+
+def get_filemaker_response_message(response):
+    try:
+        data = response.json()
+    except ValueError:
+        return str(response.text or "").strip()
+
+    if not isinstance(data, dict):
+        return ""
+
+    messages = data.get("messages") or []
+    cleaned_messages = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        message = str(item.get("message") or "").strip()
+        if code and message:
+            cleaned_messages.append(f"{code}: {message}")
+        elif message:
+            cleaned_messages.append(message)
+        elif code:
+            cleaned_messages.append(f"Code {code}")
+
+    if cleaned_messages:
+        return " | ".join(cleaned_messages)
+
+    response_block = data.get("response") or {}
+    script_error = str(response_block.get("scriptError") or "").strip()
+    if script_error:
+        return f"Script error {script_error}"
+
+    return str(response.text or "").strip()
+
+
 def fetch_all_layout_records(layout, batch_size=500, sort_fields=None, max_records=None):
     offset = 1
     records = []
@@ -399,6 +711,7 @@ def build_filemaker_master_data_cache_key():
         config["customers_layout"],
         config["customers_key_field"],
         config["customers_name_field"],
+        config["customers_parent_org_field"],
         config["customers_city_field"],
         config["customers_state_field"],
         config["customers_country_field"],
@@ -414,6 +727,7 @@ def build_filemaker_master_data_cache_key():
         config["contacts_phone_field"],
         config["contacts_cell_field"],
         config["contacts_active_field"],
+        config["contacts_unsubscribe_field"],
     )
 
 
@@ -438,6 +752,9 @@ def map_filemaker_customer_master_record(record):
         "company": normalize_text_value(
             get_field_value(field_data, config["customers_name_field"])
         ),
+        "parent_org": normalize_text_value(
+            get_field_value(field_data, config["customers_parent_org_field"])
+        ),
         "city": normalize_text_value(
             get_field_value(field_data, config["customers_city_field"])
         ),
@@ -459,10 +776,55 @@ def map_filemaker_customer_master_record(record):
     }
 
 
+def fetch_filemaker_company_directory():
+    config = get_filemaker_config()
+    if not config["customers_layout"]:
+        return {
+            "connected": False,
+            "status": "missing_master_layout",
+            "companies": [],
+        }
+
+    customers_result = fetch_all_layout_records(
+        config["customers_layout"],
+        batch_size=500,
+    )
+
+    if customers_result["status"] != "ok":
+        return {
+            "connected": customers_result.get("connected", False),
+            "status": customers_result["status"],
+            "companies": [],
+        }
+
+    companies = []
+    for raw_record in customers_result.get("records", []):
+        company = map_filemaker_customer_master_record(raw_record)
+        company["filemaker_record_id"] = str(raw_record.get("recordId") or "").strip()
+        companies.append(company)
+
+    return {
+        "connected": True,
+        "status": "ok",
+        "companies": companies,
+    }
+
+
 def map_filemaker_contact_master_record(record):
     config = get_filemaker_config()
     field_data = record.get("fieldData", {})
+    unsubscribe_value = get_field_value(field_data, config["contacts_unsubscribe_field"])
+
+    if unsubscribe_value in {None, ""}:
+        for fallback_field in ("Unsubscribed", "Unsubscribe"):
+            if fallback_field == config["contacts_unsubscribe_field"]:
+                continue
+            unsubscribe_value = get_field_value(field_data, fallback_field)
+            if unsubscribe_value not in {None, ""}:
+                break
+
     return {
+        "filemaker_record_id": str(record.get("recordId") or "").strip(),
         "primary_key": normalize_text_value(
             get_field_value(field_data, config["contacts_key_field"])
         ),
@@ -487,16 +849,28 @@ def map_filemaker_contact_master_record(record):
         "active": normalize_text_value(
             get_field_value(field_data, config["contacts_active_field"])
         ),
+        "unsubscribe": normalize_text_value(unsubscribe_value),
     }
 
 
-def fetch_filemaker_master_data():
+def is_truthy_contact_flag(value):
+    text = str(value or "").strip().lower()
+
+    if not text:
+        return False
+
+    return text not in {"0", "false", "no", "n", "off"}
+
+
+def fetch_filemaker_master_data(force_refresh=False):
     config = get_filemaker_config()
     cache_seconds = get_filemaker_master_data_cache_seconds()
     cache_key = build_filemaker_master_data_cache_key()
     now = time.time()
 
     if (
+        not force_refresh
+        and
         cache_seconds
         and _FILEMAKER_MASTER_DATA_CACHE["key"] == cache_key
         and _FILEMAKER_MASTER_DATA_CACHE["result"] is not None
@@ -527,6 +901,7 @@ def fetch_filemaker_master_data():
     all_contacts = []
     contacts_by_customer_key = {}
     contacts_by_email = {}
+    unsubscribed_emails = set()
 
     for raw_record in customers_result.get("records", []):
         customer = map_filemaker_customer_master_record(raw_record)
@@ -547,10 +922,15 @@ def fetch_filemaker_master_data():
 
         all_contacts.append(contact)
 
-        if contact["active"].lower() == "active":
+        is_unsubscribed = is_truthy_contact_flag(contact.get("unsubscribe"))
+
+        if contact["email"] and is_unsubscribed:
+            unsubscribed_emails.add(contact["email"])
+
+        if contact["active"].lower() == "active" and not is_unsubscribed:
             contacts_by_customer_key.setdefault(contact["customer_ref"], []).append(contact)
 
-        if contact["email"]:
+        if contact["email"] and not is_unsubscribed:
             existing_contact = contacts_by_email.get(contact["email"])
 
             if (
@@ -578,6 +958,7 @@ def fetch_filemaker_master_data():
         "all_contacts": all_contacts,
         "contacts_by_customer_key": contacts_by_customer_key,
         "contacts_by_email": contacts_by_email,
+        "unsubscribed_emails": sorted(unsubscribed_emails),
     }
 
     if cache_seconds:

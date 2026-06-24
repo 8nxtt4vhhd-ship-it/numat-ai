@@ -9,7 +9,10 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-06-17-activity-aware-email-variation-1"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-06-24-concise-direct-outreach-3"
+
+RECENT_REPLY_ANCHOR_DAYS = 30
+RECENT_OUTREACH_ANCHOR_DAYS = 30
 
 
 def has_stale_logistics_signal(context):
@@ -198,6 +201,34 @@ def summarise_recent_outreach_context(recent_context, max_items=2):
     return signals
 
 
+def format_elapsed_time_label(days_value):
+    if not isinstance(days_value, (int, float)):
+        return "a while"
+
+    days = int(days_value)
+    if days < 30:
+        return f"{days} days"
+    if days < 60:
+        return "about a month"
+    if days < 90:
+        return "a couple of months"
+    if days < 180:
+        months = max(3, round(days / 30))
+        return f"about {months} months"
+    if days < 270:
+        return "around six months"
+    if days < 365:
+        months = round(days / 30)
+        return f"about {months} months"
+    if days < 550:
+        return "over a year"
+    if days < 730:
+        return "well over a year"
+
+    years = round(days / 365)
+    return f"about {years} years"
+
+
 def build_text_tone_email_body(context, recommended_contact_name="", is_stale=False):
     greeting_name = get_contact_first_name(recommended_contact_name)
     greeting = f"Hi {greeting_name}," if greeting_name else "Hi,"
@@ -212,6 +243,7 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
         context.get("latest_sales_outreach_preview"),
     )
     latest_sales_days = context.get("days_since_latest_sales_outreach")
+    latest_reply_days = context.get("days_since_latest_replied_outreach")
     has_recent_sales_activity = bool(context.get("has_recent_sales_activity"))
     customer_name = str(context.get("customer") or "your team").strip()
     cycle_days = context.get("average_cycle")
@@ -221,117 +253,78 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
     likely_preferred_mode = str(context.get("likely_preferred_mode") or "").strip().lower()
     primary_activity_type = str(context.get("primary_activity_type") or "").strip().lower()
 
-    if latest_reply_signal:
+    if (
+        latest_reply_signal
+        and isinstance(latest_reply_days, (int, float))
+        and latest_reply_days <= RECENT_REPLY_ANCHOR_DAYS
+    ):
         paragraphs = [
-            (
-                f"Wanted to pick back up on your last note about {latest_reply_signal.lower()} "
-                "and see where things sit now."
-            ),
-            (
-                "If anything is starting to build up again on the repair side, I’m happy to keep it simple "
-                "and work around whatever timing is easiest for you."
-            ),
-            "If priorities have shifted, no problem at all — I just wanted to check whether this still needs planning around.",
+            f"Following up on your note about {latest_reply_signal.lower()}.",
+            "Is there anything on the repair side that needs planning now?",
+            "If yes, let me know and I’ll take it from there.",
         ]
     elif (
         len(recent_signals) >= 2
         and (likely_preferred_mode == "email" or inbound_count > 0)
+        and isinstance(latest_sales_days, (int, float))
+        and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS
         and outbound_count >= 2
     ):
         first_signal = recent_signals[0].lower()
         second_signal = recent_signals[1].lower()
         paragraphs = [
-            (
-                f"I was looking back over our recent notes around {first_signal} and {second_signal}, "
-                "so I wanted to see what feels most relevant on your side now."
-            ),
-            (
-                "If repair demand is starting to build again, I’m happy to work around whatever timing is easiest "
-                "and keep the next step straightforward."
-            ),
-            "If the focus has moved on since those conversations, that’s absolutely fine too — I just wanted to check before we leave it too long.",
+            f"I was looking back at our recent notes around {first_signal} and {second_signal}.",
+            "What is the main repair priority on your side at the moment?",
+            "If there is something active, I can get the next step moving.",
         ]
-    elif len(recent_signals) >= 2 and (likely_preferred_mode == "visit" or primary_activity_type == "meeting"):
+    elif (
+        len(recent_signals) >= 2
+        and isinstance(latest_sales_days, (int, float))
+        and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS
+        and (likely_preferred_mode == "visit" or primary_activity_type == "meeting")
+    ):
         first_signal = recent_signals[0].lower()
         second_signal = recent_signals[1].lower()
         paragraphs = [
-            (
-                f"I was reviewing the last couple of touchpoints around {first_signal} and {second_signal}, "
-                "and wanted to check what the picture looks like now."
-            ),
-            (
-                "If there is something worth picking back up, I’m happy to keep it practical and work around whatever timing suits you."
-            ),
-            "If not, no problem at all — I just wanted to make sure we were following the conversation up in the right way.",
+            f"I was reviewing the last touchpoints around {first_signal} and {second_signal}.",
+            "What needs picking up from here, if anything?",
+            "If there is something live, I can get it lined up.",
         ]
     elif outbound_count >= 3 and inbound_count == 0 and recent_signals:
-        first_signal = recent_signals[0].lower()
         paragraphs = [
-            (
-                f"I know we have tried reaching out a few times around {first_signal}, so I wanted to send one simple check-in rather than keep adding noise."
-            ),
-            (
-                "If there is anything current building up on the repair side, I’m very happy to work around whatever timing is easiest for you."
-            ),
-            "If now just isn’t the right time, that’s completely fine — even a quick steer would help us judge how useful it is to stay in touch.",
+            "We have tried a few times, so I’ll keep this brief.",
+            "Do you have any damaged mats building up that need repair?",
+            "If not, I’ll leave it there for now.",
         ]
-    elif has_recent_sales_activity and latest_sales_signal and latest_sales_days is not None and latest_sales_days <= 90:
+    elif has_recent_sales_activity and latest_sales_signal and latest_sales_days is not None and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS:
         paragraphs = [
-            (
-                f"Just following up on my last note about {latest_sales_signal.lower()} "
-                "to see whether it still makes sense to pick it up from here."
-            ),
-            (
-                "If there is anything current building up on the repair side, I’m happy to keep it brief "
-                "and work around whatever timing suits you best."
-            ),
-            "If not, that’s absolutely fine — I just wanted to make sure it didn’t get lost in the background.",
+            f"Following up on my last note about {latest_sales_signal.lower()}.",
+            "Does this still need action on your side?",
+            "If yes, I can get the next step arranged.",
         ]
     elif is_stale and latest_sales_signal:
         paragraphs = [
-            (
-                f"The last repair-related note we have on file was about {latest_sales_signal.lower()}, "
-                "and it has been quiet for a while since then."
-            ),
-            (
-                "I just wanted to check whether anything has started building up again on your side, and if so I’m happy to keep it simple "
-                "and work around whatever timing suits you."
-            ),
-            "If not, no problem at all — I just wanted to make it easy to let us know where things stand.",
+            "It has been a while since we last worked with you on repairs.",
+            "Are you setting any damaged mats aside at the moment?",
+            "If you are, I can get a pickup arranged.",
         ]
     elif is_stale:
         paragraphs = [
-            (
-                "Just wanted to check in because it’s been quiet on the repair side for a while, "
-                "and I wanted to see whether anything has started building up again."
-            ),
-            (
-                "If you do have damaged mats or anything you want us to look at, I’m happy to keep it simple "
-                "and work around whatever timing suits you."
-            ),
-            "If not, no problem at all — I just wanted to make it easy to let us know where things stand.",
+            "It has been quiet on repairs for a while.",
+            "Are you setting any damaged mats aside at the moment?",
+            "If you need us, I can get things moving.",
         ]
-    elif isinstance(cycle_days, (int, float)) and isinstance(days_since_last_order, (int, float)):
+    elif isinstance(days_since_last_order, (int, float)):
+        elapsed_label = format_elapsed_time_label(days_since_last_order)
         paragraphs = [
-            (
-                f"I’m getting in touch because {customer_name} looks a little further out than usual on repairs "
-                f"({int(days_since_last_order)} days against a typical {int(cycle_days)}-day cycle)."
-            ),
-            (
-                "I just wanted to check whether anything is building up on your side that we should be planning around, "
-                "or whether timing has simply shifted a bit."
-            ),
-            "Happy to keep it brief if a quick update is easier.",
+            f"It looks like it has been {elapsed_label} since we last worked with {customer_name}.",
+            "Are you setting any damaged mats aside at the moment?",
+            "If yes, I can get a pickup arranged.",
         ]
     else:
         paragraphs = [
-            (
-                "Just wanted to check in and see whether anything is building up on your side that we should be planning around."
-            ),
-            (
-                "If it helps, I’m happy to keep it brief and work around whatever timing is easiest for you."
-            ),
-            "No pressure either way — I just wanted to put it on your radar.",
+            "Just checking whether you have any damaged mats building up at the moment.",
+            "If you do, I can get a pickup arranged.",
         ]
 
     return "\n\n".join([greeting, *paragraphs, "Thanks,"])
@@ -573,16 +566,31 @@ def generate_outreach_prep(context):
                         "Use the inferred contact signals to decide who the most appropriate target is, and tune the tone for their likely role and influence. "
                         "Use CRM activity type as a real signal. Pay attention to whether the history is made up mostly of email, calls, meetings/visits, LinkedIn, or a mix. "
                         "That should influence the recommended mode, tone, observed pattern, and whether the relationship looks meeting-led, email-led, or call-led. "
-                        "When writing the email draft, keep the tone closer to a good business text than a formal sales letter: practical, conversational, lower-pressure, and easy to reply to. "
+                        "When writing the email draft, keep the tone closer to a good business text than a formal sales letter: practical, conversational, direct, and easy to reply to. "
+                        "Write for busy operational people who may be moving between the office and production floor. "
+                        "Keep emails concise and specific. Prefer 2 to 4 short sentences plus greeting and sign-off. "
+                        "Anchor each email to one concrete point, not several. "
+                        "End with one clear ask or next step. "
+                        "Avoid vague filler, stretched phrasing, and soft lead-ins. "
+                        "Prefer present-day, practical wording over CRM-style recap wording. "
+                        "Do not make the draft sound like it is quoting old notes back at the customer unless the contact was genuinely recent. "
                         "Do not default to a generic 'just checking in' email when there is concrete recent outreach or reply context available. "
                         "Use the broader shape of the recent communication history, not just the latest item. If there were several recent notes, reflect that naturally rather than writing every email as a follow-up to a single message. "
                         "Vary the structure and wording meaningfully between customers. Do not keep reusing the same three-paragraph shape with only one swapped reference. "
-                        "Avoid repeatedly using phrases like 'wanted to pick back up', 'if anything is starting to build up again', 'if priorities have shifted', or 'work around whatever timing is easiest' across drafts unless the context genuinely demands them. "
+                        "Avoid repeatedly using phrases like 'wanted to pick back up', 'just checking in', 'if anything is starting to build up again', 'if priorities have shifted', 'no pressure', or 'work around whatever timing is easiest' across drafts unless the context genuinely demands them. "
                         "If the history is meeting-led or visit-led, write like someone continuing an operational relationship rather than reviving an old email thread. "
-                        "If the history shows several unanswered attempts, acknowledge that lightly and either offer to leave it there or ask for a quick steer. "
+                        "If the history shows several unanswered attempts, acknowledge that lightly and either offer to leave it there or ask for a quick update. "
                         "If the history shows replies, reflect the thread as an ongoing conversation rather than reducing it to one isolated message. "
                         "Use different openings depending on the evidence: some can anchor to timing, some to the broader thread, some to operational planning, some to the customer's order rhythm. "
                         "Reference the latest sales outreach concretely when it is commercially relevant, rather than drifting into a generic follow-up. "
+                        "Prefer concrete verbs like plan, arrange, book, send, confirm, check, or schedule. "
+                        "Use at most one direct question unless the context strongly requires two. "
+                        "Do not anchor the email to the last replied message if that reply is older than 30 days. At that point it is background context, not an active thread. "
+                        "Do not anchor the email to the latest sales outreach if it is older than 30 days unless the note is still clearly operationally live. "
+                        "When the last reply or latest outreach is older than 30 days, do not write 'following up on your note', 'following up on my last note', or 'looking back at our recent notes'. Use a present-day opener instead. "
+                        "Avoid the word 'steer' in the draft. Prefer 'let me know', 'send me a note', or 'send me an update'. "
+                        "Good patterns include: noticing it has been a while since the last repair order, asking whether they are setting any mats aside, asking who is best to speak to, or offering to arrange a pickup if useful. "
+                        "It is fine to sound lightly conversational and personal, but keep it short and commercially clear. "
                         "Pay close attention to dates. Do not describe an activity as recent unless it happened within the last 90 days relative to the current analysis date. "
                         "If the latest relevant outreach or reply is older than 90 days, describe it as older, historical, previous, or the latest recorded activity instead. "
                         "If an older message is still important, make that clear without implying it happened recently. "

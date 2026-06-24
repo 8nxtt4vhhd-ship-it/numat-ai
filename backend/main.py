@@ -64,9 +64,14 @@ from crm import (
 )
 from filemaker import (
     check_filemaker_connection,
+    clear_filemaker_master_data_cache,
+    create_layout_record,
     fetch_filemaker_master_data,
+    fetch_filemaker_company_directory,
     fetch_order_records,
+    get_filemaker_config,
     has_filemaker_config,
+    update_layout_record,
 )
 from m365 import (
     build_m365_authorize_url,
@@ -487,6 +492,7 @@ def sanitize_user_record(user):
         "m365_email": str(user.get("m365_email") or "").strip(),
         "role": str(user.get("role") or "user").strip() or "user",
         "active": bool(user.get("active", True)),
+        "skip_send_confirmation": bool(user.get("skip_send_confirmation", False)),
     }
 
 
@@ -602,6 +608,12 @@ def normalize_strategic_contact_record(item):
         "id": str(item.get("id") or "").strip(),
         "organization": str(item.get("organization") or "").strip(),
         "company_record_label": str(item.get("company_record_label") or "").strip(),
+        "filemaker_company_label": str(item.get("filemaker_company_label") or "").strip(),
+        "filemaker_company_primary_key": str(item.get("filemaker_company_primary_key") or "").strip(),
+        "filemaker_contact_record_id": str(item.get("filemaker_contact_record_id") or "").strip(),
+        "filemaker_sync_status": str(item.get("filemaker_sync_status") or "").strip(),
+        "filemaker_sync_error": str(item.get("filemaker_sync_error") or "").strip(),
+        "filemaker_synced_at": str(item.get("filemaker_synced_at") or "").strip(),
         "name": str(item.get("name") or "").strip(),
         "position": str(item.get("position") or "").strip(),
         "email": str(item.get("email") or "").strip(),
@@ -673,9 +685,306 @@ STRATEGIC_CONTACT_METHOD_OPTIONS = [
     "Assistant / Gatekeeper",
 ]
 
+ORG_CHART_GROUPS = {
+    "vestis-aramark": {
+        "label": "Vestis / Aramark",
+        "organizations": ("vestis", "aramark", "ameripride"),
+    },
+    "alsco": {
+        "label": "Alsco",
+        "organizations": ("alsco",),
+    },
+    "cintas-unifirst": {
+        "label": "Cintas / UniFirst",
+        "organizations": ("cintas", "unifirst", "uni first"),
+    },
+}
+
+ORG_CHART_FILEMAKER_COMPANY_LABELS = {
+    "vestis-aramark": "Vestis Corporate",
+    "alsco": "Alsco Corporate",
+    "cintas-unifirst": "Cintas Corporate",
+}
+
 
 def can_manage_strategic_contacts(user):
     return can_manage_user_accounts(user)
+
+
+def get_default_filemaker_company_label_for_contact(contact):
+    return ORG_CHART_FILEMAKER_COMPANY_LABELS.get(
+        get_org_chart_group_key(contact.get("organization")),
+        "",
+    )
+
+
+def looks_like_corporate_company_label(value):
+    normalized = normalize_apollo_location_value(value)
+    if not normalized:
+        return False
+    return any(token in normalized for token in (" corporate", " corporation", " corp"))
+
+
+def get_expected_filemaker_company_label_for_contact(contact):
+    default_label = str(get_default_filemaker_company_label_for_contact(contact) or "").strip()
+    if default_label:
+        return default_label
+
+    saved_label = str(contact.get("filemaker_company_label") or "").strip()
+    if saved_label and looks_like_corporate_company_label(saved_label):
+        return saved_label
+
+    return str(contact.get("organization") or "").strip()
+
+
+def normalize_company_label(value):
+    normalized = normalize_apollo_location_value(value)
+    for token in (
+        " corporation",
+        " corporate",
+        " corp",
+        " company",
+        " co",
+        " inc",
+        " llc",
+        " ltd",
+        " limited",
+    ):
+        if normalized.endswith(token):
+            normalized = normalized[: -len(token)].strip()
+    return normalized
+
+
+def strategic_contact_targets_company(contact, company):
+    company_name = str(company.get("company") or "").strip()
+    parent_org = str(company.get("parent_org") or "").strip()
+    if not company_name:
+        return False
+
+    expected_primary_key = str(contact.get("filemaker_company_primary_key") or "").strip()
+    if expected_primary_key and expected_primary_key == str(company.get("primary_key") or "").strip():
+        return True
+
+    expected_label = get_expected_filemaker_company_label_for_contact(contact)
+    if expected_label and normalize_company_label(expected_label) == normalize_company_label(company_name):
+        return True
+    if expected_label and parent_org and normalize_company_label(expected_label) == normalize_company_label(parent_org):
+        return True
+
+    return False
+
+
+def resolve_strategic_contact_filemaker_company(contact):
+    directory_result = fetch_filemaker_company_directory()
+    if directory_result.get("status") != "ok":
+        return {
+            "ok": False,
+            "status": directory_result.get("status") or "directory_failed",
+            "message": "Could not load the FileMaker company directory.",
+            "company": None,
+        }
+
+    companies = directory_result.get("companies", [])
+    corporate_companies = [
+        company
+        for company in companies
+        if str(company.get("type") or "").strip().lower() == "corporate"
+    ]
+
+    for company in corporate_companies:
+        if strategic_contact_targets_company(contact, company):
+            return {
+                "ok": True,
+                "status": "ok",
+                "message": "",
+                "company": company,
+            }
+
+    preferred_label = get_expected_filemaker_company_label_for_contact(contact)
+    return {
+        "ok": False,
+        "status": "company_not_found",
+        "message": f"Could not match this contact to a corporate FileMaker company record for {preferred_label or 'that organisation'}.",
+        "company": None,
+    }
+
+
+def build_strategic_contact_filemaker_field_data(contact, company):
+    config = get_filemaker_config()
+    phone_value = str(contact.get("phone") or "").strip()
+    cell_value = str(contact.get("cell") or "").strip()
+    preferred_method = str(contact.get("preferred_contact_method") or "").strip()
+    if not preferred_method:
+        preferred_method = "Email" if str(contact.get("email") or "").strip() else ("Phone" if phone_value or cell_value else "")
+
+    raw_pairs = [
+        (config["contacts_customer_ref_field"], str(company.get("primary_key") or "").strip()),
+        (config["contacts_name_field"], str(contact.get("name") or "").strip()),
+        (config["contacts_email_field"], str(contact.get("email") or "").strip()),
+        (config["contacts_position_field"], str(contact.get("position") or "").strip()),
+        (config["contacts_phone_field"], phone_value),
+        (config["contacts_cell_field"], cell_value),
+        (config["contacts_active_field"], "Active" if bool(contact.get("active", True)) else "Inactive"),
+        (config["contacts_scope_type_field"], str(contact.get("scope_type") or "").strip()),
+        (config["contacts_region_field"], str(contact.get("region") or "").strip()),
+        (config["contacts_function_field"], str(contact.get("function") or "").strip()),
+        (config["contacts_influence_level_field"], str(contact.get("influence_level") or "").strip()),
+        (config["contacts_seniority_field"], str(contact.get("seniority") or "").strip()),
+        (config["contacts_coverage_notes_field"], str(contact.get("coverage_notes") or "").strip()),
+        (config["contacts_outreach_angle_field"], str(contact.get("outreach_angle") or "").strip()),
+        (config["contacts_relationship_notes_field"], str(contact.get("relationship_notes") or "").strip()),
+        (config["contacts_preferred_contact_method_field"], preferred_method),
+    ]
+    return {
+        field_name: value
+        for field_name, value in raw_pairs
+        if str(field_name or "").strip()
+    }
+
+
+def find_existing_filemaker_contact_for_strategic_contact(contact, company, master_data_result):
+    company_key = str(company.get("primary_key") or "").strip()
+    if not company_key:
+        return None
+
+    contacts_for_company = master_data_result.get("contacts_by_customer_key", {}).get(company_key, [])
+    if not contacts_for_company:
+        return None
+
+    filemaker_record_id = str(contact.get("filemaker_contact_record_id") or "").strip()
+    if filemaker_record_id:
+        for existing_contact in contacts_for_company:
+            if str(existing_contact.get("filemaker_record_id") or "").strip() == filemaker_record_id:
+                return existing_contact
+
+    email = str(contact.get("email") or "").strip().lower()
+    if email:
+        for existing_contact in contacts_for_company:
+            if str(existing_contact.get("email") or "").strip().lower() == email:
+                return existing_contact
+
+    name_key = normalize_apollo_location_value(contact.get("name"))
+    position_key = normalize_apollo_location_value(contact.get("position"))
+    if not name_key:
+        return None
+
+    for existing_contact in contacts_for_company:
+        existing_name_key = normalize_apollo_location_value(existing_contact.get("name"))
+        existing_position_key = normalize_apollo_location_value(existing_contact.get("position"))
+        if existing_name_key != name_key:
+            continue
+        if position_key and existing_position_key and existing_position_key != position_key:
+            continue
+        return existing_contact
+
+    return None
+
+
+def sync_strategic_contact_to_filemaker(contact_id):
+    contact = find_strategic_contact(contact_id)
+    if not contact:
+        return {
+            "ok": False,
+            "message": "Strategic contact not found.",
+            "error": "Strategic contact not found.",
+        }
+
+    config = get_filemaker_config()
+    if not config["contacts_layout"]:
+        return {
+            "ok": False,
+            "message": "FileMaker contacts layout is not configured yet.",
+            "error": "FileMaker contacts layout is not configured yet.",
+        }
+
+    def save_sync_error(error_message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        updated_items = []
+        for item in load_strategic_contacts():
+            if str(item.get("id") or "").strip() != str(contact_id or "").strip():
+                updated_items.append(item)
+                continue
+            updated_items.append(
+                normalize_strategic_contact_record(
+                    {
+                        **item,
+                        "filemaker_sync_status": "error",
+                        "filemaker_sync_error": str(error_message or "").strip(),
+                        "updated_at": timestamp,
+                    }
+                )
+            )
+        save_strategic_contacts(updated_items)
+
+    company_result = resolve_strategic_contact_filemaker_company(contact)
+    if not company_result["ok"]:
+        save_sync_error(company_result["message"])
+        return {
+            "ok": False,
+            "message": company_result["message"],
+            "error": company_result["message"],
+        }
+
+    company = company_result["company"]
+    field_data = build_strategic_contact_filemaker_field_data(contact, company)
+    master_data_result = fetch_filemaker_master_data()
+    existing_contact = None
+    if master_data_result.get("status") == "ok":
+        existing_contact = find_existing_filemaker_contact_for_strategic_contact(contact, company, master_data_result)
+
+    if existing_contact:
+        write_result = update_layout_record(
+            config["contacts_layout"],
+            str(existing_contact.get("filemaker_record_id") or "").strip(),
+            field_data,
+        )
+        write_mode = "updated"
+        filemaker_record_id = str(existing_contact.get("filemaker_record_id") or "").strip()
+    else:
+        write_result = create_layout_record(config["contacts_layout"], field_data)
+        write_mode = "created"
+        filemaker_record_id = str(write_result.get("record_id") or "").strip()
+
+    if write_result.get("status") != "ok":
+        filemaker_detail = str(write_result.get("error_message") or "").strip()
+        error_message = f"FileMaker sync failed: {write_result.get('status') or 'unknown_error'}."
+        if filemaker_detail:
+            error_message += f" {filemaker_detail}"
+        save_sync_error(error_message)
+        return {
+            "ok": False,
+            "message": error_message,
+            "error": error_message,
+        }
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updated_items = []
+    for item in load_strategic_contacts():
+        if str(item.get("id") or "").strip() != str(contact_id or "").strip():
+            updated_items.append(item)
+            continue
+        updated_items.append(
+            normalize_strategic_contact_record(
+                {
+                    **item,
+                    "filemaker_company_label": str(company.get("company") or "").strip(),
+                    "filemaker_company_primary_key": str(company.get("primary_key") or "").strip(),
+                    "filemaker_contact_record_id": filemaker_record_id,
+                    "filemaker_sync_status": "synced",
+                    "filemaker_sync_error": "",
+                    "filemaker_synced_at": timestamp,
+                    "updated_at": timestamp,
+                }
+            )
+        )
+
+    save_strategic_contacts(updated_items)
+    clear_filemaker_master_data_cache()
+    return {
+        "ok": True,
+        "message": f"Strategic contact {write_mode} in FileMaker under {str(company.get('company') or '').strip()}.",
+        "error": "",
+    }
 
 
 def render_textarea_field(label, name, value, placeholder="", rows=4):
@@ -783,6 +1092,247 @@ def render_strategic_contact_grouped_view(items):
     return "".join(sections)
 
 
+def get_org_chart_group_key(organization_name):
+    normalized = normalize_apollo_location_value(organization_name)
+    for key, config in ORG_CHART_GROUPS.items():
+        if any(token in normalized for token in config["organizations"]):
+            return key
+    return "other"
+
+
+def strategic_contact_seniority_rank(item):
+    seniority = str(item.get("seniority") or "").strip()
+    title = str(item.get("position") or "").strip()
+    seniority_value = seniority or infer_strategic_seniority(title)
+    ranking = {
+        "C-Suite": 0,
+        "VP": 1,
+        "Director": 2,
+        "Manager": 3,
+        "Senior IC": 4,
+        "Other": 5,
+    }
+    return ranking.get(seniority_value, 5)
+
+
+def render_org_chart_group_selector(selected_group):
+    buttons = []
+    for key, config in ORG_CHART_GROUPS.items():
+        class_name = "button org-chart-segment active" if key == selected_group else "button secondary org-chart-segment"
+        buttons.append(
+            f"<a class=\"{class_name} small-button\" href=\"/organisation-chart-view?group={quote(key)}\">{escape(config['label'])}</a>"
+        )
+    return "".join(buttons)
+
+
+def render_organisation_chart(items, selected_group, filemaker_presence_map=None):
+    selected_config = ORG_CHART_GROUPS.get(selected_group) or next(iter(ORG_CHART_GROUPS.values()))
+    filtered = [
+        item for item in items
+        if get_org_chart_group_key(item.get("organization")) == selected_group
+    ]
+
+    if not filtered:
+        return "<p class='subtle'>No strategic contacts are saved for this group yet.</p>"
+
+    current_user = get_current_session_user()
+    grouped = defaultdict(lambda: defaultdict(list))
+    for item in filtered:
+        scope = str(item.get("scope_type") or "").strip() or infer_strategic_scope_type(
+            item.get("position"),
+            region=str(item.get("region") or "").strip(),
+        )
+        region = str(item.get("region") or "").strip() or "Shared / Unassigned"
+        grouped[scope][region].append(item)
+
+    scope_order = ["Corporate", "National Account", "Regional", "Division"]
+    sections = []
+    total_contacts = len(filtered)
+    total_regions = len({
+        str(item.get("region") or "").strip() or "Shared / Unassigned"
+        for item in filtered
+    })
+    root_label = get_default_filemaker_company_label_for_contact({"organization": selected_config["label"]}) or selected_config["label"]
+    for scope in sorted(grouped.keys(), key=lambda value: (scope_order.index(value) if value in scope_order else 99, value.lower())):
+        region_sections = []
+        scope_contacts = grouped[scope]
+        scope_contact_count = sum(len(contact_list) for contact_list in scope_contacts.values())
+        for region in sorted(grouped[scope].keys(), key=lambda value: value.lower()):
+            cards = []
+            contacts = sorted(
+                grouped[scope][region],
+                key=lambda item: (
+                    strategic_contact_seniority_rank(item),
+                    str(item.get("function") or "").strip().lower(),
+                    str(item.get("name") or "").strip().lower(),
+                ),
+            )
+            for item in contacts:
+                item_id = str(item.get("id") or "").strip()
+                name = str(item.get("name") or "Unnamed contact").strip()
+                position = str(item.get("position") or "Unknown role").strip()
+                organization = str(item.get("organization") or "").strip()
+                function = str(item.get("function") or "").strip() or infer_strategic_function(position)
+                influence = str(item.get("influence_level") or "").strip() or infer_strategic_influence_level(position)
+                seniority = str(item.get("seniority") or "").strip() or infer_strategic_seniority(position)
+                email = str(item.get("email") or "").strip()
+                phone = str(item.get("phone") or "").strip() or str(item.get("cell") or "").strip()
+                outreach_angle = str(item.get("outreach_angle") or "").strip()
+                coverage_notes = str(item.get("coverage_notes") or "").strip()
+                relationship_notes = str(item.get("relationship_notes") or "").strip()
+                filemaker_company_label = str(item.get("filemaker_company_label") or "").strip()
+                filemaker_synced_at = str(item.get("filemaker_synced_at") or "").strip()
+                filemaker_sync_status = str(item.get("filemaker_sync_status") or "").strip().lower()
+                filemaker_sync_error = str(item.get("filemaker_sync_error") or "").strip()
+                filemaker_presence = (filemaker_presence_map or {}).get(item_id) or {}
+                presence_badge = (
+                    f"<span class='status-pill warning'>{escape(str(filemaker_presence.get('label') or 'Already in FileMaker'))}</span>"
+                    if filemaker_presence.get("exists")
+                    else "<span class='status-pill'>Not in FileMaker</span>"
+                )
+                sync_status_markup = ""
+                if filemaker_sync_status == "synced":
+                    synced_label = "Synced to FileMaker"
+                    if filemaker_company_label:
+                        synced_label += f" ({filemaker_company_label})"
+                    sync_status_markup = (
+                        f"<p class='small muted'>"
+                        f"{escape(synced_label)}"
+                        f"{f' on {escape(filemaker_synced_at)}' if filemaker_synced_at else ''}"
+                        "</p>"
+                    )
+                elif filemaker_sync_error:
+                    sync_status_markup = f"<p class='small muted' style='color:#b42318;'>{escape(filemaker_sync_error)}</p>"
+                actions = ""
+                if can_manage_strategic_contacts(current_user):
+                    actions = f"""
+                        <div class="strategic-card-actions">
+                            <form method="post" action="/strategic-contacts/sync-filemaker">
+                                <input type="hidden" name="contact_id" value="{escape(str(item.get('id') or ''))}">
+                                <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
+                                <button class="button secondary small-button" type="submit">Sync to FileMaker</button>
+                            </form>
+                            <a class="button secondary small-button" href="/strategic-contacts-view?edit={quote(str(item.get('id') or ''))}">Edit</a>
+                            <form method="post" action="/strategic-contacts/delete" onsubmit="return confirm('Remove this contact from the organisation view?');">
+                                <input type="hidden" name="contact_id" value="{escape(str(item.get('id') or ''))}">
+                                <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
+                                <button class="button secondary small-button" type="submit">Remove</button>
+                            </form>
+                        </div>
+                    """
+                cards.append(
+                    f"""
+                        <article class="panel strategic-contact-card org-chart-contact-card">
+                            <div class="org-chart-contact-node">
+                                <div class="org-chart-contact-main">
+                                    <div class="org-chart-contact-title-row">
+                                        <h4>{escape(name)}</h4>
+                                        <div class="status-pill-stack">
+                                            {presence_badge}
+                                        </div>
+                                    </div>
+                                    <p class="org-chart-contact-role">{escape(position)}</p>
+                                    <p class="org-chart-contact-region">{escape(region)}</p>
+                                </div>
+                            </div>
+                            <details class="org-chart-contact-details">
+                                <summary>Details</summary>
+                                <div class="org-chart-contact-detail-body">
+                                    <p class="small muted">{escape(organization)}</p>
+                                    <div class="summary compact-summary strategic-contact-summary org-chart-detail-summary">
+                                        <div>
+                                            <span class="label">Function</span>
+                                            <strong>{escape(function)}</strong>
+                                        </div>
+                                        <div>
+                                            <span class="label">Influence</span>
+                                            <strong>{escape(' | '.join(bit for bit in [seniority, influence] if bit) or 'Not set')}</strong>
+                                        </div>
+                                        <div>
+                                            <span class="label">Email</span>
+                                            <strong>{escape(email or 'Not set')}</strong>
+                                        </div>
+                                        <div>
+                                            <span class="label">Phone</span>
+                                            <strong>{escape(phone or 'Not set')}</strong>
+                                        </div>
+                                    </div>
+                                    {f"<p class='small muted'>{escape(str(filemaker_presence.get('details') or ''))}</p>" if filemaker_presence else ""}
+                                    {f"<p><strong>Outreach angle:</strong> {escape(outreach_angle)}</p>" if outreach_angle else ""}
+                                    {f"<p class='small muted'><strong>Coverage:</strong> {escape(coverage_notes)}</p>" if coverage_notes else ""}
+                                    {f"<p class='small muted'><strong>Relationship notes:</strong> {escape(relationship_notes)}</p>" if relationship_notes else ""}
+                                    {sync_status_markup}
+                                    {actions}
+                                </div>
+                            </details>
+                        </article>
+                    """
+                )
+            region_sections.append(
+                f"""
+                    <section class="org-chart-lane strategic-organization-panel">
+                        <div class="org-chart-lane-head strategic-organization-head">
+                            <div>
+                                <h3>{escape(region)}</h3>
+                                <p class="small muted">{len(contacts)} contact{'s' if len(contacts) != 1 else ''}</p>
+                            </div>
+                        </div>
+                        <div class="org-chart-card-stack">
+                            {''.join(cards)}
+                        </div>
+                    </section>
+                """
+            )
+        sections.append(
+            f"""
+                <section class="org-chart-level">
+                    <div class="org-chart-level-marker">
+                        <span class="org-chart-level-chip">{escape(scope)}</span>
+                    </div>
+                    <div class="org-chart-level-body">
+                        <div class="org-chart-level-summary">
+                            <div>
+                                <h2>{escape(scope)}</h2>
+                                <p class="small muted">{scope_contact_count} contact{'s' if scope_contact_count != 1 else ''} across {len(scope_contacts)} region{'s' if len(scope_contacts) != 1 else ''}</p>
+                            </div>
+                        </div>
+                        <div class="org-chart-lanes">
+                            {''.join(region_sections)}
+                        </div>
+                    </div>
+                </section>
+            """
+        )
+    return f"""
+        <section class="org-chart-shell">
+            <section class="panel org-chart-root">
+                <div class="org-chart-root-card">
+                    <p class="org-chart-root-eyebrow">Corporate Structure</p>
+                    <h2>{escape(root_label)}</h2>
+                    <p class="small muted">{escape(selected_config['label'])}</p>
+                    <div class="summary compact-summary org-chart-root-summary">
+                        <div>
+                            <span class="label">Strategic contacts</span>
+                            <strong>{total_contacts}</strong>
+                        </div>
+                        <div>
+                            <span class="label">Regions</span>
+                            <strong>{total_regions}</strong>
+                        </div>
+                        <div>
+                            <span class="label">Levels</span>
+                            <strong>{len(grouped)}</strong>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            <section class="org-chart-levels">
+                {''.join(sections)}
+            </section>
+        </section>
+    """
+
+
 def infer_strategic_scope_type(title, region=""):
     normalized_title = normalize_apollo_location_value(title)
     normalized_region = normalize_apollo_location_value(region)
@@ -839,7 +1389,68 @@ def infer_strategic_seniority(title):
     return "Other"
 
 
-def build_pdl_strategic_search_query(organization_name, region="", function=""):
+def get_saved_strategic_search_exclusions(organization_name):
+    excluded_emails = []
+    seen = set()
+    for item in load_strategic_contacts():
+        if not bool(item.get("active", True)):
+            continue
+        item_org = str(item.get("organization") or "").strip()
+        if not item_org or not company_family_matches(organization_name, item_org):
+            continue
+        email = str(item.get("email") or "").strip().lower()
+        if email and email not in seen:
+            excluded_emails.append(email)
+            seen.add(email)
+    return excluded_emails[:25]
+
+
+def get_filemaker_search_exclusions(organization_name, max_count=50):
+    excluded_emails = []
+    seen = set()
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") != "ok":
+        return excluded_emails
+
+    for row in build_contact_master_rows(master_data_result):
+        if str(row.get("active") or "").strip().lower() != "active":
+            continue
+        company_name = str(row.get("company") or "").strip()
+        if not company_name or not company_family_matches(organization_name, company_name):
+            continue
+        email = str(row.get("email") or "").strip().lower()
+        if not email or email in seen:
+            continue
+        excluded_emails.append(email)
+        seen.add(email)
+        if len(excluded_emails) >= max_count:
+            break
+
+    return excluded_emails
+
+
+def get_known_strategic_search_exclusions(organization_name, max_count=50):
+    combined = []
+    seen = set()
+
+    for email in get_saved_strategic_search_exclusions(organization_name):
+        if email and email not in seen:
+            combined.append(email)
+            seen.add(email)
+        if len(combined) >= max_count:
+            return combined
+
+    for email in get_filemaker_search_exclusions(organization_name, max_count=max_count):
+        if email and email not in seen:
+            combined.append(email)
+            seen.add(email)
+        if len(combined) >= max_count:
+            break
+
+    return combined
+
+
+def build_pdl_strategic_search_query(organization_name, region="", function="", exclude_emails=None):
     organization_aliases = get_company_search_aliases(organization_name) or [organization_name]
     organization_clauses = [
         f"job_company_name LIKE '%{escape_sql_like(alias)}%'"
@@ -856,7 +1467,7 @@ def build_pdl_strategic_search_query(organization_name, region="", function=""):
 
     function_title_terms = {
         "Executive": ["chief", "president", "vice president"],
-        "Operations": ["operations", "production", "service"],
+        "Operations": ["operations", "production", "manufacturing", "plant", "service"],
         "Procurement": ["procurement", "sourcing", "purchasing"],
         "Facilities": ["facilities", "facility"],
         "Finance": ["finance", "controller", "financial"],
@@ -871,6 +1482,9 @@ def build_pdl_strategic_search_query(organization_name, region="", function=""):
             "director",
             "regional",
             "operations",
+            "production",
+            "manufacturing",
+            "plant",
             "procurement",
             "facilities",
         ]
@@ -879,6 +1493,11 @@ def build_pdl_strategic_search_query(organization_name, region="", function=""):
         f"job_title LIKE '%{escape_sql_like(term)}%'"
         for term in selected_terms
         if escape_sql_like(term)
+    ]
+    sanitized_exclusions = [
+        escape_sql_like(email)
+        for email in (exclude_emails or [])
+        if escape_sql_like(email)
     ]
 
     lines = [
@@ -889,6 +1508,9 @@ def build_pdl_strategic_search_query(organization_name, region="", function=""):
         lines.append("AND (" + " OR ".join(region_clauses) + ")")
     if title_clauses:
         lines.append("AND (" + " OR ".join(title_clauses) + ")")
+    if sanitized_exclusions:
+        exclusion_values = ", ".join(f"'{email}'" for email in sanitized_exclusions)
+        lines.append(f"AND (work_email IS NULL OR work_email NOT IN ({exclusion_values}))")
     return "\n".join(lines)
 
 
@@ -968,6 +1590,82 @@ def assess_filemaker_contact_presence(email, name, existing_emails, existing_nam
     }
 
 
+def build_strategic_contact_filemaker_presence_map(items):
+    presence_map = {}
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") != "ok":
+        return presence_map
+
+    contact_rows = build_contact_master_rows(master_data_result)
+    cache_by_org_region = {}
+
+    for item in items or []:
+        organization_name = str(item.get("organization") or "").strip()
+        region_value = str(item.get("region") or "").strip()
+        cache_key = (
+            normalize_apollo_location_value(organization_name),
+            normalize_apollo_location_value(region_value),
+        )
+        if cache_key not in cache_by_org_region:
+            cache_by_org_region[cache_key] = build_pdl_existing_contact_sets(
+                contact_rows,
+                organization_name=organization_name,
+                expected_city="",
+                expected_state=region_value,
+            )
+
+        existing_emails, existing_names, existing_initial_last = cache_by_org_region[cache_key]
+        presence_map[str(item.get("id") or "").strip()] = assess_filemaker_contact_presence(
+            email=str(item.get("email") or "").strip().lower(),
+            name=str(item.get("name") or "").strip(),
+            existing_emails=existing_emails,
+            existing_names=existing_names,
+            existing_initial_last=existing_initial_last,
+        )
+
+    return presence_map
+
+
+def build_saved_strategic_contact_sets(existing_contacts):
+    email_keys = set()
+    composite_keys = set()
+
+    for item in existing_contacts:
+        email = str(item.get("email") or "").strip().lower()
+        phone = str(item.get("phone") or "").strip()
+        name = normalize_apollo_location_value(item.get("name"))
+        organization = normalize_apollo_location_value(item.get("organization"))
+        position = normalize_apollo_location_value(item.get("position"))
+
+        if email:
+            email_keys.add(email)
+        if phone:
+            email_keys.add(f"phone:{phone}")
+        if name and organization and position:
+            composite_keys.add((name, organization, position))
+
+    return email_keys, composite_keys
+
+
+def is_saved_strategic_contact(email, phone, name, organization, position, existing_lookup):
+    existing_keys, existing_composites = existing_lookup
+    email_key = str(email or "").strip().lower()
+    phone_key = str(phone or "").strip()
+    composite_key = (
+        normalize_apollo_location_value(name),
+        normalize_apollo_location_value(organization),
+        normalize_apollo_location_value(position),
+    )
+
+    if email_key and email_key in existing_keys:
+        return True
+    if phone_key and f"phone:{phone_key}" in existing_keys:
+        return True
+    if all(composite_key) and composite_key in existing_composites:
+        return True
+    return False
+
+
 def search_pdl_strategic_contacts(organization_name, region="", function="", force_refresh=False):
     organization_name = str(organization_name or "").strip()
     if not organization_name:
@@ -976,15 +1674,17 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
     if not has_pdl_config():
         return {"status": "pdl_disabled", "results": [], "diagnostics": {}, "sql": ""}
 
+    exclude_emails = get_known_strategic_search_exclusions(organization_name)
     sql_query = build_pdl_strategic_search_query(
         organization_name=organization_name,
         region=region,
         function=function,
+        exclude_emails=exclude_emails,
     )
     if not sql_query:
         return {"status": "missing_sql", "results": [], "diagnostics": {}, "sql": ""}
 
-    search_limit = 8
+    search_limit = 4
     enrich_limit = 2
     pdl_result = search_pdl_people(sql_query, size=search_limit, force_refresh=force_refresh)
     if pdl_result.get("status") != "ok":
@@ -999,13 +1699,7 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
         }
 
     existing_contacts = load_strategic_contacts()
-    existing_keys = {
-        (
-            str(item.get("email") or "").strip().lower(),
-            normalize_apollo_location_value(item.get("name")),
-        )
-        for item in existing_contacts
-    }
+    existing_lookup = build_saved_strategic_contact_sets(existing_contacts)
     existing_emails = set()
     existing_names = set()
     existing_initial_last = set()
@@ -1090,7 +1784,14 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
         if not enriched:
             preview_only_count += 1
 
-        already_saved = (email, normalize_apollo_location_value(name)) in existing_keys if email else False
+        already_saved = is_saved_strategic_contact(
+            email=email,
+            phone=phone,
+            name=name,
+            organization=company_name,
+            position=title,
+            existing_lookup=existing_lookup,
+        )
         filemaker_presence = assess_filemaker_contact_presence(
             email=email,
             name=name,
@@ -1138,6 +1839,7 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
     diagnostics = {
         "raw_people": len(raw_results),
         "returned": len(shortlisted),
+        "excluded_known_emails": len(exclude_emails),
         "with_email": sum(1 for item in shortlisted if item.get("email")),
         "with_phone": sum(1 for item in shortlisted if item.get("phone")),
         "with_linkedin": sum(1 for item in shortlisted if item.get("linkedin_url")),
@@ -1183,6 +1885,7 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
         <div class="summary compact-summary strategic-contact-summary">
             {render_simple_summary_item("Raw search", diagnostics.get("raw_people", 0))}
             {render_simple_summary_item("Shortlist", diagnostics.get("returned", 0))}
+            {render_simple_summary_item("Known excluded", diagnostics.get("excluded_known_emails", 0))}
             {render_simple_summary_item("Search credits", f"{search_credit:.1f}")}
             {render_simple_summary_item("Enrich credits", f"{enrich_credit:.1f}")}
             {render_simple_summary_item("Total credits", f"{total_credit:.1f}")}
@@ -1234,6 +1937,9 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
                 <form method="post" action="/strategic-contacts/import-pdl" class="inline-form strategic-save-form">
                     <input type="hidden" name="organization" value="{escape(organization_name)}" />
                     <input type="hidden" name="company_record_label" value="{escape(organization_name)}" />
+                    <input type="hidden" name="discover_org" value="{escape(organization_name)}" />
+                    <input type="hidden" name="discover_region" value="{escape(str(region or ''))}" />
+                    <input type="hidden" name="discover_function" value="{escape(str(function or ''))}" />
                     <input type="hidden" name="name" value="{escape(str(item.get("name") or ""))}" />
                     <input type="hidden" name="position" value="{escape(str(item.get("title") or ""))}" />
                     <input type="hidden" name="email" value="{escape(str(item.get("email") or ""))}" />
@@ -1788,7 +2494,11 @@ def render_strategic_apollo_results(payload, organization_name="", region="", fu
                     <input type="hidden" name="influence_level" value="{escape(str(item.get("influence_level") or ""))}" />
                     <input type="hidden" name="seniority" value="{escape(str(item.get("seniority") or ""))}" />
                     <input type="hidden" name="preferred_contact_method" value="Email" />
-                    <button class="button secondary small-button" type="submit">Save to Strategic Contacts</button>
+                    <button
+                        class="button secondary small-button"
+                        type="submit"
+                        onclick="this.disabled=true;this.textContent='Saved';this.style.background='#dcfce7';this.style.borderColor='#dcfce7';this.style.color='#166534';this.form.submit();return false;"
+                    >Save to Strategic Contacts</button>
                 </form>
             """
         linkedin_html = ""
@@ -2546,6 +3256,7 @@ def get_user_accounts_page(setup: str = "", message: str = "", error: str = "", 
                     <a class="button" href="/m365/connect?return_to=%2Fuser-accounts">Connect Microsoft 365</a>
                 </div>
             """
+    send_confirmation_mode = "fast" if bool((current_user or {}).get("skip_send_confirmation", False)) else "confirm"
 
     management_markup = ""
     if can_manage:
@@ -2653,6 +3364,18 @@ def get_user_accounts_page(setup: str = "", message: str = "", error: str = "", 
                     </div>
                     <p class="subtle">Connect your own Microsoft 365 account so Sales Focus can send email from the right mailbox.</p>
                     {connect_controls}
+                    <form method="post" action="/user-settings/send-confirmation" class="login-form compact-form user-send-mode-form">
+                        <input type="hidden" name="return_to" value="/user-accounts" />
+                        <label>
+                            <span class="label">Send behaviour</span>
+                            <select name="send_confirmation_mode">
+                                <option value="confirm" {"selected" if send_confirmation_mode == "confirm" else ""}>Confirm before send</option>
+                                <option value="fast" {"selected" if send_confirmation_mode == "fast" else ""}>Fast send (no pop-up)</option>
+                            </select>
+                        </label>
+                        <p class="subtle">Use fast send when you want Send Email to go straight out and move on without the extra confirmation step.</p>
+                        <button class="button secondary small-button" type="submit">Save send preference</button>
+                    </form>
                 </div>
             </div>
         </section>
@@ -2703,6 +3426,7 @@ def post_user_account(
             "m365_email": m365_email,
             "role": role,
             "active": str(active or "").strip().lower() != "inactive",
+            "skip_send_confirmation": False,
             "password_salt": password_payload["salt"],
             "password_hash": password_payload["hash"],
         }
@@ -2781,6 +3505,7 @@ def post_user_account_update(
     user_record["m365_email"] = m365_email
     user_record["role"] = role
     user_record["active"] = is_active
+    user_record["skip_send_confirmation"] = bool(user_record.get("skip_send_confirmation", False))
 
     if password.strip():
         password_payload = hash_user_password(password)
@@ -2870,6 +3595,7 @@ def get_strategic_contacts_page(
                 </div>
                 <div class="m365-status-actions strategic-discovery-actions">
                     <button class="button secondary strategic-discovery-submit" type="submit">Find strategic contacts</button>
+                    <a class="button secondary small-button" href="/organisation-chart-view">Organisation view</a>
                     <a class="button secondary small-button" href="/strategic-contacts-view">Clear</a>
                     {f'<a class="button secondary small-button" href="/strategic-contacts-view?discover_run=1&discover_org={quote(discover_org)}&discover_region={quote(discover_region)}&discover_function={quote(discover_function)}&discover_refresh=1">Refresh PDL</a>' if discover_org else ''}
                 </div>
@@ -2884,6 +3610,114 @@ def get_strategic_contacts_page(
         {render_strategic_pdl_results(pdl_payload, organization_name=discover_org, region=discover_region, function=discover_function) if pdl_payload else ''}
     """
     return render_page(title="Strategic Contacts", body=body)
+
+
+@app.get("/organisation-chart-view", response_class=HTMLResponse)
+def get_organisation_chart_view(group: str = "vestis-aramark", message: str = "", error: str = ""):
+    selected_group = group if group in ORG_CHART_GROUPS else "vestis-aramark"
+    items = [item for item in load_strategic_contacts() if bool(item.get("active", True))]
+    filemaker_presence_map = build_strategic_contact_filemaker_presence_map(items)
+    status_markup = ""
+    if message:
+        status_markup = f"<p class='status ok'>{escape(message)}</p>"
+    elif error:
+        status_markup = f"<p class='status error'>{escape(error)}</p>"
+
+    body = f"""
+        <section class="panel strategic-pdl-discovery org-chart-toolbar-panel">
+            <h2>Organisation View</h2>
+            <p class="small muted org-chart-toolbar-copy">
+                This is the first working influence-map view built from Strategic Contacts. We can add and remove people here while we shape the fuller organisation chart.
+            </p>
+            {status_markup}
+            <div class="org-chart-toolbar-row">
+                <div class="org-chart-segmented-control">
+                    {render_org_chart_group_selector(selected_group)}
+                </div>
+                <a class="button secondary small-button org-chart-back-link" href="/strategic-contacts-view">Back to Strategic Contacts</a>
+            </div>
+        </section>
+        {render_organisation_chart(items, selected_group, filemaker_presence_map=filemaker_presence_map)}
+    """
+    return render_page(title="Organisation View", body=body)
+
+
+@app.get("/production-analysis-view", response_class=HTMLResponse)
+def production_analysis_view():
+    body = """
+        <section class="panel">
+            <h2>Production Analysis</h2>
+            <p class="small muted">
+                This area is ready for the production analysis tools once we decide what we want to surface here.
+            </p>
+            <div class="status info" style="margin-top: 16px;">
+                We have added the launch point so the feature can be wired in cleanly during the next build pass.
+            </div>
+        </section>
+    """
+    return render_page(title="Production Analysis", body=body)
+
+
+@app.post("/strategic-contacts/delete", response_class=HTMLResponse)
+def post_strategic_contact_delete(
+    contact_id: str = Form(""),
+    return_to: str = Form("/organisation-chart-view"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+        )
+
+    contact_id = str(contact_id or "").strip()
+    if not contact_id:
+        return RedirectResponse(
+            url=f"{return_to or '/organisation-chart-view'}?error={quote('Could not identify the contact to remove.')}",
+            status_code=303,
+        )
+
+    existing = load_strategic_contacts()
+    remaining = [
+        item for item in existing
+        if str(item.get("id") or "").strip() != contact_id
+    ]
+
+    if len(remaining) == len(existing):
+        return RedirectResponse(
+            url=f"{return_to or '/organisation-chart-view'}?error={quote('Strategic contact not found.')}",
+            status_code=303,
+        )
+
+    save_strategic_contacts(remaining)
+    separator = "&" if "?" in str(return_to or "") else "?"
+    return RedirectResponse(
+        url=f"{return_to or '/organisation-chart-view'}{separator}message={quote('Strategic contact removed.')}",
+        status_code=303,
+    )
+
+
+@app.post("/strategic-contacts/sync-filemaker", response_class=HTMLResponse)
+def post_strategic_contact_sync_filemaker(
+    contact_id: str = Form(""),
+    return_to: str = Form("/organisation-chart-view"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+        )
+
+    result = sync_strategic_contact_to_filemaker(contact_id)
+    return RedirectResponse(
+        url=append_message_to_url(
+            return_to or "/organisation-chart-view",
+            message=result["message"] if result["ok"] else "",
+            error=result["error"] if not result["ok"] else "",
+        ),
+        status_code=303,
+    )
 
 
 @app.post("/strategic-contacts", response_class=HTMLResponse)
@@ -3045,6 +3879,9 @@ def post_strategic_contact_update(
 def post_strategic_contact_import_pdl(
     organization: str = Form(""),
     company_record_label: str = Form(""),
+    discover_org: str = Form(""),
+    discover_region: str = Form(""),
+    discover_function: str = Form(""),
     name: str = Form(""),
     position: str = Form(""),
     email: str = Form(""),
@@ -3064,13 +3901,23 @@ def post_strategic_contact_import_pdl(
         )
 
     organization = str(organization or "").strip()
+    discover_org = str(discover_org or "").strip() or organization
+    discover_region = str(discover_region or "").strip()
+    discover_function = str(discover_function or "").strip()
     name = str(name or "").strip()
     position = str(position or "").strip()
     email = str(email or "").strip().lower()
     phone = str(phone or "").strip()
+    return_url = (
+        "/strategic-contacts-view"
+        f"?discover_run=1&discover_org={quote(discover_org)}"
+        f"&discover_region={quote(discover_region)}"
+        f"&discover_function={quote(discover_function)}"
+        "&discover_refresh=1"
+    )
     if not organization or not name or not position:
         return RedirectResponse(
-            url=f"/strategic-contacts-view?error={quote('PDL result was missing key contact details.')}",
+            url=f"{return_url}&error={quote('PDL result was missing key contact details.')}",
             status_code=303,
         )
 
@@ -3086,7 +3933,7 @@ def post_strategic_contact_import_pdl(
             )
         ):
             return RedirectResponse(
-                url=f"/strategic-contacts-view?message={quote('That PDL contact is already saved.')}",
+                url=f"{return_url}&message={quote('That PDL contact is already saved.')}",
                 status_code=303,
             )
 
@@ -3115,7 +3962,134 @@ def post_strategic_contact_import_pdl(
     )
     save_strategic_contacts(existing)
     return RedirectResponse(
-        url=f"/strategic-contacts-view?message={quote('PDL contact saved to Strategic Contacts.')}",
+        url=f"{return_url}&message={quote('PDL contact saved to Strategic Contacts.')}",
+        status_code=303,
+    )
+
+
+@app.post("/strategic-contacts/import-contact", response_class=HTMLResponse)
+def post_strategic_contact_import_contact(
+    company: str = Form(""),
+    customer_ref: str = Form(""),
+    name: str = Form(""),
+    position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    cell: str = Form(""),
+    state: str = Form(""),
+    return_company: str = Form(""),
+    return_name: str = Form(""),
+    return_email: str = Form(""),
+    return_position: str = Form(""),
+    return_sort: str = Form("company"),
+    return_direction: str = Form("asc"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+        )
+
+    company = str(company or "").strip()
+    name = str(name or "").strip()
+    position = str(position or "").strip()
+    email = str(email or "").strip().lower()
+    phone = str(phone or "").strip()
+    cell = str(cell or "").strip()
+    state = str(state or "").strip()
+    return_url = (
+        "/contacts-view"
+        f"?company={quote(str(return_company or '').strip())}"
+        f"&name={quote(str(return_name or '').strip())}"
+        f"&email={quote(str(return_email or '').strip())}"
+        f"&position={quote(str(return_position or '').strip())}"
+        f"&sort={quote(str(return_sort or 'company').strip() or 'company')}"
+        f"&direction={quote(str(return_direction or 'asc').strip() or 'asc')}"
+    )
+
+    if not company or not name or not position:
+        return RedirectResponse(
+            url=f"{return_url}&error={quote('Contact was missing company, name, or position.')}",
+            status_code=303,
+        )
+
+    existing = load_strategic_contacts()
+    for item in existing:
+        existing_email = str(item.get("email") or "").strip().lower()
+        if (
+            ((email and existing_email == email) or (phone and str(item.get("phone") or "").strip() == phone) or (cell and str(item.get("cell") or "").strip() == cell))
+            or (
+                normalize_apollo_location_value(item.get("name")) == normalize_apollo_location_value(name)
+                and normalize_apollo_location_value(item.get("organization")) == normalize_apollo_location_value(company)
+                and normalize_apollo_location_value(item.get("position")) == normalize_apollo_location_value(position)
+            )
+        ):
+            return RedirectResponse(
+                url=f"{return_url}&message={quote('That contact is already saved to Strategic Contacts.')}",
+                status_code=303,
+            )
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    existing.append(
+        normalize_strategic_contact_record(
+            {
+                "id": secrets.token_hex(8),
+                "organization": company,
+                "company_record_label": company,
+                "name": name,
+                "position": position,
+                "email": email,
+                "phone": phone or cell,
+                "cell": cell,
+                "scope_type": infer_strategic_scope_type(position, region=state),
+                "region": state,
+                "function": infer_strategic_function(position),
+                "influence_level": infer_strategic_influence_level(position),
+                "seniority": infer_strategic_seniority(position),
+                "preferred_contact_method": "Email" if email else "Phone",
+                "active": True,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+    )
+    save_strategic_contacts(existing)
+    return RedirectResponse(
+        url=f"{return_url}&message={quote('Contact saved to Strategic Contacts.')}",
+        status_code=303,
+    )
+
+
+@app.post("/user-settings/send-confirmation", response_class=HTMLResponse)
+def post_user_send_confirmation_setting(
+    request: Request,
+    send_confirmation_mode: str = Form("confirm"),
+    return_to: str = Form("/user-accounts"),
+):
+    current_user = get_current_session_user()
+    if not current_user:
+        return RedirectResponse(url="/login?next=%2Fuser-accounts", status_code=303)
+
+    username = normalize_username(current_user.get("username"))
+    users = load_app_users()
+    match_index = next(
+        (index for index, user in enumerate(users) if normalize_username(user.get("username")) == username),
+        None,
+    )
+    if match_index is None:
+        return RedirectResponse(
+            url=append_error_to_url(return_to or "/user-accounts", "Could not update that user setting."),
+            status_code=303,
+        )
+
+    user_record = dict(users[match_index])
+    user_record["skip_send_confirmation"] = str(send_confirmation_mode or "confirm").strip().lower() == "fast"
+    users[match_index] = user_record
+    save_app_users(users)
+    CURRENT_SESSION_USER.set(sanitize_user_record(user_record))
+    return RedirectResponse(
+        url=append_message_to_url(return_to or "/user-accounts", "Send preference updated."),
         status_code=303,
     )
 
@@ -4250,6 +5224,26 @@ def render_dashboard_home(ask="", ask_run=""):
                         </span>
                         <strong>Customer Map</strong>
                     </a>
+                    <div class="home-launch-card home-launch-card-disabled" aria-disabled="true">
+                        <span class="home-launch-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <circle cx="8" cy="8" r="2.5" fill="none" stroke="currentColor" stroke-width="2"/>
+                                <circle cx="16" cy="6.5" r="2.5" fill="none" stroke="currentColor" stroke-width="2"/>
+                                <circle cx="16.5" cy="15.5" r="2.5" fill="none" stroke="currentColor" stroke-width="2"/>
+                                <path d="M10.2 8.6l3.5-1.1M9.6 10.1l5.1 4.1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                        </span>
+                        <strong>Strategic Contacts</strong>
+                    </div>
+                    <a class="home-launch-card" href="/production-analysis-view" aria-label="Production Analysis">
+                        <span class="home-launch-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <path d="M5 18.5V12M10 18.5V8.5M15 18.5V5.5M20 18.5V10.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                                <path d="M4 18.5h17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                        </span>
+                        <strong>Production Analysis</strong>
+                    </a>
                 </div>
             </section>
         </div>
@@ -4283,7 +5277,6 @@ def render_home_dashboard_sidebar():
         ("Orders", "/orders-view", "cart"),
         ("Insights", "/insights-view", "chart"),
         ("Customer Map", "/customer-map-view", "map"),
-        ("Strategic Contacts", "/strategic-contacts-view", "org"),
     ]
     admin_items = [
         ("User Accounts", "/user-accounts", "key"),
@@ -5763,8 +6756,10 @@ def get_contacts_view(
     company: str = "",
     name: str = "",
     email: str = "",
+    position: str = "",
     sort: str = "company",
     direction: str = "asc",
+    page: int = 1,
 ):
     master_data_result = fetch_filemaker_master_data()
 
@@ -5777,33 +6772,58 @@ def get_contacts_view(
             )
         )
 
-    contact_rows = build_contact_master_rows(master_data_result)
+    contact_rows = [
+        row for row in build_contact_master_rows(master_data_result)
+        if not is_unknown_contact_row(row)
+    ]
     filtered_contact_rows = filter_contact_master_rows(
         contact_rows,
         company=company,
         name=name,
         email=email,
+        position=position,
     )
     sorted_contact_rows = sort_contact_master_rows(
         filtered_contact_rows,
         sort_key=sort,
         direction=direction,
     )
+    page_size = 50
+    total_filtered = len(sorted_contact_rows)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    page = max(1, min(int(page or 1), total_pages))
+    start_index = (page - 1) * page_size
+    paged_contact_rows = sorted_contact_rows[start_index:start_index + page_size]
     company_count = len({
         row["customer_ref"]
         for row in contact_rows
         if row.get("customer_ref")
     })
 
+    strategic_lookup = build_saved_strategic_contact_sets(load_strategic_contacts())
+    current_user = get_current_session_user()
+    can_manage = can_manage_strategic_contacts(current_user)
     rows = "".join(
-        render_contact_master_row(contact)
-        for contact in sorted_contact_rows
+        render_contact_master_row(
+            contact,
+            existing_lookup=strategic_lookup,
+            current_filters={
+                "company": company,
+                "name": name,
+                "email": email,
+                "position": position,
+                "sort": sort,
+                "direction": direction,
+            },
+            can_manage=can_manage,
+        )
+        for contact in paged_contact_rows
     )
 
     if not rows:
         rows = (
             "<tr>"
-            "<td colspan='8' class='empty'>No contacts match the current filters.</td>"
+            f"<td colspan='6' class='empty'>No contacts match the current filters.</td>"
             "</tr>"
         )
 
@@ -5821,7 +6841,7 @@ def get_contacts_view(
             </div>
             <div>
                 <span class="label">Showing</span>
-                <strong>{len(sorted_contact_rows)}</strong>
+                <strong>{len(paged_contact_rows)}</strong>
             </div>
             <div>
                 <span class="label">Companies</span>
@@ -5829,7 +6849,9 @@ def get_contacts_view(
             </div>
         </div>
 
-        {render_contacts_filter_form(company, name, email, sort, direction)}
+        <div class="contacts-filter-panel">
+            {render_contacts_filter_form(company, name, email, position, sort, direction)}
+        </div>
 
         <div class="table-wrap tall-table">
         <table class="contacts-table">
@@ -5840,14 +6862,13 @@ def get_contacts_view(
                     <th>Email</th>
                     <th>Status</th>
                     <th>Position</th>
-                    <th>Phone</th>
-                    <th>Cell</th>
-                    <th>State</th>
+                    <th>Strategic</th>
                 </tr>
             </thead>
             <tbody>{rows}</tbody>
         </table>
         </div>
+        {render_contacts_pagination(company, name, email, position, sort, direction, page, total_pages, total_filtered, start_index, len(paged_contact_rows))}
     """
 
     return render_page(title="Contacts", body=body)
@@ -6980,7 +8001,21 @@ def render_customer_summary_row(summary):
     """
 
 
-def render_contact_master_row(contact):
+def is_contact_in_strategic_contacts(contact, existing_lookup):
+    company_name = str(contact.get("company") or "").strip()
+    contact_name = str(contact.get("name") or "").strip()
+    position = str(contact.get("position") or "").strip()
+    email = str(contact.get("email") or "").strip().lower()
+    phone = str(contact.get("phone") or "").strip()
+    cell = str(contact.get("cell") or "").strip()
+
+    return (
+        is_saved_strategic_contact(email, phone, contact_name, company_name, position, existing_lookup)
+        or is_saved_strategic_contact(email, cell, contact_name, company_name, position, existing_lookup)
+    )
+
+
+def render_contact_master_row(contact, existing_lookup=None, current_filters=None, can_manage=False):
     company_name = str(contact.get("company") or "")
     customer_ref = str(contact.get("customer_ref") or "")
     customers_href = f"/customers-view?customer={quote(company_name)}" if company_name else "/customers-view"
@@ -7001,6 +8036,32 @@ def render_contact_master_row(contact):
         if active_label.lower() == "active"
         else f"<span class='contact-status contact-status-inactive'>{escape(active_label.title())}</span>"
     )
+    current_filters = current_filters or {}
+    already_saved = bool(existing_lookup and is_contact_in_strategic_contacts(contact, existing_lookup))
+    strategic_action = ""
+    if can_manage:
+        if already_saved:
+            strategic_action = "<span class='contact-status contact-status-active'>Saved</span>"
+        else:
+            strategic_action = f"""
+                <form method="post" action="/strategic-contacts/import-contact" class="inline-form">
+                    <input type="hidden" name="company" value="{escape(company_name)}" />
+                    <input type="hidden" name="customer_ref" value="{escape(customer_ref)}" />
+                    <input type="hidden" name="name" value="{escape(contact_name)}" />
+                    <input type="hidden" name="position" value="{escape(position if position != '—' else '')}" />
+                    <input type="hidden" name="email" value="{escape('' if email == '—' else email)}" />
+                    <input type="hidden" name="phone" value="{escape('' if phone == '—' else phone)}" />
+                    <input type="hidden" name="cell" value="{escape('' if cell == '—' else cell)}" />
+                    <input type="hidden" name="state" value="{escape(state if state != 'n/a' else '')}" />
+                    <input type="hidden" name="return_company" value="{escape(str(current_filters.get('company') or ''))}" />
+                    <input type="hidden" name="return_name" value="{escape(str(current_filters.get('name') or ''))}" />
+                    <input type="hidden" name="return_email" value="{escape(str(current_filters.get('email') or ''))}" />
+                    <input type="hidden" name="return_position" value="{escape(str(current_filters.get('position') or ''))}" />
+                    <input type="hidden" name="return_sort" value="{escape(str(current_filters.get('sort') or 'company'))}" />
+                    <input type="hidden" name="return_direction" value="{escape(str(current_filters.get('direction') or 'asc'))}" />
+                    <button class="button secondary small-button" type="submit">Save to Strategic Contacts</button>
+                </form>
+            """
 
     return f"""
         <tr>
@@ -7009,9 +8070,7 @@ def render_contact_master_row(contact):
             <td>{escape(email)}</td>
             <td>{active_markup}</td>
             <td>{escape(position)}</td>
-            <td>{escape(phone)}</td>
-            <td>{escape(cell)}</td>
-            <td>{escape(state)}</td>
+            <td>{strategic_action}</td>
         </tr>
     """
 
@@ -7785,9 +8844,25 @@ def build_contact_master_rows(master_data_result):
             "phone": str(contact.get("phone") or "").strip(),
             "cell": str(contact.get("cell") or "").strip(),
             "active": str(contact.get("active") or "").strip(),
+            "unsubscribe": str(contact.get("unsubscribe") or "").strip(),
         })
 
     return rows
+
+
+def is_contact_unsubscribed(contact):
+    text = str((contact or {}).get("unsubscribe") or "").strip().lower()
+
+    if not text:
+        return False
+
+    return text not in {"0", "false", "no", "n", "off"}
+
+
+def is_unknown_contact_row(contact):
+    company_name = str((contact or {}).get("company") or "").strip().lower()
+    contact_name = str((contact or {}).get("name") or "").strip().lower()
+    return company_name in {"", "unknown company"} or contact_name in {"", "unknown contact"}
 
 
 def get_contact_row_branch_candidates(rows, organization_name="", expected_city="", expected_state="", require_email=False, active_only=True):
@@ -8043,10 +9118,11 @@ def build_customer_pdl_href(customer_name, customer_orders, crm_activities=None)
     return "/pdl-branch-view" + (f"?{urlencode(filtered_query)}" if filtered_query else "")
 
 
-def filter_contact_master_rows(rows, company="", name="", email=""):
+def filter_contact_master_rows(rows, company="", name="", email="", position=""):
     company_filter = company.strip().lower()
     name_filter = name.strip().lower()
     email_filter = email.strip().lower()
+    position_filter = position.strip().lower()
     filtered_rows = []
 
     for row in rows:
@@ -8057,6 +9133,9 @@ def filter_contact_master_rows(rows, company="", name="", email=""):
             continue
 
         if email_filter and email_filter not in str(row.get("email") or "").lower():
+            continue
+
+        if position_filter and position_filter not in str(row.get("position") or "").lower():
             continue
 
         filtered_rows.append(row)
@@ -8473,7 +9552,7 @@ def build_last_contact_display(last_activity_content, latest_crm_activity, crm_a
 def build_outreach_context(customer, customer_orders, attention, crm_result):
     customer_primary_key = get_customer_primary_key(customer_orders)
     cycle = analyze_order_cycle(customer_orders)
-    master_data_result = fetch_filemaker_master_data()
+    master_data_result = fetch_filemaker_master_data(force_refresh=True)
     customer_master = (
         master_data_result.get("customers_by_key", {}).get(customer_primary_key, {})
         if master_data_result.get("status") == "ok"
@@ -8488,6 +9567,11 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         master_data_result.get("contacts_by_email", {})
         if master_data_result.get("status") == "ok"
         else {}
+    )
+    unsubscribed_emails = (
+        master_data_result.get("unsubscribed_emails", [])
+        if master_data_result.get("status") == "ok"
+        else []
     )
     crm_activities = (
         crm_result.get("activity_map", {}).get(customer_primary_key, [])
@@ -8544,6 +9628,10 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
     last_reply_date = (
         format_optional_datetime(inbound_sales[0].get("date_created", ""))
         if inbound_sales else "No reply recorded"
+    )
+    days_since_last_reply = (
+        get_crm_days_since_latest_activity(inbound_sales[0])
+        if inbound_sales else None
     )
     latest_replied_subject = (
         str(latest_replied_outreach.get("subject") or "").strip()
@@ -8614,6 +9702,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         sales_activities,
         contacts_by_email=contacts_by_email,
         customer_contacts=customer_contacts,
+        excluded_emails=unsubscribed_emails,
     )
     primary_contact = select_primary_outreach_contact(top_contacts)
     order_count = len(customer_orders)
@@ -8650,6 +9739,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         "sales_reply_count": len(inbound_sales),
         "approx_response_rate": f"{approx_response_rate}%" if outbound_sales else "n/a",
         "last_reply_date": last_reply_date,
+        "days_since_latest_replied_outreach": days_since_last_reply,
         "likely_preferred_mode": likely_preferred_mode,
         "activity_type_counts": activity_type_counts,
         "activity_type_pattern": activity_type_summary["pattern"],
@@ -8735,6 +9825,7 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
     current_user = get_current_session_user()
     m365_state = get_m365_connection_state(current_user)
     sender_mailbox = str(m365_state.get("mailbox") or "").strip()
+    skip_send_confirmation = bool((current_user or {}).get("skip_send_confirmation", False))
     connect_return_to = f"/outreach-prep?{urlencode({'customer': customer, 'return_to': return_to}, quote_via=quote)}"
     m365_connect_href = f"/m365/connect?return_to={quote(connect_return_to)}"
 
@@ -8797,21 +9888,36 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
     """
     if mode_lower == "email":
         send_status_note = (
-            f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}</p>"
+            (
+                f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}<br><span class='muted'>Fast send is on. Send Email will send immediately.</span></p>"
+                if skip_send_confirmation else
+                f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}<br><span class='muted'>You will be asked to confirm before sending.</span></p>"
+            )
             if m365_state.get("connected") and sender_mailbox
             else (
                 "<p class='outreach-m365-note'>Connect your Microsoft 365 account to send from Sales Focus, or use the manual email fallback.</p>"
             )
         )
         send_button_markup = (
-            """
+            (
+                """
+                        <button type="submit" class="button outreach-primary-cta">
+                            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
+                            </svg>
+                            <span>Send Email</span>
+                        </button>
+                """
+                if skip_send_confirmation else
+                """
                         <button type="button" class="button outreach-primary-cta" onclick="showM365SendConfirm()">
                             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                                 <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
                             </svg>
                             <span>Send Email</span>
                         </button>
-            """
+                """
+            )
             if m365_state.get("connected")
             else f"""
                         <a class="button outreach-primary-cta" href="{escape(m365_connect_href)}">
@@ -9242,9 +10348,14 @@ def infer_contact_role_signal(contact):
     return "Unknown role", "Low", "Limited signal on role from recent sales history."
 
 
-def build_outreach_contact_signals(sales_activities, contacts_by_email=None, customer_contacts=None):
+def build_outreach_contact_signals(sales_activities, contacts_by_email=None, customer_contacts=None, excluded_emails=None):
     contacts_by_email = contacts_by_email or {}
     customer_contacts = customer_contacts or []
+    excluded_emails = {
+        str(email or "").strip().lower()
+        for email in (excluded_emails or [])
+        if str(email or "").strip()
+    }
     contacts = {}
 
     def get_contact_key(email, master_contact):
@@ -9328,6 +10439,9 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
                     contact_emails.append(normalized_email)
 
         for email in dict.fromkeys(contact_emails):
+            if email in excluded_emails:
+                continue
+
             master_contact = contacts_by_email.get(email, {})
             contact = seed_contact(email=email, master_contact=master_contact)
 
@@ -9354,6 +10468,8 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
                 contact["context_snippets"].append(snippet)
 
     for master_contact in customer_contacts:
+        if is_contact_unsubscribed(master_contact):
+            continue
         seed_contact(
             email=str(master_contact.get("email") or "").strip().lower(),
             master_contact=master_contact,
@@ -10686,6 +11802,11 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
         if master_data_result.get("status") == "ok"
         else {}
     )
+    unsubscribed_emails = (
+        master_data_result.get("unsubscribed_emails", [])
+        if master_data_result.get("status") == "ok"
+        else []
+    )
 
     for customer in queue_customers:
         customer_name = str(customer.get("customer", ""))
@@ -10707,6 +11828,7 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
             sales_activities,
             contacts_by_email=contacts_by_email,
             customer_contacts=contacts_by_customer_key.get(customer_primary_key, []),
+            excluded_emails=unsubscribed_emails,
         )
         primary_contact = select_primary_outreach_contact(top_contacts)
         suggested_mode = determine_home_queue_mode(
@@ -10892,6 +12014,10 @@ def build_forced_action_plan_customer(customer_name, customer_orders, crm_matche
         crm_activities=crm_matches,
     )
 
+    value_metrics = calculate_action_plan_value_metrics(customer_orders)
+    base_priority_score = round(max(1.75, (days_since_last / 30) if days_since_last else 1.75), 2)
+    priority_score = apply_action_plan_value_weight(base_priority_score, value_metrics)
+
     return {
         "customer": customer_name,
         "avg_gap": 30.0,
@@ -10899,7 +12025,7 @@ def build_forced_action_plan_customer(customer_name, customer_orders, crm_matche
         "cycle_pattern_label": "Testing override",
         "cycle_consistency": "unknown",
         "days_since_last": days_since_last,
-        "priority_score": round(max(1.75, (days_since_last / 30) if days_since_last else 1.75), 2),
+        "priority_score": priority_score,
         "action": "Testing override",
         "last_activity_date": (
             latest_sales_crm_activity.get("date_created", "")[:10]
@@ -10911,7 +12037,60 @@ def build_forced_action_plan_customer(customer_name, customer_orders, crm_matche
         "last_order": last_order_text,
         "display_last_contact": display_last_contact,
         "force_test_override": True,
+        "order_count": value_metrics["order_count"],
+        "total_spend": value_metrics["total_spend"],
+        "total_spend_value": value_metrics["total_spend_value"],
+        "average_order_value": value_metrics["average_order_value_display"],
+        "average_order_value_value": value_metrics["average_order_value"],
     }
+
+
+def calculate_action_plan_value_metrics(customer_orders):
+    customer_orders = customer_orders or []
+    total_spend_value = sum_order_amounts(customer_orders)
+    average_order_value = average_order_amount(customer_orders)
+    order_count = len(customer_orders)
+    return {
+        "order_count": order_count,
+        "total_spend_value": round(float(total_spend_value or 0), 2),
+        "average_order_value": round(float(average_order_value or 0), 2),
+        "total_spend": format_currency(total_spend_value),
+        "average_order_value_display": format_currency(average_order_value),
+    }
+
+
+def apply_action_plan_value_weight(priority_score, value_metrics):
+    base_score = float(priority_score or 0)
+    value_metrics = value_metrics or {}
+    total_spend_value = float(value_metrics.get("total_spend_value") or 0)
+    average_order_value = float(value_metrics.get("average_order_value") or 0)
+
+    spend_boost = 0.0
+    if total_spend_value >= 100000:
+        spend_boost = 0.6
+    elif total_spend_value >= 50000:
+        spend_boost = 0.45
+    elif total_spend_value >= 25000:
+        spend_boost = 0.3
+    elif total_spend_value >= 10000:
+        spend_boost = 0.18
+    elif total_spend_value >= 5000:
+        spend_boost = 0.1
+
+    average_boost = 0.0
+    if average_order_value >= 5000:
+        average_boost = 0.45
+    elif average_order_value >= 2500:
+        average_boost = 0.32
+    elif average_order_value >= 1500:
+        average_boost = 0.22
+    elif average_order_value >= 750:
+        average_boost = 0.12
+    elif average_order_value >= 250:
+        average_boost = 0.05
+
+    weighted_score = base_score + spend_boost + average_boost
+    return round(weighted_score, 2)
 
 
 def build_manual_action_plan_customer(customer_name, customer_orders, crm_matches=None):
@@ -10941,9 +12120,11 @@ def build_manual_action_plan_customer(customer_name, customer_orders, crm_matche
     if not avg_gap:
         avg_gap = 30.0
     try:
-        priority_score = round(max(1.1, days_since_last / float(avg_gap or 30.0)), 2)
+        base_priority_score = round(max(1.1, days_since_last / float(avg_gap or 30.0)), 2)
     except (TypeError, ValueError, ZeroDivisionError):
-        priority_score = 1.1
+        base_priority_score = 1.1
+    value_metrics = calculate_action_plan_value_metrics(customer_orders)
+    priority_score = apply_action_plan_value_weight(base_priority_score, value_metrics)
 
     sales_crm_matches = get_sales_outreach_activities(crm_matches)
     latest_crm_activity = crm_matches[0] if crm_matches else None
@@ -10974,6 +12155,11 @@ def build_manual_action_plan_customer(customer_name, customer_orders, crm_matche
         "last_order": last_order_text,
         "display_last_contact": display_last_contact,
         "manually_added": True,
+        "order_count": value_metrics["order_count"],
+        "total_spend": value_metrics["total_spend"],
+        "total_spend_value": value_metrics["total_spend_value"],
+        "average_order_value": value_metrics["average_order_value_display"],
+        "average_order_value_value": value_metrics["average_order_value"],
     }
 
 
@@ -11121,6 +12307,8 @@ def build_home_focus_account_overview(context, queue_summary):
     days_since_last_order = context.get("days_since_last_order")
     last_order_display = format_optional_date(context.get("last_order_date") or "")
     average_cycle = context.get("average_cycle")
+    total_value = str(context.get("total_value") or "").strip()
+    average_order_value = str(context.get("average_value_per_order") or "").strip()
 
     if isinstance(days_since_last_order, (int, float)):
         if average_cycle not in {"", None, "Not enough orders"}:
@@ -11133,6 +12321,14 @@ def build_home_focus_account_overview(context, queue_summary):
             )
     elif last_order_display != "No recent activity":
         overview_parts.append(f"Last order was {last_order_display}.")
+
+    if total_value and total_value != "—":
+        spend_summary = f"Total spend is {total_value}"
+        if average_order_value and average_order_value != "—":
+            spend_summary += f", with an average order value of {average_order_value}"
+        overview_parts.append(spend_summary + ".")
+    elif average_order_value and average_order_value != "—":
+        overview_parts.append(f"Average order value is {average_order_value}.")
 
     latest_outreach = format_optional_datetime(context.get("latest_sales_outreach") or "")
     if latest_outreach != "Not available":
@@ -11263,6 +12459,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     current_user = get_current_session_user()
     m365_state = get_m365_connection_state(current_user)
     sender_mailbox = str(m365_state.get("mailbox") or "").strip()
+    skip_send_confirmation = bool((current_user or {}).get("skip_send_confirmation", False))
     connect_return_to = f"/outreach-prep?{urlencode({'customer': customer_name, 'return_to': return_to}, quote_via=quote)}"
     m365_connect_href = f"/m365/connect?return_to={quote(connect_return_to)}"
     slug = re.sub(r"[^a-z0-9]+", "-", customer_name.lower()).strip("-") or "focus"
@@ -11428,19 +12625,34 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
             <p class="home-focus-mode-note" id="{mode_note_id}">Recommended: {escape(recommended_mode_label)}</p>
         """
         send_status_note = (
-            f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}</p>"
+            (
+                f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}<br><span class='muted'>Fast send is on. Send Email will go immediately.</span></p>"
+                if skip_send_confirmation else
+                f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}<br><span class='muted'>You will be asked to confirm before sending.</span></p>"
+            )
             if m365_state.get("connected") and sender_mailbox
             else "<p class='outreach-m365-note'>Connect Microsoft 365 to send from Sales Focus, or use the full prep page while we keep testing.</p>"
         )
         primary_action = (
-            f"""
+            (
+                f"""
+            <button type="submit" class="button home-focus-send-button">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
+                </svg>
+                <span>Send Email</span>
+            </button>
+                """
+                if skip_send_confirmation else
+                f"""
             <button type="button" class="button home-focus-send-button" onclick="showHomeFocusM365SendConfirm('{slug}')">
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                     <path fill="currentColor" d="M4 6.5h16A1.5 1.5 0 0 1 21.5 8v8A1.5 1.5 0 0 1 20 17.5H4A1.5 1.5 0 0 1 2.5 16V8A1.5 1.5 0 0 1 4 6.5Zm0 1a.5.5 0 0 0-.34.13L12 13.9l8.34-6.27A.5.5 0 0 0 20 7.5H4Zm16 9a.5.5 0 0 0 .5-.5V8.63l-7.9 5.94a1 1 0 0 1-1.2 0L3.5 8.63V16a.5.5 0 0 0 .5.5H20Z"/>
                 </svg>
                 <span>Send Email</span>
             </button>
-            """
+                """
+            )
             if m365_state.get("connected")
             else f"""
             <a class="button home-focus-send-button" href="{escape(m365_connect_href)}">
@@ -12557,7 +13769,7 @@ def render_customers_filter_form(customer, state, sort, direction):
     """
 
 
-def render_contacts_filter_form(company, name, email, sort, direction):
+def render_contacts_filter_form(company, name, email, position, sort, direction):
     sort_options = {
         "company": "Company",
         "name": "Contact",
@@ -12575,7 +13787,7 @@ def render_contacts_filter_form(company, name, email, sort, direction):
             <label>
                 <span>Company</span>
                 <input
-                    type="search"
+                    type="text"
                     name="company"
                     value="{escape(company)}"
                     placeholder="Search company"
@@ -12585,7 +13797,7 @@ def render_contacts_filter_form(company, name, email, sort, direction):
             <label>
                 <span>Contact</span>
                 <input
-                    type="search"
+                    type="text"
                     name="name"
                     value="{escape(name)}"
                     placeholder="Search contact"
@@ -12595,12 +13807,24 @@ def render_contacts_filter_form(company, name, email, sort, direction):
             <label>
                 <span>Email</span>
                 <input
-                    type="search"
+                    type="text"
                     name="email"
                     value="{escape(email)}"
                     placeholder="Search email"
                 >
             </label>
+
+            <label>
+                <span>Position</span>
+                <input
+                    type="text"
+                    name="position"
+                    value="{escape(position)}"
+                    placeholder="Search position"
+                >
+            </label>
+
+            <input type="hidden" name="page" value="1">
 
             <label>
                 <span>Sort</span>
@@ -12619,6 +13843,35 @@ def render_contacts_filter_form(company, name, email, sort, direction):
             <button type="submit">Apply</button>
             <a class="button secondary" href="/contacts-view">Reset</a>
         </form>
+    """
+
+
+def render_contacts_pagination(company, name, email, position, sort, direction, page, total_pages, total_filtered, start_index, shown_count):
+    base_query = (
+        f"company={quote(company)}&name={quote(name)}&email={quote(email)}"
+        f"&position={quote(position)}&sort={quote(sort)}&direction={quote(direction)}"
+    )
+    previous_link = (
+        f'<a class="button secondary pager-button" href="/contacts-view?{base_query}&page={page - 1}">Previous</a>'
+        if page > 1
+        else '<span></span>'
+    )
+    next_link = (
+        f'<a class="button secondary pager-button" href="/contacts-view?{base_query}&page={page + 1}">Next</a>'
+        if page < total_pages
+        else '<span></span>'
+    )
+    return f"""
+        <div class="pager">
+            <span class="small muted">
+                Showing {start_index + 1 if total_filtered else 0} to {start_index + shown_count} of {total_filtered} contacts
+            </span>
+            <span class="small muted">Page {page} of {total_pages}</span>
+            <div class="pager-actions">
+                {previous_link}
+                {next_link}
+            </div>
+        </div>
     """
 
 
@@ -15345,7 +16598,6 @@ def render_global_nav(title):
         ("Action Plan", "/action-plan-view"),
         ("Insights", "/insights-view"),
         ("Customer Map", "/customer-map-view"),
-        ("Strategic Contacts", "/strategic-contacts-view"),
         ("Orders", "/orders-view"),
         ("Customers", "/customers-view"),
         ("Contacts", "/contacts-view"),
@@ -16904,6 +18156,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         transform: translateY(-1px);
                     }}
 
+                    .home-launch-card-disabled {{
+                        cursor: default;
+                    }}
+
+                    .home-launch-card-disabled:hover {{
+                        border-color: var(--border);
+                        transform: none;
+                    }}
+
                     .home-launch-card strong {{
                         font-size: 22px;
                         line-height: 1.1;
@@ -17266,12 +18527,359 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         margin-bottom: 8px;
                     }}
 
+                    .strategic-card-actions {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        justify-content: flex-end;
+                        gap: 8px;
+                    }}
+
+                    .strategic-card-actions form {{
+                        margin: 0;
+                    }}
+
+                    .strategic-organization-stack {{
+                        display: grid;
+                        gap: 14px;
+                    }}
+
+                    .org-chart-shell {{
+                        display: grid;
+                        gap: 18px;
+                    }}
+
+                    .org-chart-root {{
+                        margin-bottom: 0;
+                        padding: 24px 18px;
+                        background: linear-gradient(180deg, #fbfdff 0%, #f4f8ff 100%);
+                    }}
+
+                    .org-chart-root-card {{
+                        max-width: 560px;
+                        margin: 0 auto;
+                        text-align: center;
+                    }}
+
+                    .org-chart-root-eyebrow {{
+                        margin: 0 0 6px;
+                        color: #184ecf;
+                        font-size: 12px;
+                        font-weight: 700;
+                        text-transform: uppercase;
+                        letter-spacing: 0.04em;
+                    }}
+
+                    .org-chart-root h2 {{
+                        margin: 0 0 4px;
+                        color: var(--text);
+                        font-size: 26px;
+                    }}
+
+                    .org-chart-root-summary {{
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        margin: 14px auto 0;
+                        max-width: 520px;
+                    }}
+
+                    .org-chart-levels {{
+                        display: grid;
+                        gap: 16px;
+                    }}
+
+                    .org-chart-level {{
+                        display: grid;
+                        grid-template-columns: 160px minmax(0, 1fr);
+                        gap: 16px;
+                        align-items: start;
+                        position: relative;
+                    }}
+
+                    .org-chart-level::before {{
+                        content: "";
+                        position: absolute;
+                        left: 79px;
+                        top: -16px;
+                        bottom: -16px;
+                        width: 2px;
+                        background: #d9e6f5;
+                    }}
+
+                    .org-chart-level:first-child::before {{
+                        top: 28px;
+                    }}
+
+                    .org-chart-level:last-child::before {{
+                        bottom: auto;
+                        height: 34px;
+                    }}
+
+                    .org-chart-level-marker {{
+                        position: relative;
+                        padding-top: 18px;
+                    }}
+
+                    .org-chart-level-marker::after {{
+                        content: "";
+                        position: absolute;
+                        top: 32px;
+                        right: -16px;
+                        width: 16px;
+                        height: 2px;
+                        background: #d9e6f5;
+                    }}
+
+                    .org-chart-level-chip {{
+                        display: inline-flex;
+                        align-items: center;
+                        min-height: 32px;
+                        padding: 0 12px;
+                        border-radius: 999px;
+                        background: #eef5ff;
+                        color: #184ecf;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }}
+
+                    .org-chart-level-body {{
+                        display: grid;
+                        gap: 12px;
+                        min-width: 0;
+                    }}
+
+                    .org-chart-level-summary {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: end;
+                        gap: 12px;
+                        padding: 6px 2px 0;
+                    }}
+
+                    .org-chart-level-summary h2 {{
+                        margin: 0 0 2px;
+                        color: var(--text);
+                        font-size: 20px;
+                    }}
+
+                    .org-chart-lanes {{
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                        gap: 12px;
+                    }}
+
+                    .org-chart-lane {{
+                        position: relative;
+                        padding: 14px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        background: #fbfdff;
+                        box-shadow: var(--shadow-inset);
+                    }}
+
+                    .org-chart-lane::before {{
+                        content: "";
+                        position: absolute;
+                        top: 30px;
+                        left: -14px;
+                        width: 14px;
+                        height: 2px;
+                        background: #d9e6f5;
+                    }}
+
+                    .org-chart-lane-head h3 {{
+                        margin: 0 0 2px;
+                        color: var(--text);
+                        font-size: 16px;
+                    }}
+
+                    .org-chart-card-stack {{
+                        display: grid;
+                        gap: 12px;
+                    }}
+
+                    .org-chart-contact-card {{
+                        margin-bottom: 0;
+                        padding: 12px 14px;
+                        background: #fff;
+                    }}
+
+                    .org-chart-contact-card h4 {{
+                        font-size: 16px;
+                    }}
+
+                    .org-chart-contact-card .strategic-contact-card-head {{
+                        align-items: flex-start;
+                    }}
+
+                    .org-chart-contact-node {{
+                        display: grid;
+                        gap: 6px;
+                    }}
+
+                    .org-chart-contact-main {{
+                        min-width: 0;
+                    }}
+
+                    .org-chart-contact-title-row {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: start;
+                        gap: 10px;
+                    }}
+
+                    .org-chart-contact-title-row h4 {{
+                        margin: 0;
+                        line-height: 1.15;
+                    }}
+
+                    .org-chart-contact-role {{
+                        margin: 2px 0 0;
+                        color: #52606d;
+                        font-size: 13px;
+                        line-height: 1.3;
+                    }}
+
+                    .org-chart-contact-region {{
+                        margin: 2px 0 0;
+                        color: #7b8794;
+                        font-size: 12px;
+                        line-height: 1.25;
+                    }}
+
+                    .org-chart-contact-details {{
+                        margin-top: 8px;
+                        border-top: 1px solid #e6eef7;
+                        padding-top: 8px;
+                    }}
+
+                    .org-chart-contact-details summary {{
+                        cursor: pointer;
+                        list-style: none;
+                        color: #245cff;
+                        font-size: 12px;
+                        font-weight: 700;
+                        user-select: none;
+                    }}
+
+                    .org-chart-contact-details summary::-webkit-details-marker {{
+                        display: none;
+                    }}
+
+                    .org-chart-contact-details summary::before {{
+                        content: "+";
+                        display: inline-block;
+                        margin-right: 6px;
+                    }}
+
+                    .org-chart-contact-details[open] summary::before {{
+                        content: "−";
+                    }}
+
+                    .org-chart-contact-detail-body {{
+                        display: grid;
+                        gap: 8px;
+                        margin-top: 10px;
+                    }}
+
+                    .org-chart-detail-summary {{
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 8px;
+                        margin: 0;
+                    }}
+
+                    .org-chart-detail-summary div {{
+                        min-width: 0;
+                        padding: 10px 12px;
+                    }}
+
+                    .org-chart-detail-summary strong {{
+                        display: block;
+                        font-size: 13px;
+                        line-height: 1.25;
+                        overflow-wrap: anywhere;
+                        word-break: break-word;
+                    }}
+
+                    .org-chart-contact-detail-body .strategic-card-actions {{
+                        justify-content: flex-start;
+                        margin-top: 2px;
+                    }}
+
+                    .org-chart-contact-detail-body .strategic-card-actions .button,
+                    .org-chart-contact-detail-body .strategic-card-actions button {{
+                        width: auto;
+                        min-width: 0;
+                        padding: 7px 10px;
+                        font-size: 12px;
+                    }}
+
                     .strategic-contact-summary {{
                         margin: 8px 0;
                     }}
 
                     .strategic-pdl-discovery {{
                         padding: 18px 20px;
+                    }}
+
+                    .org-chart-toolbar-panel {{
+                        padding: 14px 16px;
+                    }}
+
+                    .org-chart-toolbar-panel h2 {{
+                        margin-bottom: 4px;
+                        font-size: 18px;
+                    }}
+
+                    .org-chart-toolbar-copy {{
+                        margin-bottom: 10px;
+                        font-size: 12px;
+                        line-height: 1.35;
+                    }}
+
+                    .org-chart-toolbar-row {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 10px;
+                    }}
+
+                    .org-chart-segmented-control {{
+                        display: inline-flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        gap: 8px;
+                        padding: 4px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: #f8fbff;
+                    }}
+
+                    .org-chart-segmented-control .org-chart-segment {{
+                        min-width: 0;
+                        min-height: 32px;
+                        padding: 0 12px;
+                        border-radius: 8px;
+                        font-size: 12px;
+                        line-height: 1;
+                    }}
+
+                    .org-chart-segmented-control .org-chart-segment.active {{
+                        background: #245cff;
+                        color: #fff;
+                        border-color: #245cff;
+                        box-shadow: 0 8px 16px rgba(36, 92, 255, 0.14);
+                    }}
+
+                    .org-chart-segmented-control .org-chart-segment:not(.active) {{
+                        background: #fff;
+                        color: #44556b;
+                    }}
+
+                    .org-chart-back-link {{
+                        min-width: 0;
+                        min-height: 32px;
+                        padding: 0 12px;
+                        font-size: 12px;
                     }}
 
                     .strategic-pdl-discovery h3,
@@ -18299,6 +19907,19 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         border: 1px solid var(--border);
                         border-radius: 12px;
                         box-shadow: var(--shadow-soft);
+                        position: relative;
+                        z-index: 6;
+                    }}
+
+                    .contacts-filter-panel {{
+                        position: relative;
+                        z-index: 20;
+                        isolation: isolate;
+                    }}
+
+                    .contacts-filter-panel,
+                    .contacts-filter-panel * {{
+                        pointer-events: auto !important;
                     }}
 
                     .upload-form {{
@@ -18488,6 +20109,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         display: grid;
                         gap: 6px;
                         min-width: 0;
+                        position: relative;
+                        z-index: 1;
                     }}
 
                     .controls span {{
@@ -18526,6 +20149,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         background: #fff;
                         color: var(--text);
                         font: inherit;
+                        pointer-events: auto;
+                        position: relative;
+                        z-index: 2;
                     }}
 
                     textarea {{
@@ -18684,6 +20310,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         overflow-x: auto;
                         overflow-y: visible;
                         border-radius: 12px;
+                        position: relative;
+                        z-index: 0;
                     }}
 
                     .table-wrap.tall-table {{
@@ -19025,6 +20653,83 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         overflow-wrap: anywhere;
                     }}
 
+                    .contacts-table {{
+                        table-layout: fixed;
+                        min-width: 980px;
+                        font-size: 12px;
+                    }}
+
+                    .contacts-table th,
+                    .contacts-table td {{
+                        padding: 9px 10px;
+                        font-size: 12px;
+                        line-height: 1.3;
+                    }}
+
+                    .contacts-table th:nth-child(1),
+                    .contacts-table td:nth-child(1) {{
+                        width: 22%;
+                        min-width: 200px;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .contacts-table th:nth-child(2),
+                    .contacts-table td:nth-child(2) {{
+                        width: 16%;
+                        min-width: 150px;
+                    }}
+
+                    .contacts-table th:nth-child(3),
+                    .contacts-table td:nth-child(3) {{
+                        width: 24%;
+                        min-width: 220px;
+                        white-space: normal;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .contacts-table th:nth-child(4),
+                    .contacts-table td:nth-child(4) {{
+                        width: 10%;
+                        min-width: 110px;
+                    }}
+
+                    .contacts-table th:nth-child(5),
+                    .contacts-table td:nth-child(5) {{
+                        width: 16%;
+                        min-width: 170px;
+                        white-space: normal;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .contacts-table th:nth-child(6),
+                    .contacts-table td:nth-child(6) {{
+                        width: 12%;
+                        min-width: 150px;
+                        text-align: center;
+                    }}
+
+                    .contacts-table .inline-form {{
+                        display: flex;
+                        justify-content: center;
+                    }}
+
+                    .contacts-table .inline-form .button,
+                    .contacts-table .inline-form button {{
+                        width: auto;
+                        min-width: 0;
+                        height: auto;
+                        padding: 6px 10px;
+                        font-size: 11px;
+                        line-height: 1.15;
+                        white-space: normal;
+                        text-align: center;
+                    }}
+
+                    .contacts-table .contact-status {{
+                        font-size: 11px;
+                        padding: 4px 8px;
+                    }}
+
                     .crm-activity-meta {{
                         display: grid;
                         gap: 6px;
@@ -19045,7 +20750,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     th {{
                         position: sticky;
                         top: 0;
-                        z-index: 3;
+                        z-index: 1;
                         background: #eaf1f8;
                         font-size: 12px;
                         text-transform: uppercase;
@@ -19497,6 +21202,18 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             gap: 12px;
                         }}
 
+                        .home-dashboard-main > .home-chat-panel {{
+                            order: 99;
+                            width: min(100%, 100% - 0px);
+                            justify-self: stretch;
+                            align-self: start;
+                        }}
+
+                        .home-dashboard-main > .home-launch-card,
+                        .home-dashboard-main > .panel:not(.home-chat-panel) {{
+                            order: 1;
+                        }}
+
                         .home-launch-card {{
                             min-height: 112px;
                             padding: 16px;
@@ -19519,12 +21236,28 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .home-chat-panel {{
                             min-height: 0;
-                            padding: 12px 14px;
+                            width: calc(100% - 4px);
+                            max-width: calc(100% - 4px);
+                            margin: 0 auto;
+                            padding: 10px 12px;
+                        }}
+
+                        .home-chat-head {{
+                            gap: 8px;
+                        }}
+
+                        .home-chat-head h2 {{
+                            font-size: 15px;
+                        }}
+
+                        .home-chat-head p {{
+                            font-size: 11px;
+                            line-height: 1.35;
                         }}
 
                         .home-chat-thread {{
-                            min-height: 180px;
-                            padding: 10px;
+                            min-height: 148px;
+                            padding: 8px;
                         }}
 
                         .home-chat-message,
@@ -19550,8 +21283,23 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             width: 100%;
                         }}
 
+                        .home-chat-bubble {{
+                            max-width: 100%;
+                            padding: 7px 9px;
+                        }}
+
+                        .home-chat-bubble p {{
+                            font-size: 11px;
+                        }}
+
+                        .home-chat-form input[type="search"] {{
+                            min-height: 38px;
+                            padding: 0 10px;
+                            font-size: 12px;
+                        }}
+
                         main {{
-                            padding: 18px 14px 28px;
+                            padding: 12px 12px 24px;
                         }}
 
                         .panel h2.home-focus-title {{
@@ -19559,25 +21307,29 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         h1 {{
-                            margin-bottom: 14px;
+                            margin-bottom: 10px;
                             font-size: 26px;
                         }}
 
                         .top-row {{
                             align-items: start;
-                            margin-bottom: 12px;
+                            gap: 8px;
+                            margin-bottom: 8px;
                         }}
 
                         .nav {{
-                            font-size: 12px;
+                            font-size: 11px;
+                            line-height: 1.35;
                         }}
 
                         .nav-shell {{
                             flex-wrap: wrap;
+                            gap: 8px;
                         }}
 
                         .nav-admin-menu {{
                             margin-left: 0;
+                            gap: 8px;
                         }}
 
                         .hero {{
@@ -19598,30 +21350,56 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             padding: 11px 12px;
                         }}
 
+                        .home-workspace {{
+                            gap: 12px;
+                        }}
+
+                        .home-focus-panel {{
+                            padding: 16px 16px 14px;
+                        }}
+
                         .home-focus-head {{
                             flex-direction: column;
                             align-items: stretch;
-                            gap: 12px;
-                            margin-bottom: 14px;
+                            gap: 10px;
+                            margin-bottom: 10px;
                         }}
 
                         .home-workspace-topbar {{
                             align-items: stretch;
+                            gap: 8px;
+                        }}
+
+                        .home-view-toggle {{
+                            margin-bottom: 0;
+                            padding: 3px;
+                            gap: 6px;
+                        }}
+
+                        .home-view-toggle .toggle-chip {{
+                            min-height: 34px;
+                            min-width: 74px;
+                            padding: 0 14px;
+                            font-size: 13px;
                         }}
 
                         .home-add-customer-form {{
                             width: 100%;
                             flex-direction: column;
                             align-items: stretch;
+                            gap: 8px;
                         }}
 
                         .home-add-customer-input {{
                             width: 100%;
                             min-width: 0;
+                            min-height: 36px;
+                            font-size: 12px;
                         }}
 
                         .home-add-customer-button {{
                             width: 100%;
+                            min-height: 36px;
                         }}
 
                         .home-preview-dismiss-form {{
@@ -19647,7 +21425,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .home-focus-work-layout {{
                             grid-template-columns: 1fr;
-                            gap: 14px;
+                            gap: 12px;
+                        }}
+
+                        .home-focus-overview-card {{
+                            order: 1;
+                        }}
+
+                        .home-focus-work-card {{
+                            order: 2;
                         }}
 
                         .home-focus-overview-head,
@@ -19667,7 +21453,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .home-focus-work-card,
                         .home-focus-overview-card {{
-                            padding: 14px;
+                            padding: 12px;
                         }}
 
                         .home-focus-overview-head h3,

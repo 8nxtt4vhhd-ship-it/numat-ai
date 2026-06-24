@@ -186,6 +186,58 @@ def get_activity_content(extra):
     return ""
 
 
+def _safe_order_amount(order):
+    try:
+        return float(order.get("amount") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def calculate_order_value_metrics(order_list):
+    order_list = order_list or []
+    amounts = [_safe_order_amount(order) for order in order_list]
+    total_spend_value = round(sum(amounts), 2)
+    average_order_value = round((total_spend_value / len(amounts)), 2) if amounts else 0.0
+    return {
+        "order_count": len(order_list),
+        "total_spend_value": total_spend_value,
+        "average_order_value": average_order_value,
+    }
+
+
+def apply_value_weight_to_priority(priority_score, value_metrics):
+    base_score = float(priority_score or 0)
+    value_metrics = value_metrics or {}
+    total_spend_value = float(value_metrics.get("total_spend_value") or 0)
+    average_order_value = float(value_metrics.get("average_order_value") or 0)
+
+    spend_boost = 0.0
+    if total_spend_value >= 100000:
+        spend_boost = 0.6
+    elif total_spend_value >= 50000:
+        spend_boost = 0.45
+    elif total_spend_value >= 25000:
+        spend_boost = 0.3
+    elif total_spend_value >= 10000:
+        spend_boost = 0.18
+    elif total_spend_value >= 5000:
+        spend_boost = 0.1
+
+    average_boost = 0.0
+    if average_order_value >= 5000:
+        average_boost = 0.45
+    elif average_order_value >= 2500:
+        average_boost = 0.32
+    elif average_order_value >= 1500:
+        average_boost = 0.22
+    elif average_order_value >= 750:
+        average_boost = 0.12
+    elif average_order_value >= 250:
+        average_boost = 0.05
+
+    return round(base_score + spend_boost + average_boost, 2)
+
+
 def find_late_customers(customers, today=None):
     results = []
 
@@ -207,7 +259,9 @@ def find_late_customers(customers, today=None):
         days_since_last = (today - last_order).days
 
         if days_since_last > avg_gap:
-            priority = days_since_last / avg_gap
+            base_priority = days_since_last / avg_gap
+            value_metrics = calculate_order_value_metrics(orders)
+            priority = apply_value_weight_to_priority(base_priority, value_metrics)
             last_activity = get_last_activity_info(orders)
             last_activity_date = last_activity["date"] if last_activity else None
 
@@ -228,6 +282,9 @@ def find_late_customers(customers, today=None):
                 "cycle_consistency": cycle["consistency"],
                 "days_since_last": days_since_last,
                 "priority_score": round(priority, 2),
+                "order_count": value_metrics["order_count"],
+                "total_spend_value": value_metrics["total_spend_value"],
+                "average_order_value_value": value_metrics["average_order_value"],
                 "action": action,
                 "last_activity_date": (
                     last_activity_date.strftime("%Y-%m-%d")

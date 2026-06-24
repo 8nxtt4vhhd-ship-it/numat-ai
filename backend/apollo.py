@@ -209,6 +209,10 @@ def search_apollo_people(
     titles=None,
     organization_locations=None,
     person_locations=None,
+    organization_ids=None,
+    organization_names=None,
+    person_seniorities=None,
+    keywords="",
     per_page=10,
     page=1,
     force_refresh=False,
@@ -238,12 +242,30 @@ def search_apollo_people(
     normalized_titles = normalize_string_list(titles or [])
     normalized_locations = normalize_string_list(organization_locations or [])
     normalized_person_locations = normalize_string_list(person_locations or [])
+    normalized_organization_ids = normalize_string_list(organization_ids or [])
+    normalized_organization_names = normalize_string_list(organization_names or [])
+    normalized_person_seniorities = normalize_string_list(person_seniorities or [])
+    normalized_keywords = str(keywords or "").strip()
 
     if normalized_domain:
         params["q_organization_domains_list[]"] = [normalized_domain]
 
     if normalized_titles:
         params["person_titles[]"] = normalized_titles
+
+    if normalized_organization_ids:
+        params["organization_ids[]"] = normalized_organization_ids
+
+    if normalized_organization_names:
+        params["q_organization_names[]"] = normalized_organization_names
+        if len(normalized_organization_names) == 1:
+            params["q_organization_name"] = normalized_organization_names[0]
+
+    if normalized_person_seniorities:
+        params["person_seniorities[]"] = normalized_person_seniorities
+
+    if normalized_keywords:
+        params["q_keywords"] = normalized_keywords
 
     if normalized_locations:
         params["organization_locations[]"] = normalized_locations
@@ -255,6 +277,10 @@ def search_apollo_people(
         "people_search",
         domain=normalized_domain,
         titles="|".join(normalized_titles),
+        organization_ids="|".join(normalized_organization_ids),
+        organization_names="|".join(normalized_organization_names),
+        person_seniorities="|".join(normalized_person_seniorities),
+        keywords=normalized_keywords,
         organization_locations="|".join(normalized_locations),
         person_locations="|".join(normalized_person_locations),
         per_page=params["per_page"],
@@ -272,6 +298,10 @@ def search_apollo_people(
             kind="people_search",
             domain=normalized_domain,
             titles="|".join(normalized_titles),
+            organization_ids="|".join(normalized_organization_ids),
+            organization_names="|".join(normalized_organization_names),
+            person_seniorities="|".join(normalized_person_seniorities),
+            keywords=normalized_keywords,
             organization_locations="|".join(normalized_locations),
             person_locations="|".join(normalized_person_locations),
             per_page=params["per_page"],
@@ -319,6 +349,10 @@ def search_apollo_people(
         "total_entries": payload.get("total_entries", 0),
         "domain": normalized_domain,
         "titles": normalized_titles,
+        "organization_ids": normalized_organization_ids,
+        "organization_names": normalized_organization_names,
+        "person_seniorities": normalized_person_seniorities,
+        "keywords": normalized_keywords,
         "organization_locations": normalized_locations,
         "person_locations": normalized_person_locations,
         "page": params["page"],
