@@ -842,6 +842,89 @@ def build_strategic_contact_filemaker_field_data(contact, company):
     }
 
 
+def build_branch_contact_filemaker_field_data(
+    customer_ref,
+    name,
+    position,
+    email="",
+    phone="",
+    cell="",
+    state="",
+    relationship_notes="",
+):
+    config = get_filemaker_config()
+    normalized_email = str(email or "").strip().lower()
+    normalized_phone = str(phone or "").strip()
+    normalized_cell = str(cell or "").strip()
+    normalized_state = str(state or "").strip()
+    normalized_position = str(position or "").strip()
+    preferred_method = "Email" if normalized_email else ("Phone" if normalized_phone or normalized_cell else "")
+    relationship_notes = str(relationship_notes or "").strip()
+
+    raw_pairs = [
+        (config["contacts_customer_ref_field"], str(customer_ref or "").strip()),
+        (config["contacts_name_field"], str(name or "").strip()),
+        (config["contacts_email_field"], normalized_email),
+        (config["contacts_position_field"], normalized_position),
+        (config["contacts_phone_field"], normalized_phone),
+        (config["contacts_cell_field"], normalized_cell),
+        (config["contacts_active_field"], "Active"),
+        (config["contacts_scope_type_field"], infer_strategic_scope_type(normalized_position, region=normalized_state)),
+        (config["contacts_region_field"], normalized_state),
+        (config["contacts_function_field"], infer_strategic_function(normalized_position)),
+        (config["contacts_influence_level_field"], infer_strategic_influence_level(normalized_position)),
+        (config["contacts_seniority_field"], infer_strategic_seniority(normalized_position)),
+        (config["contacts_coverage_notes_field"], ""),
+        (config["contacts_outreach_angle_field"], ""),
+        (config["contacts_relationship_notes_field"], relationship_notes),
+        (config["contacts_preferred_contact_method_field"], preferred_method),
+    ]
+    return {
+        field_name: value
+        for field_name, value in raw_pairs
+        if str(field_name or "").strip()
+    }
+
+
+def build_filemaker_contact_inactive_field_data(existing_contact, relationship_notes=""):
+    config = get_filemaker_config()
+    preferred_method = ""
+    if str(existing_contact.get("email") or "").strip():
+        preferred_method = "Email"
+    elif str(existing_contact.get("phone") or "").strip() or str(existing_contact.get("cell") or "").strip():
+        preferred_method = "Phone"
+
+    raw_pairs = [
+        (config["contacts_customer_ref_field"], str(existing_contact.get("customer_ref") or "").strip()),
+        (config["contacts_name_field"], str(existing_contact.get("name") or "").strip()),
+        (config["contacts_email_field"], str(existing_contact.get("email") or "").strip().lower()),
+        (config["contacts_position_field"], str(existing_contact.get("position") or "").strip()),
+        (config["contacts_phone_field"], str(existing_contact.get("phone") or "").strip()),
+        (config["contacts_cell_field"], str(existing_contact.get("cell") or "").strip()),
+        (config["contacts_active_field"], "Inactive"),
+        (config["contacts_relationship_notes_field"], str(relationship_notes or "").strip()),
+        (config["contacts_preferred_contact_method_field"], preferred_method),
+    ]
+    return {
+        field_name: value
+        for field_name, value in raw_pairs
+        if str(field_name or "").strip()
+    }
+
+
+def append_contact_note(existing_note, new_note):
+    existing_text = str(existing_note or "").strip()
+    new_text = str(new_note or "").strip()
+
+    if not new_text:
+        return existing_text
+    if not existing_text:
+        return new_text
+    if new_text in existing_text:
+        return existing_text
+    return f"{existing_text}\n{new_text}"
+
+
 def find_existing_filemaker_contact_for_strategic_contact(contact, company, master_data_result):
     company_key = str(company.get("primary_key") or "").strip()
     if not company_key:
@@ -878,6 +961,356 @@ def find_existing_filemaker_contact_for_strategic_contact(contact, company, mast
         return existing_contact
 
     return None
+
+
+def find_existing_filemaker_branch_contact(customer_ref, name, position, email, master_data_result):
+    company_key = str(customer_ref or "").strip()
+    if not company_key:
+        return None
+
+    contacts_for_company = master_data_result.get("contacts_by_customer_key", {}).get(company_key, [])
+    if not contacts_for_company:
+        return None
+
+    normalized_email = str(email or "").strip().lower()
+    if normalized_email:
+        for existing_contact in contacts_for_company:
+            if str(existing_contact.get("email") or "").strip().lower() == normalized_email:
+                return existing_contact
+
+    name_key = normalize_apollo_location_value(name)
+    position_key = normalize_apollo_location_value(position)
+    if not name_key:
+        return None
+
+    for existing_contact in contacts_for_company:
+        existing_name_key = normalize_apollo_location_value(existing_contact.get("name"))
+        existing_position_key = normalize_apollo_location_value(existing_contact.get("position"))
+        if existing_name_key != name_key:
+            continue
+        if position_key and existing_position_key and existing_position_key != position_key:
+            continue
+        return existing_contact
+
+    return None
+
+
+def find_existing_filemaker_contact_any_branch(name, position, email, master_data_result):
+    normalized_email = str(email or "").strip().lower()
+    if normalized_email:
+        by_email = (master_data_result.get("contacts_by_email") or {}).get(normalized_email)
+        if by_email:
+            return by_email
+
+        for existing_contact in master_data_result.get("all_contacts", []):
+            if str(existing_contact.get("email") or "").strip().lower() == normalized_email:
+                return existing_contact
+
+    name_key = normalize_apollo_location_value(name)
+    position_key = normalize_apollo_location_value(position)
+    if not name_key:
+        return None
+
+    matches = []
+    for existing_contact in master_data_result.get("all_contacts", []):
+        existing_name_key = normalize_apollo_location_value(existing_contact.get("name"))
+        existing_position_key = normalize_apollo_location_value(existing_contact.get("position"))
+        if existing_name_key != name_key:
+            continue
+        if position_key and existing_position_key and existing_position_key != position_key:
+            continue
+        matches.append(existing_contact)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+def mark_enrichment_contact_moved_on_in_filemaker(
+    name,
+    position,
+    email="",
+    moved_to_company="",
+    source_label="PDL enrichment",
+):
+    normalized_name = str(name or "").strip()
+    normalized_position = str(position or "").strip()
+    normalized_email = str(email or "").strip().lower()
+    normalized_moved_to_company = str(moved_to_company or "").strip()
+
+    if not normalized_name and not normalized_email:
+        return {
+            "ok": False,
+            "message": "",
+            "error": "Moved-on action was missing the contact name or email needed for FileMaker.",
+        }
+
+    config = get_filemaker_config()
+    if not config["contacts_layout"]:
+        return {
+            "ok": False,
+            "message": "",
+            "error": "FileMaker contacts layout is not configured yet.",
+        }
+
+    master_data_result = fetch_filemaker_master_data(force_refresh=True)
+    if master_data_result.get("status") != "ok":
+        return {
+            "ok": False,
+            "message": "",
+            "error": f"Could not load FileMaker master data: {master_data_result.get('status', 'error')}.",
+        }
+
+    existing_contact = find_existing_filemaker_contact_any_branch(
+        normalized_name,
+        normalized_position,
+        normalized_email,
+        master_data_result,
+    )
+    if not existing_contact or not str(existing_contact.get("filemaker_record_id") or "").strip():
+        return {
+            "ok": False,
+            "message": "",
+            "error": "Could not find the existing FileMaker contact record to mark inactive.",
+        }
+
+    timestamp_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    moved_to_label = normalized_moved_to_company or "another company"
+    move_note = f"Marked moved on to {moved_to_label} via {source_label} on {timestamp_label}"
+    relationship_notes = append_contact_note(existing_contact.get("relationship_notes"), move_note)
+    field_data = build_filemaker_contact_inactive_field_data(
+        existing_contact,
+        relationship_notes=relationship_notes,
+    )
+    write_result = update_layout_record(
+        config["contacts_layout"],
+        existing_contact.get("filemaker_record_id"),
+        field_data,
+    )
+    if write_result.get("status") != "ok":
+        detail = str(write_result.get("error_message") or "").strip()
+        return {
+            "ok": False,
+            "message": "",
+            "error": f"FileMaker moved-on update failed: {write_result.get('status', 'error')}{f'. {detail}' if detail else ''}",
+        }
+
+    clear_filemaker_master_data_cache()
+    return {
+        "ok": True,
+        "message": f"Contact marked inactive in FileMaker after move to {moved_to_label}.",
+        "error": "",
+    }
+
+
+def resolve_enrichment_branch_customer_ref(master_data_result, company_name="", city="", state=""):
+    customers_by_key = master_data_result.get("customers_by_key") or {}
+    normalized_company_name = normalize_apollo_location_value(company_name)
+    normalized_city = normalize_apollo_location_value(city)
+    normalized_state = str(state or "").strip().upper()
+
+    if not normalized_company_name:
+        return {"customer_ref": "", "reason": "missing_company_name", "matches": []}
+
+    candidates = []
+    for customer_key, customer_record in customers_by_key.items():
+        record_name = str((customer_record or {}).get("company") or "").strip()
+        if normalize_apollo_location_value(record_name) != normalized_company_name:
+            continue
+        record_city = normalize_apollo_location_value((customer_record or {}).get("city"))
+        record_state = str((customer_record or {}).get("state") or "").strip().upper()
+        candidates.append(
+            {
+                "customer_ref": str(customer_key or "").strip(),
+                "city": record_city,
+                "state": record_state,
+                "company": record_name,
+            }
+        )
+
+    if not candidates:
+        return {"customer_ref": "", "reason": "no_company_match", "matches": []}
+
+    if normalized_city:
+        city_matches = [candidate for candidate in candidates if candidate.get("city") == normalized_city]
+        if len(city_matches) == 1:
+            return {"customer_ref": city_matches[0]["customer_ref"], "reason": "city_match", "matches": city_matches}
+        if normalized_state:
+            city_state_matches = [
+                candidate
+                for candidate in city_matches
+                if candidate.get("state") == normalized_state
+            ]
+            if len(city_state_matches) == 1:
+                return {
+                    "customer_ref": city_state_matches[0]["customer_ref"],
+                    "reason": "city_state_match",
+                    "matches": city_state_matches,
+                }
+
+    if normalized_state:
+        state_matches = [candidate for candidate in candidates if candidate.get("state") == normalized_state]
+        if len(state_matches) == 1:
+            return {"customer_ref": state_matches[0]["customer_ref"], "reason": "state_match", "matches": state_matches}
+
+    if len(candidates) == 1:
+        return {"customer_ref": candidates[0]["customer_ref"], "reason": "single_company_match", "matches": candidates}
+
+    return {"customer_ref": "", "reason": "ambiguous_company_match", "matches": candidates}
+
+
+def sync_enrichment_branch_contact_to_filemaker(
+    customer_ref,
+    company_name,
+    name,
+    position,
+    email="",
+    phone="",
+    cell="",
+    city="",
+    state="",
+    source_label="PDL enrichment",
+):
+    normalized_customer_ref = str(customer_ref or "").strip()
+    normalized_company_name = str(company_name or "").strip()
+    normalized_name = str(name or "").strip()
+    normalized_position = str(position or "").strip()
+    normalized_email = str(email or "").strip().lower()
+    normalized_phone = str(phone or "").strip()
+    normalized_cell = str(cell or "").strip()
+    normalized_city = str(city or "").strip()
+    normalized_state = str(state or "").strip()
+
+    if not normalized_name or not normalized_position:
+        return {
+            "ok": False,
+            "message": "",
+            "error": "Enrichment result was missing the name or role needed for FileMaker.",
+        }
+
+    config = get_filemaker_config()
+    if not config["contacts_layout"]:
+        return {
+            "ok": False,
+            "message": "",
+            "error": "FileMaker contacts layout is not configured yet.",
+        }
+
+    master_data_result = fetch_filemaker_master_data(force_refresh=True)
+    if master_data_result.get("status") != "ok":
+        return {
+            "ok": False,
+            "message": "",
+            "error": f"Could not load FileMaker master data: {master_data_result.get('status', 'error')}.",
+        }
+
+    if not normalized_customer_ref:
+        resolution_result = resolve_enrichment_branch_customer_ref(
+            master_data_result,
+            company_name=normalized_company_name,
+            city=normalized_city,
+            state=normalized_state,
+        )
+        normalized_customer_ref = str(resolution_result.get("customer_ref") or "").strip()
+
+    if not normalized_customer_ref:
+        match_bits = [normalized_company_name or "(blank company)"]
+        if normalized_city:
+            match_bits.append(normalized_city)
+        if normalized_state:
+            match_bits.append(normalized_state)
+        attempted_match = ", ".join(match_bits)
+        return {
+            "ok": False,
+            "message": "",
+            "error": f"Could not determine the FileMaker branch for this enrichment contact. Tried matching: {attempted_match}.",
+        }
+
+    customer_record = (master_data_result.get("customers_by_key") or {}).get(normalized_customer_ref)
+    if not customer_record:
+        return {
+            "ok": False,
+            "message": "",
+            "error": f"Could not find the FileMaker company record for {normalized_company_name or 'this branch'}.",
+        }
+
+    timestamp_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    source_note = f"Imported from {source_label} on {timestamp_label}"
+
+    existing_contact = find_existing_filemaker_branch_contact(
+        normalized_customer_ref,
+        normalized_name,
+        normalized_position,
+        normalized_email,
+        master_data_result,
+    )
+    moved_from_contact = None
+    if not existing_contact:
+        moved_from_contact = find_existing_filemaker_contact_any_branch(
+            normalized_name,
+            normalized_position,
+            normalized_email,
+            master_data_result,
+        )
+
+    update_target = existing_contact or moved_from_contact
+    relationship_notes = source_note
+
+    if moved_from_contact and str(moved_from_contact.get("customer_ref") or "").strip() != normalized_customer_ref:
+        prior_customer_ref = str(moved_from_contact.get("customer_ref") or "").strip()
+        prior_customer = (master_data_result.get("customers_by_key") or {}).get(prior_customer_ref) or {}
+        prior_label = str(prior_customer.get("company") or "").strip() or prior_customer_ref or "previous branch"
+        move_note = f"Moved from {prior_label} on {timestamp_label}"
+        relationship_notes = append_contact_note(
+            append_contact_note(moved_from_contact.get("relationship_notes"), move_note),
+            source_note,
+        )
+    elif update_target:
+        relationship_notes = append_contact_note(update_target.get("relationship_notes"), source_note)
+
+    field_data = build_branch_contact_filemaker_field_data(
+        customer_ref=normalized_customer_ref,
+        name=normalized_name,
+        position=normalized_position,
+        email=normalized_email,
+        phone=normalized_phone,
+        cell=normalized_cell,
+        state=normalized_state,
+        relationship_notes=relationship_notes,
+    )
+
+    if update_target and str(update_target.get("filemaker_record_id") or "").strip():
+        write_result = update_layout_record(
+            config["contacts_layout"],
+            update_target.get("filemaker_record_id"),
+            field_data,
+        )
+        if moved_from_contact and str(moved_from_contact.get("customer_ref") or "").strip() != normalized_customer_ref:
+            success_message = (
+                f"Enrichment contact moved to {customer_record.get('company') or normalized_company_name} "
+                "and updated in FileMaker."
+            )
+        else:
+            success_message = f"Enrichment contact updated in FileMaker under {customer_record.get('company') or normalized_company_name}."
+    else:
+        write_result = create_layout_record(config["contacts_layout"], field_data)
+        success_message = f"Enrichment contact created in FileMaker under {customer_record.get('company') or normalized_company_name}."
+
+    if write_result.get("status") != "ok":
+        detail = str(write_result.get("error_message") or "").strip()
+        return {
+            "ok": False,
+            "message": "",
+            "error": f"FileMaker sync failed: {write_result.get('status', 'error')}{f'. {detail}' if detail else ''}",
+        }
+
+    clear_filemaker_master_data_cache()
+    return {
+        "ok": True,
+        "message": success_message,
+        "error": "",
+    }
 
 
 def sync_strategic_contact_to_filemaker(contact_id):
@@ -1125,6 +1558,468 @@ def render_org_chart_group_selector(selected_group):
     return "".join(buttons)
 
 
+def build_organisation_map_rows(items, filemaker_presence_map=None):
+    rows = []
+    for item in items:
+        name = str(item.get("name") or "Unnamed contact").strip()
+        position = str(item.get("position") or "Unknown role").strip()
+        organization = str(item.get("organization") or "").strip()
+        region_text = str(item.get("region") or "").strip()
+        normalized_state = normalize_state_or_province(region_text)
+        country = infer_country_from_location_parts(
+            state=normalized_state,
+            country_hint="",
+            company_name=organization,
+        ) or "United States"
+        state_label = (
+            US_STATE_ABBR_TO_NAME.get(normalized_state)
+            or CANADA_PROVINCE_ABBR_TO_NAME.get(normalized_state)
+            or region_text
+        )
+        fallback_coords = STATE_CENTER_COORDS.get(normalized_state)
+        query_label = ", ".join(part for part in [state_label or region_text, country] if part)
+        item_id = str(item.get("id") or "").strip()
+        filemaker_presence = (filemaker_presence_map or {}).get(item_id) or {}
+        influence = str(item.get("influence_level") or "").strip() or infer_strategic_influence_level(position)
+        seniority = str(item.get("seniority") or "").strip() or infer_strategic_seniority(position)
+        phone = str(item.get("phone") or "").strip() or str(item.get("cell") or "").strip()
+        rows.append(
+            {
+                "id": item_id,
+                "name": name,
+                "position": position,
+                "organization": organization,
+                "region": region_text or "Shared / Unassigned",
+                "location_label": state_label or region_text or "Shared / Unassigned",
+                "country": country,
+                "query_label": query_label,
+                "fallback_lat": fallback_coords[0] if fallback_coords else None,
+                "fallback_lng": fallback_coords[1] if fallback_coords else None,
+                "function": str(item.get("function") or "").strip() or infer_strategic_function(position),
+                "influence": influence,
+                "seniority": seniority,
+                "email": str(item.get("email") or "").strip(),
+                "phone": phone,
+                "filemaker_exists": bool(filemaker_presence.get("exists")),
+                "filemaker_label": str(filemaker_presence.get("label") or ("Already in FileMaker" if filemaker_presence.get("exists") else "Not in FileMaker")).strip(),
+            }
+        )
+    return rows
+
+
+def render_organisation_geo_map(rows, selected_group):
+    if not rows:
+        return ""
+
+    selected_config = ORG_CHART_GROUPS.get(selected_group) or next(iter(ORG_CHART_GROUPS.values()))
+    rows_json = json.dumps(rows)
+
+    return f"""
+        <link
+            rel="stylesheet"
+            href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+            integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+            crossorigin=""
+        />
+        <style>
+            .org-map-panel {{
+                padding: 12px 14px 14px;
+            }}
+
+            .org-map-head {{
+                display: flex;
+                flex-wrap: wrap;
+                align-items: end;
+                justify-content: space-between;
+                gap: 10px 14px;
+                margin-bottom: 10px;
+            }}
+
+            .org-map-head h3 {{
+                margin: 0 0 2px;
+                font-size: 15px;
+                color: var(--text);
+            }}
+
+            .org-map-head p {{
+                margin: 0;
+                color: var(--muted);
+                font-size: 12px;
+                line-height: 1.35;
+            }}
+
+            .org-map-inline-stats {{
+                display: inline-flex;
+                flex-wrap: wrap;
+                gap: 8px;
+            }}
+
+            .org-map-inline-stat {{
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                min-height: 26px;
+                padding: 0 10px;
+                border: 1px solid #d6e3f7;
+                border-radius: 999px;
+                background: #f8fbff;
+                color: #35506f;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+
+            .org-map-shell {{
+                position: relative;
+                border: 1px solid #d6e3f7;
+                border-radius: 12px;
+                overflow: hidden;
+                background: #f8fbff;
+            }}
+
+            #org-chart-map-canvas {{
+                width: 100%;
+                height: 560px;
+            }}
+
+            .org-map-overlay {{
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                z-index: 500;
+                display: grid;
+                gap: 8px;
+                max-width: 260px;
+            }}
+
+            .org-map-overlay-card {{
+                position: relative;
+                padding: 10px 12px;
+                border: 1px solid rgba(214, 227, 247, 0.95);
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.92);
+                box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+                backdrop-filter: blur(8px);
+            }}
+
+            .org-map-overlay-card[hidden] {{
+                display: none !important;
+            }}
+
+            .org-map-overlay-dismiss {{
+                position: absolute;
+                top: 8px;
+                right: 8px;
+                width: 22px;
+                height: 22px;
+                min-width: 22px;
+                min-height: 22px;
+                padding: 0;
+                border: 1px solid #d6e3f7;
+                border-radius: 999px;
+                background: #ffffff;
+                color: #526581;
+                font-size: 14px;
+                line-height: 1;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+            }}
+
+            .org-map-overlay-dismiss:hover {{
+                border-color: #b8cdea;
+                color: #1d2a3b;
+                background: #f8fbff;
+            }}
+
+            .org-map-overlay-card strong {{
+                display: block;
+                margin-bottom: 3px;
+                padding-right: 20px;
+                color: #1d2a3b;
+                font-size: 12px;
+            }}
+
+            .org-map-overlay-card span {{
+                color: #526581;
+                font-size: 11px;
+                line-height: 1.35;
+            }}
+
+            .org-map-label {{
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                min-height: 24px;
+                padding: 0 10px;
+                border-radius: 999px;
+                border: 1px solid rgba(36, 92, 255, 0.18);
+                background: rgba(255, 255, 255, 0.96);
+                color: #1d2a3b;
+                box-shadow: 0 8px 18px rgba(36, 92, 255, 0.14);
+                font-size: 11px;
+                font-weight: 700;
+                white-space: nowrap;
+            }}
+
+            .org-map-label::before {{
+                content: "";
+                width: 8px;
+                height: 8px;
+                border-radius: 999px;
+                background: #245cff;
+                flex-shrink: 0;
+            }}
+
+            .org-map-label.is-known::before {{
+                background: #1f7a45;
+            }}
+
+            .org-map-popup strong {{
+                display: block;
+                margin-bottom: 4px;
+                color: #1d2a3b;
+                font-size: 13px;
+            }}
+
+            .org-map-popup .meta {{
+                color: #526581;
+                font-size: 12px;
+                line-height: 1.45;
+            }}
+
+            @media (max-width: 980px) {{
+                #org-chart-map-canvas {{
+                    height: 480px;
+                }}
+
+                .org-map-overlay {{
+                    position: static;
+                    max-width: none;
+                    grid-template-columns: 1fr 1fr;
+                    padding: 10px;
+                }}
+            }}
+
+            @media (max-width: 640px) {{
+                #org-chart-map-canvas {{
+                    height: 420px;
+                }}
+
+                .org-map-overlay {{
+                    grid-template-columns: 1fr;
+                }}
+            }}
+        </style>
+        <section class="panel org-map-panel">
+            <div class="org-map-head">
+                <div>
+                    <h3>Regional contact map</h3>
+                    <p>{escape(selected_config['label'])} contacts placed by their saved region. Click a name to open the fuller detail.</p>
+                </div>
+                <div class="org-map-inline-stats">
+                    <span class="org-map-inline-stat">{len(rows)} contacts</span>
+                </div>
+            </div>
+            <div class="org-map-shell">
+                <div id="org-chart-map-canvas"></div>
+                <div class="org-map-overlay">
+                    <div class="org-map-overlay-card" id="org-map-help-card">
+                        <button class="org-map-overlay-dismiss" id="org-map-help-dismiss" type="button" aria-label="Dismiss map help">x</button>
+                        <strong>How to read it</strong>
+                        <span>Each marker is one saved strategic contact. Green markers already exist in FileMaker. Blue markers still only exist in the strategic view.</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+        <script
+            src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""
+        ></script>
+        <script>
+            (function () {{
+                const rows = {rows_json};
+                const defaultCenter = [39.8, -98.6];
+                const defaultZoom = 4;
+                const geocodeCacheKey = "org-chart-geo-cache-v1";
+                const helpDismissedKey = "org-chart-map-help-dismissed-v1";
+                const map = L.map("org-chart-map-canvas", {{
+                    zoomControl: true,
+                    scrollWheelZoom: true,
+                }}).setView(defaultCenter, defaultZoom);
+                const helpCard = document.getElementById("org-map-help-card");
+                const helpDismissButton = document.getElementById("org-map-help-dismiss");
+
+                L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+                    maxZoom: 18,
+                    attribution: "&copy; OpenStreetMap contributors",
+                }}).addTo(map);
+
+                function loadGeocodeCache() {{
+                    try {{
+                        return JSON.parse(window.localStorage.getItem(geocodeCacheKey) || "{{}}");
+                    }} catch (error) {{
+                        return {{}};
+                    }}
+                }}
+
+                let geocodeCache = loadGeocodeCache();
+
+                function saveGeocodeCache() {{
+                    try {{
+                        window.localStorage.setItem(geocodeCacheKey, JSON.stringify(geocodeCache));
+                    }} catch (error) {{
+                        // ignore storage issues
+                    }}
+                }}
+
+                async function geocodeQuery(queryLabel) {{
+                    const existing = geocodeCache[queryLabel];
+                    if (existing && typeof existing.lat === "number" && typeof existing.lng === "number") {{
+                        return existing;
+                    }}
+                    const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${{encodeURIComponent(queryLabel)}}`);
+                    if (!response.ok) {{
+                        return null;
+                    }}
+                    const payload = await response.json();
+                    const first = Array.isArray(payload) ? payload[0] : null;
+                    if (!first) {{
+                        return null;
+                    }}
+                    const point = {{
+                        lat: Number(first.lat),
+                        lng: Number(first.lon),
+                    }};
+                    geocodeCache[queryLabel] = point;
+                    saveGeocodeCache();
+                    return point;
+                }}
+
+                function buildPopupHtml(item) {{
+                    const influence = [item.seniority, item.influence].filter(Boolean).join(" | ");
+                    return `
+                        <div class="org-map-popup">
+                            <strong>${{item.name}}</strong>
+                            <div class="meta">
+                                ${{item.position || "Unknown role"}}<br>
+                                ${{item.location_label || item.region}}<br>
+                                ${{item.organization || ""}}<br><br>
+                                Function: ${{item.function || "Not set"}}<br>
+                                Influence: ${{influence || "Not set"}}<br>
+                                Email: ${{item.email || "Not set"}}<br>
+                                Phone: ${{item.phone || "Not set"}}<br>
+                                FileMaker: ${{item.filemaker_label || "Not set"}}
+                            </div>
+                        </div>
+                    `;
+                }}
+
+                const bounds = [];
+                const duplicateCounts = new Map();
+                const geocodeJobs = [];
+
+                rows.forEach((item) => {{
+                    let lat = item.fallback_lat;
+                    let lng = item.fallback_lng;
+                    if ((!Number.isFinite(lat) || !Number.isFinite(lng)) && item.query_label) {{
+                        const cached = geocodeCache[item.query_label];
+                        if (cached && Number.isFinite(cached.lat) && Number.isFinite(cached.lng)) {{
+                            lat = cached.lat;
+                            lng = cached.lng;
+                        }}
+                    }}
+
+                    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {{
+                        geocodeJobs.push(item);
+                        return;
+                    }}
+
+                    const key = `${{lat.toFixed(2)}}|${{lng.toFixed(2)}}`;
+                    const currentIndex = duplicateCounts.get(key) || 0;
+                    duplicateCounts.set(key, currentIndex + 1);
+                    const angle = currentIndex * 0.92;
+                    const offsetRadius = currentIndex === 0 ? 0 : 0.55;
+                    const adjustedLat = lat + (Math.cos(angle) * offsetRadius);
+                    const adjustedLng = lng + (Math.sin(angle) * offsetRadius);
+
+                    const marker = L.marker([adjustedLat, adjustedLng], {{
+                        icon: L.divIcon({{
+                            className: "",
+                            html: `<span class="org-map-label ${{item.filemaker_exists ? "is-known" : ""}}">${{item.name}}</span>`,
+                            iconSize: null,
+                        }}),
+                    }});
+                    marker.bindPopup(buildPopupHtml(item));
+                    marker.addTo(map);
+                    bounds.push([adjustedLat, adjustedLng]);
+                }});
+
+                async function placeGeocodedItems() {{
+                    for (const item of geocodeJobs.slice(0, 20)) {{
+                        if (!item.query_label) {{
+                            continue;
+                        }}
+                        try {{
+                            const point = await geocodeQuery(item.query_label);
+                            if (!point) {{
+                                continue;
+                            }}
+                            const marker = L.marker([point.lat, point.lng], {{
+                                icon: L.divIcon({{
+                                    className: "",
+                                    html: `<span class="org-map-label ${{item.filemaker_exists ? "is-known" : ""}}">${{item.name}}</span>`,
+                                    iconSize: null,
+                                }}),
+                            }});
+                            marker.bindPopup(buildPopupHtml(item));
+                            marker.addTo(map);
+                            bounds.push([point.lat, point.lng]);
+                            if (bounds.length === 1) {{
+                                map.setView(bounds[0], 5);
+                            }} else {{
+                                map.fitBounds(bounds, {{ padding: [24, 24] }});
+                            }}
+                        }} catch (error) {{
+                            // leave unplaced if lookup fails
+                        }}
+                    }}
+                }}
+
+                if (!bounds.length) {{
+                    map.setView(defaultCenter, defaultZoom);
+                }} else if (bounds.length === 1) {{
+                    map.setView(bounds[0], 5);
+                }} else {{
+                    map.fitBounds(bounds, {{ padding: [24, 24] }});
+                }}
+
+                try {{
+                    if (window.localStorage.getItem(helpDismissedKey) === "1" && helpCard) {{
+                        helpCard.hidden = true;
+                    }}
+                }} catch (error) {{
+                    // ignore storage issues
+                }}
+
+                if (helpDismissButton && helpCard) {{
+                    helpDismissButton.addEventListener("click", () => {{
+                        helpCard.hidden = true;
+                        try {{
+                            window.localStorage.setItem(helpDismissedKey, "1");
+                        }} catch (error) {{
+                            // ignore storage issues
+                        }}
+                    }});
+                }}
+
+                placeGeocodedItems();
+            }})();
+        </script>
+    """
+
+
 def render_organisation_chart(items, selected_group, filemaker_presence_map=None):
     selected_config = ORG_CHART_GROUPS.get(selected_group) or next(iter(ORG_CHART_GROUPS.values()))
     filtered = [
@@ -1231,13 +2126,13 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                                             {presence_badge}
                                         </div>
                                     </div>
-                                    <p class="org-chart-contact-role">{escape(position)}</p>
-                                    <p class="org-chart-contact-region">{escape(region)}</p>
                                 </div>
                             </div>
                             <details class="org-chart-contact-details">
                                 <summary>Details</summary>
                                 <div class="org-chart-contact-detail-body">
+                                    <p class="org-chart-contact-role">{escape(position)}</p>
+                                    <p class="org-chart-contact-region">{escape(region)}</p>
                                     <p class="small muted">{escape(organization)}</p>
                                     <div class="summary compact-summary strategic-contact-summary org-chart-detail-summary">
                                         <div>
@@ -1272,9 +2167,9 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                 f"""
                     <section class="org-chart-lane strategic-organization-panel">
                         <div class="org-chart-lane-head strategic-organization-head">
-                            <div>
+                            <div class="org-chart-lane-title-group">
                                 <h3>{escape(region)}</h3>
-                                <p class="small muted">{len(contacts)} contact{'s' if len(contacts) != 1 else ''}</p>
+                                <span class="org-chart-lane-count">{len(contacts)} contact{'s' if len(contacts) != 1 else ''}</span>
                             </div>
                         </div>
                         <div class="org-chart-card-stack">
@@ -1291,9 +2186,10 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     </div>
                     <div class="org-chart-level-body">
                         <div class="org-chart-level-summary">
-                            <div>
-                                <h2>{escape(scope)}</h2>
-                                <p class="small muted">{scope_contact_count} contact{'s' if scope_contact_count != 1 else ''} across {len(scope_contacts)} region{'s' if len(scope_contacts) != 1 else ''}</p>
+                            <h2>{escape(scope)}</h2>
+                            <div class="org-chart-level-meta">
+                                <span>{scope_contact_count} contact{'s' if scope_contact_count != 1 else ''}</span>
+                                <span>{len(scope_contacts)} region{'s' if len(scope_contacts) != 1 else ''}</span>
                             </div>
                         </div>
                         <div class="org-chart-lanes">
@@ -1303,29 +2199,27 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                 </section>
             """
         )
+    map_rows = build_organisation_map_rows(filtered, filemaker_presence_map=filemaker_presence_map)
+
     return f"""
         <section class="org-chart-shell">
             <section class="panel org-chart-root">
                 <div class="org-chart-root-card">
-                    <p class="org-chart-root-eyebrow">Corporate Structure</p>
-                    <h2>{escape(root_label)}</h2>
-                    <p class="small muted">{escape(selected_config['label'])}</p>
-                    <div class="summary compact-summary org-chart-root-summary">
+                    <div class="org-chart-root-head">
                         <div>
-                            <span class="label">Strategic contacts</span>
-                            <strong>{total_contacts}</strong>
-                        </div>
-                        <div>
-                            <span class="label">Regions</span>
-                            <strong>{total_regions}</strong>
-                        </div>
-                        <div>
-                            <span class="label">Levels</span>
-                            <strong>{len(grouped)}</strong>
+                            <p class="org-chart-root-eyebrow">Corporate Structure</p>
+                            <h2>{escape(root_label)}</h2>
+                            <p class="small muted org-chart-root-subtitle">
+                                {escape(selected_config['label'])}
+                                <span class="org-chart-root-summary-inline">
+                                    • {total_contacts} strategic contact{'s' if total_contacts != 1 else ''} across {total_regions} region{'s' if total_regions != 1 else ''} and {len(grouped)} level{'s' if len(grouped) != 1 else ''}.
+                                </span>
+                            </p>
                         </div>
                     </div>
                 </div>
             </section>
+            {render_organisation_geo_map(map_rows, selected_group)}
             <section class="org-chart-levels">
                 {''.join(sections)}
             </section>
@@ -1629,8 +2523,10 @@ def build_strategic_contact_filemaker_presence_map(items):
 def build_saved_strategic_contact_sets(existing_contacts):
     email_keys = set()
     composite_keys = set()
+    record_ids = {}
 
     for item in existing_contacts:
+        contact_id = str(item.get("id") or "").strip()
         email = str(item.get("email") or "").strip().lower()
         phone = str(item.get("phone") or "").strip()
         name = normalize_apollo_location_value(item.get("name"))
@@ -1639,16 +2535,22 @@ def build_saved_strategic_contact_sets(existing_contacts):
 
         if email:
             email_keys.add(email)
+            if contact_id:
+                record_ids.setdefault(("email", email), contact_id)
         if phone:
             email_keys.add(f"phone:{phone}")
+            if contact_id:
+                record_ids.setdefault(("phone", phone), contact_id)
         if name and organization and position:
             composite_keys.add((name, organization, position))
+            if contact_id:
+                record_ids.setdefault(("composite", (name, organization, position)), contact_id)
 
-    return email_keys, composite_keys
+    return email_keys, composite_keys, record_ids
 
 
 def is_saved_strategic_contact(email, phone, name, organization, position, existing_lookup):
-    existing_keys, existing_composites = existing_lookup
+    existing_keys, existing_composites = existing_lookup[:2]
     email_key = str(email or "").strip().lower()
     phone_key = str(phone or "").strip()
     composite_key = (
@@ -1664,6 +2566,34 @@ def is_saved_strategic_contact(email, phone, name, organization, position, exist
     if all(composite_key) and composite_key in existing_composites:
         return True
     return False
+
+
+def get_saved_strategic_contact_id(email, phone, name, organization, position, existing_lookup):
+    if not existing_lookup or len(existing_lookup) < 3:
+        return ""
+
+    record_ids = existing_lookup[2] or {}
+    email_key = str(email or "").strip().lower()
+    phone_key = str(phone or "").strip()
+    composite_key = (
+        normalize_apollo_location_value(name),
+        normalize_apollo_location_value(organization),
+        normalize_apollo_location_value(position),
+    )
+
+    if email_key:
+        matched = str(record_ids.get(("email", email_key)) or "").strip()
+        if matched:
+            return matched
+    if phone_key:
+        matched = str(record_ids.get(("phone", phone_key)) or "").strip()
+        if matched:
+            return matched
+    if all(composite_key):
+        matched = str(record_ids.get(("composite", composite_key)) or "").strip()
+        if matched:
+            return matched
+    return ""
 
 
 def search_pdl_strategic_contacts(organization_name, region="", function="", force_refresh=False):
@@ -2805,6 +3735,21 @@ def append_message_to_url(target_url, message="", error=""):
     ))
 
 
+def clear_home_selection_from_url(target_url):
+    url_text = str(target_url or "").strip() or "/action-plan-view"
+    parts = urlsplit(url_text)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("selected_customer", None)
+    query.pop("dismiss_customer", None)
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(query, doseq=True, quote_via=quote),
+        parts.fragment,
+    ))
+
+
 def get_crm_sync_status():
     with CRM_SYNC_STATUS_LOCK:
         return dict(CRM_SYNC_STATUS)
@@ -3690,9 +4635,11 @@ def post_strategic_contact_delete(
         )
 
     save_strategic_contacts(remaining)
-    separator = "&" if "?" in str(return_to or "") else "?"
     return RedirectResponse(
-        url=f"{return_to or '/organisation-chart-view'}{separator}message={quote('Strategic contact removed.')}",
+        url=append_message_to_url(
+            return_to or "/organisation-chart-view",
+            message="Strategic contact removed.",
+        ),
         status_code=303,
     )
 
@@ -3983,6 +4930,8 @@ def post_strategic_contact_import_contact(
     return_position: str = Form(""),
     return_sort: str = Form("company"),
     return_direction: str = Form("asc"),
+    return_page: str = Form("1"),
+    return_anchor: str = Form(""),
 ):
     current_user = get_current_session_user()
     if not can_manage_strategic_contacts(current_user):
@@ -4006,7 +4955,11 @@ def post_strategic_contact_import_contact(
         f"&position={quote(str(return_position or '').strip())}"
         f"&sort={quote(str(return_sort or 'company').strip() or 'company')}"
         f"&direction={quote(str(return_direction or 'asc').strip() or 'asc')}"
+        f"&page={quote(str(return_page or '1').strip() or '1')}"
     )
+    return_anchor = str(return_anchor or "").strip()
+    if return_anchor:
+        return_url = f"{return_url}#{quote(return_anchor)}"
 
     if not company or not name or not position:
         return RedirectResponse(
@@ -4058,6 +5011,221 @@ def post_strategic_contact_import_contact(
     return RedirectResponse(
         url=f"{return_url}&message={quote('Contact saved to Strategic Contacts.')}",
         status_code=303,
+    )
+
+
+def handle_enrichment_sync_filemaker(
+    customer: str = "",
+    customer_primary_key: str = "",
+    domain: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    name: str = "",
+    position: str = "",
+    email: str = "",
+    phone: str = "",
+    city: str = "",
+    state: str = "",
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Customer Enrichment",
+            body="<p class='status error'>You do not have permission to send enrichment contacts to FileMaker.</p>",
+        )
+
+    return_url = build_enrichment_return_url(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+    )
+    result = sync_enrichment_branch_contact_to_filemaker(
+        customer_ref=customer_primary_key,
+        company_name=customer or organization_name,
+        name=name,
+        position=position,
+        email=email,
+        phone=phone,
+        city=city or expected_city,
+        state=state or expected_state,
+        source_label="PDL enrichment",
+    )
+    return RedirectResponse(
+        url=append_message_to_url(
+            return_url,
+            message=result["message"] if result["ok"] else "",
+            error=result["error"] if not result["ok"] else "",
+        ),
+        status_code=303,
+    )
+
+
+def handle_enrichment_mark_moved_on(
+    customer: str = "",
+    customer_primary_key: str = "",
+    domain: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    name: str = "",
+    position: str = "",
+    email: str = "",
+    moved_to_company: str = "",
+    source_label: str = "PDL enrichment",
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Customer Enrichment",
+            body="<p class='status error'>You do not have permission to update enrichment contacts in FileMaker.</p>",
+        )
+
+    return_url = build_enrichment_return_url(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+    )
+    result = mark_enrichment_contact_moved_on_in_filemaker(
+        name=name,
+        position=position,
+        email=email,
+        moved_to_company=moved_to_company,
+        source_label=source_label,
+    )
+    return RedirectResponse(
+        url=append_message_to_url(
+            return_url,
+            message=result["message"] if result["ok"] else "",
+            error=result["error"] if not result["ok"] else "",
+        ),
+        status_code=303,
+    )
+
+
+@app.get("/enrichment/sync-filemaker", response_class=HTMLResponse)
+def get_enrichment_sync_filemaker(
+    customer: str = "",
+    customer_primary_key: str = "",
+    domain: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    name: str = "",
+    position: str = "",
+    email: str = "",
+    phone: str = "",
+    city: str = "",
+    state: str = "",
+):
+    return handle_enrichment_sync_filemaker(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        name=name,
+        position=position,
+        email=email,
+        phone=phone,
+        city=city,
+        state=state,
+    )
+
+
+@app.post("/enrichment/sync-filemaker", response_class=HTMLResponse)
+def post_enrichment_sync_filemaker(
+    customer: str = Form(""),
+    customer_primary_key: str = Form(""),
+    domain: str = Form(""),
+    organization_name: str = Form(""),
+    expected_city: str = Form(""),
+    expected_state: str = Form(""),
+    name: str = Form(""),
+    position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    city: str = Form(""),
+    state: str = Form(""),
+):
+    return handle_enrichment_sync_filemaker(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        name=name,
+        position=position,
+        email=email,
+        phone=phone,
+        city=city,
+        state=state,
+    )
+
+
+@app.get("/enrichment/mark-moved-on", response_class=HTMLResponse)
+def get_enrichment_mark_moved_on(
+    customer: str = "",
+    customer_primary_key: str = "",
+    domain: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    name: str = "",
+    position: str = "",
+    email: str = "",
+    moved_to_company: str = "",
+    source_label: str = "PDL enrichment",
+):
+    return handle_enrichment_mark_moved_on(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        name=name,
+        position=position,
+        email=email,
+        moved_to_company=moved_to_company,
+        source_label=source_label,
+    )
+
+
+@app.post("/enrichment/mark-moved-on", response_class=HTMLResponse)
+def post_enrichment_mark_moved_on(
+    customer: str = Form(""),
+    customer_primary_key: str = Form(""),
+    domain: str = Form(""),
+    organization_name: str = Form(""),
+    expected_city: str = Form(""),
+    expected_state: str = Form(""),
+    name: str = Form(""),
+    position: str = Form(""),
+    email: str = Form(""),
+    moved_to_company: str = Form(""),
+    source_label: str = Form("PDL enrichment"),
+):
+    return handle_enrichment_mark_moved_on(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        name=name,
+        position=position,
+        email=email,
+        moved_to_company=moved_to_company,
+        source_label=source_label,
     )
 
 
@@ -5224,7 +6392,7 @@ def render_dashboard_home(ask="", ask_run=""):
                         </span>
                         <strong>Customer Map</strong>
                     </a>
-                    <div class="home-launch-card home-launch-card-disabled" aria-disabled="true">
+                    <a class="home-launch-card" href="/strategic-contacts-view">
                         <span class="home-launch-icon" aria-hidden="true">
                             <svg viewBox="0 0 24 24" focusable="false">
                                 <circle cx="8" cy="8" r="2.5" fill="none" stroke="currentColor" stroke-width="2"/>
@@ -5234,7 +6402,7 @@ def render_dashboard_home(ask="", ask_run=""):
                             </svg>
                         </span>
                         <strong>Strategic Contacts</strong>
-                    </div>
+                    </a>
                     <a class="home-launch-card" href="/production-analysis-view" aria-label="Production Analysis">
                         <span class="home-launch-icon" aria-hidden="true">
                             <svg viewBox="0 0 24 24" focusable="false">
@@ -5277,6 +6445,7 @@ def render_home_dashboard_sidebar():
         ("Orders", "/orders-view", "cart"),
         ("Insights", "/insights-view", "chart"),
         ("Customer Map", "/customer-map-view", "map"),
+        ("Strategic Contacts", "/strategic-contacts-view", "org"),
     ]
     admin_items = [
         ("User Accounts", "/user-accounts", "key"),
@@ -5510,9 +6679,10 @@ def post_m365_send_email(
     clear_attention_response_cache()
     clear_home_queue_summaries_cache()
     clear_customer_summaries_cache()
+    next_queue_url = clear_home_selection_from_url(return_to or "/action-plan-view")
     return RedirectResponse(
         url=append_message_to_url(
-            return_to or "/action-plan-view",
+            next_queue_url,
             message="Email sent.",
         ),
         status_code=303,
@@ -6760,6 +7930,8 @@ def get_contacts_view(
     sort: str = "company",
     direction: str = "asc",
     page: int = 1,
+    message: str = "",
+    error: str = "",
 ):
     master_data_result = fetch_filemaker_master_data()
 
@@ -6803,6 +7975,11 @@ def get_contacts_view(
     strategic_lookup = build_saved_strategic_contact_sets(load_strategic_contacts())
     current_user = get_current_session_user()
     can_manage = can_manage_strategic_contacts(current_user)
+    status_markup = ""
+    if message:
+        status_markup = f"<p class='status ok'>{escape(message)}</p>"
+    elif error:
+        status_markup = f"<p class='status error'>{escape(error)}</p>"
     rows = "".join(
         render_contact_master_row(
             contact,
@@ -6814,6 +7991,7 @@ def get_contacts_view(
                 "position": position,
                 "sort": sort,
                 "direction": direction,
+                "page": page,
             },
             can_manage=can_manage,
         )
@@ -6828,6 +8006,7 @@ def get_contacts_view(
         )
 
     body = f"""
+        {status_markup}
         {render_data_availability_banner(master_data_result)}
 
         <div class="summary customer-summary">
@@ -6869,6 +8048,61 @@ def get_contacts_view(
         </table>
         </div>
         {render_contacts_pagination(company, name, email, position, sort, direction, page, total_pages, total_filtered, start_index, len(paged_contact_rows))}
+        <script>
+            (function () {{
+                const windowScrollKey = "contacts-view-return-scroll-v1";
+                const tableScrollKey = "contacts-view-return-table-scroll-v1";
+                const tableWrap = document.querySelector(".table-wrap.tall-table");
+                const rowAnchor = window.location.hash ? window.location.hash.slice(1) : "";
+
+                try {{
+                    const savedWindowScroll = window.sessionStorage.getItem(windowScrollKey);
+                    const savedTableScroll = window.sessionStorage.getItem(tableScrollKey);
+                    window.sessionStorage.removeItem(windowScrollKey);
+                    window.sessionStorage.removeItem(tableScrollKey);
+
+                    window.requestAnimationFrame(() => {{
+                        if (rowAnchor) {{
+                            const row = document.getElementById(rowAnchor);
+                            if (row) {{
+                                row.scrollIntoView({{ block: "center", behavior: "auto" }});
+                                return;
+                            }}
+                        }}
+
+                        if (tableWrap && savedTableScroll) {{
+                            const top = Number(savedTableScroll);
+                            if (Number.isFinite(top) && top >= 0) {{
+                                tableWrap.scrollTop = top;
+                                return;
+                            }}
+                        }}
+
+                        if (savedWindowScroll) {{
+                            const y = Number(savedWindowScroll);
+                            if (Number.isFinite(y) && y >= 0) {{
+                                window.scrollTo({{ top: y, behavior: "auto" }});
+                            }}
+                        }}
+                    }});
+                }} catch (error) {{
+                    // ignore storage issues
+                }}
+
+                document.querySelectorAll('form[action="/strategic-contacts/import-contact"]').forEach((form) => {{
+                    form.addEventListener("submit", () => {{
+                        try {{
+                            window.sessionStorage.setItem(windowScrollKey, String(window.scrollY || window.pageYOffset || 0));
+                            if (tableWrap) {{
+                                window.sessionStorage.setItem(tableScrollKey, String(tableWrap.scrollTop || 0));
+                            }}
+                        }} catch (error) {{
+                            // ignore storage issues
+                        }}
+                    }});
+                }});
+            }})();
+        </script>
     """
 
     return render_page(title="Contacts", body=body)
@@ -6884,6 +8118,8 @@ def render_enrichment_view(
     refresh: str = "",
     customer: str = "",
     customer_primary_key: str = "",
+    message: str = "",
+    error: str = "",
 ):
     return render_pdl_branch_view(
         domain=domain,
@@ -6902,6 +8138,8 @@ def render_enrichment_view(
         help_text="This enrichment view re-checks existing contacts and looks for likely new branch contacts using your expected city/state.",
         auto_run=True,
         show_sql=False,
+        message=message,
+        error=error,
     )
 
 
@@ -6941,6 +8179,8 @@ def get_enrichment_view(
     refresh: str = "",
     customer: str = "",
     customer_primary_key: str = "",
+    message: str = "",
+    error: str = "",
 ):
     return render_enrichment_view(
         domain=domain,
@@ -6952,6 +8192,8 @@ def get_enrichment_view(
         refresh=refresh,
         customer=customer,
         customer_primary_key=customer_primary_key,
+        message=message,
+        error=error,
     )
 
 
@@ -6972,6 +8214,8 @@ def render_pdl_branch_view(
     help_text: str = "This is an admin-only branch-search comparison. It checks PDL candidates against the contacts already in FileMaker so we can judge whether PDL is worth adding for new branch discovery.",
     auto_run: bool = False,
     show_sql: bool = True,
+    message: str = "",
+    error: str = "",
 ):
     try:
         force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on", "refresh"}
@@ -7033,6 +8277,8 @@ def render_pdl_branch_view(
 
         if launched_from_customer:
             header_html = f"""
+                {f"<p class='status ok'>{escape(message)}</p>" if message else ""}
+                {f"<p class='status error'>{escape(error)}</p>" if error else ""}
                 <div class="panel enrichment-customer-head">
                     <div>
                         <h2>{escape(customer.strip())}</h2>
@@ -7051,6 +8297,8 @@ def render_pdl_branch_view(
             """
         else:
             header_html = f"""
+                {f"<p class='status ok'>{escape(message)}</p>" if message else ""}
+                {f"<p class='status error'>{escape(error)}</p>" if error else ""}
                 <div class="summary customer-summary apollo-summary">
                     <div>
                         <span class="label">Customer</span>
@@ -7082,7 +8330,17 @@ def render_pdl_branch_view(
 
             <div class="stack">
                 {render_pdl_enrichment_results(enrichment_payload, domain=domain, organization_name=organization_name, expected_city=expected_city, expected_state=expected_state, title="Existing Contact Re-check")}
-                {render_pdl_branch_results(payload, expected_city=expected_city, expected_state=expected_state, title="Branch Contacts", show_sql=show_sql)}
+                {render_pdl_branch_results(
+                    payload,
+                    expected_city=expected_city,
+                    expected_state=expected_state,
+                    title="Branch Contacts",
+                    show_sql=show_sql,
+                    customer=customer,
+                    customer_primary_key=customer_primary_key,
+                    domain=domain,
+                    organization_name=organization_name,
+                )}
             </div>
         """
 
@@ -8018,6 +9276,16 @@ def is_contact_in_strategic_contacts(contact, existing_lookup):
 def render_contact_master_row(contact, existing_lookup=None, current_filters=None, can_manage=False):
     company_name = str(contact.get("company") or "")
     customer_ref = str(contact.get("customer_ref") or "")
+    row_anchor_parts = [
+        customer_ref or company_name,
+        str(contact.get("name") or "").strip(),
+        str(contact.get("email") or "").strip(),
+    ]
+    row_anchor = "contact-row-" + re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        normalize_apollo_location_value("|".join(bit for bit in row_anchor_parts if bit)) or "contact",
+    ).strip("-")
     customers_href = f"/customers-view?customer={quote(company_name)}" if company_name else "/customers-view"
     company_markup = (
         f'<a href="{customers_href}"><strong>{escape(company_name)}</strong></a>'
@@ -8038,9 +9306,33 @@ def render_contact_master_row(contact, existing_lookup=None, current_filters=Non
     )
     current_filters = current_filters or {}
     already_saved = bool(existing_lookup and is_contact_in_strategic_contacts(contact, existing_lookup))
+    saved_contact_id = (
+        get_saved_strategic_contact_id(email, phone, contact_name, company_name, position, existing_lookup)
+        if already_saved and existing_lookup
+        else ""
+    )
+    return_url = (
+        "/contacts-view"
+        f"?company={quote(str(current_filters.get('company') or ''))}"
+        f"&name={quote(str(current_filters.get('name') or ''))}"
+        f"&email={quote(str(current_filters.get('email') or ''))}"
+        f"&position={quote(str(current_filters.get('position') or ''))}"
+        f"&sort={quote(str(current_filters.get('sort') or 'company'))}"
+        f"&direction={quote(str(current_filters.get('direction') or 'asc'))}"
+        f"&page={quote(str(current_filters.get('page') or '1'))}"
+        f"#{quote(row_anchor)}"
+    )
     strategic_action = ""
     if can_manage:
-        if already_saved:
+        if already_saved and saved_contact_id:
+            strategic_action = f"""
+                <form method="post" action="/strategic-contacts/delete" class="inline-form">
+                    <input type="hidden" name="contact_id" value="{escape(saved_contact_id)}" />
+                    <input type="hidden" name="return_to" value="{escape(return_url)}" />
+                    <button class="contact-status contact-status-active contact-status-button" type="submit">Saved</button>
+                </form>
+            """
+        elif already_saved:
             strategic_action = "<span class='contact-status contact-status-active'>Saved</span>"
         else:
             strategic_action = f"""
@@ -8059,12 +9351,14 @@ def render_contact_master_row(contact, existing_lookup=None, current_filters=Non
                     <input type="hidden" name="return_position" value="{escape(str(current_filters.get('position') or ''))}" />
                     <input type="hidden" name="return_sort" value="{escape(str(current_filters.get('sort') or 'company'))}" />
                     <input type="hidden" name="return_direction" value="{escape(str(current_filters.get('direction') or 'asc'))}" />
+                    <input type="hidden" name="return_page" value="{escape(str(current_filters.get('page') or '1'))}" />
+                    <input type="hidden" name="return_anchor" value="{escape(row_anchor)}" />
                     <button class="button secondary small-button" type="submit">Save to Strategic Contacts</button>
                 </form>
             """
 
     return f"""
-        <tr>
+        <tr id="{escape(row_anchor)}">
             <td>{company_markup}</td>
             <td><strong>{escape(contact_name)}</strong></td>
             <td>{escape(email)}</td>
@@ -9552,7 +10846,7 @@ def build_last_contact_display(last_activity_content, latest_crm_activity, crm_a
 def build_outreach_context(customer, customer_orders, attention, crm_result):
     customer_primary_key = get_customer_primary_key(customer_orders)
     cycle = analyze_order_cycle(customer_orders)
-    master_data_result = fetch_filemaker_master_data(force_refresh=True)
+    master_data_result = fetch_filemaker_master_data()
     customer_master = (
         master_data_result.get("customers_by_key", {}).get(customer_primary_key, {})
         if master_data_result.get("status") == "ok"
@@ -14467,12 +15761,36 @@ def render_apollo_branch_candidate_row(candidate_result):
     else:
         status_class = "apollo-branch-status-current"
 
+    moved_on_button = ""
+    if moved_kind == "moved_company":
+        moved_on_href = "/enrichment/mark-moved-on?" + urlencode(
+            {
+                "customer": str(contact.get("company") or "").strip(),
+                "customer_primary_key": str(contact.get("customer_ref") or "").strip(),
+                "domain": str(result.get("domain") or "").strip(),
+                "organization_name": str((person.get("organization") or {}).get("name") or result.get("organization_name") or "").strip(),
+                "expected_city": str(contact.get("city") or "").strip(),
+                "expected_state": str(contact.get("state") or "").strip(),
+                "name": str(contact.get("name") or "").strip(),
+                "position": str(contact.get("position") or "").strip(),
+                "email": str(contact.get("email") or "").strip(),
+                "moved_to_company": str((person.get("organization") or {}).get("name") or "").strip(),
+                "source_label": "Apollo enrichment",
+            },
+            quote_via=quote,
+        )
+        moved_on_button = (
+            f'<br><a class="button secondary small-button branch-filemaker-button" '
+            f'href="{escape(moved_on_href)}" title="Mark moved on in FileMaker" '
+            f'aria-label="Mark {escape(str(contact.get("name") or "this contact"))} moved on in FileMaker">Moved on</a>'
+        )
+
     return f"""
         <tr>
             <td>
                 <strong>{escape(contact.get('name') or contact.get('email') or 'Unknown')}</strong><br>
                 <span class="small muted">{escape(contact.get('email') or '—')}</span>
-                {f'<br>{linkedin_html}' if linkedin_html else ''}
+                {f'<br>{linkedin_html}' if linkedin_html else ''}{moved_on_button}
             </td>
             <td>{escape(contact.get('position') or '—')}</td>
             <td>{escape(apollo_name)}</td>
@@ -15611,7 +16929,7 @@ def get_state_search_terms(value):
     return terms
 
 
-def build_pdl_branch_search_query(organization_name, expected_city, expected_state):
+def build_pdl_branch_search_query(organization_name, expected_city, expected_state, exclude_emails=None):
     organization_aliases = get_company_search_aliases(organization_name)
     if not organization_aliases:
         organization_aliases = [organization_name]
@@ -15631,8 +16949,13 @@ def build_pdl_branch_search_query(organization_name, expected_city, expected_sta
     ]
     if not state_clauses:
         state_clauses = ["1 = 1"]
+    sanitized_exclusions = [
+        escape_sql_like(email)
+        for email in (exclude_emails or [])
+        if escape_sql_like(email)
+    ]
 
-    return "\n".join([
+    lines = [
         "SELECT * FROM person",
         "WHERE (" + " OR ".join(organization_clauses) + ")",
         "AND location_locality LIKE '%" + city_sql + "%'",
@@ -15652,7 +16975,11 @@ def build_pdl_branch_search_query(organization_name, expected_city, expected_sta
         "AND job_company_name NOT LIKE '%protection%'",
         "AND job_company_name NOT LIKE '%first aid%'",
         "AND job_company_name NOT LIKE '%safety%'",
-    ])
+    ]
+    if sanitized_exclusions:
+        exclusion_values = ", ".join(f"'{email}'" for email in sanitized_exclusions)
+        lines.append(f"AND (work_email IS NULL OR work_email NOT IN ({exclusion_values}))")
+    return "\n".join(lines)
 
 
 def get_pdl_person_name(person):
@@ -15858,10 +17185,44 @@ def search_pdl_branch_contacts(domain, organization_name, expected_city="", expe
             "cached": False,
         }
 
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") != "ok":
+        return {
+            "status": master_data_result.get("status", "error"),
+            "results": [],
+            "existing_matches": [],
+            "new_candidates": [],
+            "diagnostics": {},
+            "sql": "",
+            "cached": False,
+        }
+
+    rows = build_contact_master_rows(master_data_result)
+    if customer_primary_key:
+        branch_rows = [
+            row for row in rows
+            if str(row.get("customer_ref") or "").strip() == str(customer_primary_key or "").strip()
+        ]
+    else:
+        branch_rows = get_contact_row_branch_candidates(
+            rows,
+            organization_name=organization_name,
+            expected_city=expected_city,
+            expected_state=expected_state,
+            require_email=False,
+        )
+
+    exclude_emails = sorted({
+        str(row.get("email") or "").strip().lower()
+        for row in branch_rows
+        if str(row.get("email") or "").strip()
+    })[:50]
+
     sql_query = build_pdl_branch_search_query(
         organization_name=organization_name,
         expected_city=expected_city,
         expected_state=expected_state,
+        exclude_emails=exclude_emails,
     )
     pdl_result = search_pdl_people(sql_query, size=10, force_refresh=force_refresh)
 
@@ -15876,25 +17237,7 @@ def search_pdl_branch_contacts(domain, organization_name, expected_city="", expe
             "sql": sql_query,
             "cached": bool(pdl_result.get("cached")),
         }
-
-    master_data_result = fetch_filemaker_master_data()
-    if master_data_result.get("status") != "ok":
-        return {
-            "status": master_data_result.get("status", "error"),
-            "results": [],
-            "existing_matches": [],
-            "new_candidates": [],
-            "diagnostics": {},
-            "sql": sql_query,
-            "cached": bool(pdl_result.get("cached")),
-        }
-
-    rows = build_contact_master_rows(master_data_result)
     if customer_primary_key:
-        branch_rows = [
-            row for row in rows
-            if str(row.get("customer_ref") or "").strip() == str(customer_primary_key or "").strip()
-        ]
         existing_emails, existing_names, existing_initial_last = build_pdl_existing_contact_sets(
             branch_rows,
             organization_name=organization_name,
@@ -15961,6 +17304,7 @@ def search_pdl_branch_contacts(domain, organization_name, expected_city="", expe
         "new_with_email": sum(1 for item in new_candidates if get_pdl_person_email(item.get("person") or {})),
         "new_with_linkedin": sum(1 for item in new_candidates if str((item.get("person") or {}).get("linkedin_url") or "").strip()),
         "new_with_phone": sum(1 for item in new_candidates if get_pdl_person_phone(item.get("person") or {})),
+        "excluded_known_emails": len(exclude_emails),
     }
 
     return {
@@ -16127,6 +17471,105 @@ def render_pdl_person_row(item, existing=False):
     """
 
 
+def build_enrichment_return_url(
+    customer="",
+    customer_primary_key="",
+    domain="",
+    organization_name="",
+    expected_city="",
+    expected_state="",
+):
+    return "/enrichment-view?" + urlencode(
+        {
+            "customer": str(customer or "").strip(),
+            "customer_primary_key": str(customer_primary_key or "").strip(),
+            "domain": str(domain or "").strip(),
+            "organization_name": str(organization_name or "").strip(),
+            "expected_city": str(expected_city or "").strip(),
+            "expected_state": str(expected_state or "").strip(),
+            "run": "1",
+        },
+        quote_via=quote,
+    )
+
+
+def render_pdl_branch_new_contact_row(
+    item,
+    customer="",
+    customer_primary_key="",
+    domain="",
+    organization_name="",
+    expected_city="",
+    expected_state="",
+):
+    person = item.get("person") or {}
+    branch_fit = item.get("branch_fit") or {"label": "Unknown", "details": ""}
+    status = item.get("status") or {"label": "Needs review", "details": ""}
+    linkedin_url = normalize_external_url(person.get("linkedin_url") or "")
+    linkedin_html = (
+        f'<a class="apollo-linkedin-link" href="{escape(linkedin_url)}" target="_blank" rel="noreferrer">LinkedIn profile</a>'
+        if linkedin_url
+        else "—"
+    )
+    return_url = build_enrichment_return_url(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+    )
+    person_name = get_pdl_person_name(person)
+    person_email = get_pdl_person_email(person)
+    person_phone = get_pdl_person_phone(person)
+    city, state, _country = get_pdl_location_parts(person)
+    region_value = str(state or expected_state or "").strip()
+    location_html = render_pdl_person_location(person)
+    status_detail = f"{status.get('details', '')} {branch_fit.get('details', '')}".strip()
+    sync_href = "/enrichment/sync-filemaker?" + urlencode(
+        {
+            "customer": str(customer or "").strip(),
+            "customer_primary_key": str(customer_primary_key or "").strip(),
+            "domain": str(domain or "").strip(),
+            "organization_name": str(organization_name or "").strip(),
+            "expected_city": str(expected_city or "").strip(),
+            "expected_state": str(expected_state or "").strip(),
+            "name": person_name,
+            "position": str(person.get("job_title") or "").strip(),
+            "email": person_email,
+            "phone": person_phone,
+            "city": str(city or "").strip(),
+            "state": region_value,
+        },
+        quote_via=quote,
+    )
+
+    return f"""
+        <tr>
+            <td>
+                <div class="branch-contact-cell">
+                    <strong>{escape(person_name)}</strong>
+                    <a
+                        class="button secondary small-button branch-filemaker-button"
+                        href="{escape(sync_href)}"
+                        title="Send to FileMaker"
+                        aria-label="Send {escape(person_name)} to FileMaker"
+                    >F</a>
+                </div>
+                <span class="small muted">{escape(person_email or 'Email not returned')}</span>
+            </td>
+            <td>{escape(str(person.get('job_title') or '—'))}</td>
+            <td>{location_html}</td>
+            <td>{linkedin_html}</td>
+            <td>{escape(person_phone or '—')}</td>
+            <td>
+                <span class="apollo-branch-status-label apollo-branch-status-branch">{escape(status.get('label', 'Needs review'))}</span><br>
+                <span class="apollo-branch-status-detail">{escape(status_detail)}</span>
+            </td>
+        </tr>
+    """
+
+
 def get_pdl_company_name(person):
     return str(person.get("job_company_name") or "").strip()
 
@@ -16281,11 +17724,36 @@ def render_pdl_enrichment_candidate_row(item):
     elif moved_status.get("flag"):
         status_class = "apollo-branch-status-branch"
 
+    moved_on_button = ""
+    if moved_status.get("kind") == "moved_company":
+        moved_on_href = "/enrichment/mark-moved-on?" + urlencode(
+            {
+                "customer": str(contact.get("company") or "").strip(),
+                "customer_primary_key": str(contact.get("customer_ref") or "").strip(),
+                "domain": str(item.get("domain") or "").strip(),
+                "organization_name": str(get_pdl_company_name(person) or "").strip(),
+                "expected_city": str(contact.get("city") or "").strip(),
+                "expected_state": str(contact.get("state") or "").strip(),
+                "name": str(contact.get("name") or "").strip(),
+                "position": str(contact.get("position") or "").strip(),
+                "email": str(contact.get("email") or "").strip(),
+                "moved_to_company": str(get_pdl_company_name(person) or "").strip(),
+                "source_label": "PDL enrichment",
+            },
+            quote_via=quote,
+        )
+        moved_on_button = (
+            f'<br><a class="button secondary small-button branch-filemaker-button" '
+            f'href="{escape(moved_on_href)}" title="Mark moved on in FileMaker" '
+            f'aria-label="Mark {escape(str(contact.get("name") or "this contact"))} moved on in FileMaker">Moved on</a>'
+        )
+
     return f"""
         <tr>
             <td>
                 <strong>{escape(str(contact.get("name") or "Unknown"))}</strong><br>
                 <span class="small muted">{escape(str(contact.get("email") or "Email not on FileMaker"))}</span>
+                {moved_on_button}
             </td>
             <td>{escape(str(person.get("job_title") or '—'))}</td>
             <td>{render_pdl_person_location(person)}</td>
@@ -16368,7 +17836,17 @@ def render_pdl_enrichment_results(payload, domain="", organization_name="", expe
     """
 
 
-def render_pdl_branch_results(payload, expected_city="", expected_state="", title="PDL Branch Search", show_sql=True):
+def render_pdl_branch_results(
+    payload,
+    expected_city="",
+    expected_state="",
+    title="PDL Branch Search",
+    show_sql=True,
+    customer="",
+    customer_primary_key="",
+    domain="",
+    organization_name="",
+):
     status = payload.get("status", "idle")
     error_message = str(payload.get("error_message") or "").strip()
     cached = bool(payload.get("cached"))
@@ -16431,7 +17909,18 @@ def render_pdl_branch_results(payload, expected_city="", expected_state="", titl
         """
 
     if new_candidates:
-        new_rows = "".join(render_pdl_person_row(item, existing=False) for item in new_candidates)
+        new_rows = "".join(
+            render_pdl_branch_new_contact_row(
+                item,
+                customer=customer,
+                customer_primary_key=customer_primary_key,
+                domain=domain,
+                organization_name=organization_name,
+                expected_city=expected_city,
+                expected_state=expected_state,
+            )
+            for item in new_candidates
+        )
         new_html = f"""
             <div class="panel">
                 <h2>New Likely Branch Contacts</h2>
@@ -16601,6 +18090,7 @@ def render_global_nav(title):
         ("Action Plan", "/action-plan-view"),
         ("Insights", "/insights-view"),
         ("Customer Map", "/customer-map-view"),
+        ("Strategic Contacts", "/strategic-contacts-view"),
         ("Orders", "/orders-view"),
         ("Customers", "/customers-view"),
         ("Contacts", "/contacts-view"),
@@ -18159,15 +19649,6 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         transform: translateY(-1px);
                     }}
 
-                    .home-launch-card-disabled {{
-                        cursor: default;
-                    }}
-
-                    .home-launch-card-disabled:hover {{
-                        border-color: var(--border);
-                        transform: none;
-                    }}
-
                     .home-launch-card strong {{
                         font-size: 22px;
                         line-height: 1.1;
@@ -18553,46 +20034,56 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-root {{
                         margin-bottom: 0;
-                        padding: 24px 18px;
+                        padding: 8px 12px;
                         background: linear-gradient(180deg, #fbfdff 0%, #f4f8ff 100%);
                     }}
 
                     .org-chart-root-card {{
-                        max-width: 560px;
-                        margin: 0 auto;
-                        text-align: center;
+                        display: grid;
+                        gap: 2px;
+                    }}
+
+                    .org-chart-root-head {{
+                        display: flex;
+                        align-items: end;
+                        justify-content: space-between;
+                        gap: 12px;
                     }}
 
                     .org-chart-root-eyebrow {{
-                        margin: 0 0 6px;
+                        margin: 0 0 2px;
                         color: #184ecf;
-                        font-size: 12px;
+                        font-size: 10px;
                         font-weight: 700;
                         text-transform: uppercase;
                         letter-spacing: 0.04em;
                     }}
 
                     .org-chart-root h2 {{
-                        margin: 0 0 4px;
+                        margin: 0;
                         color: var(--text);
-                        font-size: 26px;
+                        font-size: 17px;
                     }}
 
-                    .org-chart-root-summary {{
-                        grid-template-columns: repeat(3, minmax(0, 1fr));
-                        margin: 14px auto 0;
-                        max-width: 520px;
+                    .org-chart-root-subtitle {{
+                        margin: 0;
+                        font-size: 11px;
+                        line-height: 1.25;
+                    }}
+
+                    .org-chart-root-summary-inline {{
+                        color: #526581;
                     }}
 
                     .org-chart-levels {{
                         display: grid;
-                        gap: 16px;
+                        gap: 12px;
                     }}
 
                     .org-chart-level {{
                         display: grid;
-                        grid-template-columns: 160px minmax(0, 1fr);
-                        gap: 16px;
+                        grid-template-columns: 112px minmax(0, 1fr);
+                        gap: 12px;
                         align-items: start;
                         position: relative;
                     }}
@@ -18600,33 +20091,33 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .org-chart-level::before {{
                         content: "";
                         position: absolute;
-                        left: 79px;
-                        top: -16px;
-                        bottom: -16px;
+                        left: 55px;
+                        top: -12px;
+                        bottom: -12px;
                         width: 2px;
                         background: #d9e6f5;
                     }}
 
                     .org-chart-level:first-child::before {{
-                        top: 28px;
+                        top: 24px;
                     }}
 
                     .org-chart-level:last-child::before {{
                         bottom: auto;
-                        height: 34px;
+                        height: 28px;
                     }}
 
                     .org-chart-level-marker {{
                         position: relative;
-                        padding-top: 18px;
+                        padding-top: 10px;
                     }}
 
                     .org-chart-level-marker::after {{
                         content: "";
                         position: absolute;
-                        top: 32px;
-                        right: -16px;
-                        width: 16px;
+                        top: 23px;
+                        right: -12px;
+                        width: 12px;
                         height: 2px;
                         background: #d9e6f5;
                     }}
@@ -18634,79 +20125,134 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .org-chart-level-chip {{
                         display: inline-flex;
                         align-items: center;
-                        min-height: 32px;
-                        padding: 0 12px;
+                        min-height: 26px;
+                        padding: 0 10px;
                         border-radius: 999px;
                         background: #eef5ff;
                         color: #184ecf;
-                        font-size: 12px;
+                        font-size: 11px;
                         font-weight: 700;
                     }}
 
                     .org-chart-level-body {{
                         display: grid;
-                        gap: 12px;
+                        gap: 8px;
                         min-width: 0;
                     }}
 
                     .org-chart-level-summary {{
                         display: flex;
                         justify-content: space-between;
-                        align-items: end;
+                        align-items: center;
                         gap: 12px;
-                        padding: 6px 2px 0;
+                        padding: 2px 2px 0;
                     }}
 
                     .org-chart-level-summary h2 {{
-                        margin: 0 0 2px;
+                        margin: 0;
                         color: var(--text);
-                        font-size: 20px;
+                        font-size: 16px;
+                    }}
+
+                    .org-chart-level-meta {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 8px;
+                        color: var(--muted);
+                        font-size: 12px;
+                        line-height: 1.25;
                     }}
 
                     .org-chart-lanes {{
                         display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
                         gap: 12px;
                     }}
 
                     .org-chart-lane {{
                         position: relative;
-                        padding: 14px;
-                        border: 1px solid var(--border);
-                        border-radius: 12px;
-                        background: #fbfdff;
+                        padding: 10px;
+                        border: 1px solid #d7e3f6;
+                        border-radius: 14px;
+                        background:
+                            radial-gradient(circle at 20% 20%, rgba(36, 92, 255, 0.05), transparent 34%),
+                            radial-gradient(circle at 80% 35%, rgba(36, 92, 255, 0.04), transparent 26%),
+                            linear-gradient(180deg, #fcfdff 0%, #f7faff 100%);
                         box-shadow: var(--shadow-inset);
+                        overflow: hidden;
                     }}
 
                     .org-chart-lane::before {{
                         content: "";
                         position: absolute;
-                        top: 30px;
-                        left: -14px;
-                        width: 14px;
+                        top: 24px;
+                        left: -12px;
+                        width: 12px;
                         height: 2px;
                         background: #d9e6f5;
                     }}
 
+                    .org-chart-lane::after {{
+                        content: "";
+                        position: absolute;
+                        inset: auto 10px 10px auto;
+                        width: 110px;
+                        height: 60px;
+                        border-radius: 999px;
+                        background: rgba(36, 92, 255, 0.035);
+                        filter: blur(18px);
+                        pointer-events: none;
+                    }}
+
+                    .org-chart-lane-head {{
+                        margin-bottom: 8px;
+                    }}
+
+                    .org-chart-lane-title-group {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 8px;
+                    }}
+
                     .org-chart-lane-head h3 {{
-                        margin: 0 0 2px;
+                        margin: 0;
                         color: var(--text);
-                        font-size: 16px;
+                        font-size: 14px;
+                    }}
+
+                    .org-chart-lane-count {{
+                        display: inline-flex;
+                        align-items: center;
+                        min-height: 22px;
+                        padding: 0 8px;
+                        border-radius: 999px;
+                        background: rgba(36, 92, 255, 0.08);
+                        color: #184ecf;
+                        font-size: 11px;
+                        font-weight: 700;
                     }}
 
                     .org-chart-card-stack {{
                         display: grid;
-                        gap: 12px;
+                        gap: 6px;
+                        align-content: start;
                     }}
 
                     .org-chart-contact-card {{
                         margin-bottom: 0;
-                        padding: 12px 14px;
+                        padding: 8px 10px;
                         background: #fff;
+                        border-radius: 10px;
+                        min-height: 84px;
+                        height: auto;
+                        display: grid;
+                        align-content: start;
                     }}
 
                     .org-chart-contact-card h4 {{
-                        font-size: 16px;
+                        font-size: 12px;
+                        font-weight: 400;
                     }}
 
                     .org-chart-contact-card .strategic-contact-card-head {{
@@ -18715,18 +20261,20 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-contact-node {{
                         display: grid;
-                        gap: 6px;
+                        gap: 4px;
                     }}
 
                     .org-chart-contact-main {{
                         min-width: 0;
+                        display: grid;
+                        gap: 1px;
                     }}
 
                     .org-chart-contact-title-row {{
                         display: flex;
                         justify-content: space-between;
-                        align-items: start;
-                        gap: 10px;
+                        align-items: center;
+                        gap: 8px;
                     }}
 
                     .org-chart-contact-title-row h4 {{
@@ -18735,30 +20283,32 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .org-chart-contact-role {{
-                        margin: 2px 0 0;
+                        margin: 0;
                         color: #52606d;
-                        font-size: 13px;
+                        font-size: 10.5px;
+                        font-weight: 400;
                         line-height: 1.3;
                     }}
 
                     .org-chart-contact-region {{
-                        margin: 2px 0 0;
+                        margin: 0;
                         color: #7b8794;
-                        font-size: 12px;
+                        font-size: 10px;
+                        font-weight: 400;
                         line-height: 1.25;
                     }}
 
                     .org-chart-contact-details {{
-                        margin-top: 8px;
+                        margin-top: 4px;
                         border-top: 1px solid #e6eef7;
-                        padding-top: 8px;
+                        padding-top: 4px;
                     }}
 
                     .org-chart-contact-details summary {{
                         cursor: pointer;
                         list-style: none;
                         color: #245cff;
-                        font-size: 12px;
+                        font-size: 10px;
                         font-weight: 700;
                         user-select: none;
                     }}
@@ -18779,27 +20329,40 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-contact-detail-body {{
                         display: grid;
-                        gap: 8px;
-                        margin-top: 10px;
+                        gap: 6px;
+                        margin-top: 8px;
+                        font-size: 10.5px;
                     }}
 
                     .org-chart-detail-summary {{
                         grid-template-columns: repeat(2, minmax(0, 1fr));
-                        gap: 8px;
+                        gap: 6px;
                         margin: 0;
                     }}
 
                     .org-chart-detail-summary div {{
                         min-width: 0;
-                        padding: 10px 12px;
+                        padding: 8px 10px;
                     }}
 
                     .org-chart-detail-summary strong {{
                         display: block;
-                        font-size: 13px;
-                        line-height: 1.25;
+                        font-size: 10.5px;
+                        font-weight: 400;
+                        line-height: 1.2;
                         overflow-wrap: anywhere;
                         word-break: break-word;
+                    }}
+
+                    .org-chart-contact-detail-body .label {{
+                        margin-bottom: 2px;
+                        font-size: 9.5px;
+                    }}
+
+                    .org-chart-contact-detail-body p {{
+                        margin: 0;
+                        font-size: 10.5px;
+                        line-height: 1.35;
                     }}
 
                     .org-chart-contact-detail-body .strategic-card-actions {{
@@ -18811,8 +20374,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .org-chart-contact-detail-body .strategic-card-actions button {{
                         width: auto;
                         min-width: 0;
-                        padding: 7px 10px;
-                        font-size: 12px;
+                        padding: 6px 9px;
+                        font-size: 10.5px;
                     }}
 
                     .strategic-contact-summary {{
@@ -18824,17 +20387,17 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .org-chart-toolbar-panel {{
-                        padding: 14px 16px;
+                        padding: 12px 14px;
                     }}
 
                     .org-chart-toolbar-panel h2 {{
-                        margin-bottom: 4px;
-                        font-size: 18px;
+                        margin-bottom: 2px;
+                        font-size: 16px;
                     }}
 
                     .org-chart-toolbar-copy {{
-                        margin-bottom: 10px;
-                        font-size: 12px;
+                        margin-bottom: 8px;
+                        font-size: 11px;
                         line-height: 1.35;
                     }}
 
@@ -18850,19 +20413,19 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         display: inline-flex;
                         flex-wrap: wrap;
                         align-items: center;
-                        gap: 8px;
-                        padding: 4px;
+                        gap: 6px;
+                        padding: 3px;
                         border: 1px solid var(--border);
-                        border-radius: 10px;
+                        border-radius: 9px;
                         background: #f8fbff;
                     }}
 
                     .org-chart-segmented-control .org-chart-segment {{
                         min-width: 0;
-                        min-height: 32px;
-                        padding: 0 12px;
+                        min-height: 28px;
+                        padding: 0 10px;
                         border-radius: 8px;
-                        font-size: 12px;
+                        font-size: 11px;
                         line-height: 1;
                     }}
 
@@ -18880,14 +20443,25 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-back-link {{
                         min-width: 0;
-                        min-height: 32px;
-                        padding: 0 12px;
-                        font-size: 12px;
+                        min-height: 28px;
+                        padding: 0 10px;
+                        font-size: 11px;
                     }}
 
                     .strategic-pdl-discovery h3,
                     .strategic-pdl-panel h3 {{
                         margin-bottom: 10px;
+                    }}
+
+                    .strategic-pdl-discovery {{
+                        position: relative;
+                        z-index: 20;
+                        isolation: isolate;
+                    }}
+
+                    .strategic-pdl-discovery,
+                    .strategic-pdl-discovery * {{
+                        pointer-events: auto !important;
                     }}
 
                     .strategic-pdl-discovery .login-form {{
@@ -20387,7 +21961,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .apollo-branch-table {{
                         table-layout: fixed;
-                        min-width: 1060px;
+                        min-width: 0;
+                        width: 100%;
                     }}
 
                     .apollo-branch-table th,
@@ -20398,42 +21973,42 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .apollo-branch-table th:nth-child(1),
                     .apollo-branch-table td:nth-child(1) {{
-                        width: 16%;
-                        min-width: 210px;
+                        width: 14%;
+                        min-width: 160px;
                     }}
 
                     .apollo-branch-table th:nth-child(2),
                     .apollo-branch-table td:nth-child(2) {{
-                        width: 10%;
-                        min-width: 160px;
+                        width: 11%;
+                        min-width: 130px;
                     }}
 
                     .apollo-branch-table th:nth-child(3),
                     .apollo-branch-table td:nth-child(3) {{
-                        width: 13%;
-                        min-width: 180px;
+                        width: 12%;
+                        min-width: 140px;
                         white-space: normal;
                     }}
 
                     .apollo-branch-table th:nth-child(4),
                     .apollo-branch-table td:nth-child(4) {{
-                        width: 12%;
-                        min-width: 170px;
+                        width: 10%;
+                        min-width: 110px;
                         white-space: normal;
                     }}
 
                     .apollo-branch-table th:nth-child(5),
                     .apollo-branch-table td:nth-child(5) {{
-                        width: 16%;
-                        min-width: 180px;
+                        width: 14%;
+                        min-width: 130px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
 
                     .apollo-branch-table th:nth-child(6),
                     .apollo-branch-table td:nth-child(6) {{
-                        width: 33%;
-                        min-width: 300px;
+                        width: 39%;
+                        min-width: 260px;
                     }}
 
                     .apollo-branch-status-label {{
@@ -20459,6 +22034,41 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .apollo-branch-table .small.muted {{
                         font-size: 11px;
                         line-height: 1.35;
+                    }}
+
+                    .apollo-branch-table .inline-form {{
+                        display: flex;
+                        justify-content: center;
+                    }}
+
+                    .branch-contact-cell {{
+                        display: flex;
+                        align-items: center;
+                        gap: 8px;
+                        min-width: 0;
+                        margin-bottom: 2px;
+                    }}
+
+                    .branch-contact-cell strong {{
+                        min-width: 0;
+                        flex: 1 1 auto;
+                    }}
+
+                    .branch-filemaker-inline-form {{
+                        flex: 0 0 auto;
+                        margin: 0;
+                    }}
+
+                    .apollo-branch-table .branch-filemaker-button {{
+                        min-width: 0;
+                        width: 24px;
+                        height: 24px;
+                        padding: 0;
+                        border-radius: 8px;
+                        font-size: 11px;
+                        font-weight: 700;
+                        line-height: 1.1;
+                        white-space: nowrap;
                     }}
 
                     .apollo-branch-status-detail {{
@@ -20731,6 +22341,12 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .contacts-table .contact-status {{
                         font-size: 11px;
                         padding: 4px 8px;
+                    }}
+
+                    .contacts-table .contact-status-button {{
+                        border: none;
+                        cursor: pointer;
+                        font: inherit;
                     }}
 
                     .crm-activity-meta {{
