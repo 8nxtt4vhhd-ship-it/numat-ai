@@ -11312,6 +11312,9 @@ def build_home_action_plan(attention_customers, grouped_orders, crm_activity_map
         if contact_policy.get("exclude_from_action_plan"):
             continue
 
+        if has_recent_activity(enriched_customer.get("days_since_last_activity")):
+            continue
+
         if float(enriched_customer.get("priority_score") or 0) >= 1.5:
             due_today_customers.append(enriched_customer)
 
