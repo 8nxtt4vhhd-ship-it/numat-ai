@@ -735,6 +735,7 @@ def build_empty_filemaker_master_data(status):
     return {
         "connected": status == "ok",
         "status": status,
+        "companies": [],
         "customers_by_key": {},
         "all_contacts": [],
         "contacts_by_customer_key": {},
@@ -850,6 +851,9 @@ def map_filemaker_contact_master_record(record):
             get_field_value(field_data, config["contacts_active_field"])
         ),
         "unsubscribe": normalize_text_value(unsubscribe_value),
+        "relationship_notes": normalize_text_value(
+            get_field_value(field_data, config["contacts_relationship_notes_field"])
+        ),
     }
 
 
@@ -897,6 +901,7 @@ def fetch_filemaker_master_data(force_refresh=False):
     if contacts_result["status"] != "ok":
         return build_empty_filemaker_master_data(contacts_result["status"])
 
+    companies = []
     customers_by_key = {}
     all_contacts = []
     contacts_by_customer_key = {}
@@ -905,6 +910,8 @@ def fetch_filemaker_master_data(force_refresh=False):
 
     for raw_record in customers_result.get("records", []):
         customer = map_filemaker_customer_master_record(raw_record)
+        customer["filemaker_record_id"] = str(raw_record.get("recordId") or "").strip()
+        companies.append(customer)
 
         if customer["type"].lower() != "customer":
             continue
@@ -954,6 +961,7 @@ def fetch_filemaker_master_data(force_refresh=False):
     result = {
         "connected": True,
         "status": "ok",
+        "companies": companies,
         "customers_by_key": customers_by_key,
         "all_contacts": all_contacts,
         "contacts_by_customer_key": contacts_by_customer_key,

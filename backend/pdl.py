@@ -253,10 +253,13 @@ def search_pdl_people(sql_query, size=10, force_refresh=False):
 
     try:
         log_pdl_event("fresh_lookup", kind="person_search", size=result_size)
-        response = requests.get(
+        response = requests.post(
             f"{PDL_ROOT_URL}/v5/person/search",
-            headers=get_pdl_headers(),
-            params={"sql": normalized_sql, "size": result_size},
+            headers={
+                **get_pdl_headers(),
+                "Content-Type": "application/json",
+            },
+            json={"sql": normalized_sql, "size": result_size},
             timeout=30,
         )
     except requests.RequestException as error:

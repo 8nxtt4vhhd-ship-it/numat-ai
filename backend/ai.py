@@ -10,6 +10,7 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
 _OUTREACH_PREP_PROMPT_VERSION = "2026-06-24-concise-direct-outreach-3"
+_STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 RECENT_REPLY_ANCHOR_DAYS = 30
 RECENT_OUTREACH_ANCHOR_DAYS = 30
@@ -117,6 +118,139 @@ def get_cold_outreach_context_signature():
         return (str(context_path), stat.st_mtime_ns, stat.st_size)
     except OSError:
         return ("unreadable", str(context_path))
+
+
+def discover_strategic_contacts_with_openai(
+    organization_name,
+    *,
+    region="",
+    function="",
+    limit=20,
+):
+    organization_name = str(organization_name or "").strip()
+    region = str(region or "").strip()
+    function = str(function or "").strip()
+    limit = max(1, min(int(limit or 20), 50))
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if not organization_name:
+        return {"status": "missing_organization", "results": [], "error_message": ""}
+
+    if not api_key:
+        return {"status": "missing_api_key", "results": [], "error_message": ""}
+
+    system_prompt = (
+        "You help a sales operations app identify likely strategic contacts at large uniform-services companies. "
+        "Only return people who are plausibly real and relevant. "
+        "Prioritize executive and senior decision-makers in operations, production, procurement, facilities, supply chain, or general leadership. "
+        "Include regional directors and other regional leadership when they clearly sit above branch level. "
+        "Prefer uniform-services leadership only. Avoid HR, recruiting, talent, marketing, finance, retail, medical, sports, entertainment, education, foodservice, and unrelated divisions unless the requested function clearly asks for them. "
+        "If you are not reasonably confident a person belongs to the requested organisation, leave them out. "
+        "Prefer candidates with at least one verifiable signal such as a work email, phone number, or LinkedIn profile. "
+        "When enough plausible candidates exist, fill the requested limit instead of stopping early. "
+        "Return strict JSON only with this shape: "
+        "{\"results\":[{\"name\":\"...\",\"title\":\"...\",\"organization_name\":\"...\",\"city\":\"...\",\"region\":\"...\",\"country\":\"...\",\"email\":\"...\",\"phone\":\"...\",\"linkedin_url\":\"...\",\"reason\":\"...\"}]}. "
+        "Use empty strings for unknown fields. "
+        "Do not include markdown. "
+        "Do not include commentary outside the JSON."
+    )
+    user_payload = {
+        "prompt_version": _STRATEGIC_DISCOVERY_PROMPT_VERSION,
+        "organization_name": organization_name,
+        "region": region,
+        "function": function,
+        "limit": limit,
+        "goal": (
+            "Find likely strategic contacts for this organisation. "
+            "Bias toward uniform-services leadership and practical decision-makers."
+        ),
+    }
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(user_payload, indent=2),
+                },
+            ],
+            max_output_tokens=3600,
+        )
+
+        raw_text = response.output_text.strip()
+        if not raw_text:
+            return {
+                "status": "error",
+                "results": [],
+                "error_message": "OpenAI returned no discovery data.",
+                "system_prompt": system_prompt,
+                "user_payload": user_payload,
+                "raw_response_text": raw_text,
+            }
+
+        parsed = json.loads(raw_text)
+        if not isinstance(parsed, dict):
+            return {
+                "status": "error",
+                "results": [],
+                "error_message": "OpenAI returned malformed discovery data.",
+                "system_prompt": system_prompt,
+                "user_payload": user_payload,
+                "raw_response_text": raw_text,
+            }
+
+        raw_results = parsed.get("results") or []
+        if not isinstance(raw_results, list):
+            raw_results = []
+
+        cleaned = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            title = str(item.get("title") or "").strip()
+            if not name or not title:
+                continue
+            cleaned.append(
+                {
+                    "name": name,
+                    "title": title,
+                    "organization_name": str(item.get("organization_name") or organization_name).strip(),
+                    "city": str(item.get("city") or "").strip(),
+                    "region": str(item.get("region") or region).strip(),
+                    "country": str(item.get("country") or "").strip(),
+                    "email": str(item.get("email") or "").strip(),
+                    "phone": str(item.get("phone") or "").strip(),
+                    "linkedin_url": str(item.get("linkedin_url") or "").strip(),
+                    "reason": str(item.get("reason") or "").strip(),
+                }
+            )
+
+        return {
+            "status": "ok",
+            "results": cleaned[:limit],
+            "error_message": "",
+            "system_prompt": system_prompt,
+            "user_payload": user_payload,
+            "raw_response_text": raw_text,
+        }
+    except Exception as error:
+        return {
+            "status": "error",
+            "results": [],
+            "error_message": str(error),
+            "system_prompt": system_prompt,
+            "user_payload": user_payload,
+            "raw_response_text": "",
+        }
 
 
 def build_outreach_prep_cache_key(context):

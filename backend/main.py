@@ -1,5 +1,6 @@
 from collections import Counter, defaultdict
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -29,6 +30,7 @@ from apollo import (
 )
 from ai import add_ai_explanations
 from ai import build_outreach_prep_fallback
+from ai import discover_strategic_contacts_with_openai
 from ai import generate_data_question_answer
 from ai import generate_outreach_prep
 from analysis import (
@@ -67,7 +69,6 @@ from filemaker import (
     clear_filemaker_master_data_cache,
     create_layout_record,
     fetch_filemaker_master_data,
-    fetch_filemaker_company_directory,
     fetch_order_records,
     get_filemaker_config,
     has_filemaker_config,
@@ -141,6 +142,10 @@ _CUSTOMER_SUMMARIES_CACHE = {
     "result": None,
 }
 
+_STRATEGIC_DISCOVERY_RESULTS_CACHE = {
+    "entries": {},
+}
+
 HOME_QUEUE_SUMMARIES_CACHE_VERSION = "2026-05-13-contact-policy-2"
 CUSTOMER_SUMMARIES_CACHE_VERSION = "2026-05-13-v1"
 
@@ -157,10 +162,12 @@ DEFAULT_APP_USERS_PATH = BASE_DIR / "data" / "app_users.json"
 DEFAULT_RECENT_SENT_EMAILS_PATH = BASE_DIR / "data" / "recent_sent_emails.json"
 DEFAULT_STRATEGIC_CONTACTS_PATH = BASE_DIR / "data" / "strategic_contacts.json"
 DEFAULT_LOGIN_MFA_CHALLENGES_PATH = BASE_DIR / "data" / "login_mfa_challenges.json"
+DEFAULT_AUDIT_LOG_PATH = BASE_DIR / "data" / "audit_log.json"
 APP_USERS_LOCK = Lock()
 RECENT_SENT_EMAILS_LOCK = Lock()
 STRATEGIC_CONTACTS_LOCK = Lock()
 LOGIN_MFA_CHALLENGES_LOCK = Lock()
+AUDIT_LOG_LOCK = Lock()
 CURRENT_SESSION_USER = ContextVar("CURRENT_SESSION_USER", default=None)
 
 
@@ -557,8 +564,25 @@ def get_strategic_contacts_path():
     return DEFAULT_STRATEGIC_CONTACTS_PATH
 
 
+def get_audit_log_path():
+    raw_path = os.getenv("AUDIT_LOG_PATH", "").strip()
+
+    if raw_path:
+        return Path(raw_path).expanduser()
+
+    return DEFAULT_AUDIT_LOG_PATH
+
+
 def ensure_strategic_contacts_file():
     path = get_strategic_contacts_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("[]\n", encoding="utf-8")
+    return path
+
+
+def ensure_audit_log_file():
+    path = get_audit_log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text("[]\n", encoding="utf-8")
@@ -599,6 +623,69 @@ def save_strategic_contacts(items):
     path = ensure_strategic_contacts_file()
     with STRATEGIC_CONTACTS_LOCK:
         path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def load_audit_log_entries():
+    path = ensure_audit_log_file()
+
+    try:
+        with AUDIT_LOG_LOCK:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+
+    entries = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        entries.append(
+            {
+                "timestamp": str(item.get("timestamp") or "").strip(),
+                "username": str(item.get("username") or "").strip(),
+                "display_name": str(item.get("display_name") or "").strip(),
+                "action": str(item.get("action") or "").strip(),
+                "target": str(item.get("target") or "").strip(),
+                "details": str(item.get("details") or "").strip(),
+            }
+        )
+
+    return entries
+
+
+def record_audit_event(action, target="", details="", user=None):
+    current_user = user or get_current_session_user() or {}
+    entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "username": str(current_user.get("username") or "").strip(),
+        "display_name": str(
+            current_user.get("display_name")
+            or current_user.get("username")
+            or ""
+        ).strip(),
+        "action": str(action or "").strip(),
+        "target": str(target or "").strip(),
+        "details": str(details or "").strip(),
+    }
+
+    path = ensure_audit_log_file()
+    try:
+        with AUDIT_LOG_LOCK:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = []
+
+            if not isinstance(payload, list):
+                payload = []
+
+            payload.append(entry)
+            payload = payload[-500:]
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def normalize_strategic_contact_record(item):
@@ -774,8 +861,8 @@ def strategic_contact_targets_company(contact, company):
     return False
 
 
-def resolve_strategic_contact_filemaker_company(contact):
-    directory_result = fetch_filemaker_company_directory()
+def resolve_strategic_contact_filemaker_company(contact, master_data_result=None):
+    directory_result = master_data_result or fetch_filemaker_master_data()
     if directory_result.get("status") != "ok":
         return {
             "ok": False,
@@ -1054,7 +1141,7 @@ def mark_enrichment_contact_moved_on_in_filemaker(
             "error": "FileMaker contacts layout is not configured yet.",
         }
 
-    master_data_result = fetch_filemaker_master_data(force_refresh=True)
+    master_data_result = fetch_filemaker_master_data()
     if master_data_result.get("status") != "ok":
         return {
             "ok": False,
@@ -1197,7 +1284,7 @@ def sync_enrichment_branch_contact_to_filemaker(
             "error": "FileMaker contacts layout is not configured yet.",
         }
 
-    master_data_result = fetch_filemaker_master_data(force_refresh=True)
+    master_data_result = fetch_filemaker_master_data()
     if master_data_result.get("status") != "ok":
         return {
             "ok": False,
@@ -1349,7 +1436,11 @@ def sync_strategic_contact_to_filemaker(contact_id):
             )
         save_strategic_contacts(updated_items)
 
-    company_result = resolve_strategic_contact_filemaker_company(contact)
+    master_data_result = fetch_filemaker_master_data()
+    company_result = resolve_strategic_contact_filemaker_company(
+        contact,
+        master_data_result=master_data_result,
+    )
     if not company_result["ok"]:
         save_sync_error(company_result["message"])
         return {
@@ -1360,7 +1451,6 @@ def sync_strategic_contact_to_filemaker(contact_id):
 
     company = company_result["company"]
     field_data = build_strategic_contact_filemaker_field_data(contact, company)
-    master_data_result = fetch_filemaker_master_data()
     existing_contact = None
     if master_data_result.get("status") == "ok":
         existing_contact = find_existing_filemaker_contact_for_strategic_contact(contact, company, master_data_result)
@@ -2120,14 +2210,15 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                         <article class="panel strategic-contact-card org-chart-contact-card">
                             <div class="org-chart-contact-node">
                                 <div class="org-chart-contact-main">
-                                    <div class="org-chart-contact-title-row">
-                                        <h4>{escape(name)}</h4>
-                                        <div class="status-pill-stack">
-                                            {presence_badge}
-                                        </div>
+                                <div class="org-chart-contact-title-row">
+                                    <h4>{escape(name)}</h4>
+                                    <div class="status-pill-stack">
+                                        {presence_badge}
                                     </div>
                                 </div>
+                                <p class="org-chart-contact-preview-role">{escape(position)}</p>
                             </div>
+                        </div>
                             <details class="org-chart-contact-details">
                                 <summary>Details</summary>
                                 <div class="org-chart-contact-detail-body">
@@ -2323,7 +2414,7 @@ def get_filemaker_search_exclusions(organization_name, max_count=50):
     return excluded_emails
 
 
-def get_known_strategic_search_exclusions(organization_name, max_count=50):
+def get_known_strategic_search_exclusions(organization_name, max_count=150):
     combined = []
     seen = set()
 
@@ -2346,11 +2437,7 @@ def get_known_strategic_search_exclusions(organization_name, max_count=50):
 
 def build_pdl_strategic_search_query(organization_name, region="", function="", exclude_emails=None):
     organization_aliases = get_company_search_aliases(organization_name) or [organization_name]
-    organization_clauses = [
-        f"job_company_name LIKE '%{escape_sql_like(alias)}%'"
-        for alias in organization_aliases
-        if escape_sql_like(alias)
-    ]
+    normalized_org = normalize_apollo_location_value(organization_name)
 
     region_terms = get_state_search_terms(region) if len(str(region or "").strip()) <= 3 else [str(region or "").strip()]
     region_clauses = [
@@ -2360,30 +2447,25 @@ def build_pdl_strategic_search_query(organization_name, region="", function="", 
     ]
 
     function_title_terms = {
-        "Executive": ["chief", "president", "vice president"],
-        "Operations": ["operations", "production", "manufacturing", "plant", "service"],
-        "Procurement": ["procurement", "sourcing", "purchasing"],
-        "Facilities": ["facilities", "facility"],
-        "Finance": ["finance", "controller", "financial"],
-        "Sales": ["sales", "commercial", "account manager"],
+        "Executive": ["chief", "vice president", "director", "head of"],
+        "Operations": ["supply chain"],
+        "Procurement": ["procurement"],
+        "Facilities": ["facilities"],
+        "Finance": ["finance"],
+        "Sales": ["commercial"],
         "Service": ["service"],
-        "Other": ["director", "manager", "regional"],
+        "Other": ["procurement", "facilities", "finance", "supply chain"],
     }
     selected_terms = function_title_terms.get(str(function or "").strip(), [])
     if not selected_terms:
         selected_terms = [
-            "vice president",
-            "director",
-            "regional",
-            "operations",
-            "production",
-            "manufacturing",
-            "plant",
             "procurement",
             "facilities",
+            "finance",
+            "supply chain",
         ]
 
-    title_clauses = [
+    title_keyword_clauses = [
         f"job_title LIKE '%{escape_sql_like(term)}%'"
         for term in selected_terms
         if escape_sql_like(term)
@@ -2394,18 +2476,271 @@ def build_pdl_strategic_search_query(organization_name, region="", function="", 
         if escape_sql_like(email)
     ]
 
+    include_company_terms = []
+
+    if normalized_org in {"vestis", "aramark", "ameripride"}:
+        include_company_terms = [
+            "vestis",
+            "ameripride",
+            "aramark uniform",
+        ]
+    elif normalized_org in {"cintas", "unifirst", "uni first"}:
+        include_company_terms = [
+            "cintas",
+            "unifirst",
+            "uni first",
+            "unifirst corporation",
+        ]
+
+    organization_source_terms = include_company_terms or organization_aliases
+    organization_clauses = [
+        f"job_company_name LIKE '%{escape_sql_like(alias)}%'"
+        for alias in organization_source_terms
+        if escape_sql_like(alias)
+    ]
+
     lines = [
         "SELECT * FROM person",
         "WHERE (" + " OR ".join(organization_clauses) + ")",
     ]
     if region_clauses:
         lines.append("AND (" + " OR ".join(region_clauses) + ")")
-    if title_clauses:
-        lines.append("AND (" + " OR ".join(title_clauses) + ")")
+    seniority_scope_clauses = [
+        "job_title LIKE '%chief%'",
+        "job_title LIKE '%vice president%'",
+        "job_title LIKE '%director%'",
+        "job_title LIKE '%head of%'",
+    ]
+    if seniority_scope_clauses:
+        lines.append("AND (" + " OR ".join(seniority_scope_clauses) + ")")
+    if title_keyword_clauses and str(function or "").strip() != "Executive":
+        lines.append("AND (" + " OR ".join(title_keyword_clauses) + ")")
+    if normalized_org in {"vestis", "aramark", "ameripride"}:
+        lines.extend(
+            [
+                "AND job_title NOT LIKE '%security%'",
+                "AND job_title NOT LIKE '%medical%'",
+                "AND job_title NOT LIKE '%retail%'",
+                "AND job_title NOT LIKE '%marketing%'",
+                "AND job_title NOT LIKE '%talent%'",
+                "AND job_title NOT LIKE '%arena%'",
+                "AND job_title NOT LIKE '%stadium%'",
+                "AND job_title NOT LIKE '%talent acquisition%'",
+                "AND job_title NOT LIKE '%human resources%'",
+            ]
+        )
+    elif normalized_org in {"cintas", "unifirst", "uni first"}:
+        lines.extend(
+            [
+                "AND job_title NOT LIKE '%talent acquisition%'",
+                "AND job_title NOT LIKE '%human resources%'",
+                "AND job_title NOT LIKE '%marketing%'",
+                "AND job_title NOT LIKE '%recruit%'",
+                "AND job_title NOT LIKE '%manager%'",
+                "AND job_title NOT LIKE '%supervisor%'",
+                "AND job_title NOT LIKE '%coordinator%'",
+            ]
+        )
     if sanitized_exclusions:
-        exclusion_values = ", ".join(f"'{email}'" for email in sanitized_exclusions)
-        lines.append(f"AND (work_email IS NULL OR work_email NOT IN ({exclusion_values}))")
+        for email in sanitized_exclusions:
+            lines.append(
+                f"AND (work_email IS NULL OR work_email NOT LIKE '{email}')"
+            )
     return "\n".join(lines)
+
+
+def strategic_pdl_person_matches_focus(organization_name, person, allowed_domains=None, function=""):
+    normalized_org = normalize_apollo_location_value(organization_name)
+    organization_tokens = get_alias_aware_company_tokens(organization_name)
+    company_text = normalize_apollo_location_value(person.get("job_company_name"))
+    title_text = normalize_apollo_location_value(person.get("job_title"))
+    headline_text = normalize_apollo_location_value(person.get("headline"))
+    email_domain = extract_domain_from_email(get_pdl_person_email(person))
+    combined_text = " ".join(part for part in [company_text, title_text, headline_text] if part).strip()
+    trusted_domains = {
+        extract_domain_from_url(domain)
+        for domain in (allowed_domains or [])
+        if extract_domain_from_url(domain)
+    }
+    domain_matches = bool(email_domain and email_domain in trusted_domains)
+    senior_title_terms = [
+        "chief",
+        "president",
+        "vice president",
+        "vp",
+        "director",
+        "head of",
+        "regional manager",
+        "general manager",
+        "operations manager",
+        "plant manager",
+        "production manager",
+        "procurement manager",
+        "facilities manager",
+        "supply chain manager",
+    ]
+    junior_exclude_terms = [
+        "supervisor",
+        "specialist",
+        "coordinator",
+        "administrator",
+        "assistant",
+        "analyst",
+        "associate",
+        "representative",
+        "lead",
+    ]
+    seniority_matches = any(term in title_text for term in senior_title_terms)
+    juniority_matches = any(term in title_text for term in junior_exclude_terms)
+    if not seniority_matches or juniority_matches:
+        return False
+    normalized_function = str(function or "").strip()
+    function_focus_terms = {
+        "Operations": ["operations", "production", "manufacturing", "supply chain"],
+        "Procurement": ["procurement", "sourcing", "purchasing", "supply chain"],
+        "Facilities": ["facilities", "facility", "maintenance"],
+        "Finance": ["finance", "controller", "financial"],
+        "Sales": ["sales", "commercial"],
+        "Service": ["service"],
+        "Other": ["operations", "production", "procurement", "facilities", "supply chain"],
+    }
+    required_terms = function_focus_terms.get(normalized_function, [])
+    if normalized_function and normalized_function != "Executive" and required_terms:
+        if not any(term in title_text or term in headline_text for term in required_terms):
+            return False
+    elif not normalized_function or normalized_function == "Other":
+        default_strategic_focus_terms = [
+            "operations",
+            "production",
+            "procurement",
+            "purchasing",
+            "sourcing",
+            "facilities",
+            "facility",
+            "supply chain",
+        ]
+        if not any(term in title_text or term in headline_text for term in default_strategic_focus_terms):
+            return False
+
+    if organization_tokens.intersection({"vestis", "aramark", "ameripride"}):
+        trusted_company_terms = [
+            "vestis",
+            "vestis uniform",
+            "aramark uniform",
+            "ameripride",
+        ]
+        exclude_terms = [
+            "sports",
+            "entertainment",
+            "medical",
+            "hospital",
+            "health",
+            "healthcare",
+            "dining",
+            "food",
+            "culinary",
+            "campus",
+            "student",
+            "university",
+            "college",
+            "school",
+            "correction",
+            "refreshment",
+            "workplace",
+            "facilities services",
+            "security",
+            "retail",
+            "arena",
+            "stadium",
+            "support services @",
+            "talent acquisition",
+            "human resources",
+            "hr",
+            "recruit",
+            "recruiting",
+            "people operations",
+            "cleanroom",
+            "quality-cleanroom",
+            "quality cleanroom",
+            "investment",
+            "investissements",
+            "capital",
+            "holdings",
+            "partners",
+            "marketing",
+        ]
+        company_matches = (
+            any(term in company_text for term in trusted_company_terms)
+            or company_family_matches("vestis", company_text)
+        )
+        if email_domain and trusted_domains and not domain_matches:
+            return False
+        if company_text and not company_matches and not domain_matches:
+            return False
+        return (
+            (
+                domain_matches
+                or company_matches
+            )
+            and not any(term in combined_text for term in exclude_terms)
+        )
+
+    if organization_tokens.intersection({"cintas", "unifirst", "uni first"}):
+        trusted_company_terms = ["cintas", "unifirst", "uni first"]
+        exclude_terms = [
+            "first aid",
+            "fire",
+            "safety",
+            "cleanroom",
+            "document",
+            "doc management",
+            "uniform direct sale",
+            "talent acquisition",
+            "human resources",
+            "hr",
+            "recruit",
+            "recruiting",
+            "people operations",
+            "investment",
+            "investissements",
+            "capital",
+            "holdings",
+            "partners",
+        ]
+        company_matches = (
+            any(term in company_text for term in trusted_company_terms)
+            or company_family_matches("cintas", company_text)
+            or company_family_matches("unifirst", company_text)
+        )
+        if email_domain and trusted_domains and not domain_matches:
+            return False
+        if company_text and not company_matches and not domain_matches:
+            return False
+        return (
+            (
+                domain_matches
+                or company_matches
+            )
+            and not any(term in combined_text for term in exclude_terms)
+        )
+
+    return True
+
+
+def strategic_pdl_result_matches_focus(organization_name, result_item, allowed_domains=None, function=""):
+    pseudo_person = {
+        "job_company_name": result_item.get("organization_name"),
+        "job_title": result_item.get("title"),
+        "headline": result_item.get("headline") or result_item.get("organization_name"),
+        "work_email": result_item.get("email"),
+        "email": result_item.get("email"),
+    }
+    return strategic_pdl_person_matches_focus(
+        organization_name,
+        pseudo_person,
+        allowed_domains=allowed_domains,
+        function=function,
+    )
 
 
 def parse_credit_count(value):
@@ -2442,6 +2777,18 @@ def get_pdl_strategic_status_message(status):
     if status == "ok":
         return "PDL search completed."
     return get_pdl_status_message(status)
+
+
+def get_strategic_status_message(status, source="pdl"):
+    normalized_source = str(source or "").strip().lower()
+    if normalized_source == "openai":
+        if status == "missing_organization":
+            return "Please enter an organisation to search."
+        if status == "no_results":
+            return "OpenAI discovery did not return any likely strategic contacts for that search."
+        if status == "ok":
+            return "OpenAI discovery completed."
+    return get_pdl_strategic_status_message(status)
 
 
 def assess_filemaker_contact_presence(email, name, existing_emails, existing_names, existing_initial_last):
@@ -2596,6 +2943,35 @@ def get_saved_strategic_contact_id(email, phone, name, organization, position, e
     return ""
 
 
+def build_strategic_discovery_cache_key(user, organization_name, region="", function=""):
+    username = normalize_username((user or {}).get("username"))
+    return (
+        username,
+        normalize_apollo_location_value(organization_name),
+        normalize_apollo_location_value(region),
+        normalize_apollo_location_value(function),
+    )
+
+
+def set_cached_strategic_discovery_result(cache_key, payload):
+    if not cache_key:
+        return
+    _STRATEGIC_DISCOVERY_RESULTS_CACHE["entries"][cache_key] = {
+        "stored_at": time.time(),
+        "payload": dict(payload or {}),
+    }
+
+
+def get_cached_strategic_discovery_result(cache_key):
+    if not cache_key:
+        return None
+    cached = (_STRATEGIC_DISCOVERY_RESULTS_CACHE.get("entries") or {}).get(cache_key)
+    if not cached:
+        return None
+    payload = cached.get("payload")
+    return dict(payload or {})
+
+
 def search_pdl_strategic_contacts(organization_name, region="", function="", force_refresh=False):
     organization_name = str(organization_name or "").strip()
     if not organization_name:
@@ -2614,8 +2990,9 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
     if not sql_query:
         return {"status": "missing_sql", "results": [], "diagnostics": {}, "sql": ""}
 
-    search_limit = 4
-    enrich_limit = 2
+    allowed_domains = sorted(get_known_company_domains(organization_name))
+    search_limit = 20
+    enrich_limit = 20
     pdl_result = search_pdl_people(sql_query, size=search_limit, force_refresh=force_refresh)
     if pdl_result.get("status") != "ok":
         return {
@@ -2660,9 +3037,17 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
     search_credit_spent = parse_credit_count((pdl_result.get("credit_headers") or {}).get("x-call-credits-spent"))
     preview_only_count = 0
     enriched_count = 0
+    enriched_record_used = False
 
     for person in raw_results:
         if is_excluded_pdl_person(person):
+            continue
+        if not strategic_pdl_person_matches_focus(
+            organization_name,
+            person,
+            allowed_domains=allowed_domains,
+            function=function,
+        ):
             continue
 
         title = str(person.get("job_title") or "").strip()
@@ -2679,13 +3064,32 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
         detail_status = assess_pdl_detail_status(person)
         effective_person = person
         enriched = False
+        pre_enrich_saved = is_saved_strategic_contact(
+            email=email,
+            phone=phone,
+            name=name,
+            organization=company_name,
+            position=title,
+            existing_lookup=existing_lookup,
+        )
+        pre_enrich_filemaker_presence = assess_filemaker_contact_presence(
+            email=email,
+            name=name,
+            existing_emails=existing_emails,
+            existing_names=existing_names,
+            existing_initial_last=existing_initial_last,
+        )
 
         enrich_priority = (
-            rank_contact_position(title) >= 2
+            not enriched_record_used
+            and not pre_enrich_saved
+            and not pre_enrich_filemaker_presence.get("exists")
+            and rank_contact_position(title) >= 4
             and (
                 not email
+                or not phone
                 or not linkedin_url
-                or detail_status.get("score", 0) < 2
+                or detail_status.get("score", 0) < 3
             )
         )
         if enrich_attempts < enrich_limit and enrich_priority:
@@ -2703,6 +3107,7 @@ def search_pdl_strategic_contacts(organization_name, region="", function="", for
             if enriched_person:
                 effective_person = enriched_person
                 enriched = True
+                enriched_record_used = True
                 enriched_count += 1
                 email = str(get_pdl_person_email(effective_person) or email).strip().lower()
                 phone = str(get_pdl_person_phone(effective_person) or phone).strip()
@@ -2803,13 +3208,20 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
         return ""
 
     status = str(payload.get("status") or "")
+    error_message = str(payload.get("error_message") or "").strip()
     diagnostics = payload.get("diagnostics") or {}
     sql_query = str(payload.get("sql") or "").strip()
+    openai_response = str(payload.get("openai_response") or "").strip()
     credit_headers = payload.get("credit_headers") or {}
+    is_openai_source = str(payload.get("source") or "").strip() == "openai"
+    source_label = "OpenAI candidates" if is_openai_source else "PDL candidates"
+    query_label = "View OpenAI request" if is_openai_source else "View PDL SQL"
+    result_label = "View OpenAI response" if is_openai_source else ""
     search_credit = float(diagnostics.get("search_credit_spent") or 0.0)
     enrich_credit = float(diagnostics.get("enrich_credit_spent") or 0.0)
     total_credit = float(diagnostics.get("total_credit_spent") or 0.0)
     estimated_cost = float(diagnostics.get("estimated_cost") or 0.0)
+    allowed_domains = sorted(get_known_company_domains(organization_name))
 
     credit_markup = f"""
         <div class="summary compact-summary strategic-contact-summary">
@@ -2827,22 +3239,45 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
             remaining={escape(str(credit_headers.get("x-totallimit-remaining") or "unknown"))},
             lifetime_used={escape(str(credit_headers.get("x-lifetime-used") or "unknown"))},
             rate_remaining={escape(str(credit_headers.get("x-ratelimit-remaining") or "unknown"))}.
-            {escape("Used cached PDL search result." if payload.get("cached") else "Fresh PDL search result.")}
+            {escape(("Used cached OpenAI discovery result." if payload.get("cached") else "Fresh OpenAI discovery result.") if is_openai_source else ("Used cached PDL search result." if payload.get("cached") else "Fresh PDL search result."))}
         </p>
     """
 
     if status != "ok":
         return f"""
             <section class="panel strategic-pdl-panel">
-                <h3>PDL candidates</h3>
-                <p class="status error">{escape(get_pdl_strategic_status_message(status))}</p>
+                <h3>{escape(source_label)}</h3>
+                <p class="status error">{escape(get_strategic_status_message(status, payload.get("source") or ""))}</p>
+                {f'<p class="small muted">{escape(error_message)}</p>' if error_message else ''}
                 {credit_markup if diagnostics else ""}
-                {f"<details class='apollo-rejected-details'><summary>View PDL SQL</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
+                {f"<details class='apollo-rejected-details'><summary>{escape(query_label)}</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
+                {f"<details class='apollo-rejected-details'><summary>{escape(result_label)}</summary><pre>{escape(openai_response)}</pre></details>" if is_openai_source and openai_response else ""}
             </section>
         """
 
-    rows = []
-    for item in payload.get("results") or []:
+    primary_rows = []
+    verification_rows = []
+    filtered_results = [
+        item
+        for item in (payload.get("results") or [])
+        if strategic_pdl_result_matches_focus(
+            organization_name,
+            item,
+            allowed_domains=allowed_domains,
+            function=function,
+        )
+    ]
+    contact_ready_results = []
+    needs_verification_results = []
+    for item in filtered_results:
+        has_email = bool(str(item.get("email") or "").strip())
+        has_linkedin = bool(str(item.get("linkedin_url") or "").strip())
+        if has_email or has_linkedin:
+            contact_ready_results.append(item)
+        else:
+            needs_verification_results.append(item)
+
+    for item in contact_ready_results + needs_verification_results:
         location_bits = [
             str(item.get("city") or "").strip(),
             str(item.get("region") or "").strip(),
@@ -2880,63 +3315,300 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
                     <input type="hidden" name="influence_level" value="{escape(str(item.get("influence_level") or ""))}" />
                     <input type="hidden" name="seniority" value="{escape(str(item.get("seniority") or ""))}" />
                     <input type="hidden" name="preferred_contact_method" value="Email" />
-                    <button class="button secondary small-button strategic-save-button" type="submit">Save to Strategic Contacts</button>
+                    <button class="button secondary small-button strategic-save-button" type="submit">Save &amp; Send to FileMaker</button>
                 </form>
             """
-        rows.append(
-            f"""
-                <article class="panel strategic-pdl-card">
-                    <div class="strategic-contact-card-head">
-                        <div>
-                            <h4>{escape(str(item.get("name") or "Unknown"))}</h4>
-                            <p class="small muted">{escape(str(item.get("title") or "Unknown title"))}</p>
-                        </div>
-                        <div class="status-pill-stack">{status_badge}{filemaker_badge}</div>
+        card_markup = f"""
+            <article class="panel strategic-pdl-card">
+                <div class="strategic-contact-card-head">
+                    <div>
+                        <h4>{escape(str(item.get("name") or "Unknown"))}</h4>
+                        <p class="small muted">{escape(str(item.get("title") or "Unknown title"))}</p>
                     </div>
-                    <p class="small muted"><strong>{escape(str(item.get("organization_name") or organization_name))}</strong></p>
-                    <p class="small muted">{escape(location)}</p>
-                    <div class="summary compact-summary strategic-contact-summary">
-                        <div>
-                            <span class="label">Email</span>
-                            <strong>{escape(str(item.get("email") or "Not returned"))}</strong>
-                        </div>
-                        <div>
-                            <span class="label">Phone</span>
-                            <strong>{escape(str(item.get("phone") or "Not returned"))}</strong>
-                        </div>
+                    <div class="status-pill-stack">{status_badge}{filemaker_badge}</div>
+                </div>
+                <p class="small muted"><strong>{escape(str(item.get("organization_name") or organization_name))}</strong></p>
+                <p class="small muted">{escape(location)}</p>
+                <div class="summary compact-summary strategic-contact-summary">
+                    <div>
+                        <span class="label">Email</span>
+                        <strong>{escape(str(item.get("email") or "Not returned"))}</strong>
                     </div>
-                    <p class="small muted">{escape(str(filemaker_presence.get("details") or ""))}</p>
-                    <p class="small muted">{escape(str(item.get("scope_type") or ""))} | {escape(str(item.get("function") or ""))} | {escape(str(item.get("influence_level") or ""))}</p>
-                    <p class="small muted">{escape(str((item.get("detail_status") or {}).get("label") or "Matched, limited detail"))}</p>
-                    <div class="strategic-pdl-actions">
-                        {linkedin_html}
-                        {save_button}
+                    <div>
+                        <span class="label">Phone</span>
+                        <strong>{escape(str(item.get("phone") or "Not returned"))}</strong>
                     </div>
-                </article>
-            """
-        )
+                </div>
+                <p class="small muted">{escape(str(filemaker_presence.get("details") or ""))}</p>
+                <p class="small muted">{escape(str(item.get("scope_type") or ""))} | {escape(str(item.get("function") or ""))} | {escape(str(item.get("influence_level") or ""))}</p>
+                <p class="small muted">{escape(str((item.get("detail_status") or {}).get("label") or "Matched, limited detail"))}</p>
+                <div class="strategic-pdl-actions">
+                    {linkedin_html}
+                    {save_button}
+                </div>
+            </article>
+        """
+        if has_email or has_linkedin:
+            primary_rows.append(card_markup)
+        else:
+            verification_rows.append(card_markup)
+
+    verification_section = ""
+    if verification_rows:
+        verification_section = f"""
+            <details class="apollo-rejected-details strategic-weaker-results">
+                <summary>Needs verification ({len(verification_rows)})</summary>
+                <p class="small muted">These names do not yet have an email address or LinkedIn link, so they are harder to verify before saving.</p>
+                <div class="strategic-contact-grid">{''.join(verification_rows)}</div>
+            </details>
+        """
 
     return f"""
         <section class="panel strategic-pdl-panel">
-            <h3>PDL candidates</h3>
+            <h3>{escape(source_label)}</h3>
             <p class="small muted">
                 Checked <strong>{escape(organization_name)}</strong>
                 {f" in {escape(region)}" if region else ""}
                 {f" for {escape(function)} roles" if function else ""}.
-                PDL search saw {int(payload.get("search_total", 0))} total candidate(s),
+                {escape("OpenAI discovery returned" if str(payload.get("source") or "").strip() == "openai" else "PDL search saw")} {int(payload.get("search_total", 0))} total candidate(s),
                 fetched {int(diagnostics.get("raw_people", 0))},
-                shortlisted {int(diagnostics.get("returned", 0))},
-                with {int(diagnostics.get("with_email", 0))} email(s),
-                {int(diagnostics.get("with_phone", 0))} phone number(s),
-                and {int(diagnostics.get("with_linkedin", 0))} LinkedIn link(s).
+                shortlisted {len(filtered_results)},
+                with {sum(1 for item in filtered_results if str(item.get("email") or "").strip())} email(s),
+                {sum(1 for item in filtered_results if str(item.get("phone") or "").strip())} phone number(s),
+                and {sum(1 for item in filtered_results if str(item.get("linkedin_url") or "").strip())} LinkedIn link(s).
+                {f" {len(contact_ready_results)} are ready to review now." if contact_ready_results else ""}
+                {f" {len(needs_verification_results)} need verification before they can be trusted." if needs_verification_results else ""}
                 {f" {int(diagnostics.get('already_in_filemaker', 0))} appear to already exist in FileMaker." if int(diagnostics.get('already_in_filemaker', 0)) else ""}
                 {f" {int(diagnostics.get('preview_only_returned', 0))} still need fuller enrichment." if int(diagnostics.get('preview_only_returned', 0)) else ""}
             </p>
             {credit_markup}
-            {f"<details class='apollo-rejected-details'><summary>View PDL SQL</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
-            <div class="strategic-contact-grid">{''.join(rows)}</div>
+            {f"<details class='apollo-rejected-details'><summary>{escape(query_label)}</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
+            <div class="strategic-contact-grid">{''.join(primary_rows)}</div>
+            {verification_section}
         </section>
     """
+
+
+def search_openai_strategic_contacts(organization_name, region="", function="", force_refresh=False):
+    organization_name = str(organization_name or "").strip()
+    region = str(region or "").strip()
+    function = str(function or "").strip()
+    discovery_limit = 50
+    enrich_limit = 30
+
+    if not organization_name:
+        return {
+            "status": "missing_organization",
+            "results": [],
+            "diagnostics": {},
+            "sql": "",
+            "source": "openai",
+            "openai_response": "",
+        }
+
+    openai_result = discover_strategic_contacts_with_openai(
+        organization_name,
+        region=region,
+        function=function,
+        limit=discovery_limit,
+    )
+    openai_request = json.dumps(
+        {
+            "source": "openai",
+            "organization_name": organization_name,
+            "region": region,
+            "function": function,
+            "limit": discovery_limit,
+            "system_prompt": str(openai_result.get("system_prompt") or "").strip(),
+            "user_payload": openai_result.get("user_payload") or {},
+        },
+        indent=2,
+    )
+    openai_response = str(openai_result.get("raw_response_text") or "").strip()
+    status = str(openai_result.get("status") or "").strip()
+    if status == "missing_api_key":
+        return {
+            "status": "missing_api_key",
+            "results": [],
+            "diagnostics": {},
+            "sql": openai_request,
+            "source": "openai",
+            "error_message": "OPENAI_API_KEY is not set.",
+            "openai_response": openai_response,
+        }
+    if status != "ok":
+        return {
+            "status": "error",
+            "results": [],
+            "diagnostics": {},
+            "sql": openai_request,
+            "source": "openai",
+            "error_message": str(openai_result.get("error_message") or "OpenAI discovery failed."),
+            "openai_response": openai_response,
+        }
+
+    existing_contacts = load_strategic_contacts()
+    existing_lookup = build_saved_strategic_contact_sets(existing_contacts)
+    strategic_existing_keys = existing_lookup[0]
+    allowed_domains = sorted(get_known_company_domains(organization_name))
+    known_search_exclusions = get_known_strategic_search_exclusions(organization_name)
+    existing_filemaker_emails = set()
+    existing_names = set()
+    existing_initial_last = set()
+    master_data_result = fetch_filemaker_master_data()
+    if master_data_result.get("status") == "ok":
+        contact_rows = build_contact_master_rows(master_data_result)
+        (
+            existing_filemaker_emails,
+            existing_names,
+            existing_initial_last,
+        ) = build_pdl_existing_contact_sets(
+            contact_rows,
+            organization_name=organization_name,
+            expected_city="",
+            expected_state="",
+        )
+    already_saved_count = 0
+    existing_filemaker_count = 0
+    preview_only_count = 0
+    enrich_attempts = 0
+    enrich_credit_spent = 0.0
+    enriched_count = 0
+    shortlisted = []
+    skipped_without_contact_signal = 0
+
+    for item in openai_result.get("results") or []:
+        organization_value = str(item.get("organization_name") or organization_name).strip() or organization_name
+        title = str(item.get("title") or "").strip()
+        email = str(item.get("email") or "").strip().lower()
+        phone = str(item.get("phone") or "").strip()
+        city = str(item.get("city") or "").strip()
+        candidate_region = str(item.get("region") or region).strip()
+        country = str(item.get("country") or "").strip()
+        linkedin_url = ""
+        person = {
+            "job_title": title,
+            "headline": str(item.get("reason") or "").strip(),
+            "job_company_name": organization_value,
+            "job_company_website": "",
+            "work_email": email,
+        }
+        if not strategic_pdl_person_matches_focus(
+            organization_name,
+            person,
+            allowed_domains=allowed_domains,
+            function=function,
+        ):
+            continue
+        if email and email.lower() in known_search_exclusions:
+            continue
+
+        enriched_person = {}
+        if enrich_attempts < enrich_limit:
+            enrich_attempts += 1
+            enrich_result = enrich_pdl_person(
+                email=email,
+                full_name=str(item.get("name") or "").strip(),
+                organization_name=organization_value,
+                locality=city,
+                region=candidate_region,
+                force_refresh=force_refresh,
+            )
+            enrich_credit_spent += parse_credit_count(
+                (enrich_result.get("credit_headers") or {}).get("x-call-credits-spent")
+            )
+            enriched_person = enrich_result.get("result") or {}
+
+        if enriched_person:
+            enriched_count += 1
+            email = str(get_pdl_person_email(enriched_person) or email).strip().lower()
+            phone = str(get_pdl_person_phone(enriched_person) or phone).strip()
+            city, candidate_region, country = get_pdl_location_parts(enriched_person)
+            organization_value = get_pdl_company_name(enriched_person) or organization_value
+            linkedin_url = normalize_external_url(enriched_person.get("linkedin_url") or "")
+
+        has_usable_signal = bool(email or phone or linkedin_url)
+        if not has_usable_signal:
+            skipped_without_contact_signal += 1
+            preview_only = True
+
+        already_saved = bool(email and email.lower() in strategic_existing_keys)
+        filemaker_presence = assess_filemaker_contact_presence(
+            email,
+            str(item.get("name") or ""),
+            existing_emails=existing_filemaker_emails,
+            existing_names=existing_names,
+            existing_initial_last=existing_initial_last,
+        )
+        if already_saved:
+            already_saved_count += 1
+        if filemaker_presence.get("exists"):
+            existing_filemaker_count += 1
+
+        shortlisted.append(
+            {
+                "name": str(item.get("name") or "").strip(),
+                "email": email,
+                "phone": phone,
+                "title": title,
+                "linkedin_url": linkedin_url,
+                "organization_name": organization_value,
+                "organization_domain": "",
+                "region": candidate_region,
+                "city": city,
+                "country": country,
+                "scope_type": infer_strategic_scope_type(title, region=candidate_region),
+                "function": infer_strategic_function(title),
+                "influence_level": infer_strategic_influence_level(title),
+                "seniority": infer_strategic_seniority(title),
+                "detail_status": {
+                    "level": "strong" if enriched_person else "medium",
+                    "label": "PDL-verified strategic candidate" if enriched_person else "OpenAI discovery candidate",
+                },
+                "already_saved": already_saved,
+                "filemaker_presence": filemaker_presence,
+                "preview_only": not bool(enriched_person),
+            }
+        )
+
+    shortlisted = shortlisted[:24]
+    diagnostics = {
+        "raw_people": len(openai_result.get("results") or []),
+        "returned": len(shortlisted),
+        "excluded_known_emails": len(known_search_exclusions),
+        "with_email": sum(1 for item in shortlisted if str(item.get("email") or "").strip()),
+        "with_phone": sum(1 for item in shortlisted if str(item.get("phone") or "").strip()),
+        "with_linkedin": sum(1 for item in shortlisted if str(item.get("linkedin_url") or "").strip()),
+        "without_contact_detail": sum(
+            1
+            for item in shortlisted
+            if not str(item.get("email") or "").strip() and not str(item.get("phone") or "").strip()
+        ),
+        "skipped_without_contact_signal": skipped_without_contact_signal,
+        "preview_only_returned": sum(1 for item in shortlisted if item.get("preview_only")),
+        "enriched_count": enriched_count,
+        "enrich_attempts": enrich_attempts,
+        "search_limit": discovery_limit,
+        "enrich_limit": enrich_limit,
+        "search_credit_spent": 0.0,
+        "enrich_credit_spent": enrich_credit_spent,
+        "total_credit_spent": enrich_credit_spent,
+        "estimated_cost": estimate_pdl_credit_cost(enrich_credit_spent),
+        "already_saved": already_saved_count,
+        "already_in_filemaker": existing_filemaker_count,
+    }
+    return {
+        "status": "ok" if shortlisted else "no_results",
+        "results": shortlisted,
+        "diagnostics": diagnostics,
+        "sql": openai_request,
+        "search_total": len(openai_result.get("results") or []),
+        "credit_headers": {},
+        "cached": False,
+        "source": "openai",
+        "error_message": str(openai_result.get("error_message") or "").strip(),
+        "openai_response": openai_response,
+    }
 
 
 def get_apollo_strategic_search_titles(function=""):
@@ -4070,6 +4742,7 @@ def post_login(request: Request, username: str = Form(""), password: str = Form(
     request.session["app_username"] = str(user.get("username") or "")
     request.session.pop("pending_mfa_username", None)
     request.session.pop("pending_mfa_next", None)
+    record_audit_event("login", target=str(next or "/"), details="Signed in without MFA.", user=user)
     return RedirectResponse(url=next or "/", status_code=303)
 
 
@@ -4095,6 +4768,8 @@ def post_login_mfa(request: Request, code: str = Form("")):
     request.session["app_username"] = pending_username
     request.session.pop("pending_mfa_username", None)
     request.session.pop("pending_mfa_next", None)
+    user = find_app_user(pending_username)
+    record_audit_event("login", target=pending_next, details="Signed in with MFA.", user=user)
     return RedirectResponse(url=pending_next, status_code=303)
 
 
@@ -4133,6 +4808,9 @@ def post_login_mfa_resend(request: Request):
 
 @app.get("/logout")
 def logout(request: Request):
+    current_user = get_current_session_user()
+    if current_user:
+        record_audit_event("logout", details="Signed out of Sales Focus.", user=current_user)
     request.session.pop("app_username", None)
     request.session.pop("pending_mfa_username", None)
     request.session.pop("pending_mfa_next", None)
@@ -4328,6 +5006,71 @@ def get_user_accounts_page(setup: str = "", message: str = "", error: str = "", 
     return render_page(title="User Accounts", body=body)
 
 
+@app.get("/admin-audit-log", response_class=HTMLResponse)
+def get_admin_audit_log_page(message: str = "", error: str = ""):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return render_page(
+            title="Audit Log",
+            body="<p class='status error'>You do not have permission to view the audit log.</p>",
+        )
+
+    entries = list(reversed(load_audit_log_entries()))
+    rows = []
+    for entry in entries[:200]:
+        display_name = str(entry.get("display_name") or entry.get("username") or "Unknown user").strip()
+        details = str(entry.get("details") or "").strip()
+        target = str(entry.get("target") or "").strip()
+        summary_parts = [part for part in [target, details] if part]
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(entry.get('timestamp') or ''))}</td>"
+            f"<td>{escape(display_name)}</td>"
+            f"<td>{escape(str(entry.get('action') or ''))}</td>"
+            f"<td>{escape(' • '.join(summary_parts) or '—')}</td>"
+            "</tr>"
+        )
+
+    rows_markup = "".join(rows) or "<tr><td colspan='4'>No audit activity recorded yet.</td></tr>"
+    status_markup = ""
+    if message:
+        status_markup = f"<p class='status ok'>{escape(message)}</p>"
+    elif error:
+        status_markup = f"<p class='status error'>{escape(error)}</p>"
+
+    body = f"""
+        <section class="panel">
+            <h2>Audit log</h2>
+            <p class="subtle">A lightweight testing log showing who is signing in and the main actions they are taking.</p>
+            {status_markup}
+            <div class="summary compact-summary">
+                <div>
+                    <span class="label">Entries shown</span>
+                    <strong>{min(len(entries), 200)}</strong>
+                </div>
+                <div>
+                    <span class="label">Total saved</span>
+                    <strong>{len(entries)}</strong>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table class="user-accounts-table">
+                    <thead>
+                        <tr>
+                            <th>When</th>
+                            <th>User</th>
+                            <th>Action</th>
+                            <th>Summary</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows_markup}</tbody>
+                </table>
+            </div>
+        </section>
+    """
+    return render_page(title="Audit Log", body=body)
+
+
 @app.post("/user-accounts", response_class=HTMLResponse)
 def post_user_account(
     display_name: str = Form(""),
@@ -4494,21 +5237,24 @@ def get_strategic_contacts_page(
     discover_org: str = "",
     discover_region: str = "",
     discover_function: str = "",
-    discover_run: str = "",
-    discover_refresh: str = "",
+    discover_view: str = "",
 ):
-    pdl_payload = None
+    discovery_payload = None
+    current_user = get_current_session_user()
     discover_org = str(discover_org or "").strip()
     discover_region = str(discover_region or "").strip()
     discover_function = str(discover_function or "").strip()
+    cache_key = build_strategic_discovery_cache_key(
+        current_user,
+        discover_org,
+        discover_region,
+        discover_function,
+    )
 
-    if discover_org and str(discover_run or "").strip().lower() in {"1", "true", "yes", "on", "run"}:
-        pdl_payload = search_pdl_strategic_contacts(
-            organization_name=discover_org,
-            region=discover_region,
-            function=discover_function,
-            force_refresh=str(discover_refresh or "").strip().lower() in {"1", "true", "yes", "on", "refresh"},
-        )
+    if discover_org and str(discover_view or "").strip().lower() in {"1", "true", "yes", "on", "view"}:
+        cached_payload = get_cached_strategic_discovery_result(cache_key)
+        if str((cached_payload or {}).get("source") or "").strip().lower() == "openai":
+            discovery_payload = cached_payload
 
     status_markup = ""
     if message:
@@ -4518,9 +5264,8 @@ def get_strategic_contacts_page(
 
     discovery_markup = f"""
         <section class="panel strategic-pdl-discovery">
-            <h3>Find with PDL</h3>
-            <form method="get" action="/strategic-contacts-view" class="login-form">
-                <input type="hidden" name="discover_run" value="1" />
+            <h3>Find strategic contacts</h3>
+            <form method="post" action="/strategic-contacts/search" class="login-form">
                 <label>
                     <span class="label">Organisation</span>
                     <input type="text" name="discover_org" value="{escape(discover_org)}" placeholder="Cintas / Vestis / UniFirst" required />
@@ -4542,19 +5287,93 @@ def get_strategic_contacts_page(
                     <button class="button secondary strategic-discovery-submit" type="submit">Find strategic contacts</button>
                     <a class="button secondary small-button" href="/organisation-chart-view">Organisation view</a>
                     <a class="button secondary small-button" href="/strategic-contacts-view">Clear</a>
-                    {f'<a class="button secondary small-button" href="/strategic-contacts-view?discover_run=1&discover_org={quote(discover_org)}&discover_region={quote(discover_region)}&discover_function={quote(discover_function)}&discover_refresh=1">Refresh PDL</a>' if discover_org else ''}
+                    {f'''
+                    <form method="post" action="/strategic-contacts/search" class="inline-form">
+                        <input type="hidden" name="discover_org" value="{escape(discover_org)}" />
+                        <input type="hidden" name="discover_region" value="{escape(discover_region)}" />
+                        <input type="hidden" name="discover_function" value="{escape(discover_function)}" />
+                        <input type="hidden" name="discover_refresh" value="1" />
+                        <button class="button secondary small-button" type="submit">Refresh search</button>
+                    </form>
+                    ''' if discover_org else ''}
                 </div>
             </form>
-            <p class="small muted">During testing we show search credits and estimated cost here so we can tune the workflow. Once we are happy with it, we can hide that from the wider team.</p>
         </section>
     """
+
+    results_markup = ""
+    if discovery_payload:
+        try:
+            results_markup = render_strategic_pdl_results(
+                discovery_payload,
+                organization_name=discover_org,
+                region=discover_region,
+                function=discover_function,
+            )
+        except Exception:
+            results_markup = (
+                "<p class='status error'>"
+                "We could not open the saved strategic contact results for this search. "
+                "Please run the search again."
+                "</p>"
+            )
 
     body = f"""
         {status_markup}
         {discovery_markup}
-        {render_strategic_pdl_results(pdl_payload, organization_name=discover_org, region=discover_region, function=discover_function) if pdl_payload else ''}
+        {results_markup}
     """
     return render_page(title="Strategic Contacts", body=body)
+
+
+@app.post("/strategic-contacts/search", response_class=HTMLResponse)
+def post_strategic_contacts_search(
+    discover_org: str = Form(""),
+    discover_region: str = Form(""),
+    discover_function: str = Form(""),
+    discover_refresh: str = Form(""),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+        )
+
+    discover_org = str(discover_org or "").strip()
+    discover_region = str(discover_region or "").strip()
+    discover_function = str(discover_function or "").strip()
+    if not discover_org:
+        return RedirectResponse(
+            url=f"/strategic-contacts-view?error={quote('Please enter an organisation to search.')}",
+            status_code=303,
+        )
+
+    force_refresh = str(discover_refresh or "").strip().lower() in {"1", "true", "yes", "on"}
+    pdl_payload = search_openai_strategic_contacts(
+        discover_org,
+        region=discover_region,
+        function=discover_function,
+        force_refresh=force_refresh,
+    )
+    cache_key = build_strategic_discovery_cache_key(
+        current_user,
+        discover_org,
+        discover_region,
+        discover_function,
+    )
+    set_cached_strategic_discovery_result(cache_key, pdl_payload)
+
+    return RedirectResponse(
+        url=(
+            "/strategic-contacts-view"
+            f"?discover_org={quote(discover_org)}"
+            f"&discover_region={quote(discover_region)}"
+            f"&discover_function={quote(discover_function)}"
+            "&discover_view=1"
+        ),
+        status_code=303,
+    )
 
 
 @app.get("/organisation-chart-view", response_class=HTMLResponse)
@@ -4635,6 +5454,15 @@ def post_strategic_contact_delete(
         )
 
     save_strategic_contacts(remaining)
+    removed_contact = next(
+        (item for item in existing if str(item.get("id") or "").strip() == contact_id),
+        {},
+    )
+    record_audit_event(
+        "strategic-remove",
+        target=str(removed_contact.get("name") or contact_id),
+        details=str(removed_contact.get("organization") or "").strip(),
+    )
     return RedirectResponse(
         url=append_message_to_url(
             return_to or "/organisation-chart-view",
@@ -4657,6 +5485,12 @@ def post_strategic_contact_sync_filemaker(
         )
 
     result = sync_strategic_contact_to_filemaker(contact_id)
+    strategic_contact = find_strategic_contact(contact_id) or {}
+    record_audit_event(
+        "strategic-sync-filemaker",
+        target=str(strategic_contact.get("name") or contact_id),
+        details=result["message"] if result.get("ok") else result.get("error"),
+    )
     return RedirectResponse(
         url=append_message_to_url(
             return_to or "/organisation-chart-view",
@@ -4733,6 +5567,11 @@ def post_strategic_contact(
         )
     )
     save_strategic_contacts(items)
+    record_audit_event(
+        "strategic-add",
+        target=name,
+        details=f"{organization} • added from manual form",
+    )
     return RedirectResponse(
         url=f"/strategic-contacts-view?message={quote('Strategic contact added.')}",
         status_code=303,
@@ -4848,7 +5687,7 @@ def post_strategic_contact_import_pdl(
         )
 
     organization = str(organization or "").strip()
-    discover_org = str(discover_org or "").strip() or organization
+    discover_org = str(discover_org or "").strip()
     discover_region = str(discover_region or "").strip()
     discover_function = str(discover_function or "").strip()
     name = str(name or "").strip()
@@ -4857,11 +5696,20 @@ def post_strategic_contact_import_pdl(
     phone = str(phone or "").strip()
     return_url = (
         "/strategic-contacts-view"
-        f"?discover_run=1&discover_org={quote(discover_org)}"
+        f"?discover_org={quote(discover_org)}"
         f"&discover_region={quote(discover_region)}"
         f"&discover_function={quote(discover_function)}"
-        "&discover_refresh=1"
+        "&discover_view=1"
     )
+    if not discover_org:
+        discover_org = organization
+        return_url = (
+            "/strategic-contacts-view"
+            f"?discover_org={quote(discover_org)}"
+            f"&discover_region={quote(discover_region)}"
+            f"&discover_function={quote(discover_function)}"
+            "&discover_view=1"
+        )
     if not organization or not name or not position:
         return RedirectResponse(
             url=f"{return_url}&error={quote('PDL result was missing key contact details.')}",
@@ -4885,10 +5733,11 @@ def post_strategic_contact_import_pdl(
             )
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    contact_id = secrets.token_hex(8)
     existing.append(
         normalize_strategic_contact_record(
             {
-                "id": secrets.token_hex(8),
+                "id": contact_id,
                 "organization": organization,
                 "company_record_label": company_record_label or organization,
                 "name": name,
@@ -4908,8 +5757,27 @@ def post_strategic_contact_import_pdl(
         )
     )
     save_strategic_contacts(existing)
+    record_audit_event(
+        "strategic-add",
+        target=name,
+        details=f"{organization} • added from PDL search",
+    )
+
+    sync_result = sync_strategic_contact_to_filemaker(contact_id)
+    record_audit_event(
+        "strategic-sync-filemaker",
+        target=name,
+        details=sync_result["message"] if sync_result.get("ok") else sync_result.get("error"),
+    )
+    if not sync_result.get("ok"):
+        sync_error = str(sync_result.get("error") or "FileMaker sync failed.").strip()
+        return RedirectResponse(
+            url=f"{return_url}&error={quote(f'Contact saved to Organisation View, but {sync_error}')}",
+            status_code=303,
+        )
+
     return RedirectResponse(
-        url=f"{return_url}&message={quote('PDL contact saved to Strategic Contacts.')}",
+        url=f"{return_url}&message={quote('Contact saved to Organisation View and sent to FileMaker.')}",
         status_code=303,
     )
 
@@ -5008,6 +5876,11 @@ def post_strategic_contact_import_contact(
         )
     )
     save_strategic_contacts(existing)
+    record_audit_event(
+        "strategic-add",
+        target=name,
+        details=f"{company} • added from contacts view",
+    )
     return RedirectResponse(
         url=f"{return_url}&message={quote('Contact saved to Strategic Contacts.')}",
         status_code=303,
@@ -5097,6 +5970,58 @@ def handle_enrichment_mark_moved_on(
         position=position,
         email=email,
         moved_to_company=moved_to_company,
+        source_label=source_label,
+    )
+    return RedirectResponse(
+        url=append_message_to_url(
+            return_url,
+            message=result["message"] if result["ok"] else "",
+            error=result["error"] if not result["ok"] else "",
+        ),
+        status_code=303,
+    )
+
+
+def handle_enrichment_move_branch(
+    customer: str = "",
+    customer_primary_key: str = "",
+    resolved_customer_ref: str = "",
+    domain: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    name: str = "",
+    position: str = "",
+    email: str = "",
+    phone: str = "",
+    city: str = "",
+    state: str = "",
+    source_label: str = "PDL enrichment branch move",
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Customer Enrichment",
+            body="<p class='status error'>You do not have permission to update enrichment contacts in FileMaker.</p>",
+        )
+
+    return_url = build_enrichment_return_url(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+    )
+    result = sync_enrichment_branch_contact_to_filemaker(
+        customer_ref=resolved_customer_ref,
+        company_name=organization_name,
+        name=name,
+        position=position,
+        email=email,
+        phone=phone,
+        city=city,
+        state=state,
         source_label=source_label,
     )
     return RedirectResponse(
@@ -5229,6 +6154,76 @@ def post_enrichment_mark_moved_on(
     )
 
 
+@app.get("/enrichment/move-branch", response_class=HTMLResponse)
+def get_enrichment_move_branch(
+    customer: str = "",
+    customer_primary_key: str = "",
+    resolved_customer_ref: str = "",
+    domain: str = "",
+    organization_name: str = "",
+    expected_city: str = "",
+    expected_state: str = "",
+    name: str = "",
+    position: str = "",
+    email: str = "",
+    phone: str = "",
+    city: str = "",
+    state: str = "",
+    source_label: str = "PDL enrichment branch move",
+):
+    return handle_enrichment_move_branch(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        resolved_customer_ref=resolved_customer_ref,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        name=name,
+        position=position,
+        email=email,
+        phone=phone,
+        city=city,
+        state=state,
+        source_label=source_label,
+    )
+
+
+@app.post("/enrichment/move-branch", response_class=HTMLResponse)
+def post_enrichment_move_branch(
+    customer: str = Form(""),
+    customer_primary_key: str = Form(""),
+    resolved_customer_ref: str = Form(""),
+    domain: str = Form(""),
+    organization_name: str = Form(""),
+    expected_city: str = Form(""),
+    expected_state: str = Form(""),
+    name: str = Form(""),
+    position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    city: str = Form(""),
+    state: str = Form(""),
+    source_label: str = Form("PDL enrichment branch move"),
+):
+    return handle_enrichment_move_branch(
+        customer=customer,
+        customer_primary_key=customer_primary_key,
+        resolved_customer_ref=resolved_customer_ref,
+        domain=domain,
+        organization_name=organization_name,
+        expected_city=expected_city,
+        expected_state=expected_state,
+        name=name,
+        position=position,
+        email=email,
+        phone=phone,
+        city=city,
+        state=state,
+        source_label=source_label,
+    )
+
+
 @app.post("/user-settings/send-confirmation", response_class=HTMLResponse)
 def post_user_send_confirmation_setting(
     request: Request,
@@ -5345,6 +6340,7 @@ def post_m365_disconnect():
 def get_action_plan_view(
     selected_customer: str = "",
     view: str = "focus",
+    group: str = "all",
     dismiss_customer: str = "",
     message: str = "",
     error: str = "",
@@ -5352,6 +6348,7 @@ def get_action_plan_view(
     return render_home_page(
         selected_customer=selected_customer,
         view=view,
+        group=group,
         dismiss_customer=dismiss_customer,
         message=message,
         error=error,
@@ -5608,6 +6605,7 @@ def post_action_plan_dismiss(
 ):
     effective_reason = str(reason or "").strip() or str(reason_preset or "").strip()
     dismiss_action_plan_customer(customer, last_order, effective_reason)
+    record_audit_event("action-plan-dismiss", target=customer, details=effective_reason)
     return RedirectResponse(url=return_to or "/action-plan-view#action-plan", status_code=303)
 
 
@@ -5617,19 +6615,34 @@ def post_action_plan_restore(
     return_to: str = Form("/action-plan-view#action-plan"),
 ):
     restore_action_plan_customer(customer)
+    record_audit_event("action-plan-restore", target=customer, details="Restored to active queue.")
     return RedirectResponse(url=return_to or "/action-plan-view#action-plan", status_code=303)
 
 
-def render_home_page(selected_customer="", view="focus", dismiss_customer="", message="", error=""):
+def render_home_page(selected_customer="", view="focus", group="all", dismiss_customer="", message="", error=""):
     home_started_at = time.perf_counter()
 
-    stage_started_at = time.perf_counter()
-    order_result = get_orders_for_analysis()
-    log_perf_metric("home.get_orders_for_analysis", stage_started_at)
+    def load_home_source(label, loader):
+        source_started_at = time.perf_counter()
+        result = loader()
+        log_perf_metric(label, source_started_at)
+        return result
 
     stage_started_at = time.perf_counter()
-    crm_result = fetch_crm_activities()
-    log_perf_metric("home.fetch_crm_activities", stage_started_at)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        order_future = executor.submit(
+            load_home_source,
+            "home.get_orders_for_analysis",
+            get_orders_for_analysis,
+        )
+        crm_future = executor.submit(
+            load_home_source,
+            "home.fetch_crm_activities",
+            fetch_crm_activities,
+        )
+        order_result = order_future.result()
+        crm_result = crm_future.result()
+    log_perf_metric("home.load_data_sources_parallel", stage_started_at)
 
     stage_started_at = time.perf_counter()
     attention_result = build_customers_needing_attention_response(
@@ -5651,11 +6664,23 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer="", me
 
     orders = order_result["orders"]
     attention_customers = attention_result["late_customers"]
+    normalized_group = normalize_action_plan_group_filter(group)
 
     stage_started_at = time.perf_counter()
     grouped_orders = group_by_customer(orders)
     log_perf_metric("home.group_by_customer", stage_started_at)
-    customer_options = sorted(grouped_orders.keys(), key=lambda item: str(item or "").lower())
+
+    master_data_result = None
+    customers_by_key = {}
+    if normalized_group != "all":
+        stage_started_at = time.perf_counter()
+        master_data_result = fetch_filemaker_master_data()
+        log_perf_metric("home.fetch_filemaker_master_data", stage_started_at)
+        customers_by_key = (
+            master_data_result.get("customers_by_key", {})
+            if master_data_result.get("status") == "ok"
+            else {}
+        )
 
     stage_started_at = time.perf_counter()
     crm_activity_map = (
@@ -5669,14 +6694,26 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer="", me
         grouped_orders,
         crm_activity_map,
         attention_result.get("dismissed_customers", []),
+        group_filter=normalized_group,
+        customers_by_key=customers_by_key,
     )
     log_perf_metric("home.build_action_plan", stage_started_at)
+
+    customer_options = sorted(
+        (
+            str(customer.get("customer", "")).strip()
+            for customer in action_plan.get("due_today", [])
+            if str(customer.get("customer", "")).strip()
+        ),
+        key=lambda item: str(item or "").lower(),
+    )
 
     stage_started_at = time.perf_counter()
     queue_summaries = build_home_queue_summaries(
         action_plan.get("due_today", []),
         grouped_orders,
         crm_activity_map,
+        master_data_result=master_data_result,
     )
     log_perf_metric("home.build_queue_summaries", stage_started_at)
 
@@ -5707,7 +6744,7 @@ def render_home_page(selected_customer="", view="focus", dismiss_customer="", me
     body = f"""
         {render_data_availability_banner(order_result, crm_result)}
         {status_markup}
-        {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, customer_options=customer_options, dismiss_customer=dismiss_customer)}
+        {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, group_filter=normalized_group, customer_options=customer_options, dismiss_customer=dismiss_customer)}
     """
 
     log_perf_metric("home.total", home_started_at)
@@ -6033,9 +7070,19 @@ STATE_CENTER_COORDS = {
 
 CUSTOMER_GROUP_META = {
     "A": {"label": "A - Vestis / Aramark", "color": "#1d4ed8"},
-    "B": {"label": "B - Independents / Other", "color": "#2563eb"},
+    "B": {"label": "B - Alsco", "color": "#2563eb"},
     "C": {"label": "C - Cintas & UniFirst", "color": "#0f766e"},
     "D": {"label": "D - CSC Customers", "color": "#7c3aed"},
+    "E": {"label": "E - Independents / Other", "color": "#0ea5e9"},
+}
+
+ACTION_PLAN_GROUP_FILTERS = {
+    "all": {"label": "All"},
+    "A": {"label": "Vestis / Aramark"},
+    "B": {"label": "Alsco"},
+    "C": {"label": "Cintas / UniFirst"},
+    "D": {"label": "CSC"},
+    "E": {"label": "Independents"},
 }
 
 NON_CITY_LOCATION_WORDS = {
@@ -6449,6 +7496,7 @@ def render_home_dashboard_sidebar():
     ]
     admin_items = [
         ("User Accounts", "/user-accounts", "key"),
+        ("Audit Log", "/admin-audit-log", "clock"),
         ("Dismissed Customers", "/dismissed-customers-view", "archive"),
         ("PDL Enrichment Test", "/pdl-branch-view", "search"),
         ("CRM Activities", "/crm-activities-view", "clock"),
@@ -6469,7 +7517,9 @@ def render_home_dashboard_sidebar():
         render_item(label, href, icon, current=(label == "Home"))
         for label, href, icon in primary_items
     )
-    admin_html = "".join(render_item(label, href, icon) for label, href, icon in admin_items)
+    admin_html = ""
+    if can_manage_user_accounts(current_user):
+        admin_html = "".join(render_item(label, href, icon) for label, href, icon in admin_items)
     account_html = ""
     if current_display_name:
         account_html = (
@@ -6675,6 +7725,11 @@ def post_m365_send_email(
         recipient=recipient,
         subject=subject_text,
         body=body_text,
+    )
+    record_audit_event(
+        "send-email",
+        target=customer_name,
+        details=f"Sent to {recipient}",
     )
     clear_attention_response_cache()
     clear_home_queue_summaries_cache()
@@ -8118,6 +9173,7 @@ def render_enrichment_view(
     refresh: str = "",
     customer: str = "",
     customer_primary_key: str = "",
+    selected_customer_key: str = "",
     message: str = "",
     error: str = "",
 ):
@@ -8129,6 +9185,7 @@ def render_enrichment_view(
         refresh=refresh,
         customer=customer,
         customer_primary_key=customer_primary_key,
+        selected_customer_key=selected_customer_key,
         run="1",
         page_title="Customer Enrichment",
         mode_label="Existing re-check + new branch search",
@@ -8154,6 +9211,7 @@ def get_apollo_view(
     refresh: str = "",
     customer: str = "",
     customer_primary_key: str = "",
+    selected_customer_key: str = "",
 ):
     return render_enrichment_view(
         domain=domain,
@@ -8165,6 +9223,7 @@ def get_apollo_view(
         refresh=refresh,
         customer=customer,
         customer_primary_key=customer_primary_key,
+        selected_customer_key=selected_customer_key,
     )
 
 
@@ -8179,6 +9238,7 @@ def get_enrichment_view(
     refresh: str = "",
     customer: str = "",
     customer_primary_key: str = "",
+    selected_customer_key: str = "",
     message: str = "",
     error: str = "",
 ):
@@ -8192,6 +9252,7 @@ def get_enrichment_view(
         refresh=refresh,
         customer=customer,
         customer_primary_key=customer_primary_key,
+        selected_customer_key=selected_customer_key,
         message=message,
         error=error,
     )
@@ -8205,6 +9266,7 @@ def render_pdl_branch_view(
     refresh: str = "",
     customer: str = "",
     customer_primary_key: str = "",
+    selected_customer_key: str = "",
     run: str = "",
     page_title: str = "PDL Branch Test",
     mode_label: str = "PDL branch comparison",
@@ -8218,13 +9280,45 @@ def render_pdl_branch_view(
     error: str = "",
 ):
     try:
+        master_data_result = fetch_filemaker_master_data()
+        customer_options = (
+            build_enrichment_customer_options(master_data_result)
+            if master_data_result.get("status") == "ok"
+            else []
+        )
+        normalized_selected_customer_key = str(selected_customer_key or "").strip()
+        normalized_customer_primary_key = str(customer_primary_key or "").strip()
+        effective_customer_key = normalized_selected_customer_key or normalized_customer_primary_key
+        if effective_customer_key and master_data_result.get("status") == "ok":
+            customer_record = (master_data_result.get("customers_by_key") or {}).get(effective_customer_key) or {}
+            if customer_record:
+                customer = str(customer_record.get("company") or customer or "").strip()
+                customer_primary_key = effective_customer_key
+                branch_parts = extract_customer_branch_parts(customer)
+                organization_name = get_customer_organization_label(customer) or str(organization_name or "").strip()
+                expected_city = str(
+                    customer_record.get("city")
+                    or branch_parts.get("city")
+                    or expected_city
+                    or ""
+                ).strip()
+                expected_state = str(
+                    customer_record.get("state")
+                    or branch_parts.get("state")
+                    or expected_state
+                    or ""
+                ).strip()
+                inferred_domain = infer_customer_domain(effective_customer_key)
+                if inferred_domain:
+                    domain = inferred_domain
+
         force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on", "refresh"}
         explicit_run = str(run or "").strip().lower() in {"1", "true", "yes", "on", "run"}
         should_run = force_refresh or explicit_run or (
             auto_run and organization_name.strip() and expected_city.strip() and expected_state.strip()
         )
         branch_label = format_branch_expectation(expected_city, expected_state)
-        launched_from_customer = bool(str(customer or "").strip())
+        launched_from_customer = bool(str(customer_primary_key or "").strip())
         payload = {
             "status": "idle",
             "results": [],
@@ -8269,6 +9363,8 @@ def render_pdl_branch_view(
             organization_name,
             expected_city,
             expected_state,
+            customer_options=customer_options,
+            selected_customer_key=effective_customer_key,
             action_path=action_path,
             run_button_label=run_button_label,
             reset_href=reset_href,
@@ -8367,6 +9463,7 @@ def get_pdl_branch_view(
     refresh: str = "",
     customer: str = "",
     customer_primary_key: str = "",
+    selected_customer_key: str = "",
     run: str = "",
 ):
     return render_pdl_branch_view(
@@ -8377,6 +9474,7 @@ def get_pdl_branch_view(
         refresh=refresh,
         customer=customer,
         customer_primary_key=customer_primary_key,
+        selected_customer_key=selected_customer_key,
         run=run,
     )
 
@@ -9078,23 +10176,24 @@ def get_customer_latest_price_list(customer_orders):
 
 
 def infer_customer_group_code(customer_name, customer_orders=None, customer_record=None):
-    price_list = get_customer_latest_price_list(customer_orders)
-    if price_list in CUSTOMER_GROUP_META:
-        return price_list
-
     customer_text = normalize_apollo_location_value(customer_name)
     customer_type = normalize_apollo_location_value(
         (customer_record or {}).get("type", "")
     )
+    price_list = get_customer_latest_price_list(customer_orders)
 
     if "vestis" in customer_text or "aramark" in customer_text:
         return "A"
+    if "alsco" in customer_text:
+        return "B"
     if "cintas" in customer_text or "unifirst" in customer_text or "uni first" in customer_text:
         return "C"
     if "csc" in customer_text or "csc" in customer_type:
         return "D"
+    if price_list == "D":
+        return "D"
 
-    return "B"
+    return "E"
 
 
 def build_customer_map_rows(order_result=None, master_data_result=None):
@@ -10388,6 +11487,44 @@ def build_customer_enrichment_href(customer_name, customer_orders, crm_activitie
         if str(value or "").strip()
     }
     return "/enrichment-view" + (f"?{urlencode(filtered_query)}" if filtered_query else "")
+
+
+def build_enrichment_customer_options(master_data_result):
+    customers_by_key = (master_data_result or {}).get("customers_by_key") or {}
+    options = []
+    seen_keys = set()
+    for customer_key, customer_record in customers_by_key.items():
+        normalized_key = str(customer_key or "").strip()
+        if not normalized_key or normalized_key in seen_keys:
+            continue
+        seen_keys.add(normalized_key)
+
+        company_name = str((customer_record or {}).get("company") or "").strip()
+        if not company_name:
+            continue
+
+        city = str((customer_record or {}).get("city") or "").strip()
+        state = str((customer_record or {}).get("state") or "").strip()
+        branch_label = ", ".join(part for part in [city, state] if part)
+        label = f"{company_name} - {branch_label}" if branch_label else company_name
+        options.append(
+            {
+                "key": normalized_key,
+                "label": label,
+                "company": company_name,
+                "city": city,
+                "state": state,
+            }
+        )
+
+    return sorted(
+        options,
+        key=lambda item: (
+            str(item.get("company") or "").lower(),
+            str(item.get("state") or "").lower(),
+            str(item.get("city") or "").lower(),
+        ),
+    )
 
 
 def build_customer_pdl_href(customer_name, customer_orders, crm_activities=None):
@@ -12579,14 +13716,33 @@ def render_top_attention_row(customer):
     """
 
 
-def build_home_action_plan(attention_customers, grouped_orders, crm_activity_map, dismissed_customers=None):
+def build_home_action_plan(
+    attention_customers,
+    grouped_orders,
+    crm_activity_map,
+    dismissed_customers=None,
+    group_filter="all",
+    customers_by_key=None,
+):
     due_today_customers = []
     dismissed_customers = dismissed_customers or []
+    normalized_group_filter = normalize_action_plan_group_filter(group_filter)
+    customers_by_key = customers_by_key or {}
 
     for customer in attention_customers:
         customer_name = str(customer.get("customer", ""))
         customer_orders = grouped_orders.get(customer_name, [])
         customer_primary_key = get_customer_primary_key(customer_orders)
+        customer_record = customers_by_key.get(customer_primary_key, {})
+        customer_group = infer_customer_group_code(
+            customer_name,
+            customer_orders=customer_orders,
+            customer_record=customer_record,
+        )
+
+        if normalized_group_filter != "all" and customer_group != normalized_group_filter:
+            continue
+
         crm_activities = crm_activity_map.get(customer_primary_key, [])
         crm_activities = merge_recent_sent_emails_with_crm(customer_name, crm_activities)
         sales_activities = get_sales_outreach_activities(crm_activities)
@@ -12893,7 +14049,7 @@ def render_home_action_plan(action_plan):
     """
 
 
-def render_home_add_customer_form(customer_options, selected_customer="", home_view="focus"):
+def render_home_add_customer_form(customer_options, selected_customer="", home_view="focus", group_filter="all"):
     options_markup = "".join(
         f"<option value=\"{escape(str(customer_name or ''))}\"></option>"
         for customer_name in customer_options
@@ -12902,6 +14058,7 @@ def render_home_add_customer_form(customer_options, selected_customer="", home_v
     return f"""
         <form class="home-add-customer-form" method="get" action="/action-plan-view">
             <input type="hidden" name="view" value="{escape(str(home_view or 'focus'))}">
+            <input type="hidden" name="group" value="{escape(str(group_filter or 'all'))}">
             <label class="sr-only" for="home-add-customer">Add customer</label>
             <input
                 id="home-add-customer"
@@ -12921,7 +14078,40 @@ def render_home_add_customer_form(customer_options, selected_customer="", home_v
     """
 
 
-def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, customer_options=None, dismiss_customer=""):
+def normalize_action_plan_group_filter(group):
+    group_text = str(group or "all").strip()
+    if not group_text:
+        return "all"
+    if group_text.lower() == "all":
+        return "all"
+    group_code = group_text.upper()
+    if group_code in ACTION_PLAN_GROUP_FILTERS:
+        return group_code
+    return "all"
+
+
+def render_action_plan_group_toggle(selected_customer="", home_view="focus", group_filter="all"):
+    normalized_group = normalize_action_plan_group_filter(group_filter)
+
+    chips = []
+    for group_key, meta in ACTION_PLAN_GROUP_FILTERS.items():
+        class_name = "toggle-chip active" if group_key == normalized_group else "toggle-chip"
+        href = build_home_selection_href(
+            selected_customer="",
+            view=home_view,
+            group=group_key,
+            anchor="",
+        )
+        chips.append(f'<a class="{class_name}" href="{href}">{escape(str(meta.get("label") or group_key))}</a>')
+
+    return f"""
+        <div class="home-view-toggle home-group-toggle">
+            {''.join(chips)}
+        </div>
+    """
+
+
+def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, group_filter="all", customer_options=None, dismiss_customer=""):
     customer_options = customer_options or []
     queue_rows = "".join(
         render_home_queue_row(
@@ -12945,8 +14135,11 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
     return f"""
         <section class="home-workspace">
             <div class="home-workspace-topbar">
-                {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view)}
-                {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view)}
+                <div class="home-topbar-filters">
+                    {render_action_plan_group_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view=home_view, group_filter=group_filter)}
+                    {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view, group_filter=group_filter)}
+                </div>
+                {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view, group_filter=group_filter)}
             </div>
             {render_home_focus_preview(selected_preview, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
 
@@ -12974,15 +14167,17 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
     """
 
 
-def render_home_view_toggle(selected_customer, home_view):
+def render_home_view_toggle(selected_customer, home_view, group_filter="all"):
     focus_href = build_home_selection_href(
         selected_customer=selected_customer,
         view="focus",
+        group=group_filter,
         anchor="focus-preview",
     )
     list_href = build_home_selection_href(
         selected_customer=selected_customer,
         view="list",
+        group=group_filter,
         anchor="home-queue",
     )
     focus_class = "toggle-chip active" if home_view == "focus" else "toggle-chip"
@@ -12996,7 +14191,7 @@ def render_home_view_toggle(selected_customer, home_view):
     """
 
 
-def build_home_selection_href(selected_customer="", view="focus", anchor=""):
+def build_home_selection_href(selected_customer="", view="focus", group="all", anchor=""):
     params = {}
 
     if selected_customer:
@@ -13004,6 +14199,10 @@ def build_home_selection_href(selected_customer="", view="focus", anchor=""):
 
     if view and view != "focus":
         params["view"] = str(view)
+
+    normalized_group = normalize_action_plan_group_filter(group)
+    if normalized_group in ACTION_PLAN_GROUP_FILTERS and normalized_group != "all":
+        params["group"] = normalized_group
 
     query = urlencode(params)
     href = "/action-plan-view"
@@ -13046,7 +14245,7 @@ def get_home_selected_customer_name(queue_summaries, selected_customer="", custo
     return str(queue_summaries[0].get("customer", ""))
 
 
-def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map):
+def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map, master_data_result=None):
     started_at = time.perf_counter()
     cache_seconds = get_home_queue_summaries_cache_seconds()
     now = time.time()
@@ -13088,7 +14287,7 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
         return _HOME_QUEUE_SUMMARIES_CACHE["result"]
 
     summaries = []
-    master_data_result = fetch_filemaker_master_data()
+    master_data_result = master_data_result or fetch_filemaker_master_data()
     contacts_by_customer_key = (
         master_data_result.get("contacts_by_customer_key", {})
         if master_data_result.get("status") == "ok"
@@ -15287,12 +16486,25 @@ def render_apollo_refresh_action(customer, customer_primary_key, domain, contact
     return ""
 
 
-def render_pdl_filter_form(customer, customer_primary_key, domain, organization_name, expected_city, expected_state, action_path="/pdl-branch-view", run_button_label="Run PDL Search", reset_href="/pdl-branch-view", help_text="This is an admin-only branch-search comparison. It checks PDL candidates against the contacts already in FileMaker so we can judge whether PDL is worth adding for new branch discovery."):
+def render_pdl_filter_form(customer, customer_primary_key, domain, organization_name, expected_city, expected_state, customer_options=None, selected_customer_key="", action_path="/pdl-branch-view", run_button_label="Run PDL Search", reset_href="/pdl-branch-view", help_text="This is an admin-only branch-search comparison. It checks PDL candidates against the contacts already in FileMaker so we can judge whether PDL is worth adding for new branch discovery."):
+    customer_options_markup = "".join(
+        f'<option value="{escape(str(option.get("key") or ""))}"{" selected" if str(option.get("key") or "") == str(selected_customer_key or customer_primary_key or "").strip() else ""}>{escape(str(option.get("label") or ""))}</option>'
+        for option in (customer_options or [])
+        if str((option or {}).get("key") or "").strip()
+    )
     return f"""
         <form class="controls apollo-controls" method="get" action="{escape(action_path)}">
             <input type="hidden" name="customer" value="{escape(customer)}">
             <input type="hidden" name="customer_primary_key" value="{escape(customer_primary_key)}">
             <input type="hidden" name="run" value="1">
+
+            <label>
+                <span>Customer</span>
+                <select name="selected_customer_key">
+                    <option value="">Choose customer</option>
+                    {customer_options_markup}
+                </select>
+            </label>
 
             <label>
                 <span>Company Domain</span>
@@ -16906,6 +18118,8 @@ def get_pdl_status_message(status):
         return "PDL did not respond in time."
     if status == "invalid_response":
         return "PDL returned a response the app could not read."
+    if status == "http_404":
+        return "PDL did not find any branch contacts for that search."
     return f"PDL search failed: {status}."
 
 
@@ -17391,12 +18605,23 @@ def build_pdl_contact_enrichment_results(domain, organization_name, expected_cit
         elif moved_status.get("flag"):
             moved_branch += 1
 
+        branch_resolution = {"customer_ref": "", "reason": "", "matches": []}
+        if moved_status.get("kind") in {"moved_branch", "possible_branch_move"}:
+            pdl_city, pdl_state, _pdl_country = get_pdl_location_parts(person)
+            branch_resolution = resolve_enrichment_branch_customer_ref(
+                master_data_result,
+                company_name=get_pdl_company_name(person) or organization_name,
+                city=pdl_city,
+                state=pdl_state,
+            )
+
         results.append({
             "contact": row,
             "pdl_result": pdl_result,
             "branch_fit": branch_fit,
             "moved_status": moved_status,
             "detail_status": detail_status,
+            "branch_resolution": branch_resolution,
         })
 
     results = sorted(
@@ -17702,6 +18927,7 @@ def render_pdl_enrichment_candidate_row(item):
     branch_fit = item.get("branch_fit") or {}
     moved_status = item.get("moved_status") or {}
     detail_status = item.get("detail_status") or {}
+    branch_resolution = item.get("branch_resolution") or {}
     linkedin_url = normalize_external_url(person.get("linkedin_url") or "")
     linkedin_html = (
         f'<a href="{escape(linkedin_url)}" target="_blank" rel="noreferrer">LinkedIn profile</a>'
@@ -17724,7 +18950,7 @@ def render_pdl_enrichment_candidate_row(item):
     elif moved_status.get("flag"):
         status_class = "apollo-branch-status-branch"
 
-    moved_on_button = ""
+    action_html = "—"
     if moved_status.get("kind") == "moved_company":
         moved_on_href = "/enrichment/mark-moved-on?" + urlencode(
             {
@@ -17742,18 +18968,58 @@ def render_pdl_enrichment_candidate_row(item):
             },
             quote_via=quote,
         )
-        moved_on_button = (
-            f'<br><a class="button secondary small-button branch-filemaker-button" '
+        action_html = (
+            f'<a class="button secondary small-button branch-filemaker-button" '
             f'href="{escape(moved_on_href)}" title="Mark moved on in FileMaker" '
             f'aria-label="Mark {escape(str(contact.get("name") or "this contact"))} moved on in FileMaker">Moved on</a>'
         )
+    elif moved_status.get("kind") in {"moved_branch", "possible_branch_move"}:
+        pdl_city, pdl_state, _pdl_country = get_pdl_location_parts(person)
+        resolved_customer_ref = str(branch_resolution.get("customer_ref") or "").strip()
+        if resolved_customer_ref:
+            move_branch_href = "/enrichment/move-branch?" + urlencode(
+                {
+                    "customer": str(contact.get("company") or "").strip(),
+                    "customer_primary_key": str(contact.get("customer_ref") or "").strip(),
+                    "resolved_customer_ref": resolved_customer_ref,
+                    "domain": str(item.get("domain") or "").strip(),
+                    "organization_name": str(get_pdl_company_name(person) or "").strip(),
+                    "expected_city": str(contact.get("city") or "").strip(),
+                    "expected_state": str(contact.get("state") or "").strip(),
+                    "name": str(contact.get("name") or "").strip(),
+                    "position": str(contact.get("position") or "").strip(),
+                    "email": str(contact.get("email") or "").strip(),
+                    "phone": str(get_pdl_person_phone(person) or "").strip(),
+                    "city": str(pdl_city or "").strip(),
+                    "state": str(pdl_state or "").strip(),
+                    "source_label": "PDL enrichment branch move",
+                },
+                quote_via=quote,
+            )
+            action_label = "Update branch"
+            action_html = (
+                f'<a class="button secondary small-button branch-filemaker-button" '
+                f'href="{escape(move_branch_href)}" title="{escape(action_label)} in FileMaker" '
+                f'aria-label="{escape(action_label)} for {escape(str(contact.get("name") or "this contact"))} in FileMaker">{escape(action_label)}</a>'
+            )
+        else:
+            resolution_reason = str(branch_resolution.get("reason") or "").strip()
+            if resolution_reason in {"no_company_match", "ambiguous_company_match"}:
+                status_detail_text = (
+                    f"{status_detail_text} No matching FileMaker branch was found for this suggested move."
+                ).strip()
+
+    status_action_html = (
+        f'<div class="apollo-branch-status-action">{action_html}</div>'
+        if action_html != "—"
+        else ""
+    )
 
     return f"""
         <tr>
             <td>
                 <strong>{escape(str(contact.get("name") or "Unknown"))}</strong><br>
                 <span class="small muted">{escape(str(contact.get("email") or "Email not on FileMaker"))}</span>
-                {moved_on_button}
             </td>
             <td>{escape(str(person.get("job_title") or '—'))}</td>
             <td>{render_pdl_person_location(person)}</td>
@@ -17762,6 +19028,7 @@ def render_pdl_enrichment_candidate_row(item):
             <td>
                 <span class="apollo-branch-status-label {status_class}">{escape(status_label)}</span><br>
                 <span class="apollo-branch-status-detail">{escape(status_detail_text)}</span>
+                {status_action_html}
             </td>
         </tr>
     """
@@ -17851,6 +19118,7 @@ def render_pdl_branch_results(
     error_message = str(payload.get("error_message") or "").strip()
     cached = bool(payload.get("cached"))
     cache_note = render_pdl_cache_note(cached)
+    sql_query = payload.get("sql") or ""
 
     if status == "idle":
         return (
@@ -17867,13 +19135,18 @@ def render_pdl_branch_results(
                 {cache_note}
                 <p class="status error">{escape(get_pdl_status_message(status))}</p>
                 {f'<p class="small muted">{escape(error_message)}</p>' if error_message else ''}
+                {f'''
+                <details class="apollo-rejected-details" open>
+                    <summary>View PDL SQL</summary>
+                    <pre class="apollo-sql-preview">{escape(sql_query)}</pre>
+                </details>
+                ''' if sql_query else ''}
             </div>
         """
 
     diagnostics = payload.get("diagnostics") or {}
     existing_matches = payload.get("existing_matches") or []
     new_candidates = payload.get("new_candidates") or []
-    sql_query = payload.get("sql") or ""
 
     diagnostics_text = (
         f"PDL returned {int(diagnostics.get('total_returned', 0))} branch-local people. "
@@ -17946,10 +19219,16 @@ def render_pdl_branch_results(
             </div>
         """
     else:
-        new_html = """
+        new_html = f"""
             <div class="panel">
                 <h2>New Likely Branch Contacts</h2>
                 <p class="small muted">PDL did not return any branch-local candidates beyond the contacts already in FileMaker.</p>
+                {f'''
+                <details class="apollo-rejected-details" open>
+                    <summary>View PDL SQL</summary>
+                    <pre class="apollo-sql-preview">{escape(sql_query)}</pre>
+                </details>
+                ''' if sql_query else ''}
             </div>
         """
 
@@ -18115,6 +19394,7 @@ def render_global_nav(title):
                 <a href="/enrichment-view">Customer Enrichment</a>
                 <a href="/pdl-branch-view">PDL Enrichment Test</a>
                 <a href="/user-accounts">User Accounts</a>
+                <a href="/admin-audit-log">Audit Log</a>
                 <a href="/dismissed-customers-view">Dismissed Customers</a>
                 <a href="/filemaker-health">FileMaker Health</a>
                 <a href="/crm-activities-view">CRM Activities</a>
@@ -18124,6 +19404,8 @@ def render_global_nav(title):
             </div>
         </details>
     """
+    if not can_manage_user_accounts(current_user):
+        admin_menu = ""
 
     user_shell = ""
     if current_display_name:
@@ -18464,6 +19746,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         gap: 12px;
                     }}
 
+                    .home-topbar-filters {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        gap: 10px;
+                    }}
+
                     .home-view-toggle {{
                         display: inline-flex;
                         align-items: center;
@@ -18519,6 +19808,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         background: #ffffff;
                         color: #1652d1;
                         box-shadow: 0 6px 14px rgba(31, 95, 153, 0.08);
+                    }}
+
+                    .home-group-toggle .toggle-chip {{
+                        min-width: 0;
+                        padding: 0 14px;
                     }}
 
                     .home-focus-panel {{
@@ -20282,6 +21576,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         line-height: 1.15;
                     }}
 
+                    .org-chart-contact-preview-role {{
+                        margin: 1px 0 0;
+                        color: #52606d;
+                        font-size: 10px;
+                        font-weight: 400;
+                        line-height: 1.25;
+                    }}
+
                     .org-chart-contact-role {{
                         margin: 0;
                         color: #52606d;
@@ -21973,50 +23275,50 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .apollo-branch-table th:nth-child(1),
                     .apollo-branch-table td:nth-child(1) {{
-                        width: 14%;
-                        min-width: 160px;
+                        width: 18%;
+                        min-width: 150px;
                     }}
 
                     .apollo-branch-table th:nth-child(2),
                     .apollo-branch-table td:nth-child(2) {{
                         width: 11%;
-                        min-width: 130px;
+                        min-width: 100px;
                     }}
 
                     .apollo-branch-table th:nth-child(3),
                     .apollo-branch-table td:nth-child(3) {{
                         width: 12%;
-                        min-width: 140px;
+                        min-width: 105px;
                         white-space: normal;
                     }}
 
                     .apollo-branch-table th:nth-child(4),
                     .apollo-branch-table td:nth-child(4) {{
-                        width: 10%;
-                        min-width: 110px;
+                        width: 9%;
+                        min-width: 85px;
                         white-space: normal;
                     }}
 
                     .apollo-branch-table th:nth-child(5),
                     .apollo-branch-table td:nth-child(5) {{
-                        width: 14%;
-                        min-width: 130px;
+                        width: 10%;
+                        min-width: 95px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
 
                     .apollo-branch-table th:nth-child(6),
                     .apollo-branch-table td:nth-child(6) {{
-                        width: 39%;
-                        min-width: 260px;
+                        width: 40%;
+                        min-width: 240px;
                     }}
 
                     .apollo-branch-status-label {{
                         display: inline-block;
-                        margin-bottom: 6px;
-                        font-size: 13px;
+                        margin-bottom: 4px;
+                        font-size: 12px;
                         font-weight: 700;
-                        line-height: 1.25;
+                        line-height: 1.2;
                     }}
 
                     .apollo-branch-status-current {{
@@ -22061,21 +23363,29 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .apollo-branch-table .branch-filemaker-button {{
                         min-width: 0;
-                        width: 24px;
-                        height: 24px;
-                        padding: 0;
+                        width: auto;
+                        height: 26px;
+                        padding: 0 8px;
                         border-radius: 8px;
-                        font-size: 11px;
-                        font-weight: 700;
+                        font-size: 9px;
+                        font-weight: 600;
                         line-height: 1.1;
                         white-space: nowrap;
                     }}
 
                     .apollo-branch-status-detail {{
                         display: block;
-                        font-size: 10px;
+                        max-width: 100%;
+                        font-size: 9px;
                         line-height: 1.3;
                         color: #64748b;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .apollo-branch-status-action {{
+                        display: flex;
+                        justify-content: flex-start;
+                        margin-top: 6px;
                     }}
 
                     .apollo-linkedin-link {{
@@ -22986,6 +24296,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .home-workspace-topbar {{
                             align-items: stretch;
+                            gap: 8px;
+                        }}
+
+                        .home-topbar-filters {{
+                            width: 100%;
                             gap: 8px;
                         }}
 
