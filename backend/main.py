@@ -3212,36 +3212,11 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
     diagnostics = payload.get("diagnostics") or {}
     sql_query = str(payload.get("sql") or "").strip()
     openai_response = str(payload.get("openai_response") or "").strip()
-    credit_headers = payload.get("credit_headers") or {}
     is_openai_source = str(payload.get("source") or "").strip() == "openai"
     source_label = "OpenAI candidates" if is_openai_source else "PDL candidates"
     query_label = "View OpenAI request" if is_openai_source else "View PDL SQL"
     result_label = "View OpenAI response" if is_openai_source else ""
-    search_credit = float(diagnostics.get("search_credit_spent") or 0.0)
-    enrich_credit = float(diagnostics.get("enrich_credit_spent") or 0.0)
-    total_credit = float(diagnostics.get("total_credit_spent") or 0.0)
-    estimated_cost = float(diagnostics.get("estimated_cost") or 0.0)
     allowed_domains = sorted(get_known_company_domains(organization_name))
-
-    credit_markup = f"""
-        <div class="summary compact-summary strategic-contact-summary">
-            {render_simple_summary_item("Raw search", diagnostics.get("raw_people", 0))}
-            {render_simple_summary_item("Shortlist", diagnostics.get("returned", 0))}
-            {render_simple_summary_item("Known excluded", diagnostics.get("excluded_known_emails", 0))}
-            {render_simple_summary_item("Search credits", f"{search_credit:.1f}")}
-            {render_simple_summary_item("Enrich credits", f"{enrich_credit:.1f}")}
-            {render_simple_summary_item("Total credits", f"{total_credit:.1f}")}
-            {render_simple_summary_item("Est. cost", f"${estimated_cost:.2f}")}
-        </div>
-        <p class="small muted">
-            Credit headers:
-            spent={escape(str(credit_headers.get("x-call-credits-spent") or "0"))},
-            remaining={escape(str(credit_headers.get("x-totallimit-remaining") or "unknown"))},
-            lifetime_used={escape(str(credit_headers.get("x-lifetime-used") or "unknown"))},
-            rate_remaining={escape(str(credit_headers.get("x-ratelimit-remaining") or "unknown"))}.
-            {escape(("Used cached OpenAI discovery result." if payload.get("cached") else "Fresh OpenAI discovery result.") if is_openai_source else ("Used cached PDL search result." if payload.get("cached") else "Fresh PDL search result."))}
-        </p>
-    """
 
     if status != "ok":
         return f"""
@@ -3249,7 +3224,6 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
                 <h3>{escape(source_label)}</h3>
                 <p class="status error">{escape(get_strategic_status_message(status, payload.get("source") or ""))}</p>
                 {f'<p class="small muted">{escape(error_message)}</p>' if error_message else ''}
-                {credit_markup if diagnostics else ""}
                 {f"<details class='apollo-rejected-details'><summary>{escape(query_label)}</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
                 {f"<details class='apollo-rejected-details'><summary>{escape(result_label)}</summary><pre>{escape(openai_response)}</pre></details>" if is_openai_source and openai_response else ""}
             </section>
@@ -3381,7 +3355,6 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
                 {f" {int(diagnostics.get('already_in_filemaker', 0))} appear to already exist in FileMaker." if int(diagnostics.get('already_in_filemaker', 0)) else ""}
                 {f" {int(diagnostics.get('preview_only_returned', 0))} still need fuller enrichment." if int(diagnostics.get('preview_only_returned', 0)) else ""}
             </p>
-            {credit_markup}
             {f"<details class='apollo-rejected-details'><summary>{escape(query_label)}</summary><pre>{escape(sql_query)}</pre></details>" if sql_query else ""}
             <div class="strategic-contact-grid">{''.join(primary_rows)}</div>
             {verification_section}
