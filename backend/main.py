@@ -799,6 +799,12 @@ def can_manage_strategic_contacts(user):
     return can_manage_user_accounts(user)
 
 
+def can_search_strategic_contacts(user):
+    if not get_app_login_enabled():
+        return True
+    return bool(user and bool(user.get("active", True)))
+
+
 def get_default_filemaker_company_label_for_contact(contact):
     return ORG_CHART_FILEMAKER_COMPANY_LABELS.get(
         get_org_chart_group_key(contact.get("organization")),
@@ -5329,10 +5335,10 @@ def post_strategic_contacts_search(
     discover_refresh: str = Form(""),
 ):
     current_user = get_current_session_user()
-    if not can_manage_strategic_contacts(current_user):
+    if not can_search_strategic_contacts(current_user):
         return render_page(
             title="Strategic Contacts",
-            body="<p class='status error'>You do not have permission to manage strategic contacts.</p>",
+            body="<p class='status error'>You must be signed in to search strategic contacts.</p>",
         )
 
     discover_org = str(discover_org or "").strip()
