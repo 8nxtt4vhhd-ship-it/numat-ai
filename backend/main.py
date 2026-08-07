@@ -16641,46 +16641,6 @@ def render_pdl_filter_form(customer, customer_primary_key, domain, organization_
                 </select>
             </label>
 
-            <label>
-                <span>Company Domain</span>
-                <input
-                    type="search"
-                    name="domain"
-                    value="{escape(domain)}"
-                    placeholder="cintas.com"
-                >
-            </label>
-
-            <label>
-                <span>Organisation Name</span>
-                <input
-                    type="search"
-                    name="organization_name"
-                    value="{escape(organization_name)}"
-                    placeholder="Cintas"
-                >
-            </label>
-
-            <label>
-                <span>Expected City</span>
-                <input
-                    type="search"
-                    name="expected_city"
-                    value="{escape(expected_city)}"
-                    placeholder="Branford"
-                >
-            </label>
-
-            <label>
-                <span>Expected State</span>
-                <input
-                    type="search"
-                    name="expected_state"
-                    value="{escape(expected_state)}"
-                    placeholder="CT"
-                >
-            </label>
-
             <div class="apollo-action-row apollo-form-actions">
                 <button type="submit">{escape(run_button_label)}</button>
                 <a class="button secondary" href="{escape(reset_href)}">Reset</a>
