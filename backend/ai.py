@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-07-substantive-concise-outreach-7"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-07-assume-uncompleted-schedules-10"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 RECENT_REPLY_ANCHOR_DAYS = 30
@@ -816,6 +816,7 @@ def generate_action_plan_email_draft(context):
 
     payload_keys = [
         "customer",
+        "analysis_date",
         "days_since_last_order",
         "average_cycle",
         "order_cycle_pattern",
@@ -831,6 +832,9 @@ def generate_action_plan_email_draft(context):
         "primary_contact",
     ]
     draft_context = {key: context.get(key) for key in payload_keys}
+    draft_context["recent_sales_context"] = redact_expired_scheduling_notes(
+        draft_context.get("recent_sales_context")
+    )
     cache_key = (
         "action-plan-email-only",
         _OUTREACH_PREP_PROMPT_VERSION,
@@ -854,6 +858,9 @@ def generate_action_plan_email_draft(context):
                         "Write one short customer email for NuMat, which repairs damaged mats for industrial laundry and mat-service customers. "
                         "Return strict JSON with only email_subject and email_body. Use only supplied facts. "
                         "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
+                        "Treat analysis_date as today. Every CRM item's date and age_days determine when its wording was true. Relative phrases inside an old item—such as 'tomorrow', 'this week', 'next week', 'later this month', or 'next month'—are relative to that item's date, not analysis_date. "
+                        "For an expired scheduling proposal with no later recorded outcome, assume the proposed visit or meeting did not take place. You may acknowledge that naturally (for example, 'We didn't manage to connect when I was due to be in the area') and suggest arranging another time when that is the most useful next step. Never ask the customer whether the visit happened, imply that it did happen, or invent a reason it was missed. "
+                        "Do not invent a new visit date, travel plan, meeting, or availability. You may ask whether the customer would like to arrange a new time, but only state specific new timing when the supplied current context explicitly supports it. "
                         "Sound simple, purposeful, sincere, familiar, and plainspoken—not polished sales copy. Match usable outbound style without copying errors. "
                         "Choose one purpose: answer a live update; address a recorded blocker; continue an agreed action; close the loop after unanswered attempts; re-open a responsive relationship; identify the right contact; or check for a current repair need. "
                         "If outbound attempts are 3 or more with no replies, do not ask about damaged-mat volume or pitch benefits; ask whether this is still the right contact or close the loop. "
@@ -891,9 +898,11 @@ def generate_action_plan_email_draft(context):
         )
         parsed = json.loads(response.output_text.strip())
         subject = str(parsed.get("email_subject") or "").strip()
-        body = str(parsed.get("email_body") or "").strip()
+        body = normalize_action_plan_email_signoff(parsed.get("email_body"))
         if not subject or not body:
             raise ValueError("Email-only response was missing subject or body")
+        if draft_reuses_expired_relative_timing(context, subject, body):
+            return build_expired_timing_safe_email(context)
         result = {"email_subject": subject, "email_body": body}
         cache_outreach_prep(cache_key, result)
         return result
@@ -903,6 +912,85 @@ def generate_action_plan_email_draft(context):
             "email_subject": fallback["email_subject"],
             "email_body": fallback["email_body"],
         }
+
+
+def draft_reuses_expired_relative_timing(context, subject, body):
+    if not any(
+        bool(item.get("relative_timing_expired"))
+        for item in (context.get("recent_sales_context") or [])
+        if isinstance(item, dict)
+    ):
+        return False
+
+    draft_text = f"{subject} {body}".lower()
+    unsupported_timing_phrases = [
+        "tomorrow",
+        "later this week",
+        "this week",
+        "next week",
+        "later this month",
+        "this month",
+        "next month",
+        "i will be in",
+        "i'll be in",
+        "i’m planning to be in",
+        "i'm planning to be in",
+        "cancelled visit",
+        "canceled visit",
+        "after our visit",
+        "after the visit",
+        "during our visit",
+        "when we met",
+        "visit went well",
+        "planned visit",
+        "possible visit",
+        "proposed visit",
+        "did the visit",
+        "if that visit",
+        "whether the visit",
+        "whether we visited",
+    ]
+    return any(phrase in draft_text for phrase in unsupported_timing_phrases)
+
+
+def build_expired_timing_safe_email(context):
+    primary_contact = context.get("primary_contact") or {}
+    first_name = get_contact_first_name(primary_contact.get("name"))
+    greeting = f"Hi {first_name}," if first_name else "Hi,"
+    return {
+        "email_subject": "Current repair needs",
+        "email_body": (
+            f"{greeting}\n\n"
+            "It has been a while since the last repair order. "
+            "Do you have any mats that would be useful for us to review at the moment?\n\n"
+            "Thanks,"
+        ),
+    }
+
+
+def redact_expired_scheduling_notes(items):
+    redacted = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        cleaned = dict(item)
+        if cleaned.get("relative_timing_expired"):
+            cleaned["subject"] = "Expired scheduling proposal"
+            cleaned["preview"] = (
+                "The proposed timing has passed and there is no later CRM note confirming that it happened. "
+                "Assume it did not take place. It may be acknowledged as a missed connection, but do not ask "
+                "whether it happened, claim that it happened, or invent why it was missed."
+            )
+        redacted.append(cleaned)
+    return redacted
+
+
+def normalize_action_plan_email_signoff(body):
+    lines = str(body or "").strip().splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().lower() == "thanks,":
+            return "\n".join(lines[:index] + ["Thanks,"]).strip()
+    return "\n".join(lines).strip()
 
 
 def build_data_question_fallback(question_payload):

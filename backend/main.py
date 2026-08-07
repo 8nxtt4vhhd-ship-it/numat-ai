@@ -12061,8 +12061,18 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
     # and to learn the salesperson's voice. Direction is deliberately explicit so
     # customer replies are treated as conversation, not as style examples.
     for activity in sales_activities[:6]:
+        activity_age_days = get_crm_days_since_latest_activity(activity)
+        activity_text = " ".join(
+            part for part in [
+                str(activity.get("subject") or "").strip(),
+                clean_activity_content(activity.get("body", "")),
+            ]
+            if part
+        )
         recent_sales_context.append({
             "date": format_optional_datetime(activity.get("date_created", "")),
+            "age_days": activity_age_days,
+            "relative_timing_expired": has_expired_relative_timing(activity_text, activity_age_days),
             "direction": str(activity.get("direction") or "").strip().title() or "Unknown",
             "crm_type": format_sales_activity_type(activity.get("crm_type")),
             "subject": str(activity.get("subject") or "").strip(),
@@ -12183,6 +12193,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
 
     return {
         "customer": customer,
+        "analysis_date": get_analysis_today().strftime("%Y-%m-%d"),
         "priority_score": attention.get("priority_score") if attention else "",
         "action": attention.get("action") if attention else "",
         "days_since_last_order": days_since_last_order,
@@ -13939,6 +13950,24 @@ def get_crm_days_since_latest_activity(latest_crm_activity):
         return None
 
     return (get_analysis_today().date() - activity_date.date()).days
+
+
+def has_expired_relative_timing(text, age_days):
+    """Return true when relative scheduling language is no longer current."""
+    if not isinstance(age_days, (int, float)) or age_days < 0:
+        return False
+
+    lowered = str(text or "").lower()
+    thresholds = {
+        "tomorrow": 2,
+        "later this week": 7,
+        "this week": 7,
+        "next week": 14,
+        "later this month": 31,
+        "this month": 31,
+        "next month": 45,
+    }
+    return any(phrase in lowered and age_days > max_age for phrase, max_age in thresholds.items())
 
 
 def get_sales_outreach_activities(activities):
