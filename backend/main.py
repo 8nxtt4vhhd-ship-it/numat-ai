@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import itsdangerous
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from apollo import (
@@ -32,6 +32,7 @@ from ai import add_ai_explanations
 from ai import build_outreach_prep_fallback
 from ai import discover_strategic_contacts_with_openai
 from ai import generate_data_question_answer
+from ai import generate_action_plan_email_draft
 from ai import generate_outreach_prep
 from analysis import (
     analyze_order_cycle,
@@ -115,8 +116,8 @@ CRM_SYNC_STATUS = {
 AUTO_CRM_SYNC_THREAD_LOCK = Lock()
 AUTO_CRM_SYNC_THREAD_STARTED = False
 
-APOLLO_BRANCH_CACHE_VERSION = "v5"
-PDL_BRANCH_CACHE_VERSION = "v2"
+APOLLO_BRANCH_CACHE_VERSION = "v6-no-aramark"
+PDL_BRANCH_CACHE_VERSION = "v3-no-aramark"
 
 COMMON_COMPANY_TOKENS = {
     "inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation",
@@ -774,8 +775,8 @@ STRATEGIC_CONTACT_METHOD_OPTIONS = [
 
 ORG_CHART_GROUPS = {
     "vestis-aramark": {
-        "label": "Vestis / Aramark",
-        "organizations": ("vestis", "aramark", "ameripride"),
+        "label": "Vestis",
+        "organizations": ("vestis", "ameripride"),
     },
     "alsco": {
         "label": "Alsco",
@@ -2436,7 +2437,7 @@ def get_known_strategic_search_exclusions(organization_name, max_count=150):
 
 
 def build_pdl_strategic_search_query(organization_name, region="", function="", exclude_emails=None):
-    organization_aliases = get_company_search_aliases(organization_name) or [organization_name]
+    organization_aliases = get_enrichment_company_search_aliases(organization_name)
     normalized_org = normalize_apollo_location_value(organization_name)
 
     region_terms = get_state_search_terms(region) if len(str(region or "").strip()) <= 3 else [str(region or "").strip()]
@@ -2482,7 +2483,6 @@ def build_pdl_strategic_search_query(organization_name, region="", function="", 
         include_company_terms = [
             "vestis",
             "ameripride",
-            "aramark uniform",
         ]
     elif normalized_org in {"cintas", "unifirst", "uni first"}:
         include_company_terms = [
@@ -2557,6 +2557,12 @@ def strategic_pdl_person_matches_focus(organization_name, person, allowed_domain
     headline_text = normalize_apollo_location_value(person.get("headline"))
     email_domain = extract_domain_from_email(get_pdl_person_email(person))
     combined_text = " ".join(part for part in [company_text, title_text, headline_text] if part).strip()
+    if (
+        "aramark" in company_text
+        or "aramark" in headline_text
+        or email_domain == "aramark.com"
+    ):
+        return False
     trusted_domains = {
         extract_domain_from_url(domain)
         for domain in (allowed_domains or [])
@@ -2626,7 +2632,6 @@ def strategic_pdl_person_matches_focus(organization_name, person, allowed_domain
         trusted_company_terms = [
             "vestis",
             "vestis uniform",
-            "aramark uniform",
             "ameripride",
         ]
         exclude_terms = [
@@ -3703,16 +3708,24 @@ def search_apollo_strategic_contacts(organization_name, region="", function="", 
                 "industry": str(organization_payload.get("industry") or "").strip(),
             }
         )
-        if canonical_name and canonical_name.lower() not in {
+        if (
+            canonical_name
+            and "aramark" not in normalize_apollo_location_value(canonical_name)
+            and canonical_name.lower() not in {
             item.lower() for item in canonical_organization_names
-        }:
+            }
+        ):
             canonical_organization_names.append(canonical_name)
         organization_id = str(
             organization_payload.get("id")
             or organization_payload.get("organization_id")
             or ""
         ).strip()
-        if organization_id and organization_id not in organization_ids:
+        if (
+            organization_id
+            and "aramark" not in normalize_apollo_location_value(canonical_name)
+            and organization_id not in organization_ids
+        ):
             organization_ids.append(organization_id)
 
     existing_contacts = load_strategic_contacts()
@@ -3727,7 +3740,7 @@ def search_apollo_strategic_contacts(organization_name, region="", function="", 
     searched_titles = get_apollo_strategic_search_titles(function=function)
     searched_seniorities = get_apollo_strategic_seniorities(function=function)
     location_filters = [str(region or "").strip()] if str(region or "").strip() else []
-    organization_aliases = get_company_search_aliases(organization_name)
+    organization_aliases = get_enrichment_company_search_aliases(organization_name)
     for canonical_name in canonical_organization_names:
         if canonical_name and canonical_name.lower() not in {
             item.lower() for item in organization_aliases
@@ -3748,7 +3761,7 @@ def search_apollo_strategic_contacts(organization_name, region="", function="", 
                 organization_ids=organization_ids,
                 organization_names=organization_aliases,
                 person_seniorities=searched_seniorities,
-                keywords=organization_name,
+                keywords=("Vestis" if "aramark" in normalize_apollo_location_value(organization_name) else organization_name),
                 per_page=25,
                 page=page,
                 force_refresh=force_refresh,
@@ -3797,15 +3810,24 @@ def search_apollo_strategic_contacts(organization_name, region="", function="", 
         raw_name = get_apollo_person_name(person)
         raw_title = str(person.get("title") or "").strip()
         raw_org = str((person.get("organization") or {}).get("name") or organization_name).strip()
+        raw_domain = extract_domain_from_url((person.get("organization") or {}).get("primary_domain") or "")
+        raw_email = str(person.get("email") or "").strip().lower()
+        if (
+            "aramark" in normalize_apollo_location_value(raw_org)
+            or raw_domain == "aramark.com"
+            or extract_domain_from_email(raw_email) == "aramark.com"
+        ):
+            skipped_company_mismatch += 1
+            continue
         raw_preview_candidates.append(
             {
                 "name": raw_name,
-                "email": str(person.get("email") or "").strip().lower(),
+                "email": raw_email,
                 "phone": str(extract_apollo_phone(person) or "").strip(),
                 "title": raw_title,
                 "linkedin_url": normalize_external_url(person.get("linkedin_url") or ""),
                 "organization_name": raw_org,
-                "organization_domain": extract_domain_from_url((person.get("organization") or {}).get("primary_domain") or ""),
+                "organization_domain": raw_domain,
                 "region": str(person.get("state") or region or "").strip(),
                 "city": str(person.get("city") or "").strip(),
                 "country": str(person.get("country") or "").strip(),
@@ -6328,6 +6350,36 @@ def get_action_plan_view(
     )
 
 
+@app.post("/action-plan-draft")
+def post_action_plan_draft(draft_token: str = Form("")):
+    """Generate the slower tailored draft without blocking the Action Plan page."""
+    current_user = get_current_session_user()
+    if not current_user:
+        return JSONResponse({"status": "unauthorized"}, status_code=401)
+
+    try:
+        payload = itsdangerous.URLSafeTimedSerializer(
+            os.getenv("APP_SESSION_SECRET", "change-this-session-secret"),
+            salt="action-plan-draft",
+        ).loads(str(draft_token or ""), max_age=600)
+    except itsdangerous.BadData:
+        return JSONResponse({"status": "invalid_or_expired_draft"}, status_code=400)
+
+    if str(payload.get("username") or "") != str(current_user.get("username") or ""):
+        return JSONResponse({"status": "draft_owner_mismatch"}, status_code=403)
+
+    context = payload.get("context") or {}
+    if not isinstance(context, dict) or not str(context.get("customer") or "").strip():
+        return JSONResponse({"status": "invalid_draft_context"}, status_code=400)
+
+    result = generate_action_plan_email_draft(context)
+    return {
+        "status": "ok",
+        "email_subject": str(result.get("email_subject") or "").strip(),
+        "email_body": str(result.get("email_body") or "").strip(),
+    }
+
+
 @app.get("/api")
 def read_api_root():
     return {
@@ -7042,7 +7094,7 @@ STATE_CENTER_COORDS = {
 }
 
 CUSTOMER_GROUP_META = {
-    "A": {"label": "A - Vestis / Aramark", "color": "#1d4ed8"},
+    "A": {"label": "A - Vestis", "color": "#1d4ed8"},
     "B": {"label": "B - Alsco", "color": "#2563eb"},
     "C": {"label": "C - Cintas & UniFirst", "color": "#0f766e"},
     "D": {"label": "D - CSC Customers", "color": "#7c3aed"},
@@ -7051,7 +7103,7 @@ CUSTOMER_GROUP_META = {
 
 ACTION_PLAN_GROUP_FILTERS = {
     "all": {"label": "All"},
-    "A": {"label": "Vestis / Aramark"},
+    "A": {"label": "Vestis"},
     "B": {"label": "Alsco"},
     "C": {"label": "Cintas / UniFirst"},
     "D": {"label": "CSC"},
@@ -8170,7 +8222,7 @@ def render_customer_map_page(rows):
                         <span class="customer-map-control-label">Group Filter</span>
                         <select class="customer-map-select" id="customer-map-group-filter">
                             <option value="all">All groups</option>
-                            <option value="A">A - Vestis / Aramark</option>
+                            <option value="A">A - Vestis</option>
                             <option value="B">B - Independents / Other</option>
                             <option value="C">C - Cintas & UniFirst</option>
                             <option value="D">D - CSC Customers</option>
@@ -11320,7 +11372,7 @@ def is_trusted_company_domain_for_org(domain, organization_name):
         return False
 
     alias_tokens = set()
-    for alias in get_company_search_aliases(organization_name):
+    for alias in get_enrichment_company_search_aliases(organization_name):
         normalized_alias = normalize_apollo_location_value(alias)
         if not normalized_alias:
             continue
@@ -11333,7 +11385,7 @@ def is_trusted_company_domain_for_org(domain, organization_name):
             if token and len(token) > 2
         )
 
-    if "vestis" in alias_tokens or "aramark" in alias_tokens:
+    if "vestis" in alias_tokens:
         alias_tokens.update({"ameripride"})
 
     domain_compact = normalized_domain.replace("-", "").replace(".", "")
@@ -11350,7 +11402,7 @@ def get_known_company_domains(organization_name):
         return set()
 
     override_domains = set()
-    for alias in get_company_search_aliases(organization_name) + [organization_name]:
+    for alias in get_enrichment_company_search_aliases(organization_name):
         normalized_alias = normalize_apollo_location_value(alias)
         if not normalized_alias:
             continue
@@ -11370,9 +11422,13 @@ def get_known_company_domains(organization_name):
     domain_counts = {}
     for row in rows:
         company = str(row.get("company") or "").strip()
+        if "aramark" in normalize_apollo_location_value(company):
+            continue
         if not company_family_matches(organization_name, company):
             continue
         domain = extract_domain_from_email(row.get("email"))
+        if domain == "aramark.com":
+            continue
         if not is_trusted_company_domain_for_org(domain, organization_name):
             continue
         domain_counts[domain] = domain_counts.get(domain, 0) + 1
@@ -12001,13 +12057,16 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
     activity_type_summary = summarize_sales_activity_types(sales_activities)
     activity_type_counts = activity_type_summary["counts"]
 
-    for activity in sales_activities[:5]:
+    # Give the model enough of the real exchange to understand what was discussed
+    # and to learn the salesperson's voice. Direction is deliberately explicit so
+    # customer replies are treated as conversation, not as style examples.
+    for activity in sales_activities[:6]:
         recent_sales_context.append({
             "date": format_optional_datetime(activity.get("date_created", "")),
             "direction": str(activity.get("direction") or "").strip().title() or "Unknown",
             "crm_type": format_sales_activity_type(activity.get("crm_type")),
             "subject": str(activity.get("subject") or "").strip(),
-            "preview": truncate_text(clean_activity_content(activity.get("body", "")) or activity.get("subject", ""), 180),
+            "preview": truncate_text(clean_activity_content(activity.get("body", "")) or activity.get("subject", ""), 700),
         })
 
     last_sales_activity = sales_activities[0] if sales_activities else None
@@ -14089,6 +14148,7 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
     queue_rows = "".join(
         render_home_queue_row(
             summary,
+            group_filter=group_filter,
             is_selected=(
                 home_view == "focus"
                 and selected_preview
@@ -14114,7 +14174,7 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
                 </div>
                 {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view, group_filter=group_filter)}
             </div>
-            {render_home_focus_preview(selected_preview, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
+            {render_home_focus_preview(selected_preview, group_filter=group_filter, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
 
             <section class="panel home-queue-panel" id="home-queue">
                 <div class="panel-head home-queue-head">
@@ -14682,7 +14742,17 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         if not attention:
             attention = manual_customer
     context = build_outreach_context(selected_customer, customer_orders, attention, crm_result)
+    # Render immediately with local data; the tailored draft is fetched after the
+    # page is interactive so model latency never blocks navigation.
     result = build_outreach_prep_fallback(context)
+    current_user = get_current_session_user() or {}
+    draft_token = itsdangerous.URLSafeTimedSerializer(
+        os.getenv("APP_SESSION_SECRET", "change-this-session-secret"),
+        salt="action-plan-draft",
+    ).dumps({
+        "username": str(current_user.get("username") or ""),
+        "context": context,
+    })
     result = apply_test_customer_outreach_mode_overrides(result, selected_customer)
     target_contact_name = str(result.get("recommended_contact_name") or "").strip()
     target_contact_email = str(result.get("recommended_contact_email") or "").strip()
@@ -14709,6 +14779,8 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         "queue_summary": queue_summary,
         "context": context,
         "result": result,
+        "draft_async": True,
+        "draft_token": draft_token,
         "target_name": target_contact_name,
         "target_email": target_contact_email,
         "target_role": target_role,
@@ -14914,6 +14986,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     context = preview.get("context") or {}
     result = preview.get("result") or {}
     queue_summary = preview.get("queue_summary") or {}
+    draft_async = bool(preview.get("draft_async"))
     primary_contact = context.get("primary_contact") or {}
     target_name = str(preview.get("target_name") or "Best known contact").strip()
     target_email = str(preview.get("target_email") or "").strip()
@@ -14941,8 +15014,10 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     confirm_body_id = f"home-focus-confirm-body-{slug}"
     overview_text = build_home_focus_account_overview(context, queue_summary)
     evidence_strength = condense_evidence_strength(result.get("evidence_strength") or "Not available")
-    email_subject = str(result.get("email_subject") or "").strip() or "Not available"
-    email_body = str(result.get("email_body") or "").strip() or "Not available"
+    email_subject = "" if draft_async else (str(result.get("email_subject") or "").strip() or "Not available")
+    email_body = "" if draft_async else (str(result.get("email_body") or "").strip() or "Not available")
+    draft_status_id = f"home-focus-draft-status-{slug}"
+    draft_token_json = json.dumps(str(preview.get("draft_token") or ""))
     suggested_text_message = str(result.get("suggested_text_message") or "").strip() or "Not available"
     recipient_options = build_home_focus_recipient_options(
         customer_name=customer_name,
@@ -15093,15 +15168,6 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
             </div>
             <p class="home-focus-mode-note" id="{mode_note_id}">Recommended: {escape(recommended_mode_label)}</p>
         """
-        send_status_note = (
-            (
-                f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}<br><span class='muted'>Fast send is on. Send Email will go immediately.</span></p>"
-                if skip_send_confirmation else
-                f"<p class='outreach-m365-note'><strong>Sending as:</strong> {escape(sender_mailbox)}<br><span class='muted'>You will be asked to confirm before sending.</span></p>"
-            )
-            if m365_state.get("connected") and sender_mailbox
-            else "<p class='outreach-m365-note'>Connect Microsoft 365 to send from Sales Focus, or use the full prep page while we keep testing.</p>"
-        )
         primary_action = (
             (
                 f"""
@@ -15157,8 +15223,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         <form method="post" action="/m365/send-email" class="outreach-draft-form home-focus-draft-form" id="home-focus-send-form-{slug}">
                             <input type="hidden" name="customer" value="{escape(customer_name)}">
                             <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
-                            <p class="outreach-edit-note">Edit the draft here, then send without leaving the queue.</p>
-                            {send_status_note}
+                            {f'<p class="outreach-edit-note" id="{draft_status_id}">Writing a tailored draft from the conversation history…</p>' if draft_async else ''}
                             <div class="outreach-draft-row">
                                 <label class="label" for="{to_input_id}">To</label>
                                 <div class="home-focus-recipient-row">
@@ -15176,11 +15241,11 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             </div>
                             <div class="outreach-draft-row">
                                 <label class="label" for="{subject_input_id}">Subject</label>
-                                <input id="{subject_input_id}" class="outreach-draft-input" type="text" name="subject" value="{escape(email_subject)}" placeholder="Enter subject" autocomplete="off" />
+                                <input id="{subject_input_id}" class="outreach-draft-input" type="text" name="subject" value="{escape(email_subject)}" placeholder="{'Writing tailored subject…' if draft_async else 'Enter subject'}" autocomplete="off" />
                             </div>
                             <div class="outreach-draft-row outreach-draft-row-body">
                                 <label class="label" for="{body_input_id}">Body</label>
-                                <textarea id="{body_input_id}" class="outreach-draft-textarea home-focus-draft-textarea" name="body" rows="9" placeholder="Enter email draft">{escape(email_body)}</textarea>
+                                <textarea id="{body_input_id}" class="outreach-draft-textarea home-focus-draft-textarea" name="body" rows="9" placeholder="{'Writing tailored draft…' if draft_async else 'Enter email draft'}">{escape(email_body)}</textarea>
                             </div>
                             <div class="outreach-draft-actions home-focus-draft-actions">
                                 {primary_action}
@@ -15325,10 +15390,41 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         }}
                         if (missingState) missingState.hidden = !!phone;
                     }}
+                    async function loadHomeFocusDraft(slug) {{
+                        const form = document.getElementById(`home-focus-send-form-${{slug}}`);
+                        const status = document.getElementById(`home-focus-draft-status-${{slug}}`);
+                        const subject = document.getElementById(`home-focus-email-subject-${{slug}}`);
+                        const body = document.getElementById(`home-focus-email-body-${{slug}}`);
+                        const sendButton = form?.querySelector('.home-focus-send-button');
+                        if (sendButton?.tagName === 'BUTTON') sendButton.disabled = true;
+                        try {{
+                            const draftData = new URLSearchParams();
+                            draftData.set('draft_token', {draft_token_json});
+                            const response = await fetch('/action-plan-draft', {{
+                                method: 'POST',
+                                headers: {{'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded'}},
+                                body: draftData.toString(),
+                            }});
+                            const payload = await response.json();
+                            if (!response.ok || payload.status !== 'ok' || !payload.email_body) {{
+                                throw new Error(payload.status || 'draft_unavailable');
+                            }}
+                            if (subject) subject.value = payload.email_subject || '';
+                            if (body) body.value = payload.email_body;
+                            if (status) status.hidden = true;
+                            if (sendButton?.tagName === 'BUTTON') sendButton.disabled = false;
+                        }} catch (error) {{
+                            if (status) {{
+                                status.hidden = false;
+                                status.textContent = 'The tailored draft could not be loaded. Open the full prep page to retry.';
+                            }}
+                        }}
+                    }}
                     document.addEventListener('DOMContentLoaded', function () {{
                         hideHomeFocusM365SendConfirm('{slug}');
                         setHomeFocusMode('{slug}', '{initial_mode}');
                         syncHomeFocusCallContact('{slug}');
+                        {'loadHomeFocusDraft(' + json.dumps(slug) + ');' if draft_async else ''}
                     }});
                 </script>
             </section>
@@ -15350,7 +15446,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     """
 
 
-def render_home_focus_preview(preview, dismiss_open=False):
+def render_home_focus_preview(preview, group_filter="all", dismiss_open=False):
     if not preview:
         return """
             <section class="panel home-focus-panel" id="focus-preview">
@@ -15366,6 +15462,7 @@ def render_home_focus_preview(preview, dismiss_open=False):
     return_to = build_home_selection_href(
         selected_customer=customer_name,
         view="focus",
+        group=group_filter,
         anchor="focus-preview",
     )
     outreach_prep_href = build_outreach_prep_href(
@@ -15391,7 +15488,7 @@ def render_home_focus_preview(preview, dismiss_open=False):
             <form method="post" action="/action-plan-dismiss" class="home-dismiss-form">
                 <input type="hidden" name="customer" value="{escape(customer_name)}">
                 <input type="hidden" name="last_order" value="{escape(str(queue_summary.get('last_order', '')))}">
-                <input type="hidden" name="return_to" value="/#home-queue">
+                <input type="hidden" name="return_to" value="{escape(build_home_selection_href(view='focus', group=group_filter, anchor='home-queue'))}">
                 <div class="home-dismiss-presets">
                     <button type="submit" name="reason_preset" value="No damaged mats ready" class="home-dismiss-chip">No damaged mats ready</button>
                     <button type="submit" name="reason_preset" value="Waiting on manager decision" class="home-dismiss-chip">Waiting on manager decision</button>
@@ -15436,11 +15533,12 @@ def render_home_focus_preview(preview, dismiss_open=False):
     """
 
 
-def render_home_queue_row(summary, is_selected=False):
+def render_home_queue_row(summary, group_filter="all", is_selected=False):
     customer_name = str(summary.get("customer", ""))
     select_href = build_home_selection_href(
         selected_customer=customer_name,
         view="focus",
+        group=group_filter,
         anchor="focus-preview",
     )
     outreach_prep_href = build_outreach_prep_href(
@@ -17157,8 +17255,7 @@ EMAIL_FIRST_COMPANY_ALIASES = (
 )
 
 STRATEGIC_CONTACT_DOMAIN_OVERRIDES = {
-    "vestis": ["vestis.com", "aramark.com", "ameripride.com"],
-    "aramark": ["aramark.com", "vestis.com", "ameripride.com"],
+    "vestis": ["vestis.com", "ameripride.com"],
     "cintas": ["cintas.com"],
     "alsco": ["alsco.com"],
     "unifirst": ["unifirst.com"],
@@ -17335,6 +17432,20 @@ def get_company_search_aliases(value):
             cleaned_aliases.append(cleaned)
             seen.add(lowered)
     return cleaned_aliases
+
+
+def get_enrichment_company_search_aliases(value):
+    """Return search aliases without sending the retired Aramark name to providers."""
+    normalized = normalize_apollo_location_value(value)
+    aliases = [
+        alias for alias in get_company_search_aliases(value)
+        if "aramark" not in normalize_apollo_location_value(alias)
+    ]
+    if "aramark" in normalized and not any(
+        normalize_apollo_location_value(alias) == "vestis" for alias in aliases
+    ):
+        aliases.append("vestis")
+    return aliases
 
 
 def get_apollo_branch_results_cache_seconds():
@@ -18117,9 +18228,7 @@ def get_state_search_terms(value):
 
 
 def build_pdl_branch_search_query(organization_name, expected_city, expected_state, exclude_emails=None):
-    organization_aliases = get_company_search_aliases(organization_name)
-    if not organization_aliases:
-        organization_aliases = [organization_name]
+    organization_aliases = get_enrichment_company_search_aliases(organization_name)
     organization_clauses = [
         f"job_company_name LIKE '%{escape_sql_like(alias)}%'"
         for alias in organization_aliases

@@ -46,7 +46,7 @@ Do not over-explain or over-sell. One or two useful value points is enough.
 
 ## Default Cold Email Structure
 
-Keep most cold emails to roughly 80-150 words.
+Keep net-new emails to roughly 60-100 words. Keep dormant-customer email bodies roughly 45-85 words unless answering a current question requires more.
 
 Use this pattern:
 
@@ -55,9 +55,9 @@ Use this pattern:
    - customer type
    - dormant history
    - prior order history if relevant
-2. One clear value point:
+2. For net-new contacts only, one clear value point:
    - damaged mats do not always need to be discarded or replaced
-3. One operational simplicity point:
+3. For net-new contacts only, one operational simplicity point when it is genuinely useful:
    - no contracts, no new equipment, no process change
 4. One low-friction ask:
    - review damaged mats
@@ -79,10 +79,16 @@ For net-new prospects:
 For dormant customers:
 
 - assume they already know the category
+- write as an existing supplier, not as a prospecting salesperson
+- do not reintroduce NuMat or restate the full value proposition
+- do not stack generic benefits such as cost, waste, contracts, equipment, and process in the same message
 - do not blame or pressure them
 - treat prior activity as history, not a commitment
-- ask whether damaged mats may be building up again
-- suggest larger mats, logo mats, or border-damaged mats as the easiest place to restart
+- use at most one relevant reminder about repair candidates, and only when it helps overcome a recorded blocker
+- ask one plain question that reveals the current situation or identifies the right person
+- include one useful reason to reply or one practical next step when the account history supports it; concise should not mean empty
+- after three or more unanswered attempts, do not ask about mat volume again; ask whether the recipient is still the right contact or close the loop politely
+- when a previous message records a management or programme blocker, ask whether that specific situation has changed; do not offer a list of speculative reasons
 
 ## Subject Line Guidance
 
@@ -96,6 +102,7 @@ Prefer short, practical subjects like:
 - Professional Mat Service
 
 Avoid vague or hype-heavy subjects.
+For existing or dormant customers, prefer the practical topic or question over "Damaged mats at [Customer]". Do not repeatedly use the same subject pattern across the action plan.
 
 ## CTA Guidance
 
@@ -108,6 +115,7 @@ Prefer soft CTAs:
 - Can I send a few examples of good repair candidates?
 
 Avoid pushy calendar asks in cold outreach unless the context strongly supports it.
+For dormant customers, prefer an ordinary replyable question over offering guides, examples, reviews, or other collateral that has not been requested.
 
 ## Candidate Guidance
 

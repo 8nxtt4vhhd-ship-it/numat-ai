@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-06-24-concise-direct-outreach-3"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-07-substantive-concise-outreach-7"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 RECENT_REPLY_ANCHOR_DAYS = 30
@@ -393,23 +393,20 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
         and latest_reply_days <= RECENT_REPLY_ANCHOR_DAYS
     ):
         paragraphs = [
-            f"Following up on your note about {latest_reply_signal.lower()}.",
-            "Is there anything on the repair side that needs planning now?",
-            "If yes, let me know and I’ll take it from there.",
+            "Thanks for the update.",
+            "Is there anything you need us to arrange on the repair side?",
         ]
     elif (
-        len(recent_signals) >= 2
-        and (likely_preferred_mode == "email" or inbound_count > 0)
+        (likely_preferred_mode == "email" or inbound_count > 0)
         and isinstance(latest_sales_days, (int, float))
         and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS
         and outbound_count >= 2
     ):
-        first_signal = recent_signals[0].lower()
-        second_signal = recent_signals[1].lower()
+        # A deterministic fallback cannot reliably interpret or paraphrase free-form
+        # CRM notes. Keep it useful without quoting fragments back to the customer.
         paragraphs = [
-            f"I was looking back at our recent notes around {first_signal} and {second_signal}.",
-            "What is the main repair priority on your side at the moment?",
-            "If there is something active, I can get the next step moving.",
+            "Do you have any mats that need repairing at the moment?",
+            "If so, let me know and I can arrange the next step.",
         ]
     elif (
         len(recent_signals) >= 2
@@ -417,12 +414,9 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
         and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS
         and (likely_preferred_mode == "visit" or primary_activity_type == "meeting")
     ):
-        first_signal = recent_signals[0].lower()
-        second_signal = recent_signals[1].lower()
         paragraphs = [
-            f"I was reviewing the last touchpoints around {first_signal} and {second_signal}.",
-            "What needs picking up from here, if anything?",
-            "If there is something live, I can get it lined up.",
+            "Is there anything from our last visit that still needs sorting?",
+            "If so, let me know and I can arrange the next step.",
         ]
     elif outbound_count >= 3 and inbound_count == 0 and recent_signals:
         paragraphs = [
@@ -432,15 +426,14 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
         ]
     elif has_recent_sales_activity and latest_sales_signal and latest_sales_days is not None and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS:
         paragraphs = [
-            f"Following up on my last note about {latest_sales_signal.lower()}.",
-            "Does this still need action on your side?",
-            "If yes, I can get the next step arranged.",
+            "Does this still need any action from us?",
+            "If so, let me know and I can arrange the next step.",
         ]
     elif is_stale and latest_sales_signal:
         paragraphs = [
             "It has been a while since we last worked with you on repairs.",
-            "Are you setting any damaged mats aside at the moment?",
-            "If you are, I can get a pickup arranged.",
+            "Do you have anything coming up that you would like us to look at?",
+            "If so, send me a quick update and I can suggest the next step.",
         ]
     elif is_stale:
         paragraphs = [
@@ -452,13 +445,13 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
         elapsed_label = format_elapsed_time_label(days_since_last_order)
         paragraphs = [
             f"It looks like it has been {elapsed_label} since we last worked with {customer_name}.",
-            "Are you setting any damaged mats aside at the moment?",
-            "If yes, I can get a pickup arranged.",
+            "Do you have any repair work coming up?",
+            "If so, let me know and I can suggest the next step.",
         ]
     else:
         paragraphs = [
-            "Just checking whether you have any damaged mats building up at the moment.",
-            "If you do, I can get a pickup arranged.",
+            "Do you have any mats that need repairing at the moment?",
+            "If so, let me know and I can suggest the next step.",
         ]
 
     return "\n\n".join([greeting, *paragraphs, "Thanks,"])
@@ -595,11 +588,7 @@ def build_outreach_prep_fallback(context):
     if context.get("customer_services_present"):
         rationale_bullets.append("Customer service traffic exists, but it has been excluded from the sales recommendation.")
 
-    email_subject = (
-        f"Checking in on {customer_name}"
-        if not last_subject else
-        f"Following up on {customer_name}"
-    )
+    email_subject = "Any mats for repair?"
     is_stale = has_stale_logistics_signal(context) or (latest_sales_days is not None and latest_sales_days > 90)
     email_body = build_text_tone_email_body(
         context,
@@ -701,8 +690,21 @@ def generate_outreach_prep(context):
                         "Use CRM activity type as a real signal. Pay attention to whether the history is made up mostly of email, calls, meetings/visits, LinkedIn, or a mix. "
                         "That should influence the recommended mode, tone, observed pattern, and whether the relationship looks meeting-led, email-led, or call-led. "
                         "When writing the email draft, keep the tone closer to a good business text than a formal sales letter: practical, conversational, direct, and easy to reply to. "
+                        "The team's standard is simple and purposeful. The draft must feel sincere, familiar, and written by a real salesperson who has read the conversation. It must never feel distant, performative, over-polished, or like generic sales copy. "
+                        "Avoid sales filler such as 'I wanted to touch base', 'reach out', 'circle back', 'connect', or 'whenever you have a moment'. Start with the useful point. "
+                        "Read recent_sales_context as a conversation in date order: inbound items are the customer's words and must be answered or acknowledged when they are still relevant; outbound items are examples of how the Numat salesperson naturally writes. "
+                        "Adapt to the salesperson's established level of formality, sentence length, greeting, sign-off, and vocabulary when there are usable outbound email examples. Match the voice, but do not copy whole sentences or reproduce typos. "
+                        "CRM entries may be shorthand notes rather than customer-facing prose. Never paste, quote, or mechanically join note fragments in the draft. In particular, do not write constructions such as 'our notes around X and Y'. First understand the underlying point, then respond in normal language—or omit it if its meaning is unclear. "
+                        "Continue the actual conversation rather than merely announcing a follow-up. If the customer asked a question or gave an update, address it directly before making the next ask. Do not claim to answer something unless the supplied history supports the answer. "
+                        "Before drafting, silently choose one primary purpose supported by the evidence. Use this priority order: respond to a live customer question or update; address a recorded objection or decision blocker; continue a recent visit or agreed action; close the loop after repeated unanswered contact; re-open a previously responsive relationship; identify the right owner when contact evidence is weak; otherwise check for a current repair need. Do not combine several purposes in one email. "
+                        "For dormant accounts, do not assume every useful email asks whether mats are being set aside. Where supported, vary the substance instead: ask whether the repair programme is still active, ask what changed, confirm whether this is still the right contact, refer to a genuine earlier blocker, or offer one relevant next step. Variation must come from evidence, not synonyms or arbitrary creativity. "
+                        "If several outbound attempts have received no reply, do not send another normal check-in. Keep it especially short and either ask whether the contact is still responsible or give them an easy way to say the timing is not right. "
+                        "When sales_outreach_sent_count is 3 or more and sales_reply_count is 0, this is mandatory: do not ask again whether mats are building up and do not add a value proposition. Ask whether this is still the right contact, or briefly close the loop. "
+                        "If the account previously replied or ordered regularly but has gone quiet, write as an existing supplier relationship, not as a cold prospect and not as though a transaction is currently active. "
+                        "When an older reply records a blocker, acknowledge it without interrogating the customer or listing possible causes. Ask only whether the situation has changed or who now owns the decision. "
                         "Write for busy operational people who may be moving between the office and production floor. "
                         "Keep emails concise and specific. Prefer 2 to 4 short sentences plus greeting and sign-off. "
+                        "For dormant existing customers, usually keep the body between 45 and 85 words unless a current customer question needs a different length. "
                         "Anchor each email to one concrete point, not several. "
                         "End with one clear ask or next step. "
                         "Avoid vague filler, stretched phrasing, and soft lead-ins. "
@@ -719,11 +721,15 @@ def generate_outreach_prep(context):
                         "Reference the latest sales outreach concretely when it is commercially relevant, rather than drifting into a generic follow-up. "
                         "Prefer concrete verbs like plan, arrange, book, send, confirm, check, or schedule. "
                         "Use at most one direct question unless the context strongly requires two. "
+                        "Use a short, natural subject that reflects the real next step. Do not use 'Following up on [customer name]' or put the customer's full account/location label in the subject. "
+                        "Avoid vague subjects beginning with 'Checking in'. "
+                        "End with 'Thanks,' only. Do not add '[Your Name]', a fabricated name, or a signature because the sending mailbox adds the salesperson's signature. "
                         "Do not anchor the email to the last replied message if that reply is older than 30 days. At that point it is background context, not an active thread. "
                         "Do not anchor the email to the latest sales outreach if it is older than 30 days unless the note is still clearly operationally live. "
                         "When the last reply or latest outreach is older than 30 days, do not write 'following up on your note', 'following up on my last note', or 'looking back at our recent notes'. Use a present-day opener instead. "
                         "Avoid the word 'steer' in the draft. Prefer 'let me know', 'send me a note', or 'send me an update'. "
-                        "Good patterns include: noticing it has been a while since the last repair order, asking whether they are setting any mats aside, asking who is best to speak to, or offering to arrange a pickup if useful. "
+                        "Do not introduce pallet minimums, weights, pricing claims, process explanations, sustainability points, or repair thresholds merely to make the email more specific. Include such detail only when it directly answers the customer or removes a recorded blocker. "
+                        "Do not promise or imply that a pickup will be arranged unless the supplied history shows enough current volume or an active logistics conversation. Otherwise offer to check, discuss, or suggest the next step. "
                         "It is fine to sound lightly conversational and personal, but keep it short and commercially clear. "
                         "Pay close attention to dates. Do not describe an activity as recent unless it happened within the last 90 days relative to the current analysis date. "
                         "If the latest relevant outreach or reply is older than 90 days, describe it as older, historical, previous, or the latest recorded activity instead. "
@@ -796,6 +802,107 @@ def generate_outreach_prep(context):
         print(f"AI outreach prep failed: {error}")
         cache_outreach_prep(cache_key, fallback)
         return fallback
+
+
+def generate_action_plan_email_draft(context):
+    """Generate only the two fields needed by the Action Plan focus view."""
+    fallback = build_outreach_prep_fallback(context)
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "email_subject": fallback["email_subject"],
+            "email_body": fallback["email_body"],
+        }
+
+    payload_keys = [
+        "customer",
+        "days_since_last_order",
+        "average_cycle",
+        "order_cycle_pattern",
+        "order_count",
+        "sales_outreach_sent_count",
+        "sales_reply_count",
+        "days_since_latest_sales_outreach",
+        "days_since_latest_replied_outreach",
+        "primary_activity_type",
+        "likely_preferred_mode",
+        "is_cold_outreach",
+        "recent_sales_context",
+        "primary_contact",
+    ]
+    draft_context = {key: context.get(key) for key in payload_keys}
+    cache_key = (
+        "action-plan-email-only",
+        _OUTREACH_PREP_PROMPT_VERSION,
+        os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        json.dumps(draft_context, sort_keys=True, default=str),
+    )
+    cached_result = get_cached_outreach_prep(cache_key)
+    if cached_result is not None:
+        return cached_result
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Write one short customer email for NuMat, which repairs damaged mats for industrial laundry and mat-service customers. "
+                        "Return strict JSON with only email_subject and email_body. Use only supplied facts. "
+                        "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
+                        "Sound simple, purposeful, sincere, familiar, and plainspoken—not polished sales copy. Match usable outbound style without copying errors. "
+                        "Choose one purpose: answer a live update; address a recorded blocker; continue an agreed action; close the loop after unanswered attempts; re-open a responsive relationship; identify the right contact; or check for a current repair need. "
+                        "If outbound attempts are 3 or more with no replies, do not ask about damaged-mat volume or pitch benefits; ask whether this is still the right contact or close the loop. "
+                        "If an older reply records a blocker, ask only whether it changed or who owns the decision; do not list speculative causes. "
+                        "For dormant existing customers, write as an existing supplier and usually use 45 to 85 body words. Do not reintroduce NuMat or stack generic benefits. "
+                        "Give the email enough substance to be worth sending. When evidence allows, include: one natural reference to the specific history or relationship; one practical reason it matters now; and one easy next step. Do not pad the email when the history is sparse. "
+                        "A recorded blocker should normally produce 2 or 3 useful body sentences: acknowledge the blocker, say briefly how NuMat can help if it has changed, then ask one direct question. Do not reduce it to only 'has the situation changed?' "
+                        "Use only one conversational ask. Do not ask whether the situation changed and who the right contact is in the same email. Choose the question that best fits the evidence. "
+                        "Avoid empty offers such as 'we can help if you are ready'. When a useful offer is supported, name it plainly—for example reviewing likely repair candidates or comparing repair with replacement—without turning it into a pitch. "
+                        "Use 2 to 4 short body sentences and one clear question or next step. Format email_body as a normal email with a blank line after the greeting and a blank line before the final 'Thanks,'. "
+                        "Never quote or mechanically join CRM note fragments. Do not use 'touch base', 'reach out', 'circle back', 'just checking in', or vague 'Checking in' subjects. "
+                        "Do not add pallet minimums, weights, pricing, sustainability claims, guides, process claims, or pickup promises unless directly required by a current message. "
+                        "Use a short practical subject. Do not include the full customer/location label or 'Following up on [customer]'."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(draft_context, indent=2)},
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "action_plan_email_draft",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "email_subject": {"type": "string"},
+                            "email_body": {"type": "string"},
+                        },
+                        "required": ["email_subject", "email_body"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            max_output_tokens=500,
+        )
+        parsed = json.loads(response.output_text.strip())
+        subject = str(parsed.get("email_subject") or "").strip()
+        body = str(parsed.get("email_body") or "").strip()
+        if not subject or not body:
+            raise ValueError("Email-only response was missing subject or body")
+        result = {"email_subject": subject, "email_body": body}
+        cache_outreach_prep(cache_key, result)
+        return result
+    except Exception as error:
+        print(f"AI action-plan email draft failed: {error}")
+        return {
+            "email_subject": fallback["email_subject"],
+            "email_body": fallback["email_body"],
+        }
 
 
 def build_data_question_fallback(question_payload):

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import time
 
 import requests
@@ -243,9 +244,11 @@ def search_apollo_people(
     normalized_locations = normalize_string_list(organization_locations or [])
     normalized_person_locations = normalize_string_list(person_locations or [])
     normalized_organization_ids = normalize_string_list(organization_ids or [])
-    normalized_organization_names = normalize_string_list(organization_names or [])
+    normalized_organization_names = normalize_string_list(
+        normalize_company_search_value(value) for value in (organization_names or [])
+    )
     normalized_person_seniorities = normalize_string_list(person_seniorities or [])
-    normalized_keywords = str(keywords or "").strip()
+    normalized_keywords = normalize_company_search_value(keywords)
 
     if normalized_domain:
         params["q_organization_domains_list[]"] = [normalized_domain]
@@ -417,8 +420,10 @@ def enrich_apollo_person(name="", email="", domain="", organization_name="", for
     params = {}
     normalized_domain = normalize_domain(domain)
     normalized_email = str(email or "").strip().lower()
+    if normalized_email.endswith("@aramark.com"):
+        normalized_email = ""
     normalized_name = str(name or "").strip()
-    normalized_org_name = str(organization_name or "").strip()
+    normalized_org_name = normalize_company_search_value(organization_name)
 
     if normalized_email:
         params["email"] = normalized_email
@@ -493,7 +498,16 @@ def normalize_domain(domain):
     value = value.removeprefix("www.")
     value = value.split("/", 1)[0]
     value = value.lstrip("@")
+    if value == "aramark.com" or value.endswith(".aramark.com"):
+        return "vestis.com"
     return value
+
+
+def normalize_company_search_value(value):
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return ""
+    return re.sub(r"\baramark\b", "Vestis", cleaned, flags=re.IGNORECASE)
 
 
 def normalize_string_list(values):
