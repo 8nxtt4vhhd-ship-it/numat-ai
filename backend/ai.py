@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-07-assume-uncompleted-schedules-10"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-07-order-sequencing-11"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 RECENT_REPLY_ANCHOR_DAYS = 30
@@ -818,6 +818,7 @@ def generate_action_plan_email_draft(context):
         "customer",
         "analysis_date",
         "days_since_last_order",
+        "last_order_date",
         "average_cycle",
         "order_cycle_pattern",
         "order_count",
@@ -833,6 +834,9 @@ def generate_action_plan_email_draft(context):
     ]
     draft_context = {key: context.get(key) for key in payload_keys}
     draft_context["recent_sales_context"] = redact_expired_scheduling_notes(
+        draft_context.get("recent_sales_context")
+    )
+    draft_context["recent_sales_context"] = redact_intent_resolved_by_later_order(
         draft_context.get("recent_sales_context")
     )
     cache_key = (
@@ -859,6 +863,7 @@ def generate_action_plan_email_draft(context):
                         "Return strict JSON with only email_subject and email_body. Use only supplied facts. "
                         "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
                         "Treat analysis_date as today. Every CRM item's date and age_days determine when its wording was true. Relative phrases inside an old item—such as 'tomorrow', 'this week', 'next week', 'later this month', or 'next month'—are relative to that item's date, not analysis_date. "
+                        "Sequence CRM activity against last_order_date. If a note anticipated mats, a repair order, or a pickup and later_order_recorded is true, treat that anticipated need as fulfilled by the later order unless a newer record explicitly says otherwise. Do not ask for those same mats or describe that old plan as still pending. You may refer to the later order itself when useful. "
                         "For an expired scheduling proposal with no later recorded outcome, assume the proposed visit or meeting did not take place. You may acknowledge that naturally (for example, 'We didn't manage to connect when I was due to be in the area') and suggest arranging another time when that is the most useful next step. Never ask the customer whether the visit happened, imply that it did happen, or invent a reason it was missed. "
                         "Do not invent a new visit date, travel plan, meeting, or availability. You may ask whether the customer would like to arrange a new time, but only state specific new timing when the supplied current context explicitly supports it. "
                         "Sound simple, purposeful, sincere, familiar, and plainspoken—not polished sales copy. Match usable outbound style without copying errors. "
@@ -980,6 +985,23 @@ def redact_expired_scheduling_notes(items):
                 "The proposed timing has passed and there is no later CRM note confirming that it happened. "
                 "Assume it did not take place. It may be acknowledged as a missed connection, but do not ask "
                 "whether it happened, claim that it happened, or invent why it was missed."
+            )
+        redacted.append(cleaned)
+    return redacted
+
+
+def redact_intent_resolved_by_later_order(items):
+    redacted = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        cleaned = dict(item)
+        if cleaned.get("later_order_recorded") and cleaned.get("likely_order_intent"):
+            later_order_date = str(cleaned.get("later_order_date") or "").strip()
+            cleaned["subject"] = "Earlier order intent — resolved by a later order"
+            cleaned["preview"] = (
+                f"A later order was recorded on {later_order_date}. Treat the need discussed in this "
+                "earlier activity as fulfilled; do not present it as pending or ask for the same mats."
             )
         redacted.append(cleaned)
     return redacted

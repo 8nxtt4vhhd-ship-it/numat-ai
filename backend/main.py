@@ -12056,12 +12056,18 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
     recent_sales_context = []
     activity_type_summary = summarize_sales_activity_types(sales_activities)
     activity_type_counts = activity_type_summary["counts"]
+    last_order_date = max(
+        (str(order.get("order_date") or "").strip() for order in customer_orders),
+        default="",
+    )
+    last_order_dt = parse_display_datetime(last_order_date)
 
     # Give the model enough of the real exchange to understand what was discussed
     # and to learn the salesperson's voice. Direction is deliberately explicit so
     # customer replies are treated as conversation, not as style examples.
     for activity in sales_activities[:6]:
         activity_age_days = get_crm_days_since_latest_activity(activity)
+        activity_dt = parse_crm_datetime(activity.get("date_created", ""))
         activity_text = " ".join(
             part for part in [
                 str(activity.get("subject") or "").strip(),
@@ -12069,10 +12075,16 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
             ]
             if part
         )
+        later_order_recorded = bool(
+            activity_dt and last_order_dt and last_order_dt.date() > activity_dt.date()
+        )
         recent_sales_context.append({
             "date": format_optional_datetime(activity.get("date_created", "")),
             "age_days": activity_age_days,
             "relative_timing_expired": has_expired_relative_timing(activity_text, activity_age_days),
+            "later_order_recorded": later_order_recorded,
+            "later_order_date": last_order_date if later_order_recorded else "",
+            "likely_order_intent": has_likely_order_intent(activity_text),
             "direction": str(activity.get("direction") or "").strip().title() or "Unknown",
             "crm_type": format_sales_activity_type(activity.get("crm_type")),
             "subject": str(activity.get("subject") or "").strip(),
@@ -12200,7 +12212,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         "average_cycle": cycle["cycle_days"] if cycle["cycle_days"] is not None else "Not enough orders",
         "order_cycle_pattern": cycle["pattern_label"],
         "order_cycle_consistency": cycle["consistency"],
-        "last_order_date": max(order.get("order_date", "") for order in customer_orders),
+        "last_order_date": last_order_date,
         "first_order_date": min(order.get("order_date", "") for order in customer_orders),
         "order_count": order_count,
         "total_value": format_currency(sum_order_amounts(customer_orders)),
@@ -13968,6 +13980,23 @@ def has_expired_relative_timing(text, age_days):
         "next month": 45,
     }
     return any(phrase in lowered and age_days > max_age for phrase, max_age in thresholds.items())
+
+
+def has_likely_order_intent(text):
+    """Identify CRM notes describing mats expected for a future repair order."""
+    lowered = str(text or "").lower()
+    phrases = [
+        "mats ready",
+        "ready for repair",
+        "ready to repair",
+        "next order",
+        "send an order",
+        "place an order",
+        "repair order",
+        "pickup arranged",
+        "pick up arranged",
+    ]
+    return any(phrase in lowered for phrase in phrases)
 
 
 def get_sales_outreach_activities(activities):
