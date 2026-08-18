@@ -13004,6 +13004,8 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
             "later_order_date": last_order_date if later_order_recorded else "",
             "likely_order_intent": has_likely_order_intent(activity_text),
             "direction": str(activity.get("direction") or "").strip().title() or "Unknown",
+            "sender_email": str(activity.get("sender_email") or "").strip().lower(),
+            "recipient": str(activity.get("to") or activity.get("recipient") or "").strip().lower(),
             "crm_type": format_sales_activity_type(activity.get("crm_type")),
             "subject": str(activity.get("subject") or "").strip(),
             "preview": truncate_text(clean_activity_content(activity.get("body", "")) or activity.get("subject", ""), 700),

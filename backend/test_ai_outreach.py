@@ -104,6 +104,42 @@ class OutreachStyleTests(unittest.TestCase):
         ])
         self.assertEqual(fact, {})
 
+    def test_recent_outbound_thread_outranks_older_repair_history(self):
+        fact = select_primary_outreach_fact([
+            {
+                "age_days": 13,
+                "direction": "Outbound",
+                "recipient": "neil@alsco.com",
+                "subject": "cost saving initiative",
+                "preview": "We signed a corporate agreement with Alsco for remanufacturing. Do you have rippled or damaged mats?",
+                "later_order_recorded": False,
+            },
+            {
+                "age_days": 120,
+                "direction": "Outbound",
+                "subject": "Repair opportunity",
+                "preview": "Possible wavy mats for edge repair.",
+                "later_order_recorded": False,
+            },
+        ])
+        self.assertEqual(fact["type"], "recent_outbound_thread")
+        self.assertEqual(fact["subject"], "cost saving initiative")
+
+    def test_recent_thread_fallback_handles_a_change_of_contact(self):
+        fact = {
+            "type": "recent_outbound_thread",
+            "direction": "Outbound",
+            "recipient": "neil@alsco.com",
+            "subject": "cost saving initiative",
+            "preview": "We signed a corporate agreement with Alsco for remanufacturing and asked about rippled or damaged mats.",
+        }
+        fallback = build_primary_fact_fallback_email(
+            {"primary_contact": {"name": "Clinton", "email": "clinton@alsco.com"}}, fact
+        )
+        self.assertIn("I recently emailed your team", fallback["email_body"])
+        self.assertIn("Are you the right person to speak with about this?", fallback["email_body"])
+        self.assertNotIn("two years", fallback["email_body"])
+
 
 if __name__ == "__main__":
     unittest.main()

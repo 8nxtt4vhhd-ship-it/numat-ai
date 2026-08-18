@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-speech-act-provenance-16"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-recent-thread-first-17"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 OUTREACH_EMAIL_STYLE_GUIDANCE = (
@@ -76,6 +76,7 @@ def draft_violates_outreach_style(text):
         "due to schedule a visit",
         "due to be in the area",
         "i wanted to check",
+        "i wanted to ask",
         "unlock value",
         "exciting opportunity",
         "partner with you",
@@ -726,7 +727,7 @@ def generate_outreach_prep(context):
                         "You are a practical B2B sales assistant. Recommend an outreach mode, tone, and draft using only the provided data. "
                         "Treat customer service traffic as supporting context, not the main sales signal. "
                         "Use the supplied business context to correctly interpret what Numat does, what damaged mats usually mean, and how repair-service outreach differs from complaint handling. "
-                        "Treat the latest sales outreach item as a high-priority signal. If the most recent sales outreach is a visit note, meeting summary, or post-visit follow-up, use that as the primary anchor for the recommendation, rationale, and draft unless a newer reply clearly changes the situation. "
+                        "Use this strict subject hierarchy: answer a current inbound reply first; otherwise continue a meaningful outbound thread from the last 30 days; otherwise use an older unresolved repair signal or blocker; use order age only as the final fallback. If the most recent sales outreach is a visit note, meeting summary, or post-visit follow-up, use that as the primary anchor unless a newer reply clearly changes the situation. "
                         "Use the inferred contact signals to decide who the most appropriate target is, and tune the tone for their likely role and influence. "
                         "Use CRM activity type as a real signal. Pay attention to whether the history is made up mostly of email, calls, meetings/visits, LinkedIn, or a mix. "
                         "That should influence the recommended mode, tone, observed pattern, and whether the relationship looks meeting-led, email-led, or call-led. "
@@ -912,7 +913,7 @@ def generate_action_plan_email_draft(context):
                         "Write one short customer email for NuMat, which repairs damaged mats for industrial laundry and mat-service customers. "
                         "Return strict JSON with only email_subject and email_body. Use only supplied facts. "
                         "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
-                        "Use primary_outreach_fact as the default subject of the email. It was selected by a deterministic commercial-priority step. A specific unresolved repair signal or recorded blocker outranks years since the last order, general account dormancy, and expired scheduling. Depart from it only when a later order clearly resolved it or using it would contradict a newer customer message. A brief acknowledgement of the latest inbound message may precede the primary fact when it connects naturally. Preserve both speaker and speech act: direction Inbound means the customer wrote it; direction Outbound means the NuMat salesperson wrote it. speech_act salesperson_question means the salesperson asked or conditionally offered something—it is not evidence that the customer had those mats. Never convert 'if you have any damaged or wavy mats' into 'you mentioned', 'we discussed', 'I noted some mats', or a claim that mats existed. Ask the question directly instead. Use 'we discussed' only when the records clearly show a two-way discussion. "
+                        "Use primary_outreach_fact as the subject of the email. It was selected before drafting with this strict hierarchy: first answer a current inbound reply; second continue a meaningful outbound thread from the last 30 days; third use an older unresolved repair signal or blocker; use order age only when none of those exists. Do not replace a recent specific thread with a generic dormant-account email. For a recent outbound message with no reply, follow up on the same purpose and wording rather than creating a new pitch. If the target contact differs from the previous recipient, briefly state that the team was contacted and ask whether this person is responsible. Preserve both speaker and speech act: direction Inbound means the customer wrote it; direction Outbound means the NuMat salesperson wrote it. speech_act salesperson_question means the salesperson asked or conditionally offered something—it is not evidence that the customer had those mats. Never convert 'if you have any damaged or wavy mats' into 'you mentioned', 'we discussed', 'I noted some mats', or a claim that mats existed. Ask the question directly instead. Use 'we discussed' only when the records clearly show a two-way discussion. "
                         "Treat analysis_date as today. Every CRM item's date and age_days determine when its wording was true. Relative phrases inside an old item—such as 'tomorrow', 'this week', 'next week', 'later this month', or 'next month'—are relative to that item's date, not analysis_date. "
                         "Sequence CRM activity against last_order_date. If a note anticipated mats, a repair order, or a pickup and later_order_recorded is true, treat that anticipated need as fulfilled by the later order unless a newer record explicitly says otherwise. Do not ask for those same mats or describe that old plan as still pending. You may refer to the later order itself when useful. "
                         "For an expired scheduling proposal with no later recorded outcome, assume the proposed visit or meeting did not take place. If that missed meeting is the single best reason to write, say simply 'We missed each other' or 'We didn't get a chance to meet', then ask one direct question about arranging another time. Do not combine it with an unrelated old repair note. Never ask whether the visit happened, imply that it did happen, or invent why it was missed. "
@@ -1075,19 +1076,33 @@ def select_primary_outreach_fact(items):
         fact_type = "conversation"
         speech_act = "statement"
         reason = "Most recent usable sales context"
+        direction = str(item.get("direction") or "").strip().lower()
+        age_days = item.get("age_days")
+        is_recent = isinstance(age_days, (int, float)) and 0 <= age_days <= 30
+        if is_recent and direction == "inbound":
+            score += 350
+            fact_type = "recent_inbound_thread"
+            reason = "A current customer reply is the first priority"
+        elif is_recent and direction == "outbound":
+            score += 300
+            fact_type = "recent_outbound_thread"
+            reason = "Continue the recent unresolved outbound thread before using older history"
         if any(term in lowered for term in repair_terms):
             score += 100
-            fact_type = "unresolved_repair_signal"
-            reason = "Specific unresolved repair need outranks general order age or a missed visit"
+            if not is_recent:
+                fact_type = "unresolved_repair_signal"
+                reason = "Specific unresolved repair need outranks general order age or a missed visit"
         elif any(term in lowered for term in blocker_terms):
             score += 75
-            fact_type = "recorded_blocker"
-            reason = "A recorded commercial blocker is more useful than general order age"
+            if not is_recent:
+                fact_type = "recorded_blocker"
+                reason = "A recorded commercial blocker is more useful than general order age"
         elif item.get("likely_order_intent"):
             score += 65
-            fact_type = "order_intent"
-            reason = "Unresolved order intent is more useful than general order age"
-        if str(item.get("direction") or "").lower() == "inbound":
+            if not is_recent:
+                fact_type = "order_intent"
+                reason = "Unresolved order intent is more useful than general order age"
+        if direction == "inbound":
             score += 25
         elif any(term in lowered for term in question_terms):
             speech_act = "salesperson_question"
@@ -1100,7 +1115,10 @@ def select_primary_outreach_fact(items):
             "type": fact_type,
             "reason": reason,
             "date": item.get("date"),
+            "age_days": age_days,
             "direction": item.get("direction"),
+            "sender_email": item.get("sender_email"),
+            "recipient": item.get("recipient"),
             "speech_act": speech_act,
             "subject": item.get("subject"),
             "preview": item.get("preview"),
@@ -1110,12 +1128,40 @@ def select_primary_outreach_fact(items):
 
 
 def build_primary_fact_fallback_email(context, primary_fact):
-    if str(primary_fact.get("type") or "") != "unresolved_repair_signal":
+    fact_type = str(primary_fact.get("type") or "")
+    if fact_type not in {"unresolved_repair_signal", "recent_outbound_thread", "recent_inbound_thread"}:
         return None
     primary_contact = context.get("primary_contact") or {}
     first_name = get_contact_first_name(primary_contact.get("name"))
     greeting = f"Hi {first_name}," if first_name else "Hi,"
     text = " ".join(str(primary_fact.get(key) or "") for key in ("subject", "preview")).lower()
+    if fact_type in {"recent_outbound_thread", "recent_inbound_thread"}:
+        target_email = str(primary_contact.get("email") or "").strip().lower()
+        previous_recipient = str(primary_fact.get("recipient") or "").strip().lower()
+        changed_contact = bool(target_email and previous_recipient and target_email not in previous_recipient)
+        has_damaged_mat_topic = "damaged mat" in text or "rippled mat" in text or "wavy mat" in text
+        has_agreement_topic = "agreement" in text and ("alsco" in text or "corporate" in text)
+        topic = "the recent repair email"
+        if has_agreement_topic and has_damaged_mat_topic:
+            topic = "the remanufacturing agreement and damaged mats"
+        elif has_agreement_topic:
+            topic = "the remanufacturing agreement"
+        elif has_damaged_mat_topic:
+            topic = "damaged mats that may need repair"
+        if changed_contact:
+            sentence = f"I recently emailed your team about {topic}."
+            question = "Are you the right person to speak with about this?"
+        elif fact_type == "recent_inbound_thread":
+            sentence = "Thanks for the update."
+            question = "Does this need any action from us now?"
+        else:
+            sentence = f"Following up on my note about {topic}."
+            question = "Do you have any mats that need repair now?" if has_damaged_mat_topic else "Is this still something you are working on?"
+        return {
+            "email_subject": str(primary_fact.get("subject") or "Follow-up").strip(),
+            "email_body": f"{greeting}\n\n{sentence} {question}\n\nThanks,",
+        }
+
     repair_description = "mats for repair"
     if "wavy" in text and "edge repair" in text:
         repair_description = "wavy mats for edge repair"
