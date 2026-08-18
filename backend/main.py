@@ -5738,6 +5738,18 @@ def calendar_event_form_value(event, key, fallback):
     return parsed.strftime("%Y-%m-%dT%H:%M") if parsed else fallback
 
 
+def calendar_event_covers_date(event, selected_date):
+    start = calendar_event_datetime(event, "start")
+    end = calendar_event_datetime(event, "end")
+    if not start:
+        return False
+    first_day = start.date()
+    last_day = (end or start).date()
+    if end and end > start and end.hour == 0 and end.minute == 0 and end.second == 0:
+        last_day -= timedelta(days=1)
+    return first_day <= selected_date <= max(first_day, last_day)
+
+
 def render_calendar_month_grid(events, month_start):
     first_weekday, days_in_month = calendar_module.monthrange(month_start.year, month_start.month)
     grid_start = month_start - timedelta(days=first_weekday)
@@ -5745,17 +5757,14 @@ def render_calendar_month_grid(events, month_start):
     for event in events:
         start = calendar_event_datetime(event, "start")
         end = calendar_event_datetime(event, "end")
-        if not start:
-            continue
-        first_day = start.date()
-        last_day = (end or start).date()
-        if end and end > start and end.hour == 0 and end.minute == 0 and end.second == 0:
-            last_day -= timedelta(days=1)
-        last_day = max(first_day, last_day)
-        day = first_day
-        while day <= last_day:
-            grouped[day.isoformat()].append(event)
-            day += timedelta(days=1)
+        if start:
+            day = start.date()
+            final_day = (end or start).date()
+            if end and end > start and end.hour == 0 and end.minute == 0 and end.second == 0:
+                final_day -= timedelta(days=1)
+            while day <= max(start.date(), final_day):
+                grouped[day.isoformat()].append(event)
+                day += timedelta(days=1)
     headers = "".join(f"<div class='calendar-weekday'>{label}</div>" for label in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
     cells = []
     for offset in range(42):
@@ -5780,7 +5789,7 @@ def render_calendar_month_grid(events, month_start):
             f'''<details class="calendar-day-more"><summary>+{len(hidden_events)} more</summary><div>{''.join(event_chip(item) for item in hidden_events)}</div></details>'''
             if hidden_events else ""
         )
-        cells.append(f'''<div class="{' '.join(classes)}"><div class="calendar-day-number">{day.day}</div><div class="calendar-day-events">{event_markup}{more}</div></div>''')
+        cells.append(f'''<div class="{' '.join(classes)}"><a class="calendar-day-number" href="/calendar-view?view=day&date={day_key}&month={day.strftime('%Y-%m')}" aria-label="View {day.strftime('%A %d %B')}">{day.day}</a><div class="calendar-day-events">{event_markup}{more}</div></div>''')
     return f'<div class="calendar-month-grid">{headers}{"".join(cells)}</div>'
 
 
@@ -5808,11 +5817,38 @@ def render_calendar_agenda(events, month_start):
     return "<div class='calendar-agenda'>" + "".join(sections) + "</div>"
 
 
-def render_calendar_event_form(event, month_start):
+def render_calendar_day(events, selected_date, month_start):
+    day_events = [item for item in events if calendar_event_covers_date(item, selected_date)]
+    day_events.sort(key=lambda item: str(item.get("start") or ""))
+    if not day_events:
+        return f'''<div class="calendar-day-detail-empty"><strong>No events on {selected_date.strftime('%A %d %B')}</strong><a class="button" href="#calendar-event-editor">Add an event</a></div>'''
+    cards = []
+    for event in day_events:
+        location = str(event.get("location") or "").strip()
+        notes = str(event.get("notes") or event.get("body_preview") or "").strip()
+        attendees = event.get("attendees") or []
+        meta = []
+        if location:
+            meta.append(location)
+        if attendees:
+            meta.append(f"{len(attendees)} attendee{'s' if len(attendees) != 1 else ''}")
+        multi_day = calendar_event_datetime(event, "start") and calendar_event_datetime(event, "end") and calendar_event_datetime(event, "start").date() != calendar_event_datetime(event, "end").date()
+        if multi_day:
+            meta.append("Multi-day event")
+        cards.append(f'''<a class="calendar-day-detail-card" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view=day&date={selected_date.isoformat()}&edit={quote(str(event.get('id') or ''))}">
+            <span class="calendar-day-detail-time">{escape(format_calendar_event_time(event))}</span>
+            <div><strong>{escape(str(event.get('subject') or 'Untitled event'))}</strong>{f'<p>{escape(notes)}</p>' if notes else ''}<small>{escape(' · '.join(meta) or 'No additional details')}</small></div>
+        </a>''')
+    return f'''<div class="calendar-day-detail"><div class="calendar-day-detail-heading"><span>{selected_date.strftime('%A')}</span><strong>{selected_date.strftime('%d')}</strong><small>{selected_date.strftime('%B %Y')}</small></div><div class="calendar-day-detail-list">{''.join(cards)}</div></div>'''
+
+
+def render_calendar_event_form(event, month_start, selected_date=None):
     event = event or {}
     editing = bool(event.get("id"))
     default_start = datetime.now(UK_TIMEZONE).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    if default_start.month != month_start.month or default_start.year != month_start.year:
+    if selected_date:
+        default_start = datetime.combine(selected_date, datetime.min.time(), tzinfo=UK_TIMEZONE).replace(hour=9)
+    elif default_start.month != month_start.month or default_start.year != month_start.year:
         default_start = month_start.replace(day=1, hour=9)
     default_end = default_start + timedelta(hours=1)
     start_value = calendar_event_form_value(event, "start", default_start.strftime("%Y-%m-%dT%H:%M"))
@@ -5863,8 +5899,14 @@ def get_calendar_events_api(start: str = "", end: str = "", refresh: bool = Fals
 
 
 @app.get("/calendar-view", response_class=HTMLResponse)
-def get_calendar_view(month: str = "", view: str = "month", edit: str = "", refresh: bool = False, message: str = "", error: str = ""):
+def get_calendar_view(month: str = "", view: str = "month", date: str = "", edit: str = "", refresh: bool = False, message: str = "", error: str = ""):
     month_start = parse_calendar_month(month)
+    try:
+        selected_date = datetime.strptime(date, "%Y-%m-%d").date() if date else datetime.now(UK_TIMEZONE).date()
+    except ValueError:
+        selected_date = datetime.now(UK_TIMEZONE).date()
+    if view == "day" and (selected_date.year != month_start.year or selected_date.month != month_start.month):
+        month_start = datetime.combine(selected_date.replace(day=1), datetime.min.time(), tzinfo=UK_TIMEZONE)
     next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
     grid_start = month_start - timedelta(days=month_start.weekday())
     grid_end = next_month + timedelta(days=(6 - (next_month - timedelta(days=1)).weekday()))
@@ -5873,29 +5915,45 @@ def get_calendar_view(month: str = "", view: str = "month", edit: str = "", refr
     editing_event = next((item for item in events if str(item.get("id") or "") == str(edit or "")), {})
     previous_month = (month_start - timedelta(days=1)).strftime("%Y-%m")
     following_month = next_month.strftime("%Y-%m")
-    selected_view = "agenda" if view == "agenda" else "month"
+    selected_view = view if view in {"month", "agenda", "day"} else "month"
     status_markup = f"<p class='status'>{escape(message)}</p>" if message else ""
     if error or result.get("status") != "ok":
         status_markup += f"<p class='status error'>{escape(error or result.get('error_message') or result.get('status') or 'Calendar unavailable')}</p>"
-    content = render_calendar_agenda(events, month_start) if selected_view == "agenda" else render_calendar_month_grid(events, month_start)
+    if selected_view == "agenda":
+        content = render_calendar_agenda(events, month_start)
+    elif selected_view == "day":
+        content = render_calendar_day(events, selected_date, month_start)
+    else:
+        content = render_calendar_month_grid(events, month_start)
+    if selected_view == "day":
+        previous_href = f"/calendar-view?view=day&date={(selected_date - timedelta(days=1)).isoformat()}"
+        next_href = f"/calendar-view?view=day&date={(selected_date + timedelta(days=1)).isoformat()}"
+        today_href = f"/calendar-view?view=day&date={datetime.now(UK_TIMEZONE).date().isoformat()}"
+        title_label = selected_date.strftime("%A %d %B %Y")
+    else:
+        previous_href = f"/calendar-view?month={previous_month}&view={selected_view}"
+        next_href = f"/calendar-view?month={following_month}&view={selected_view}"
+        today_href = "/calendar-view"
+        title_label = month_start.strftime("%B %Y")
     body = f'''
         {status_markup}
         <div class="calendar-page-layout">
             <section class="panel calendar-main-panel">
                 <div class="calendar-toolbar">
-                    <div><span class="home-focus-inline-kicker">Shared NuMat Calendar</span><h2>{month_start.strftime('%B %Y')}</h2><p class="small muted">Synced {escape(format_optional_datetime(result.get('synced_at')) if result.get('synced_at') else 'not available')}</p></div>
+                    <div><span class="home-focus-inline-kicker">Shared NuMat Calendar</span><h2>{escape(title_label)}</h2><p class="small muted">Synced {escape(format_optional_datetime(result.get('synced_at')) if result.get('synced_at') else 'not available')}</p></div>
                     <div class="calendar-toolbar-actions">
-                        <a class="button secondary" href="/calendar-view?month={previous_month}&view={selected_view}">Previous</a>
-                        <a class="button secondary" href="/calendar-view">Today</a>
-                        <a class="button secondary" href="/calendar-view?month={following_month}&view={selected_view}">Next</a>
-                        <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view={'agenda' if selected_view == 'month' else 'month'}">{'Agenda' if selected_view == 'month' else 'Month'}</a>
-                        <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view={selected_view}&refresh=true">Refresh</a>
+                        <a class="button secondary" href="{previous_href}">Previous</a>
+                        <a class="button secondary" href="{today_href}">Today</a>
+                        <a class="button secondary" href="{next_href}">Next</a>
+                        <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view=month">Month</a>
+                        <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view=agenda">Agenda</a>
+                        <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view={selected_view}{f'&date={selected_date.isoformat()}' if selected_view == 'day' else ''}&refresh=true">Refresh</a>
                         <a class="button calendar-add-jump" href="#calendar-event-editor">Add event</a>
                     </div>
                 </div>
                 {content}
             </section>
-            {render_calendar_event_form(editing_event, month_start)}
+            {render_calendar_event_form(editing_event, month_start, selected_date if selected_view == 'day' else None)}
         </div>
     '''
     return render_page(title="Calendar", body=body, main_class="calendar-main")
@@ -21479,9 +21537,19 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .calendar-day-number {{
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
                         margin-bottom: 6px;
+                        color: inherit;
                         font-size: 12px;
                         font-weight: 800;
+                        text-decoration: none;
+                    }}
+
+                    .calendar-day-number:hover,
+                    .calendar-day-number:focus-visible {{
+                        color: var(--blue);
                     }}
 
                     .calendar-day-events {{
@@ -21652,6 +21720,105 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         color: var(--muted);
                     }}
 
+                    .calendar-day-detail {{
+                        display: grid;
+                        grid-template-columns: 150px minmax(0, 1fr);
+                        gap: 22px;
+                        align-items: start;
+                    }}
+
+                    .calendar-day-detail-heading {{
+                        padding: 20px;
+                        border-radius: 14px;
+                        color: #24406e;
+                        background: #edf2ff;
+                        text-align: center;
+                    }}
+
+                    .calendar-day-detail-heading span,
+                    .calendar-day-detail-heading strong,
+                    .calendar-day-detail-heading small {{
+                        display: block;
+                    }}
+
+                    .calendar-day-detail-heading span {{
+                        font-size: 14px;
+                        font-weight: 800;
+                        text-transform: uppercase;
+                    }}
+
+                    .calendar-day-detail-heading strong {{
+                        margin: 4px 0;
+                        color: var(--blue);
+                        font-size: 52px;
+                        line-height: 1;
+                    }}
+
+                    .calendar-day-detail-heading small {{
+                        color: var(--muted);
+                        font-size: 12px;
+                        font-weight: 700;
+                    }}
+
+                    .calendar-day-detail-list {{
+                        display: grid;
+                        gap: 10px;
+                    }}
+
+                    .calendar-day-detail-card {{
+                        display: grid;
+                        grid-template-columns: 105px minmax(0, 1fr);
+                        gap: 14px;
+                        padding: 14px 16px;
+                        border: 1px solid #d5ebe5;
+                        border-left: 4px solid #00a884;
+                        border-radius: 11px;
+                        color: var(--ink);
+                        background: #ffffff;
+                        text-decoration: none;
+                    }}
+
+                    .calendar-day-detail-card:hover {{
+                        border-color: #9ed9cb;
+                        box-shadow: 0 8px 22px rgba(20, 54, 78, 0.08);
+                    }}
+
+                    .calendar-day-detail-time {{
+                        color: var(--blue);
+                        font-size: 13px;
+                        font-weight: 800;
+                    }}
+
+                    .calendar-day-detail-card strong {{
+                        font-size: 15px;
+                    }}
+
+                    .calendar-day-detail-card p {{
+                        margin: 5px 0;
+                        color: #40566d;
+                        font-size: 13px;
+                        line-height: 1.4;
+                        white-space: pre-wrap;
+                    }}
+
+                    .calendar-day-detail-card small {{
+                        display: block;
+                        margin-top: 5px;
+                        color: var(--muted);
+                        font-size: 11px;
+                    }}
+
+                    .calendar-day-detail-empty {{
+                        min-height: 280px;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        justify-content: center;
+                        gap: 14px;
+                        color: var(--muted);
+                        text-align: center;
+                    }}
+
                     @media (max-width: 900px) {{
                         main.calendar-main {{
                             padding-inline: 10px;
@@ -21714,6 +21881,23 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         .calendar-agenda-event small {{
                             grid-column: 2;
                         }}
+
+                        .calendar-day-detail {{
+                            grid-template-columns: minmax(0, 1fr);
+                            gap: 12px;
+                        }}
+
+                        .calendar-day-detail-heading {{
+                            display: flex;
+                            align-items: baseline;
+                            justify-content: center;
+                            gap: 8px;
+                            padding: 12px;
+                        }}
+
+                        .calendar-day-detail-heading strong {{
+                            font-size: 30px;
+                        }}
                     }}
 
                     @media (max-width: 520px) {{
@@ -21760,6 +21944,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .calendar-day-more > div {{
                             gap: 2px;
+                        }}
+
+                        .calendar-day-detail-card {{
+                            grid-template-columns: minmax(0, 1fr);
+                            gap: 5px;
+                            padding: 12px;
+                        }}
+
+                        .calendar-day-detail-card strong {{
+                            font-size: 14px;
                         }}
 
                         .calendar-toolbar-actions {{
