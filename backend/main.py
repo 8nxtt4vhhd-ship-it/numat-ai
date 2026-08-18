@@ -662,13 +662,15 @@ def load_audit_log_entries():
                 "action": str(item.get("action") or "").strip(),
                 "target": str(item.get("target") or "").strip(),
                 "details": str(item.get("details") or "").strip(),
+                "area": str(item.get("area") or "general").strip() or "general",
+                "status": str(item.get("status") or "success").strip() or "success",
             }
         )
 
     return entries
 
 
-def record_audit_event(action, target="", details="", user=None):
+def record_audit_event(action, target="", details="", user=None, area="general", status="success"):
     current_user = user or get_current_session_user() or {}
     entry = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -681,6 +683,8 @@ def record_audit_event(action, target="", details="", user=None):
         "action": str(action or "").strip(),
         "target": str(target or "").strip(),
         "details": str(details or "").strip(),
+        "area": str(area or "general").strip(),
+        "status": str(status or "success").strip(),
     }
 
     path = ensure_audit_log_file()
@@ -695,7 +699,7 @@ def record_audit_event(action, target="", details="", user=None):
                 payload = []
 
             payload.append(entry)
-            payload = payload[-500:]
+            payload = payload[-5000:]
             path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -4278,6 +4282,27 @@ def record_recent_sent_email(customer, sender_username, sender_email, recipient,
     write_recent_sent_emails(items)
 
 
+def classify_outreach_recommendation_usage(recipient, subject, body, recommended_to="", recommended_subject="", recommended_body=""):
+    recommended_fields_available = any(str(value or "").strip() for value in (recommended_to, recommended_subject, recommended_body))
+    if not recommended_fields_available:
+        return "recommendation not recorded"
+
+    def normalize_body(value):
+        return "\n".join(line.rstrip() for line in str(value or "").strip().replace("\r\n", "\n").split("\n"))
+
+    final_values = (
+        str(recipient or "").strip().lower(),
+        " ".join(str(subject or "").strip().split()),
+        normalize_body(body),
+    )
+    recommended_values = (
+        str(recommended_to or "").strip().lower(),
+        " ".join(str(recommended_subject or "").strip().split()),
+        normalize_body(recommended_body),
+    )
+    return "recommended used" if final_values == recommended_values else "recommended edited"
+
+
 def build_recent_sent_email_activity(item):
     sent_at = str(item.get("sent_at") or "").strip()
     recipient = str(item.get("recipient") or "").strip()
@@ -4755,7 +4780,7 @@ def post_login(request: Request, username: str = Form(""), password: str = Form(
     request.session["app_username"] = str(user.get("username") or "")
     request.session.pop("pending_mfa_username", None)
     request.session.pop("pending_mfa_next", None)
-    record_audit_event("login", target=str(next or "/"), details="Signed in without MFA.", user=user)
+    record_audit_event("login", target=str(next or "/"), details="Signed in without MFA.", user=user, area="authentication")
     return RedirectResponse(url=next or "/", status_code=303)
 
 
@@ -4782,7 +4807,7 @@ def post_login_mfa(request: Request, code: str = Form("")):
     request.session.pop("pending_mfa_username", None)
     request.session.pop("pending_mfa_next", None)
     user = find_app_user(pending_username)
-    record_audit_event("login", target=pending_next, details="Signed in with MFA.", user=user)
+    record_audit_event("login", target=pending_next, details="Signed in with MFA.", user=user, area="authentication")
     return RedirectResponse(url=pending_next, status_code=303)
 
 
@@ -4823,7 +4848,7 @@ def post_login_mfa_resend(request: Request):
 def logout(request: Request):
     current_user = get_current_session_user()
     if current_user:
-        record_audit_event("logout", details="Signed out of Sales Focus.", user=current_user)
+        record_audit_event("logout", details="Signed out of Sales Focus.", user=current_user, area="authentication")
     request.session.pop("app_username", None)
     request.session.pop("pending_mfa_username", None)
     request.session.pop("pending_mfa_next", None)
@@ -5020,7 +5045,7 @@ def get_user_accounts_page(setup: str = "", message: str = "", error: str = "", 
 
 
 @app.get("/admin-audit-log", response_class=HTMLResponse)
-def get_admin_audit_log_page(message: str = "", error: str = ""):
+def get_admin_audit_log_page(area: str = "", status: str = "", user: str = "", action: str = "", q: str = "", message: str = "", error: str = ""):
     current_user = get_current_session_user()
     if not can_manage_user_accounts(current_user):
         return render_page(
@@ -5028,7 +5053,32 @@ def get_admin_audit_log_page(message: str = "", error: str = ""):
             body="<p class='status error'>You do not have permission to view the audit log.</p>",
         )
 
-    entries = list(reversed(load_audit_log_entries()))
+    all_entries = list(reversed(load_audit_log_entries()))
+    area_filter = str(area or "").strip().lower()
+    status_filter = str(status or "").strip().lower()
+    user_filter = str(user or "").strip().lower()
+    action_filter = str(action or "").strip().lower()
+    query_filter = str(q or "").strip().lower()
+    entries = []
+    for entry in all_entries:
+        if area_filter and str(entry.get("area") or "").lower() != area_filter:
+            continue
+        if status_filter and str(entry.get("status") or "").lower() != status_filter:
+            continue
+        if user_filter and str(entry.get("username") or "").lower() != user_filter:
+            continue
+        if action_filter and action_filter not in str(entry.get("action") or "").lower():
+            continue
+        haystack = " ".join(str(entry.get(key) or "") for key in ("display_name", "username", "action", "target", "details", "area", "status")).lower()
+        if query_filter and query_filter not in haystack:
+            continue
+        entries.append(entry)
+    areas = sorted({str(item.get("area") or "general") for item in all_entries})
+    users = sorted({str(item.get("username") or "") for item in all_entries if item.get("username")})
+    statuses = sorted({str(item.get("status") or "success") for item in all_entries})
+    area_options = "".join(f'<option value="{escape(value)}"{" selected" if value.lower() == area_filter else ""}>{escape(value.replace("-", " ").title())}</option>' for value in areas)
+    user_options = "".join(f'<option value="{escape(value)}"{" selected" if value.lower() == user_filter else ""}>{escape(value)}</option>' for value in users)
+    status_options = "".join(f'<option value="{escape(value)}"{" selected" if value.lower() == status_filter else ""}>{escape(value.title())}</option>' for value in statuses)
     rows = []
     for entry in entries[:200]:
         display_name = str(entry.get("display_name") or entry.get("username") or "Unknown user").strip()
@@ -5039,12 +5089,14 @@ def get_admin_audit_log_page(message: str = "", error: str = ""):
             "<tr>"
             f"<td>{escape(str(entry.get('timestamp') or ''))}</td>"
             f"<td>{escape(display_name)}</td>"
+            f"<td>{escape(str(entry.get('area') or 'general').replace('-', ' ').title())}</td>"
             f"<td>{escape(str(entry.get('action') or ''))}</td>"
+            f"<td><span class='audit-status audit-status-{escape(str(entry.get('status') or 'success').lower())}'>{escape(str(entry.get('status') or 'success').title())}</span></td>"
             f"<td>{escape(' • '.join(summary_parts) or '—')}</td>"
             "</tr>"
         )
 
-    rows_markup = "".join(rows) or "<tr><td colspan='4'>No audit activity recorded yet.</td></tr>"
+    rows_markup = "".join(rows) or "<tr><td colspan='6'>No audit activity matches these filters.</td></tr>"
     status_markup = ""
     if message:
         status_markup = f"<p class='status ok'>{escape(message)}</p>"
@@ -5054,8 +5106,17 @@ def get_admin_audit_log_page(message: str = "", error: str = ""):
     body = f"""
         <section class="panel">
             <h2>Audit log</h2>
-            <p class="subtle">A lightweight testing log showing who is signing in and the main actions they are taking.</p>
+            <p class="subtle">Admin-only activity history for sign-ins, customer communication, calendar changes, FileMaker synchronisation and other key actions.</p>
             {status_markup}
+            <form class="audit-filter-form" method="get" action="/admin-audit-log">
+                <label><span>Area</span><select name="area"><option value="">All areas</option>{area_options}</select></label>
+                <label><span>Status</span><select name="status"><option value="">All statuses</option>{status_options}</select></label>
+                <label><span>User</span><select name="user"><option value="">All users</option>{user_options}</select></label>
+                <label><span>Action</span><input name="action" value="{escape(action)}" placeholder="e.g. send-email"></label>
+                <label class="audit-filter-search"><span>Search</span><input name="q" value="{escape(q)}" placeholder="Customer or detail"></label>
+                <button class="button small-button" type="submit">Filter</button>
+                <a class="button secondary small-button" href="/admin-audit-log">Clear</a>
+            </form>
             <div class="summary compact-summary">
                 <div>
                     <span class="label">Entries shown</span>
@@ -5063,16 +5124,18 @@ def get_admin_audit_log_page(message: str = "", error: str = ""):
                 </div>
                 <div>
                     <span class="label">Total saved</span>
-                    <strong>{len(entries)}</strong>
+                    <strong>{len(all_entries)}</strong>
                 </div>
             </div>
             <div class="table-wrap">
-                <table class="user-accounts-table">
+                <table class="user-accounts-table audit-table">
                     <thead>
                         <tr>
                             <th>When</th>
                             <th>User</th>
+                            <th>Area</th>
                             <th>Action</th>
+                            <th>Status</th>
                             <th>Summary</th>
                         </tr>
                     </thead>
@@ -5133,6 +5196,13 @@ def post_user_account(
         }
     )
     save_app_users(users)
+    record_audit_event(
+        "user-create",
+        target=username,
+        details=f"Role: {role} • Mailbox: {m365_email}",
+        user=current_user,
+        area="administration",
+    )
     return RedirectResponse(
         url=f"/user-accounts?message={quote('User created successfully.')}",
         status_code=303,
@@ -5235,6 +5305,14 @@ def post_user_account_update(
     message = "User updated successfully."
     if token_cleared:
         message += " Microsoft 365 connection was cleared because the mailbox changed."
+
+    record_audit_event(
+        "user-update",
+        target=username,
+        details=f"Role: {role} • {'Active' if is_active else 'Inactive'}{' • password changed' if password.strip() else ''}",
+        user=current_user,
+        area="administration",
+    )
 
     return RedirectResponse(
         url=f"/user-accounts?message={quote(message)}",
@@ -5970,7 +6048,7 @@ def calendar_write_redirect(month, result, success_message):
 def post_calendar_event_create(subject: str = Form(""), start_value: str = Form(""), end_value: str = Form(""), is_all_day: str = Form(""), location: str = Form(""), attendees: str = Form(""), notes: str = Form(""), month: str = Form("")):
     result = create_calendar_event(subject=subject, start_value=start_value, end_value=end_value, is_all_day=bool(is_all_day), location=location, attendees=attendees, notes=notes)
     if result.get("status") == "ok":
-        record_audit_event("calendar-create", target=subject, details=f"Shared NuMat Calendar • {start_value}")
+        record_audit_event("calendar-create", target=subject, details=f"Shared NuMat Calendar • {start_value}", area="calendar")
     return calendar_write_redirect(month, result, "Event added to Shared NuMat Calendar.")
 
 
@@ -5978,7 +6056,7 @@ def post_calendar_event_create(subject: str = Form(""), start_value: str = Form(
 def post_calendar_event_update(event_id: str = Form(""), subject: str = Form(""), start_value: str = Form(""), end_value: str = Form(""), is_all_day: str = Form(""), location: str = Form(""), attendees: str = Form(""), notes: str = Form(""), month: str = Form("")):
     result = update_calendar_event(event_id, subject=subject, start_value=start_value, end_value=end_value, is_all_day=bool(is_all_day), location=location, attendees=attendees, notes=notes)
     if result.get("status") == "ok":
-        record_audit_event("calendar-update", target=subject, details=f"Shared NuMat Calendar • {start_value}")
+        record_audit_event("calendar-update", target=subject, details=f"Shared NuMat Calendar • {start_value}", area="calendar")
     return calendar_write_redirect(month, result, "Calendar event updated.")
 
 
@@ -5986,7 +6064,7 @@ def post_calendar_event_update(event_id: str = Form(""), subject: str = Form("")
 def post_calendar_event_delete(event_id: str = Form(""), month: str = Form("")):
     result = delete_calendar_event(event_id)
     if result.get("status") == "ok":
-        record_audit_event("calendar-delete", target=event_id, details="Shared NuMat Calendar")
+        record_audit_event("calendar-delete", target=event_id, details="Shared NuMat Calendar", area="calendar")
     return calendar_write_redirect(month, result, "Calendar event deleted.")
 
 
@@ -6241,6 +6319,7 @@ def post_strategic_contact_delete(
         "strategic-remove",
         target=str(removed_contact.get("name") or contact_id),
         details=str(removed_contact.get("organization") or "").strip(),
+        area="strategic-contacts",
     )
     return RedirectResponse(
         url=append_message_to_url(
@@ -6269,6 +6348,8 @@ def post_strategic_contact_sync_filemaker(
         "strategic-sync-filemaker",
         target=str(strategic_contact.get("name") or contact_id),
         details=result["message"] if result.get("ok") else result.get("error"),
+        area="filemaker",
+        status="success" if result.get("ok") else "failed",
     )
     return RedirectResponse(
         url=append_message_to_url(
@@ -6350,6 +6431,7 @@ def post_strategic_contact(
         "strategic-add",
         target=name,
         details=f"{organization} • added from manual form",
+        area="strategic-contacts",
     )
     return RedirectResponse(
         url=f"/strategic-contacts-view?message={quote('Strategic contact added.')}",
@@ -6540,6 +6622,7 @@ def post_strategic_contact_import_pdl(
         "strategic-add",
         target=name,
         details=f"{organization} • added from PDL search",
+        area="strategic-contacts",
     )
 
     sync_result = sync_strategic_contact_to_filemaker(contact_id)
@@ -6547,6 +6630,8 @@ def post_strategic_contact_import_pdl(
         "strategic-sync-filemaker",
         target=name,
         details=sync_result["message"] if sync_result.get("ok") else sync_result.get("error"),
+        area="filemaker",
+        status="success" if sync_result.get("ok") else "failed",
     )
     if not sync_result.get("ok"):
         sync_error = str(sync_result.get("error") or "FileMaker sync failed.").strip()
@@ -6659,6 +6744,7 @@ def post_strategic_contact_import_contact(
         "strategic-add",
         target=name,
         details=f"{company} • added from contacts view",
+        area="strategic-contacts",
     )
     return RedirectResponse(
         url=f"{return_url}&message={quote('Contact saved to Strategic Contacts.')}",
@@ -7420,7 +7506,7 @@ def post_action_plan_dismiss(
 ):
     effective_reason = str(reason or "").strip() or str(reason_preset or "").strip()
     dismiss_action_plan_customer(customer, last_order, effective_reason)
-    record_audit_event("action-plan-dismiss", target=customer, details=effective_reason)
+    record_audit_event("action-plan-dismiss", target=customer, details=effective_reason, area="action-plan")
     return RedirectResponse(url=return_to or "/action-plan-view#action-plan", status_code=303)
 
 
@@ -7430,7 +7516,7 @@ def post_action_plan_restore(
     return_to: str = Form("/action-plan-view#action-plan"),
 ):
     restore_action_plan_customer(customer)
-    record_audit_event("action-plan-restore", target=customer, details="Restored to active queue.")
+    record_audit_event("action-plan-restore", target=customer, details="Restored to active queue.", area="action-plan")
     return RedirectResponse(url=return_to or "/action-plan-view#action-plan", status_code=303)
 
 
@@ -8486,6 +8572,9 @@ def post_m365_send_email(
     to: str = Form(""),
     subject: str = Form(""),
     body: str = Form(""),
+    recommended_to: str = Form(""),
+    recommended_subject: str = Form(""),
+    recommended_body: str = Form(""),
 ):
     current_user = get_current_session_user()
     if not current_user:
@@ -8504,6 +8593,14 @@ def post_m365_send_email(
     recipient = str(to or "").strip()
     subject_text = str(subject or "").strip()
     body_text = str(body or "")
+    recommendation_usage = classify_outreach_recommendation_usage(
+        recipient,
+        subject_text,
+        body_text,
+        recommended_to,
+        recommended_subject,
+        recommended_body,
+    )
 
     if not customer_name or not recipient or not subject_text or not body_text.strip():
         return render_page(
@@ -8527,6 +8624,7 @@ def post_m365_send_email(
     token_result = ensure_valid_access_token(current_user.get("username"))
     if token_result.get("status") != "ok":
         error_text = token_result.get("error_message") or token_result.get("status") or "Could not refresh the Microsoft 365 connection."
+        record_audit_event("send-email", target=customer_name, details=f"Send failed before delivery • {recommendation_usage}", area="customer-email", status="failed")
         return render_page(
             title="Send Email",
             body=(
@@ -8543,6 +8641,7 @@ def post_m365_send_email(
     )
     if send_result.get("status") != "ok":
         error_text = send_result.get("error_message") or send_result.get("status") or "Microsoft 365 could not send the email."
+        record_audit_event("send-email", target=customer_name, details=f"Send to {recipient} failed • {recommendation_usage}", area="customer-email", status="failed")
         return render_page(
             title="Send Email",
             body=(
@@ -8562,7 +8661,9 @@ def post_m365_send_email(
     record_audit_event(
         "send-email",
         target=customer_name,
-        details=f"Sent to {recipient}",
+        details=f"Sent to {recipient} • {recommendation_usage}",
+        area="customer-email",
+        status="success",
     )
     clear_attention_response_cache()
     clear_home_queue_summaries_cache()
@@ -13227,6 +13328,9 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
                 <form method="post" action="/m365/send-email" class="outreach-draft-form" id="outreach-send-form">
                     <input type="hidden" name="customer" value="{escape(customer)}">
                     <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
+                    <input type="hidden" name="recommended_to" value="{escape(target_email)}">
+                    <input type="hidden" name="recommended_subject" value="{escape(email_subject)}">
+                    <input type="hidden" name="recommended_body" value="{escape(email_body)}">
                     <p class="outreach-edit-note">You can tweak the recipient, subject, or email draft before sending.</p>
                     {send_status_note}
                     <div class="outreach-draft-row">
@@ -15873,6 +15977,9 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     to_input_id = f"home-focus-email-to-{slug}"
     subject_input_id = f"home-focus-email-subject-{slug}"
     body_input_id = f"home-focus-email-body-{slug}"
+    recommended_to_id = f"home-focus-recommended-to-{slug}"
+    recommended_subject_id = f"home-focus-recommended-subject-{slug}"
+    recommended_body_id = f"home-focus-recommended-body-{slug}"
     confirm_to_id = f"home-focus-confirm-to-{slug}"
     confirm_subject_id = f"home-focus-confirm-subject-{slug}"
     confirm_body_id = f"home-focus-confirm-body-{slug}"
@@ -16085,6 +16192,9 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         <form method="post" action="/m365/send-email" class="outreach-draft-form home-focus-draft-form" id="home-focus-send-form-{slug}">
                             <input type="hidden" name="customer" value="{escape(customer_name)}">
                             <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
+                            <input id="{recommended_to_id}" type="hidden" name="recommended_to" value="{escape(target_email)}">
+                            <input id="{recommended_subject_id}" type="hidden" name="recommended_subject" value="{escape(email_subject)}">
+                            <input id="{recommended_body_id}" type="hidden" name="recommended_body" value="{escape(email_body)}">
                             {f'<p class="outreach-edit-note" id="{draft_status_id}">Writing a tailored draft from the conversation history…</p>' if draft_async else ''}
                             <div class="outreach-draft-row">
                                 <label class="label" for="{to_input_id}">To</label>
@@ -16276,6 +16386,8 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         const status = document.getElementById(`home-focus-draft-status-${{slug}}`);
                         const subject = document.getElementById(`home-focus-email-subject-${{slug}}`);
                         const body = document.getElementById(`home-focus-email-body-${{slug}}`);
+                        const recommendedSubject = document.getElementById(`home-focus-recommended-subject-${{slug}}`);
+                        const recommendedBody = document.getElementById(`home-focus-recommended-body-${{slug}}`);
                         const sendButton = form?.querySelector('.home-focus-send-button');
                         if (sendButton?.tagName === 'BUTTON') sendButton.disabled = true;
                         try {{
@@ -16292,6 +16404,8 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             }}
                             if (subject) subject.value = payload.email_subject || '';
                             if (body) body.value = payload.email_body;
+                            if (recommendedSubject) recommendedSubject.value = payload.email_subject || '';
+                            if (recommendedBody) recommendedBody.value = payload.email_body;
                             if (status) status.hidden = true;
                             if (sendButton?.tagName === 'BUTTON') sendButton.disabled = false;
                         }} catch (error) {{
@@ -25554,6 +25668,58 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         text-decoration: underline;
                     }}
 
+                    .audit-filter-form {{
+                        display: grid;
+                        grid-template-columns: repeat(3, minmax(130px, 0.7fr)) minmax(150px, 0.8fr) minmax(220px, 1.2fr) auto auto;
+                        gap: 10px;
+                        align-items: end;
+                        margin: 18px 0;
+                    }}
+
+                    .audit-filter-form label {{
+                        display: grid;
+                        gap: 5px;
+                    }}
+
+                    .audit-filter-form label > span {{
+                        color: var(--muted);
+                        font-size: 11px;
+                        font-weight: 800;
+                        text-transform: uppercase;
+                    }}
+
+                    .audit-filter-form input,
+                    .audit-filter-form select {{
+                        min-width: 0;
+                        height: 36px;
+                        padding: 6px 9px;
+                        font-size: 12px;
+                    }}
+
+                    .audit-table th:nth-child(1), .audit-table td:nth-child(1) {{ width: 14%; }}
+                    .audit-table th:nth-child(2), .audit-table td:nth-child(2) {{ width: 12%; }}
+                    .audit-table th:nth-child(3), .audit-table td:nth-child(3) {{ width: 11%; }}
+                    .audit-table th:nth-child(4), .audit-table td:nth-child(4) {{ width: 13%; }}
+                    .audit-table th:nth-child(5), .audit-table td:nth-child(5) {{ width: 9%; text-align: left; }}
+                    .audit-table th:nth-child(6), .audit-table td:nth-child(6) {{ width: 41%; text-align: left; }}
+                    .audit-table td:nth-child(6) {{ white-space: normal; }}
+
+                    .audit-status {{
+                        display: inline-flex;
+                        padding: 3px 7px;
+                        border-radius: 999px;
+                        color: #176447;
+                        background: #e5f7ef;
+                        font-size: 10px;
+                        font-weight: 800;
+                    }}
+
+                    .audit-status-failed,
+                    .audit-status-error {{
+                        color: #a12d2d;
+                        background: #fdecec;
+                    }}
+
                     .attention-table {{
                         table-layout: fixed;
                     }}
@@ -25986,6 +26152,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 1120px) {{
+                        .audit-filter-form {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .audit-filter-search {{
+                            grid-column: span 2;
+                        }}
+
                         .user-account-columns {{
                             grid-template-columns: 1fr;
                         }}
