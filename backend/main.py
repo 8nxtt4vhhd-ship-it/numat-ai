@@ -5768,13 +5768,18 @@ def render_calendar_month_grid(events, month_start):
             classes.append("today")
         day_events = sorted(grouped.get(day_key, []), key=lambda item: str(item.get("start") or ""))
         visible = day_events[:4]
-        event_markup = "".join(
+        def event_chip(item):
+            return (
             f'''<a class="calendar-event-chip{' all-day' if item.get('is_all_day') else ''}" href="/calendar-view?month={month_start.strftime('%Y-%m')}&edit={quote(str(item.get('id') or ''))}" title="{escape(str(item.get('subject') or ''))}">
                 <span>{escape(format_calendar_event_time(item))}</span><strong>{escape(str(item.get('subject') or 'Untitled event'))}</strong>
             </a>'''
-            for item in visible
+            )
+        event_markup = "".join(event_chip(item) for item in visible)
+        hidden_events = day_events[len(visible):]
+        more = (
+            f'''<details class="calendar-day-more"><summary>+{len(hidden_events)} more</summary><div>{''.join(event_chip(item) for item in hidden_events)}</div></details>'''
+            if hidden_events else ""
         )
-        more = f"<span class='calendar-more'>+{len(day_events) - len(visible)} more</span>" if len(day_events) > len(visible) else ""
         cells.append(f'''<div class="{' '.join(classes)}"><div class="calendar-day-number">{day.day}</div><div class="calendar-day-events">{event_markup}{more}</div></div>''')
     return f'<div class="calendar-month-grid">{headers}{"".join(cells)}</div>'
 
@@ -21517,6 +21522,27 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-weight: 700;
                     }}
 
+                    .calendar-day-more summary {{
+                        cursor: pointer;
+                        color: var(--blue);
+                        font-size: 10px;
+                        font-weight: 800;
+                        list-style: none;
+                    }}
+
+                    .calendar-day-more summary::-webkit-details-marker {{
+                        display: none;
+                    }}
+
+                    .calendar-day-more[open] summary {{
+                        margin-bottom: 4px;
+                    }}
+
+                    .calendar-day-more > div {{
+                        display: grid;
+                        gap: 4px;
+                    }}
+
                     .calendar-event-form {{
                         display: grid;
                         gap: 14px;
@@ -21727,8 +21753,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             font-size: 8px;
                         }}
 
-                        .calendar-more {{
+                        .calendar-more,
+                        .calendar-day-more summary {{
                             font-size: 8px;
+                        }}
+
+                        .calendar-day-more > div {{
+                            gap: 2px;
                         }}
 
                         .calendar-toolbar-actions {{
