@@ -1,5 +1,6 @@
 from collections import Counter, defaultdict
 import base64
+import calendar as calendar_module
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from datetime import datetime, timedelta
@@ -66,6 +67,13 @@ from crm import (
     sync_filemaker_crm_cache,
     validate_crm_csv_content,
     validate_crm_csv_path,
+)
+from calendar_sync import (
+    UK_TIMEZONE,
+    create_calendar_event,
+    delete_calendar_event,
+    fetch_calendar_events,
+    update_calendar_event,
 )
 from filemaker import (
     check_filemaker_connection,
@@ -5699,6 +5707,213 @@ def render_operator_analysis(rows):
     '''
 
 
+def parse_calendar_month(value):
+    try:
+        return datetime.strptime(str(value or ""), "%Y-%m").replace(day=1)
+    except ValueError:
+        return datetime.now(UK_TIMEZONE).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def calendar_event_datetime(event, key="start"):
+    try:
+        return datetime.fromisoformat(str(event.get(key) or ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def format_calendar_event_time(event):
+    if event.get("is_all_day"):
+        return "All day"
+    start = calendar_event_datetime(event, "start")
+    end = calendar_event_datetime(event, "end")
+    if not start:
+        return "Time not available"
+    if end:
+        return f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
+    return start.strftime("%H:%M")
+
+
+def calendar_event_form_value(event, key, fallback):
+    parsed = calendar_event_datetime(event, key)
+    return parsed.strftime("%Y-%m-%dT%H:%M") if parsed else fallback
+
+
+def render_calendar_month_grid(events, month_start):
+    first_weekday, days_in_month = calendar_module.monthrange(month_start.year, month_start.month)
+    grid_start = month_start - timedelta(days=first_weekday)
+    grouped = defaultdict(list)
+    for event in events:
+        grouped[str(event.get("start_date") or "")].append(event)
+    headers = "".join(f"<div class='calendar-weekday'>{label}</div>" for label in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+    cells = []
+    for offset in range(42):
+        day = grid_start + timedelta(days=offset)
+        day_key = day.strftime("%Y-%m-%d")
+        classes = ["calendar-day"]
+        if day.month != month_start.month:
+            classes.append("outside")
+        if day.date() == datetime.now(UK_TIMEZONE).date():
+            classes.append("today")
+        day_events = sorted(grouped.get(day_key, []), key=lambda item: str(item.get("start") or ""))
+        visible = day_events[:4]
+        event_markup = "".join(
+            f'''<a class="calendar-event-chip{' all-day' if item.get('is_all_day') else ''}" href="/calendar-view?month={month_start.strftime('%Y-%m')}&edit={quote(str(item.get('id') or ''))}" title="{escape(str(item.get('subject') or ''))}">
+                <span>{escape(format_calendar_event_time(item))}</span><strong>{escape(str(item.get('subject') or 'Untitled event'))}</strong>
+            </a>'''
+            for item in visible
+        )
+        more = f"<span class='calendar-more'>+{len(day_events) - len(visible)} more</span>" if len(day_events) > len(visible) else ""
+        cells.append(f'''<div class="{' '.join(classes)}"><div class="calendar-day-number">{day.day}</div><div class="calendar-day-events">{event_markup}{more}</div></div>''')
+    return f'<div class="calendar-month-grid">{headers}{"".join(cells)}</div>'
+
+
+def render_calendar_agenda(events, month_start):
+    if not events:
+        return "<p class='empty-action'>No events are recorded for this month.</p>"
+    grouped = defaultdict(list)
+    for event in events:
+        grouped[str(event.get("start_date") or "")].append(event)
+    sections = []
+    for day_key in sorted(grouped):
+        try:
+            label = datetime.strptime(day_key, "%Y-%m-%d").strftime("%A %d %B")
+        except ValueError:
+            label = day_key
+        items = []
+        for event in sorted(grouped[day_key], key=lambda item: str(item.get("start") or "")):
+            location = str(event.get("location") or "").strip()
+            items.append(f'''<a class="calendar-agenda-event" href="/calendar-view?month={month_start.strftime('%Y-%m')}&edit={quote(str(event.get('id') or ''))}">
+                <span>{escape(format_calendar_event_time(event))}</span>
+                <strong>{escape(str(event.get('subject') or 'Untitled event'))}</strong>
+                <small>{escape(location or 'No location')}</small>
+            </a>''')
+        sections.append(f"<section class='calendar-agenda-day'><h3>{escape(label)}</h3>{''.join(items)}</section>")
+    return "<div class='calendar-agenda'>" + "".join(sections) + "</div>"
+
+
+def render_calendar_event_form(event, month_start):
+    event = event or {}
+    editing = bool(event.get("id"))
+    default_start = datetime.now(UK_TIMEZONE).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    if default_start.month != month_start.month or default_start.year != month_start.year:
+        default_start = month_start.replace(day=1, hour=9)
+    default_end = default_start + timedelta(hours=1)
+    start_value = calendar_event_form_value(event, "start", default_start.strftime("%Y-%m-%dT%H:%M"))
+    end_value = calendar_event_form_value(event, "end", default_end.strftime("%Y-%m-%dT%H:%M"))
+    attendees = ", ".join(event.get("attendees") or [])
+    action = "/calendar/events/update" if editing else "/calendar/events/create"
+    heading = "Edit event" if editing else "Add event"
+    recurring_note = "<p class='small muted'>This is an occurrence in a recurring series. Changes apply to this occurrence.</p>" if event.get("series_master_id") else ""
+    delete_form = ""
+    if editing:
+        delete_form = f'''<form method="post" action="/calendar/events/delete" onsubmit="return confirm('Delete this event? Attendees may receive a cancellation.');">
+            <input type="hidden" name="event_id" value="{escape(str(event.get('id') or ''))}">
+            <input type="hidden" name="month" value="{month_start.strftime('%Y-%m')}">
+            <button class="button danger" type="submit">Delete event</button>
+        </form>'''
+    return f'''
+        <aside class="panel calendar-editor-panel">
+            <div class="calendar-editor-head"><h2>{heading}</h2>{f'<a href="/calendar-view?month={month_start.strftime("%Y-%m")}">Close</a>' if editing else ''}</div>
+            {recurring_note}
+            <form class="calendar-event-form" method="post" action="{action}">
+                <input type="hidden" name="event_id" value="{escape(str(event.get('id') or ''))}">
+                <input type="hidden" name="month" value="{month_start.strftime('%Y-%m')}">
+                <label><span>Event title</span><input name="subject" required value="{escape(str(event.get('subject') or ''))}"></label>
+                <div class="calendar-form-row">
+                    <label><span>Starts</span><input type="datetime-local" name="start_value" required value="{escape(start_value)}"></label>
+                    <label><span>Ends</span><input type="datetime-local" name="end_value" required value="{escape(end_value)}"></label>
+                </div>
+                <label class="calendar-checkbox"><input type="checkbox" name="is_all_day" value="true"{' checked' if event.get('is_all_day') else ''}><span>All-day event</span></label>
+                <label><span>Location</span><input name="location" value="{escape(str(event.get('location') or ''))}" placeholder="Customer or meeting location"></label>
+                <label><span>Attendees</span><input name="attendees" value="{escape(attendees)}" placeholder="name@example.com, another@example.com"><small>Adding or changing attendees can send Outlook invitations or updates.</small></label>
+                <label><span>Notes</span><textarea name="notes" rows="5">{escape(str(event.get('notes') or event.get('body_preview') or ''))}</textarea></label>
+                <div class="calendar-form-actions"><button type="submit">{'Save changes' if editing else 'Add to calendar'}</button>{f'<a class="button secondary" target="_blank" rel="noopener" href="{escape(str(event.get("web_link") or ""))}">Open in Outlook</a>' if event.get('web_link') else ''}</div>
+            </form>
+            {delete_form}
+        </aside>
+    '''
+
+
+@app.get("/api/calendar-events")
+def get_calendar_events_api(start: str = "", end: str = "", refresh: bool = False):
+    now = datetime.now(UK_TIMEZONE)
+    try:
+        start_dt = datetime.fromisoformat(start) if start else now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = datetime.fromisoformat(end) if end else start_dt + timedelta(days=14)
+    except ValueError:
+        return JSONResponse({"status": "invalid_date_range"}, status_code=400)
+    return fetch_calendar_events(start_dt, end_dt, force_refresh=refresh)
+
+
+@app.get("/calendar-view", response_class=HTMLResponse)
+def get_calendar_view(month: str = "", view: str = "month", edit: str = "", refresh: bool = False, message: str = "", error: str = ""):
+    month_start = parse_calendar_month(month)
+    next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    grid_start = month_start - timedelta(days=month_start.weekday())
+    grid_end = next_month + timedelta(days=(6 - (next_month - timedelta(days=1)).weekday()))
+    result = fetch_calendar_events(grid_start, grid_end, force_refresh=refresh)
+    events = result.get("events", []) if result.get("status") == "ok" else []
+    editing_event = next((item for item in events if str(item.get("id") or "") == str(edit or "")), {})
+    previous_month = (month_start - timedelta(days=1)).strftime("%Y-%m")
+    following_month = next_month.strftime("%Y-%m")
+    selected_view = "agenda" if view == "agenda" else "month"
+    status_markup = f"<p class='status'>{escape(message)}</p>" if message else ""
+    if error or result.get("status") != "ok":
+        status_markup += f"<p class='status error'>{escape(error or result.get('error_message') or result.get('status') or 'Calendar unavailable')}</p>"
+    content = render_calendar_agenda(events, month_start) if selected_view == "agenda" else render_calendar_month_grid(events, month_start)
+    body = f'''
+        {status_markup}
+        <div class="calendar-page-layout">
+            <section class="panel calendar-main-panel">
+                <div class="calendar-toolbar">
+                    <div><span class="home-focus-inline-kicker">Shared NuMat Calendar</span><h2>{month_start.strftime('%B %Y')}</h2><p class="small muted">Synced {escape(format_optional_datetime(result.get('synced_at')) if result.get('synced_at') else 'not available')}</p></div>
+                    <div class="calendar-toolbar-actions">
+                        <a class="button secondary" href="/calendar-view?month={previous_month}&view={selected_view}">Previous</a>
+                        <a class="button secondary" href="/calendar-view">Today</a>
+                        <a class="button secondary" href="/calendar-view?month={following_month}&view={selected_view}">Next</a>
+                        <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view={'agenda' if selected_view == 'month' else 'month'}">{'Agenda' if selected_view == 'month' else 'Month'}</a>
+                        <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view={selected_view}&refresh=true">Refresh</a>
+                    </div>
+                </div>
+                {content}
+            </section>
+            {render_calendar_event_form(editing_event, month_start)}
+        </div>
+    '''
+    return render_page(title="Calendar", body=body, main_class="calendar-main")
+
+
+def calendar_write_redirect(month, result, success_message):
+    month_value = parse_calendar_month(month).strftime("%Y-%m")
+    if result.get("status") == "ok":
+        return RedirectResponse(url=f"/calendar-view?month={month_value}&message={quote(success_message)}", status_code=303)
+    return RedirectResponse(url=f"/calendar-view?month={month_value}&error={quote(str(result.get('error_message') or result.get('status') or 'Calendar update failed.'))}", status_code=303)
+
+
+@app.post("/calendar/events/create")
+def post_calendar_event_create(subject: str = Form(""), start_value: str = Form(""), end_value: str = Form(""), is_all_day: str = Form(""), location: str = Form(""), attendees: str = Form(""), notes: str = Form(""), month: str = Form("")):
+    result = create_calendar_event(subject=subject, start_value=start_value, end_value=end_value, is_all_day=bool(is_all_day), location=location, attendees=attendees, notes=notes)
+    if result.get("status") == "ok":
+        record_audit_event("calendar-create", target=subject, details=f"Shared NuMat Calendar • {start_value}")
+    return calendar_write_redirect(month, result, "Event added to Shared NuMat Calendar.")
+
+
+@app.post("/calendar/events/update")
+def post_calendar_event_update(event_id: str = Form(""), subject: str = Form(""), start_value: str = Form(""), end_value: str = Form(""), is_all_day: str = Form(""), location: str = Form(""), attendees: str = Form(""), notes: str = Form(""), month: str = Form("")):
+    result = update_calendar_event(event_id, subject=subject, start_value=start_value, end_value=end_value, is_all_day=bool(is_all_day), location=location, attendees=attendees, notes=notes)
+    if result.get("status") == "ok":
+        record_audit_event("calendar-update", target=subject, details=f"Shared NuMat Calendar • {start_value}")
+    return calendar_write_redirect(month, result, "Calendar event updated.")
+
+
+@app.post("/calendar/events/delete")
+def post_calendar_event_delete(event_id: str = Form(""), month: str = Form("")):
+    result = delete_calendar_event(event_id)
+    if result.get("status") == "ok":
+        record_audit_event("calendar-delete", target=event_id, details="Shared NuMat Calendar")
+    return calendar_write_redirect(month, result, "Calendar event deleted.")
+
+
 def build_current_month_production_payload(production_result=None, today=None):
     production_result = production_result or fetch_production_analysis_data()
     today = today or datetime.now()
@@ -5723,7 +5938,7 @@ def build_current_month_production_payload(production_result=None, today=None):
     return payload
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None):
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None):
     if crm_result is None:
         crm_result = fetch_promise_of_order_activities()
         if crm_result.get("status") != "ok":
@@ -5764,6 +5979,10 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None):
     customer_count = len({item["customer"].casefold() for item in promises if item["customer"]})
     aged_promises = [item for item in promises if item.get("age_days") is not None]
     production_mtd = build_current_month_production_payload(production_result=production_result)
+    if calendar_result is None:
+        calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
+        calendar_result = fetch_calendar_events(calendar_start, calendar_start + timedelta(days=14))
+    planned_visits = calendar_result.get("events", []) if calendar_result.get("status") == "ok" else []
 
     return {
         "status": crm_result.get("status", "error"),
@@ -5771,6 +5990,10 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None):
         "synced_at": crm_result.get("synced_at") or crm_result.get("cache_updated_at") or "",
         "open_promises": promises,
         "production_mtd": production_mtd,
+        "planned_visits": planned_visits,
+        "calendar_status": calendar_result.get("status", "error"),
+        "calendar_error": calendar_result.get("error_message", ""),
+        "calendar_synced_at": calendar_result.get("synced_at", ""),
         "summary": {
             "open_count": len(promises),
             "customer_count": customer_count,
@@ -5778,6 +6001,24 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None):
             "oldest_days": max((item["age_days"] for item in aged_promises), default=None),
         },
     }
+
+
+def render_kpi_planned_visits(events, calendar_status="ok", calendar_error=""):
+    if calendar_status != "ok":
+        return f"<p class='status error'>{escape(calendar_error or 'Shared calendar is currently unavailable.')}</p>"
+    if not events:
+        return "<div class='kpi-visits-empty'><strong>No planned visits</strong><span>Nothing is scheduled in the next two weeks.</span></div>"
+    cards = []
+    for event in events[:12]:
+        start = calendar_event_datetime(event, "start")
+        date_label = start.strftime("%a %d %b") if start else "Date unavailable"
+        location = str(event.get("location") or "").strip()
+        cards.append(f'''<a class="kpi-visit-card" href="/calendar-view?month={(start or datetime.now(UK_TIMEZONE)).strftime('%Y-%m')}&edit={quote(str(event.get('id') or ''))}">
+            <span class="kpi-visit-date">{escape(date_label)}</span>
+            <div><strong>{escape(str(event.get('subject') or 'Untitled event'))}</strong><small>{escape(format_calendar_event_time(event))}{f' · {escape(location)}' if location else ''}</small></div>
+        </a>''')
+    more = f"<p class='small muted'>Showing 12 of {len(events)} events. Open the calendar to see all.</p>" if len(events) > 12 else ""
+    return f"<div class='kpi-visits-list'>{''.join(cards)}</div>{more}"
 
 
 def render_open_promises_table(promises):
@@ -5850,20 +6091,16 @@ def get_weekly_kpi_dashboard():
                 {render_open_promises_table(payload.get("open_promises", []))}
             </section>
 
-            <section class="panel kpi-planned-visits-panel" aria-label="Planned Visits placeholder">
+            <section class="panel kpi-planned-visits-panel" aria-label="Planned Visits">
+                <div class="kpi-visits-head">
                 <div class="kpi-section-title">
                     <span class="kpi-section-mark visits" aria-hidden="true"></span>
                     <h2>Planned Visits</h2>
                 </div>
-                <div class="kpi-coming-soon">
-                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                        <rect x="3.5" y="5.5" width="17" height="15" rx="2"></rect>
-                        <path d="M7.5 3.5v4M16.5 3.5v4M3.5 10h17"></path>
-                        <path d="M8 14h2M14 14h2M8 17h2M14 17h2"></path>
-                    </svg>
-                    <strong>Planned visits</strong>
-                    <span>Calendar view coming next</span>
+                <a class="button secondary small-button" href="/calendar-view">Open calendar</a>
                 </div>
+                <p class="small muted">Next 14 days · Shared NuMat Calendar</p>
+                {render_kpi_planned_visits(payload.get('planned_visits', []), payload.get('calendar_status'), payload.get('calendar_error'))}
             </section>
 
             <section class="panel kpi-production-panel">
@@ -6862,6 +7099,8 @@ def read_api_root():
         "crm_data": "/crm-data",
         "weekly_kpis": "/api/weekly-kpis",
         "weekly_kpi_dashboard": "/weekly-kpi-dashboard",
+        "calendar_events": "/api/calendar-events",
+        "calendar_view": "/calendar-view",
         "production_analysis": "/api/production-analysis",
         "production_analysis_view": "/production-analysis-view",
         "customers_view": "/customers-view",
@@ -7967,6 +8206,15 @@ def render_dashboard_home(ask="", ask_run=""):
                             </svg>
                         </span>
                         <strong>Weekly KPI Dashboard</strong>
+                    </a>
+                    <a class="home-launch-card" href="/calendar-view" aria-label="Shared Calendar">
+                        <span class="home-launch-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <rect x="4" y="5.5" width="16" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
+                                <path d="M8 3.5v4M16 3.5v4M4 10h16M8 14h2M14 14h2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                        </span>
+                        <strong>Shared Calendar</strong>
                     </a>
                 </div>
             </section>
@@ -19967,6 +20215,7 @@ def render_global_nav(title):
         ("Home", "/"),
         ("Action Plan", "/action-plan-view"),
         ("Weekly KPI Dashboard", "/weekly-kpi-dashboard"),
+        ("Calendar", "/calendar-view"),
         ("Insights", "/insights-view"),
         ("Customer Map", "/customer-map-view"),
         ("Strategic Contacts", "/strategic-contacts-view"),
@@ -21050,6 +21299,267 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-height: 500px;
                         padding: 24px;
                         border-top: 4px solid #00a884;
+                    }}
+
+                    .kpi-visits-head {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 16px;
+                    }}
+
+                    .kpi-visits-list {{
+                        display: grid;
+                        gap: 8px;
+                        margin-top: 16px;
+                    }}
+
+                    .kpi-visit-card {{
+                        display: grid;
+                        grid-template-columns: 90px minmax(0, 1fr);
+                        gap: 12px;
+                        align-items: center;
+                        padding: 11px 13px;
+                        border: 1px solid #d5ebe5;
+                        border-radius: 11px;
+                        color: var(--ink);
+                        background: linear-gradient(145deg, #f3fbf8, #ffffff);
+                        text-decoration: none;
+                    }}
+
+                    .kpi-visit-card:hover {{
+                        border-color: #7acbb8;
+                        background: #effaf7;
+                    }}
+
+                    .kpi-visit-card div,
+                    .kpi-visit-card strong,
+                    .kpi-visit-card small {{
+                        display: block;
+                        min-width: 0;
+                    }}
+
+                    .kpi-visit-card strong {{
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .kpi-visit-card small {{
+                        margin-top: 2px;
+                        color: var(--muted);
+                    }}
+
+                    .kpi-visit-date {{
+                        color: #087960;
+                        font-size: 12px;
+                        font-weight: 800;
+                        text-transform: uppercase;
+                    }}
+
+                    .kpi-visits-empty {{
+                        min-height: 300px;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        justify-content: center;
+                        color: var(--muted);
+                    }}
+
+                    main.calendar-main {{
+                        max-width: 1800px;
+                    }}
+
+                    .calendar-page-layout {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr) 380px;
+                        gap: 18px;
+                        align-items: start;
+                    }}
+
+                    .calendar-main-panel,
+                    .calendar-editor-panel {{
+                        padding: 22px;
+                    }}
+
+                    .calendar-editor-panel {{
+                        position: sticky;
+                        top: 18px;
+                    }}
+
+                    .calendar-toolbar,
+                    .calendar-toolbar-actions,
+                    .calendar-editor-head,
+                    .calendar-form-actions {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 10px;
+                    }}
+
+                    .calendar-toolbar {{
+                        margin-bottom: 18px;
+                    }}
+
+                    .calendar-toolbar h2,
+                    .calendar-toolbar p,
+                    .calendar-editor-head h2 {{
+                        margin: 0;
+                    }}
+
+                    .calendar-toolbar-actions {{
+                        flex-wrap: wrap;
+                        justify-content: flex-end;
+                    }}
+
+                    .calendar-month-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(7, minmax(0, 1fr));
+                        overflow: hidden;
+                        border: 1px solid var(--border);
+                        border-radius: 14px;
+                        background: var(--border);
+                        gap: 1px;
+                    }}
+
+                    .calendar-weekday {{
+                        padding: 10px;
+                        color: #40566d;
+                        background: #eaf1f8;
+                        font-size: 12px;
+                        font-weight: 800;
+                        text-align: center;
+                        text-transform: uppercase;
+                    }}
+
+                    .calendar-day {{
+                        min-height: 132px;
+                        padding: 8px;
+                        background: #ffffff;
+                    }}
+
+                    .calendar-day.outside {{
+                        background: #f7f9fc;
+                        color: #9aabba;
+                    }}
+
+                    .calendar-day.today {{
+                        box-shadow: inset 0 0 0 2px #245cff;
+                    }}
+
+                    .calendar-day-number {{
+                        margin-bottom: 6px;
+                        font-size: 12px;
+                        font-weight: 800;
+                    }}
+
+                    .calendar-day-events {{
+                        display: grid;
+                        gap: 4px;
+                    }}
+
+                    .calendar-event-chip {{
+                        display: block;
+                        min-width: 0;
+                        padding: 5px 6px;
+                        border-left: 3px solid #00a884;
+                        border-radius: 5px;
+                        color: #173e35;
+                        background: #e9f8f4;
+                        font-size: 10px;
+                        line-height: 1.25;
+                        text-decoration: none;
+                    }}
+
+                    .calendar-event-chip.all-day {{
+                        border-left-color: #245cff;
+                        color: #24406e;
+                        background: #edf2ff;
+                    }}
+
+                    .calendar-event-chip span,
+                    .calendar-event-chip strong {{
+                        display: block;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                        white-space: nowrap;
+                    }}
+
+                    .calendar-more {{
+                        color: var(--muted);
+                        font-size: 10px;
+                        font-weight: 700;
+                    }}
+
+                    .calendar-event-form {{
+                        display: grid;
+                        gap: 14px;
+                        margin-top: 16px;
+                    }}
+
+                    .calendar-event-form label {{
+                        display: grid;
+                        gap: 6px;
+                    }}
+
+                    .calendar-event-form label > span {{
+                        color: #40566d;
+                        font-size: 12px;
+                        font-weight: 800;
+                    }}
+
+                    .calendar-event-form input,
+                    .calendar-event-form textarea {{
+                        width: 100%;
+                    }}
+
+                    .calendar-form-row {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px;
+                    }}
+
+                    .calendar-event-form .calendar-checkbox {{
+                        display: flex;
+                        align-items: center;
+                        gap: 8px;
+                    }}
+
+                    .calendar-event-form .calendar-checkbox input {{
+                        width: auto;
+                    }}
+
+                    .calendar-agenda {{
+                        display: grid;
+                        gap: 12px;
+                    }}
+
+                    .calendar-agenda-day {{
+                        display: grid;
+                        grid-template-columns: 180px minmax(0, 1fr);
+                        gap: 10px;
+                        align-items: start;
+                        padding: 12px 0;
+                        border-bottom: 1px solid var(--border);
+                    }}
+
+                    .calendar-agenda-day h3 {{
+                        margin: 8px 0 0;
+                        font-size: 14px;
+                    }}
+
+                    .calendar-agenda-event {{
+                        display: grid;
+                        grid-template-columns: 100px minmax(0, 1fr) minmax(120px, 0.6fr);
+                        gap: 10px;
+                        padding: 10px 12px;
+                        border: 1px solid #d5ebe5;
+                        border-radius: 9px;
+                        color: var(--ink);
+                        text-decoration: none;
+                    }}
+
+                    .calendar-agenda-event span,
+                    .calendar-agenda-event small {{
+                        color: var(--muted);
                     }}
 
                     .kpi-coming-soon {{
