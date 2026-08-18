@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import base64
 from pathlib import Path
 from threading import Lock
 from urllib.parse import urlencode
@@ -50,6 +51,137 @@ def has_m365_config():
         and config["client_secret"]
         and config["redirect_uri"]
     )
+
+
+def get_m365_reporting_config():
+    return {
+        "enabled": get_bool_env("M365_REPORTING_ENABLED", default=False),
+        "tenant_id": os.getenv("M365_REPORTING_TENANT_ID", "").strip(),
+        "client_id": os.getenv("M365_REPORTING_CLIENT_ID", "").strip(),
+        "client_secret": os.getenv("M365_REPORTING_CLIENT_SECRET", "").strip(),
+        "sender_email": os.getenv(
+            "M365_REPORTING_SENDER_EMAIL",
+            "apps@numatsystems.com",
+        ).strip().lower(),
+    }
+
+
+def has_m365_reporting_config():
+    config = get_m365_reporting_config()
+    return bool(
+        config["enabled"]
+        and config["tenant_id"]
+        and config["client_id"]
+        and config["client_secret"]
+        and config["sender_email"]
+    )
+
+
+def get_m365_reporting_access_token():
+    config = get_m365_reporting_config()
+    if not has_m365_reporting_config():
+        return {"status": "m365_reporting_disabled"}
+
+    try:
+        response = requests.post(
+            f"https://login.microsoftonline.com/{config['tenant_id']}/oauth2/v2.0/token",
+            data={
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "grant_type": "client_credentials",
+                "scope": "https://graph.microsoft.com/.default",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as error:
+        return {"status": get_request_error_status(error)}
+
+    if response.status_code != 200:
+        try:
+            payload = response.json()
+            error_message = str(
+                payload.get("error_description")
+                or payload.get("error")
+                or response.text
+                or ""
+            ).strip()
+        except ValueError:
+            error_message = str(response.text or "").strip()
+        return {
+            "status": f"http_{response.status_code}",
+            "error_message": error_message,
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return {"status": "invalid_response"}
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        return {"status": "missing_access_token"}
+    return {"status": "ok", "access_token": access_token}
+
+
+def send_m365_reporting_mail(recipients, subject, body, attachments=None):
+    recipient_addresses = []
+    seen = set()
+    for recipient in recipients or []:
+        address = str(recipient or "").strip().lower()
+        if address and "@" in address and address not in seen:
+            recipient_addresses.append(address)
+            seen.add(address)
+    if not recipient_addresses:
+        return {"status": "missing_recipient"}
+
+    token_result = get_m365_reporting_access_token()
+    if token_result.get("status") != "ok":
+        return token_result
+    config = get_m365_reporting_config()
+    payload = {
+        "message": {
+            "subject": str(subject or "").strip(),
+            "body": {"contentType": "Text", "content": str(body or "")},
+            "toRecipients": [
+                {"emailAddress": {"address": address}}
+                for address in recipient_addresses
+            ],
+            "attachments": [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": str(item.get("name") or "attachment"),
+                    "contentType": str(item.get("content_type") or "application/octet-stream"),
+                    "contentBytes": base64.b64encode(item.get("content") or b"").decode("ascii"),
+                }
+                for item in (attachments or [])
+                if item.get("content") is not None
+            ],
+        },
+        "saveToSentItems": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {token_result['access_token']}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        response = requests.post(
+            f"{M365_GRAPH_ROOT}/users/{config['sender_email']}/sendMail",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+    except requests.RequestException as error:
+        return {"status": get_request_error_status(error)}
+    if response.status_code not in {200, 202}:
+        return {
+            "status": f"http_{response.status_code}",
+            "error_message": str(response.text or "").strip(),
+        }
+    return {
+        "status": "ok",
+        "sender": config["sender_email"],
+        "recipients": recipient_addresses,
+    }
 
 
 def should_log_m365():

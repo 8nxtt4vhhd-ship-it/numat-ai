@@ -1,0 +1,10 @@
+[Unit]
+Description=Run NuMat production anomaly report monthly
+
+[Timer]
+OnCalendar=*-*-01 07:00:00 Europe/London
+Persistent=true
+Unit=numat-production-anomaly-report.service
+
+[Install]
+WantedBy=timers.target

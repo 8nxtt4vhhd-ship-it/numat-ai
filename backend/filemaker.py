@@ -298,6 +298,72 @@ def fetch_layout_records(layout, limit=100, offset=1, sort_fields=None):
         close_session(token)
 
 
+def find_layout_records(layout, query, limit=100, offset=1, sort_fields=None):
+    if not layout or not query:
+        return {
+            "connected": False,
+            "status": "missing_layout_or_query",
+            "records": [],
+        }
+
+    token = None
+    try:
+        config = get_filemaker_config()
+        token = get_session_token()
+        if not token:
+            return {"connected": False, "status": "login_failed", "records": []}
+
+        layout_name = quote(layout, safe="")
+        url = f"{get_database_path(config)}/layouts/{layout_name}/_find"
+        payload = {
+            "query": query if isinstance(query, list) else [query],
+            "limit": max(1, int(limit)),
+            "offset": max(1, int(offset)),
+        }
+        if sort_fields:
+            payload["sort"] = sort_fields
+
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+            verify=config["verify_ssl"],
+        )
+
+        if response.status_code != 200:
+            error_message = get_filemaker_response_message(response)
+            if "401" in error_message or "no records" in error_message.lower():
+                return {"connected": True, "status": "ok", "records": []}
+            print(
+                "FileMaker find records failed with status "
+                f"{response.status_code}: {error_message or 'No FileMaker error detail returned'}"
+            )
+            return {"connected": True, "status": f"http_{response.status_code}", "records": []}
+
+        data = response.json()
+        return {
+            "connected": True,
+            "status": "ok",
+            "records": data.get("response", {}).get("data", []),
+        }
+    except requests.RequestException as error:
+        print(f"FileMaker find records connection error: {format_request_error(error)}")
+        return {
+            "connected": False,
+            "status": get_request_error_status(error),
+            "records": [],
+        }
+    except (TypeError, ValueError):
+        print("FileMaker find records response was not valid")
+        return {"connected": True, "status": "invalid_response", "records": []}
+    finally:
+        close_session(token)
+
+
 def fetch_layout_field_names(layout):
     if not layout:
         return {

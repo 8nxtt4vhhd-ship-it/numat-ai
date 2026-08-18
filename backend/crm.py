@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dateutil import parser
 from dotenv import load_dotenv
-from filemaker import fetch_layout_records, get_filemaker_config
+from filemaker import fetch_layout_records, find_layout_records, get_filemaker_config
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CRM_SAMPLE_CSV_PATH = Path(
@@ -20,6 +20,10 @@ DEFAULT_FILEMAKER_CRM_RECENT_CACHE_PATH = BASE_DIR / "data" / "filemaker_crm_rec
 MAX_CRM_SAMPLE_ROWS = 50000
 _CRM_CACHE = {
     "key": None,
+    "expires_at": 0,
+    "result": None,
+}
+_PROMISE_OF_ORDER_CACHE = {
     "expires_at": 0,
     "result": None,
 }
@@ -188,6 +192,68 @@ def get_filemaker_crm_incremental_sync_enabled():
 
 def get_filemaker_crm_sort_field():
     return os.getenv("FILEMAKER_CRM_SORT_FIELD", "Date Created").strip()
+
+
+def get_filemaker_crm_complete_field():
+    return os.getenv("FILEMAKER_CRM_COMPLETE_FIELD", "Complete").strip()
+
+
+def get_filemaker_crm_type_field():
+    return os.getenv("FILEMAKER_CRM_TYPE_FIELD", "CRM Type").strip()
+
+
+def get_promise_of_order_cache_seconds():
+    raw_seconds = os.getenv("PROMISE_OF_ORDER_CACHE_SECONDS", "120")
+    try:
+        return max(0, int(raw_seconds))
+    except ValueError:
+        return 120
+
+
+def fetch_promise_of_order_activities(force_refresh=False):
+    now = time.time()
+    cache_seconds = get_promise_of_order_cache_seconds()
+    if (
+        not force_refresh
+        and cache_seconds
+        and _PROMISE_OF_ORDER_CACHE["result"] is not None
+        and _PROMISE_OF_ORDER_CACHE["expires_at"] > now
+    ):
+        return _PROMISE_OF_ORDER_CACHE["result"]
+
+    layout = get_filemaker_emails_layout()
+    type_field = get_filemaker_crm_type_field()
+    result = find_layout_records(
+        layout,
+        query=[{type_field: "Promise of Order"}],
+        limit=1000,
+        offset=1,
+        sort_fields=[{
+            "fieldName": get_filemaker_crm_sort_field(),
+            "sortOrder": "descend",
+        }] if get_filemaker_crm_sort_field() else None,
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status", "error"),
+            "source": "filemaker_promise_query",
+            "activities": [],
+        }
+
+    activities = [
+        normalize_crm_row(record.get("fieldData", {}), index=index)
+        for index, record in enumerate(result.get("records", []), start=1)
+    ]
+    payload = {
+        "status": "ok",
+        "source": "filemaker_promise_query",
+        "activities": activities,
+        "synced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if cache_seconds:
+        _PROMISE_OF_ORDER_CACHE["expires_at"] = now + cache_seconds
+        _PROMISE_OF_ORDER_CACHE["result"] = payload
+    return payload
 
 
 def get_row_value(row, *field_names):
@@ -1031,6 +1097,21 @@ def normalize_crm_row(row, index):
         else "sales_outreach"
     )
 
+    crm_type = str(
+        get_row_value(row, "emails::CRM Type", "CRM Type")
+    ).strip()
+    completion_value = str(
+        get_row_value(
+            row,
+            get_filemaker_crm_complete_field(),
+            f"emails::{get_filemaker_crm_complete_field()}",
+            "Complete",
+            "emails::Complete",
+            "Completed",
+            "emails::Completed",
+        )
+    ).strip()
+
     return {
         "row_number": index,
         "date_created": normalize_crm_date(
@@ -1041,9 +1122,10 @@ def normalize_crm_row(row, index):
         "crm_category": str(
             get_row_value(row, "emails::CRM Category", "CRM Category")
         ).strip(),
-        "crm_type": str(
-            get_row_value(row, "emails::CRM Type", "CRM Type")
-        ).strip(),
+        "crm_type": crm_type,
+        "crm_complete": completion_value,
+        "crm_is_complete": normalize_crm_completion(completion_value),
+        "is_promise_of_order": crm_type.casefold() == "promise of order",
         "customer_label": str(
             get_row_value(
                 row,
@@ -1065,6 +1147,23 @@ def normalize_crm_row(row, index):
         "sender_is_internal": sender_is_internal,
         "recipient_has_internal": recipient_has_internal,
         "exclude": exclude,
+    }
+
+
+def normalize_crm_completion(value):
+    normalized = str(value or "").strip().casefold()
+    if not normalized:
+        return False
+    return normalized not in {
+        "0",
+        "false",
+        "no",
+        "n",
+        "open",
+        "active",
+        "incomplete",
+        "not complete",
+        "pending",
     }
 
 

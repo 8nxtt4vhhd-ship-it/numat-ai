@@ -1185,3 +1185,60 @@ def generate_data_question_answer(question_payload):
     except Exception as error:
         print(f"AI data question failed: {error}")
         return fallback
+
+
+def generate_production_analysis_report(facts):
+    fallback = {
+        "executive_summary": ["The report contains verified production and operator results for the selected completed-day period."],
+        "comparison": ["Review the current and previous-period figures together before drawing conclusions about changes."],
+        "press_flow": ["Department and press results should be reviewed for sustained changes rather than isolated daily movements."],
+        "quality": ["Re-cook activity is reported separately from new press throughput and should be monitored as a trend."],
+        "strengths": ["Completed-day production data is available for consistent historical comparison."],
+        "focus_areas": ["Investigate material variances and confirm anomalous time bookings before acting on performance figures."],
+        "workforce_observations": ["Operator results should be interpreted alongside attendance, role, training and booking accuracy."],
+        "operator_comments": {},
+        "final_message": "Use the verified figures in this report to guide the next production review and agree practical follow-up actions.",
+    }
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {**fallback, "_analysis_status": "missing_api_key"}
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful production operations analyst. Interpret only the supplied JSON facts. "
+                        "Business context: NuMat repairs rubber-backed carpeted mats; this is a mat-repair operation, not new-product manufacturing. "
+                        "The word 'mats' is the required business term and must remain unchanged. Never replace it with materials, units, products, items or goods. "
+                        "total_mats_repaired_through_presses is the recorded number of mats repaired/processed through FF1, FF2 and FF3 combined. "
+                        "Describe changes in that figure as mats processed or mats repaired through the presses, never as materials used or consumed. "
+                        "Backlog contains new customer orders awaiting their first repair only. Re-cook work is never included in backlog and cannot cause backlog to rise. "
+                        "Re-cook lineal feet is a separate quality measure for repairs that must pass through the press again. Analyse backlog and re-cook independently; "
+                        "never combine them into a shared cause, consequence or corrective action unless independent supplied facts explicitly support one. "
+                        "NuMat's preferred backlog is approximately two weeks. Backlog below that level means production has less new-order repair work available and should prompt sales to secure more orders. "
+                        "An increase that remains below approximately two weeks is movement toward a healthier workload, not an adverse growth trend or a reason to improve turnaround. "
+                        "Low backlog normally enables faster-than-usual turnaround, although it can constrain production output because the plant can repair only the customer mats it has received. "
+                        "Only describe backlog as a turnaround pressure when it is materially above the two-week preference and the supplied facts support that conclusion. "
+                        "Never invent causes, staffing events, bottlenecks, targets or business context. Distinguish facts from hypotheses. "
+                        "Use concise British English suitable for a management production report. "
+                        "Return strict JSON with keys executive_summary, comparison, press_flow, quality, strengths, focus_areas, "
+                        "workforce_observations, operator_comments and final_message. All section values except operator_comments and "
+                        "final_message must be arrays of short strings. operator_comments must map operator names to one cautious sentence. "
+                        "Mention uncertainty when data is missing or anomalous. Do not use markdown."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(facts, indent=2)},
+            ],
+            max_output_tokens=2800,
+        )
+        parsed = json.loads(response.output_text.strip())
+        if not isinstance(parsed, dict):
+            return {**fallback, "_analysis_status": "invalid_response"}
+        return {**fallback, **parsed, "_analysis_status": "ok"}
+    except Exception as error:
+        print(f"AI production analysis failed: {error}")
+        return {**fallback, "_analysis_status": "error"}

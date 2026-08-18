@@ -1,0 +1,10 @@
+[Unit]
+Description=Run NuMat AI production analysis monthly
+
+[Timer]
+OnCalendar=*-*-03 07:00:00 Europe/London
+Persistent=true
+Unit=numat-production-analysis-report.service
+
+[Install]
+WantedBy=timers.target

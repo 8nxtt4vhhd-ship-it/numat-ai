@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import itsdangerous
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 
 from apollo import (
@@ -32,6 +32,7 @@ from ai import add_ai_explanations
 from ai import build_outreach_prep_fallback
 from ai import discover_strategic_contacts_with_openai
 from ai import generate_data_question_answer
+from ai import generate_production_analysis_report
 from ai import generate_action_plan_email_draft
 from ai import generate_outreach_prep
 from analysis import (
@@ -54,6 +55,7 @@ from crm import (
     MAX_CRM_SAMPLE_ROWS,
     extract_emails,
     fetch_crm_activities,
+    fetch_promise_of_order_activities,
     get_crm_data_source,
     get_filemaker_crm_cache_path,
     get_filemaker_crm_use_sync_cache,
@@ -87,6 +89,8 @@ from m365 import (
     send_m365_mail,
     set_m365_token_record,
 )
+from production import build_production_kpi_payload, fetch_production_analysis_data
+from production_reports import build_ai_analysis_docx, build_ai_report_facts, build_anomaly_workbook, clean_filename
 from pdl import (
     check_pdl_connection,
     enrich_pdl_person,
@@ -5408,19 +5412,480 @@ def get_organisation_chart_view(group: str = "vestis-aramark", message: str = ""
 
 
 @app.get("/production-analysis-view", response_class=HTMLResponse)
-def production_analysis_view():
-    body = """
-        <section class="panel">
-            <h2>Production Analysis</h2>
-            <p class="small muted">
-                This area is ready for the production analysis tools once we decide what we want to surface here.
-            </p>
-            <div class="status info" style="margin-top: 16px;">
-                We have added the launch point so the feature can be wired in cleanly during the next build pass.
+def production_analysis_view(days: int = 90, refresh: str = ""):
+    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
+    force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on"}
+    production_result = fetch_production_analysis_data(force_refresh=force_refresh)
+    payload = build_production_kpi_payload(production_result, days=selected_days)
+    current_month_payload = build_current_month_production_payload(production_result=production_result)
+    current_month_summary = current_month_payload.get("summary", {})
+    latest = payload.get("latest", {})
+    summary = payload.get("summary", {})
+    latest_date = format_optional_datetime(latest.get("date")) if latest else "No data"
+    body = f"""
+        <section class="production-analysis-toolbar">
+            <div>
+                <span class="home-focus-inline-kicker">Historical production</span>
+                <h2>Production performance</h2>
+                <p class="small muted">Data through: <strong>{escape(latest_date)}</strong> · today is excluded · refreshed {escape(format_optional_datetime(payload.get('synced_at')))}</p>
+            </div>
+            <div class="production-toolbar-actions">
+                <div class="production-period-control">{render_production_period_control(selected_days)}</div>
+                <a class="button secondary small-button" href="/production-analysis-view?days={selected_days}&refresh=1">Refresh</a>
+                <a class="button secondary small-button" href="/production-analysis/export-anomalies?days={selected_days}">Export anomalies</a>
+                <form method="post" action="/production-analysis/export-ai-report" class="production-report-form">
+                    <input type="hidden" name="days" value="{selected_days}">
+                    <button class="button small-button" type="submit">AI analysis report</button>
+                </form>
             </div>
         </section>
+        {render_data_availability_banner(payload)}
+        <div class="production-kpi-grid">
+            <div><span>Average press throughput</span><strong>{format_production_number(summary.get('average_press_throughput'))}</strong><small>FF1 + FF2 + FF3 LF per completed day</small></div>
+            <div><span>Plant productivity</span><strong>{format_production_number(summary.get('plant_productivity'), '%', decimals=1)}</strong><small>selected period · total booked ÷ clocked</small></div>
+            <div><span>Current backlog</span><strong>{format_production_number(latest.get('backlog_weeks'), decimals=1)}</strong><small>weeks · latest completed day</small></div>
+            <div><span>Average daily production value</span><strong>{format_production_number(summary.get('average_production_revenue'), currency=True)}</strong><small>per completed recorded day</small></div>
+            <div class="quality"><span>Re-cook activity</span><strong>{format_production_number(summary.get('recook_lf'))}</strong><small>LF in selected period</small></div>
+            <div><span>Labour %</span><strong>{format_production_number(current_month_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong><small>MTD labour cost ÷ invoiced revenue</small></div>
+        </div>
+        <div class="production-analysis-grid">
+            <section class="panel production-span-2">
+                <div class="panel-head"><div><span class="home-focus-inline-kicker">Weekly flow trend</span><h2>Department throughput</h2></div></div>
+                {render_production_trend_chart(payload.get('rows', []))}
+            </section>
+            <section class="panel">
+                <span class="home-focus-inline-kicker">Latest available completed day</span><h2>Most recent department activity</h2>
+                <div class="production-flow-list">{render_production_flow(latest, payload.get('rows', []))}</div>
+            </section>
+            <section class="panel production-span-2">
+                <span class="home-focus-inline-kicker">Latest available completed day</span><h2>Most recent press performance</h2>
+                <div class="production-press-grid">{render_press_cards(payload.get('rows', []))}</div>
+            </section>
+            <section class="panel production-quality-panel">
+                <span class="home-focus-inline-kicker">Quality trend</span><h2>Re-cook activity</h2>
+                <p class="small muted">Tracked separately from daily press throughput.</p>
+                {render_recook_trend(payload.get('rows', []))}
+            </section>
+            <section class="panel production-span-full">
+                <div class="panel-head"><div><span class="home-focus-inline-kicker">Production staff only</span><h2>Operator performance</h2></div><span class="small muted">Excluded: Trudy Dunlap, Kelly Bainbridge, Lois Horace, Temp 1 and Temp 2</span></div>
+                {render_operator_analysis(payload.get('operator_summary', []))}
+            </section>
+        </div>
     """
-    return render_page(title="Production Analysis", body=body)
+    return render_page(title="Production Analysis", body=body, main_class="production-analysis-main")
+
+
+@app.get("/api/production-analysis")
+def get_production_analysis_api(days: int = 90, refresh: bool = False):
+    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
+    return build_production_kpi_payload(fetch_production_analysis_data(force_refresh=refresh), days=selected_days)
+
+
+@app.get("/production-analysis/export-anomalies")
+def export_production_anomalies(days: int = 90):
+    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
+    payload = build_production_kpi_payload(fetch_production_analysis_data(), days=selected_days)
+    content, _ = build_anomaly_workbook(payload)
+    filename = f"numat-production-anomalies-{selected_days}-days.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/production-analysis/export-ai-report")
+def export_production_ai_report(days: int = Form(90)):
+    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
+    result = fetch_production_analysis_data()
+    facts = build_ai_report_facts(result, selected_days)
+    analysis = generate_production_analysis_report(facts)
+    content = build_ai_analysis_docx(facts, analysis)
+    period_end = clean_filename(facts.get("period", {}).get("end") or "report")
+    filename = f"numat-production-analysis-{period_end}.docx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def format_production_number(value, suffix="", currency=False, decimals=0):
+    if value is None:
+        return "—"
+    value = float(value)
+    return f"${value:,.{decimals}f}" if currency else f"{value:,.{decimals}f}{suffix}"
+
+
+def render_production_period_control(days):
+    options = [(30, "1 month"), (60, "2 months"), (90, "3 months"), (120, "4 months"), (150, "5 months"), (180, "6 months")]
+    return "".join(
+        f'<a class="production-period-chip{" active" if days == value else ""}" href="/production-analysis-view?days={value}">{escape(label)}</a>'
+        for value, label in options
+    )
+
+
+def render_production_trend_chart(rows):
+    if not rows:
+        return '<p class="empty-action">No production history is available for this period.</p>'
+    series = [("sort_throughput", "Sort", "#245cff"), ("grind_throughput", "Grind", "#00a884"), ("press_throughput", "Press", "#f59e0b"), ("trim_throughput", "Trim", "#8b5cf6")]
+    weekly_rows = build_weekly_throughput_rows(rows, [key for key, _, _ in series])
+    if not weekly_rows:
+        return '<p class="empty-action">No dated production history is available for this period.</p>'
+    maximum = max([float(item[key]) for item in weekly_rows for key, _, _ in series if item.get(key) is not None] or [1]) or 1
+    width, height, left, top, bottom = 760, 230, 48, 18, 34
+    plot_width, plot_height = width - left - 18, height - top - bottom
+    point_count = max(len(weekly_rows) - 1, 1)
+    lines = []
+    for key, label, color in series:
+        points = []
+        circles = []
+        for index, item in enumerate(weekly_rows):
+            if item.get(key) is None:
+                continue
+            x = left + (index / point_count) * plot_width
+            y = top + plot_height - ((float(item[key]) / maximum) * plot_height)
+            points.append(f"{x:.1f},{y:.1f}")
+            circles.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.4" fill="{color}"><title>{escape(label)} · week of {escape(item["week_label"])}: {float(item[key]):,.0f} LF average</title></circle>')
+        if points:
+            lines.append(f'<g class="production-chart-series" data-production-series="{key}"><polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>{"".join(circles)}</g>')
+    legend = '<button type="button" class="production-chart-legend-button active" data-production-series="all" aria-pressed="true" title="Show all departments">All</button>' + "".join(f'<button type="button" class="production-chart-legend-button" data-production-series="{key}" aria-pressed="false" title="Show {escape(label)} only"><i style="background:{color}"></i>{escape(label)}</button>' for key, label, color in series)
+    midpoint = maximum / 2
+    return f"""
+        <div class="production-trend-component">
+        <div class="production-chart-legend" aria-label="Choose a department to isolate">{legend}</div>
+        <p class="production-chart-note">Select a department to isolate it or All to reset · weekly average per recorded production day · blanks excluded</p>
+        <svg class="production-trend-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Weekly average department throughput trend">
+            <line x1="{left}" y1="{top}" x2="{width - 18}" y2="{top}" stroke="#edf2f7"/>
+            <line x1="{left}" y1="{top + (plot_height / 2)}" x2="{width - 18}" y2="{top + (plot_height / 2)}" stroke="#edf2f7" stroke-dasharray="3 4"/>
+            <line x1="{left}" y1="{top + plot_height}" x2="{width - 18}" y2="{top + plot_height}" stroke="#dce7f2"/><line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#dce7f2"/>
+            <text x="{left}" y="{height - 8}" class="production-chart-axis">Week of {escape(weekly_rows[0]['week_label'])}</text><text x="{width - 18}" y="{height - 8}" text-anchor="end" class="production-chart-axis">Week of {escape(weekly_rows[-1]['week_label'])}</text>
+            <text x="{left - 8}" y="{top + 5}" text-anchor="end" class="production-chart-axis">{maximum:,.0f}</text><text x="{left - 8}" y="{top + (plot_height / 2) + 4}" text-anchor="end" class="production-chart-axis">{midpoint:,.0f}</text><text x="{left - 8}" y="{top + plot_height}" text-anchor="end" class="production-chart-axis">0</text>{''.join(lines)}
+        </svg>
+        </div>
+        <script>
+            (() => {{
+                const component = document.currentScript.previousElementSibling;
+                const buttons = Array.from(component.querySelectorAll('.production-chart-legend-button'));
+                const chartSeries = Array.from(component.querySelectorAll('.production-chart-series'));
+                buttons.forEach((button) => button.addEventListener('click', () => {{
+                    const selected = button.dataset.productionSeries;
+                    const isAlreadySelected = button.getAttribute('aria-pressed') === 'true';
+                    const showAll = selected === 'all' || isAlreadySelected;
+                    buttons.forEach((item) => {{
+                        const isActive = showAll ? item.dataset.productionSeries === 'all' : item.dataset.productionSeries === selected;
+                        item.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+                        item.classList.toggle('active', isActive);
+                        item.classList.toggle('muted', !showAll && item.dataset.productionSeries !== 'all' && !isActive);
+                    }});
+                    chartSeries.forEach((item) => {{
+                        item.style.display = (!showAll && item.dataset.productionSeries !== selected) ? 'none' : '';
+                    }});
+                }}));
+            }})();
+        </script>
+    """
+
+
+def build_weekly_throughput_rows(rows, keys):
+    weeks = {}
+    for item in rows:
+        try:
+            activity_date = datetime.strptime(str(item.get("date") or "")[:10], "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+        week_start = activity_date - timedelta(days=activity_date.weekday())
+        bucket = weeks.setdefault(week_start, {key: [] for key in keys})
+        for key in keys:
+            if item.get(key) is not None:
+                bucket[key].append(float(item[key]))
+    return [
+        {
+            "week_start": week_start.strftime("%Y-%m-%d"),
+            "week_label": week_start.strftime("%d %b"),
+            **{key: (sum(values[key]) / len(values[key]) if values[key] else None) for key in keys},
+        }
+        for week_start, values in sorted(weeks.items())
+    ]
+
+
+def render_production_flow(latest, rows):
+    department_config = [("Sort", "sort_throughput", "backlog_sort", "#245cff"), ("Grind", "grind_throughput", "backlog_grind", "#00a884"), ("Press", "press_throughput", "backlog_press", "#f59e0b"), ("Trim", "trim_throughput", "backlog_trim", "#8b5cf6")]
+    departments = []
+    for label, throughput_key, backlog_key, color in department_config:
+        activity = next((item for item in reversed(rows) if item.get(throughput_key) is not None), {})
+        departments.append((label, activity.get(throughput_key), latest.get(backlog_key), activity.get("date"), color))
+    maximum = max([float(value or 0) for _, value, _, _, _ in departments] or [1]) or 1
+    return "".join(f"""
+        <div class="production-flow-row"><strong>{label}</strong><div class="production-flow-track"><span style="width:{((float(throughput or 0) / maximum) * 100) if throughput else 0:.1f}%;background:{color}"></span></div><div class="production-flow-values"><b>{format_production_number(throughput)} LF <small>· {escape(format_optional_datetime(activity_date))}</small></b><span>{format_production_number(backlog)} current backlog</span></div></div>
+    """ for label, throughput, backlog, activity_date, color in departments)
+
+
+def render_press_cards(rows):
+    cards = []
+    for press in (1, 2, 3):
+        activity = next(
+            (
+                item for item in reversed(rows)
+                if any(item.get(f"ff{press}_{field}") is not None for field in ("lf", "mats", "cycles"))
+            ),
+            {},
+        )
+        activity_date = format_optional_datetime(activity.get("date")) if activity else "No recorded activity"
+        cards.append(f"""
+            <article class="production-press-card">
+                <div class="production-press-head"><div><strong>FF{press}</strong><small>{escape(activity_date)}</small></div><span>{format_production_number(activity.get(f'ff{press}_utilisation'), '%', decimals=1)}</span></div>
+                <div class="production-press-metrics"><span><b>{format_production_number(activity.get(f'ff{press}_mats'))}</b>Mats</span><span><b>{format_production_number(activity.get(f'ff{press}_lf'))}</b>Linear ft</span><span><b>{format_production_number(activity.get(f'ff{press}_cycles'))}</b>Cycles</span></div>
+                <small>{format_production_number(activity.get(f'ff{press}_lost_hours'), ' hrs', decimals=1)} lost time</small>
+            </article>
+        """)
+    return "".join(cards)
+
+
+def render_recook_trend(rows):
+    recent = rows[-30:]
+    if not recent:
+        return '<p class="empty-action">No re-cook history is available.</p>'
+    maximum = max([float(item.get("recook_lf") or 0) for item in recent] or [1]) or 1
+    bars = "".join(f'<span class="production-recook-bar" style="height:{((float(item.get("recook_lf") or 0) / maximum) * 100) if item.get("recook_lf") else 2:.1f}%" title="{escape(format_optional_datetime(item.get("date")))}: {float(item.get("recook_lf") or 0):,.0f} LF"></span>' for item in recent)
+    return f'<div class="production-recook-chart">{bars}</div><div class="production-recook-axis"><span>{escape(format_optional_datetime(recent[0].get("date")))}</span><span>{escape(format_optional_datetime(recent[-1].get("date")))}</span></div>'
+
+
+def render_operator_analysis(rows):
+    if not rows:
+        return '<p class="empty-action">No operator history is available for this period.</p>'
+    body = "".join(f'''<tr>
+        <td data-sort-value="{escape(str(item.get('name') or '').casefold())}"><strong>{escape(item.get('name') or '')}</strong></td>
+        <td data-sort-value="{int(item.get('days') or 0)}">{int(item.get('days') or 0)}</td>
+        <td data-sort-value="{'' if item.get('productivity') is None else float(item['productivity'])}">{format_production_number(item.get('productivity'), '%', decimals=1)}</td>
+        <td data-sort-value="{'' if item.get('target_achieved') is None else float(item['target_achieved'])}">{format_production_number(item.get('target_achieved'), '%', decimals=1)}</td>
+        <td data-sort-value="{'' if item.get('booked_hours') is None else float(item['booked_hours'])}">{format_production_number(item.get('booked_hours'), ' hrs', decimals=1)}</td>
+    </tr>''' for item in rows)
+    headings = [("Operator", "text", "ascending"), ("Active days", "number", "descending"), ("Productivity", "number", "descending"), ("LF target", "number", "descending"), ("Booked", "number", "descending")]
+    header = "".join(f'<th aria-sort="none"><button type="button" class="production-table-sort" data-column="{index}" data-type="{data_type}" data-default-direction="{direction}">{escape(label)}</button></th>' for index, (label, data_type, direction) in enumerate(headings))
+    return f'''
+        <div class="table-wrap production-operator-table-wrap">
+            <table class="production-operator-table"><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>
+        </div>
+        <script>
+            (() => {{
+                const wrapper = document.currentScript.previousElementSibling;
+                const table = wrapper.querySelector('.production-operator-table');
+                const tbody = table.querySelector('tbody');
+                const headers = Array.from(table.querySelectorAll('th'));
+                table.querySelectorAll('.production-table-sort').forEach((button) => button.addEventListener('click', () => {{
+                    const headerCell = button.closest('th');
+                    const currentDirection = headerCell.getAttribute('aria-sort');
+                    const direction = currentDirection === 'ascending' ? 'descending' : currentDirection === 'descending' ? 'ascending' : button.dataset.defaultDirection;
+                    const column = Number(button.dataset.column);
+                    const dataType = button.dataset.type;
+                    const rows = Array.from(tbody.querySelectorAll('tr'));
+                    rows.sort((first, second) => {{
+                        const firstValue = first.cells[column].dataset.sortValue || '';
+                        const secondValue = second.cells[column].dataset.sortValue || '';
+                        if (firstValue === '' && secondValue !== '') return 1;
+                        if (secondValue === '' && firstValue !== '') return -1;
+                        const comparison = dataType === 'number'
+                            ? Number(firstValue) - Number(secondValue)
+                            : firstValue.localeCompare(secondValue, undefined, {{ sensitivity: 'base' }});
+                        return direction === 'ascending' ? comparison : -comparison;
+                    }});
+                    headers.forEach((item) => item.setAttribute('aria-sort', 'none'));
+                    headerCell.setAttribute('aria-sort', direction);
+                    rows.forEach((row) => tbody.appendChild(row));
+                }}));
+            }})();
+        </script>
+    '''
+
+
+def build_current_month_production_payload(production_result=None, today=None):
+    production_result = production_result or fetch_production_analysis_data()
+    today = today or datetime.now()
+    month_start = today.replace(day=1).strftime("%Y-%m-%d")
+    today_key = today.strftime("%Y-%m-%d")
+    month_result = {
+        **production_result,
+        "production_rows": [item for item in production_result.get("production_rows", []) if month_start <= str(item.get("date") or "") < today_key],
+        "operator_rows": [item for item in production_result.get("operator_rows", []) if month_start <= str(item.get("date") or "") < today_key],
+    }
+    payload = build_production_kpi_payload(month_result, days=0)
+    month_rows = payload.get("rows", [])
+    labour_costs = [float(item["labour_cost"]) for item in month_rows if item.get("labour_cost") is not None]
+    invoiced_revenue = next((float(item["invoiced_revenue_mtd"]) for item in reversed(month_rows) if item.get("invoiced_revenue_mtd") is not None), None)
+    payload["summary"].update({
+        "total_labour_cost": sum(labour_costs) if labour_costs else None,
+        "invoiced_revenue_mtd": invoiced_revenue,
+        "labour_percentage_mtd": ((sum(labour_costs) / invoiced_revenue) * 100 if labour_costs and invoiced_revenue and invoiced_revenue > 0 else 0.0),
+    })
+    payload["period_start"] = month_start
+    payload["period_end"] = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    return payload
+
+
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None):
+    if crm_result is None:
+        crm_result = fetch_promise_of_order_activities()
+        if crm_result.get("status") != "ok":
+            crm_result = fetch_crm_activities()
+    activities = crm_result.get("activities", []) if crm_result.get("status") == "ok" else []
+    promises = []
+
+    for activity in activities:
+        if str(activity.get("crm_type") or "").strip().casefold() != "promise of order":
+            continue
+        if bool(activity.get("crm_is_complete")):
+            continue
+
+        created_at = parse_crm_datetime(activity.get("date_created"))
+        age_days = max((datetime.now() - created_at).days, 0) if created_at else None
+        customer = str(
+            activity.get("customer_company")
+            or activity.get("customer_label")
+            or activity.get("recipient_company")
+            or activity.get("sender_company")
+            or "Customer not identified"
+        ).strip()
+        promises.append({
+            "customer": customer,
+            "customer_primary_key": str(activity.get("customer_primary_key") or "").strip(),
+            "promise": str(activity.get("subject") or activity.get("body") or "Promise details not recorded").strip(),
+            "created_at": str(activity.get("date_created") or "").strip(),
+            "created_label": format_optional_datetime(activity.get("date_created")),
+            "age_days": age_days,
+            "owner": str(activity.get("sender_email") or "Owner not recorded").strip(),
+            "completion": str(activity.get("crm_complete") or "").strip(),
+        })
+
+    promises.sort(
+        key=lambda item: parse_crm_datetime(item.get("created_at")) or datetime.min,
+        reverse=True,
+    )
+    customer_count = len({item["customer"].casefold() for item in promises if item["customer"]})
+    aged_promises = [item for item in promises if item.get("age_days") is not None]
+    production_mtd = build_current_month_production_payload(production_result=production_result)
+
+    return {
+        "status": crm_result.get("status", "error"),
+        "source": crm_result.get("source", ""),
+        "synced_at": crm_result.get("synced_at") or crm_result.get("cache_updated_at") or "",
+        "open_promises": promises,
+        "production_mtd": production_mtd,
+        "summary": {
+            "open_count": len(promises),
+            "customer_count": customer_count,
+            "new_last_7_days": sum(1 for item in promises if item.get("age_days") is not None and item["age_days"] <= 7),
+            "oldest_days": max((item["age_days"] for item in aged_promises), default=None),
+        },
+    }
+
+
+def render_open_promises_table(promises):
+    if not promises:
+        return "<p class='empty-action'>No open promises of order were found in the current CRM data.</p>"
+
+    rows = []
+    for item in promises:
+        customer = str(item.get("customer") or "Customer not identified")
+        customer_href = f"/customer-view?customer={quote(customer)}"
+        rows.append(f"""
+            <tr>
+                <td data-label="Customer"><a href="{escape(customer_href)}"><strong>{escape(customer)}</strong></a></td>
+                <td data-label="Promise">{escape(str(item.get("promise") or ""))}</td>
+            </tr>
+        """)
+
+    return f"""
+        <div class="table-wrap kpi-promises-table-wrap">
+            <table class="contacts-table kpi-promises-table">
+                <colgroup><col class="kpi-customer-column"><col class="kpi-promise-column"></colgroup>
+                <thead><tr><th>Customer</th><th>Promise</th></tr></thead>
+                <tbody>{''.join(rows)}</tbody>
+            </table>
+        </div>
+    """
+
+
+@app.get("/api/weekly-kpis")
+def get_weekly_kpis():
+    return build_weekly_kpi_dashboard_payload()
+
+
+@app.get("/weekly-kpi-dashboard", response_class=HTMLResponse)
+def get_weekly_kpi_dashboard():
+    crm_result = fetch_promise_of_order_activities()
+    if crm_result.get("status") != "ok":
+        crm_result = fetch_crm_activities()
+    payload = build_weekly_kpi_dashboard_payload(crm_result=crm_result)
+    summary = payload["summary"]
+    production_mtd = payload.get("production_mtd", {})
+    production_summary = production_mtd.get("summary", {})
+    production_latest = production_mtd.get("latest", {})
+    oldest_days = summary.get("oldest_days")
+    oldest_label = (
+        f"{oldest_days} day{'s' if oldest_days != 1 else ''}"
+        if oldest_days is not None else "—"
+    )
+    refresh_label = format_optional_datetime(payload.get("synced_at")) if payload.get("synced_at") else "Current CRM cache"
+
+    body = f"""
+        <div class="kpi-dashboard-grid">
+            <section class="panel kpi-promises-panel">
+                <div class="kpi-promises-head">
+                    <div class="kpi-section-title">
+                        <span class="kpi-section-mark" aria-hidden="true"></span>
+                        <h2>Open Promises of Order</h2>
+                    </div>
+                    <div class="kpi-dashboard-actions">
+                        <span class="small muted">Updated {escape(refresh_label)}</span>
+                        <button class="button secondary small-button" type="button" onclick="document.documentElement.requestFullscreen?.()">Presentation mode</button>
+                    </div>
+                </div>
+                <div class="summary compact-summary kpi-summary-grid">
+                    {render_simple_summary_item("Open promises", str(summary.get("open_count", 0)))}
+                    {render_simple_summary_item("Customers", str(summary.get("customer_count", 0)))}
+                    {render_simple_summary_item("Added in last 7 days", str(summary.get("new_last_7_days", 0)))}
+                    {render_simple_summary_item("Oldest open promise", oldest_label)}
+                </div>
+                {render_open_promises_table(payload.get("open_promises", []))}
+            </section>
+
+            <section class="panel kpi-planned-visits-panel" aria-label="Planned Visits placeholder">
+                <div class="kpi-section-title">
+                    <span class="kpi-section-mark visits" aria-hidden="true"></span>
+                    <h2>Planned Visits</h2>
+                </div>
+                <div class="kpi-coming-soon">
+                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <rect x="3.5" y="5.5" width="17" height="15" rx="2"></rect>
+                        <path d="M7.5 3.5v4M16.5 3.5v4M3.5 10h17"></path>
+                        <path d="M8 14h2M14 14h2M8 17h2M14 17h2"></path>
+                    </svg>
+                    <strong>Planned visits</strong>
+                    <span>Calendar view coming next</span>
+                </div>
+            </section>
+
+            <section class="panel kpi-production-panel">
+                <div class="kpi-production-head">
+                    <div class="kpi-section-title">
+                        <span class="kpi-section-mark production" aria-hidden="true"></span>
+                        <div><h2>Production MTD</h2><p class="small muted">Current calendar month through yesterday · today excluded</p></div>
+                    </div>
+                    <span class="small muted">Data through {escape(format_optional_datetime(production_latest.get('date')) if production_latest else 'No completed production day this month')}</span>
+                </div>
+                <div class="production-kpi-grid kpi-production-mtd-grid">
+                    <div><span>Average press throughput</span><strong>{format_production_number(production_summary.get('average_press_throughput'))}</strong><small>FF1 + FF2 + FF3 LF per completed day</small></div>
+                    <div><span>Plant productivity</span><strong>{format_production_number(production_summary.get('plant_productivity'), '%', decimals=1)}</strong><small>MTD · total booked ÷ clocked</small></div>
+                    <div><span>Current backlog</span><strong>{format_production_number(production_latest.get('backlog_weeks'), decimals=1)}</strong><small>weeks · latest completed day</small></div>
+                    <div><span>Average daily production value</span><strong>{format_production_number(production_summary.get('average_production_revenue'), currency=True)}</strong><small>per completed recorded day</small></div>
+                    <div><span>Re-cook activity</span><strong>{format_production_number(production_summary.get('recook_lf'))}</strong><small>LF month to date</small></div>
+                    <div><span>Labour %</span><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong><small>MTD labour cost ÷ invoiced revenue</small></div>
+                </div>
+            </section>
+        </div>
+    """
+    return render_page(title="Weekly KPI Dashboard", body=body, main_class="kpi-dashboard-main")
 
 
 @app.post("/strategic-contacts/delete", response_class=HTMLResponse)
@@ -6395,6 +6860,10 @@ def read_api_root():
         "crm_activities_json": "/crm-activities",
         "crm_activities_view": "/crm-activities-view",
         "crm_data": "/crm-data",
+        "weekly_kpis": "/api/weekly-kpis",
+        "weekly_kpi_dashboard": "/weekly-kpi-dashboard",
+        "production_analysis": "/api/production-analysis",
+        "production_analysis_view": "/production-analysis-view",
         "customers_view": "/customers-view",
         "sample_data": "/sample-data",
         "customers_needing_attention_json": "/customers-needing-attention",
@@ -7449,7 +7918,7 @@ def render_dashboard_home(ask="", ask_run=""):
                             </div>
                         </form>
                     </section>
-                    <a class="home-launch-card" href="/route-planner-view">
+                    <a class="home-launch-card" href="https://fieldloop-numat.mrcoffee.chatgpt.site" target="_blank" rel="noopener noreferrer">
                         <span class="home-launch-icon" aria-hidden="true">
                             <svg viewBox="0 0 24 24" focusable="false">
                                 <path d="M5 18l4-10 4 6 6-8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -7489,6 +7958,15 @@ def render_dashboard_home(ask="", ask_run=""):
                             </svg>
                         </span>
                         <strong>Production Analysis</strong>
+                    </a>
+                    <a class="home-launch-card" href="/weekly-kpi-dashboard" aria-label="Weekly KPI Dashboard">
+                        <span class="home-launch-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <path d="M4.5 18.5h15M6.5 16V10M11.5 16V6M16.5 16v-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                                <path d="M5.5 5.5h3M15.5 8.5h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                        </span>
+                        <strong>Weekly KPI Dashboard</strong>
                     </a>
                 </div>
             </section>
@@ -15056,10 +15534,8 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     target_email = str(preview.get("target_email") or "").strip()
     target_role = str(preview.get("target_role") or "Likely sales contact").strip()
     target_status_note = str(preview.get("target_status_note") or "").strip()
-    target_phone = (
-        str(primary_contact.get("phone") or "").strip()
-        or str(primary_contact.get("cell") or "").strip()
-    )
+    target_phone = str(primary_contact.get("phone") or "").strip()
+    target_cell = str(primary_contact.get("cell") or "").strip()
     mode = str(preview.get("mode") or "Email").strip() or "Email"
     mode_lower = mode.lower()
     current_user = get_current_session_user()
@@ -15093,8 +15569,10 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     call_name_id = f"home-focus-call-name-{slug}"
     call_role_id = f"home-focus-call-role-{slug}"
     call_phone_id = f"home-focus-call-phone-{slug}"
+    call_cell_id = f"home-focus-call-cell-{slug}"
     call_status_id = f"home-focus-call-status-{slug}"
-    call_button_id = f"home-focus-call-button-{slug}"
+    call_phone_card_id = f"home-focus-call-phone-card-{slug}"
+    call_cell_card_id = f"home-focus-call-cell-card-{slug}"
     latest_outreach_subject = str(context.get("latest_sales_outreach_subject") or "").strip()
     latest_outreach_preview = str(context.get("latest_sales_outreach_preview") or "").strip()
     latest_outreach_date = format_optional_datetime(context.get("latest_sales_outreach") or "")
@@ -15120,6 +15598,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
         if target_phone else ""
     )
     current_call_phone = target_phone
+    current_call_cell = target_cell
     current_call_name = target_name
     current_call_role = target_role
     current_call_status = target_status_note
@@ -15262,11 +15741,6 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
             </a>
             """
         )
-        call_action = (
-            f'<a class="button home-focus-send-button" href="tel:{escape(target_phone)}"><span>Call {escape(target_name)}</span></a>'
-            if target_phone
-            else '<button type="button" class="button home-focus-send-button" disabled>No phone number available</button>'
-        )
         return f"""
             <section class="home-focus-work-card">
                 <div class="home-focus-work-head">
@@ -15354,19 +15828,32 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                                     </label>
                                 </div>
                                 <span class="home-focus-inline-meta" id="{call_role_id}">{escape(current_call_role)}</span>
-                                <span class="home-focus-inline-meta" id="{call_phone_id}">{escape(current_call_phone) if current_call_phone else 'Phone not recorded'}</span>
                                 <span class="home-focus-inline-meta" id="{call_status_id}" {'hidden' if not current_call_status else ''}>{escape(current_call_status)}</span>
                             </div>
+                            <div class="home-focus-call-number-grid">
+                                <a
+                                    class="home-focus-call-number-card"
+                                    id="{call_phone_card_id}"
+                                    href="tel:{escape(current_call_phone)}"
+                                    {'hidden' if not current_call_phone else ''}
+                                >
+                                    <span class="home-focus-inline-kicker">Phone</span>
+                                    <strong id="{call_phone_id}">{escape(current_call_phone)}</strong>
+                                    <span class="home-focus-call-number-action">Tap to call</span>
+                                </a>
+                                <a
+                                    class="home-focus-call-number-card"
+                                    id="{call_cell_card_id}"
+                                    href="tel:{escape(current_call_cell)}"
+                                    {'hidden' if not current_call_cell else ''}
+                                >
+                                    <span class="home-focus-inline-kicker">Cell</span>
+                                    <strong id="{call_cell_id}">{escape(current_call_cell)}</strong>
+                                    <span class="home-focus-call-number-action">Tap to call</span>
+                                </a>
+                                <p class="home-focus-call-missing" id="{call_phone_card_id}-missing" {'hidden' if current_call_phone or current_call_cell else ''}>No phone or cell number available</p>
+                            </div>
                             <ul class="home-focus-call-points">{call_points_markup}</ul>
-                        </div>
-                        <div class="home-focus-draft-actions">
-                            <a
-                                class="button home-focus-send-button"
-                                id="{call_button_id}"
-                                href="tel:{escape(current_call_phone)}"
-                                {'hidden' if not current_call_phone else ''}
-                            ><span>Call {escape(current_call_name)}{f' ({escape(current_call_phone)})' if current_call_phone else ''}</span></a>
-                            <p class="home-focus-call-missing" id="{call_button_id}-missing" {'hidden' if current_call_phone else ''}>No phone number available</p>
                         </div>
                     </div>
                 </div>
@@ -15432,27 +15919,33 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         const nameField = document.getElementById(`home-focus-call-name-${{slug}}`);
                         const roleField = document.getElementById(`home-focus-call-role-${{slug}}`);
                         const phoneField = document.getElementById(`home-focus-call-phone-${{slug}}`);
+                        const cellField = document.getElementById(`home-focus-call-cell-${{slug}}`);
                         const statusField = document.getElementById(`home-focus-call-status-${{slug}}`);
-                        const callButton = document.getElementById(`home-focus-call-button-${{slug}}`);
-                        const missingState = document.getElementById(`home-focus-call-button-${{slug}}-missing`);
+                        const phoneCard = document.getElementById(`home-focus-call-phone-card-${{slug}}`);
+                        const cellCard = document.getElementById(`home-focus-call-cell-card-${{slug}}`);
+                        const missingState = document.getElementById(`home-focus-call-phone-card-${{slug}}-missing`);
                         const name = selected.dataset.name || selected.value || 'Best known contact';
                         const title = selected.dataset.title || 'Likely sales contact';
-                        const phone = selected.dataset.phone || selected.dataset.cell || '';
+                        const phone = selected.dataset.phone || '';
+                        const cell = selected.dataset.cell || '';
                         const status = selected.dataset.status || '';
                         if (nameField) nameField.textContent = name;
                         if (roleField) roleField.textContent = title;
-                        if (phoneField) phoneField.textContent = phone || 'Phone not recorded';
+                        if (phoneField) phoneField.textContent = phone;
+                        if (cellField) cellField.textContent = cell;
                         if (statusField) {{
                             statusField.textContent = status;
                             statusField.hidden = !status;
                         }}
-                        if (callButton) {{
-                            callButton.hidden = !phone;
-                            callButton.href = phone ? `tel:${{phone}}` : '#';
-                            const span = callButton.querySelector('span');
-                            if (span) span.textContent = phone ? `Call ${{name}} (${{phone}})` : `Call ${{name}}`;
+                        if (phoneCard) {{
+                            phoneCard.hidden = !phone;
+                            phoneCard.href = phone ? `tel:${{phone}}` : '#';
                         }}
-                        if (missingState) missingState.hidden = !!phone;
+                        if (cellCard) {{
+                            cellCard.hidden = !cell;
+                            cellCard.href = cell ? `tel:${{cell}}` : '#';
+                        }}
+                        if (missingState) missingState.hidden = !!(phone || cell);
                     }}
                     async function loadHomeFocusDraft(slug) {{
                         const form = document.getElementById(`home-focus-send-form-${{slug}}`);
@@ -19473,6 +19966,7 @@ def render_global_nav(title):
     nav_items = [
         ("Home", "/"),
         ("Action Plan", "/action-plan-view"),
+        ("Weekly KPI Dashboard", "/weekly-kpi-dashboard"),
         ("Insights", "/insights-view"),
         ("Customer Map", "/customer-map-view"),
         ("Strategic Contacts", "/strategic-contacts-view"),
@@ -20305,6 +20799,41 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         flex: 0 0 32px;
                     }}
 
+                    .home-focus-call-number-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px;
+                    }}
+
+                    .home-focus-call-number-card {{
+                        display: grid;
+                        gap: 4px;
+                        min-width: 0;
+                        padding: 12px 14px;
+                        border: 1px solid #b9d7ec;
+                        border-radius: 10px;
+                        background: #f2f9fe;
+                        color: #123a59;
+                        text-decoration: none;
+                        transition: border-color 0.15s ease, background 0.15s ease;
+                    }}
+
+                    .home-focus-call-number-card:hover {{
+                        border-color: #6aaed8;
+                        background: #e7f4fc;
+                    }}
+
+                    .home-focus-call-number-card strong {{
+                        overflow-wrap: anywhere;
+                        font-size: 17px;
+                    }}
+
+                    .home-focus-call-number-action {{
+                        color: #456f8c;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }}
+
                     .home-focus-call-points {{
                         margin: 0;
                         padding-left: 18px;
@@ -20323,6 +20852,465 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 13px;
                         line-height: 1.4;
                     }}
+
+                    main.kpi-dashboard-main {{
+                        max-width: 1800px;
+                        padding-inline: 24px;
+                    }}
+
+                    .kpi-dashboard-main .top-row {{
+                        margin-bottom: 14px;
+                    }}
+
+                    .kpi-dashboard-main .nav,
+                    .kpi-dashboard-main .nav-admin-menu,
+                    .kpi-dashboard-main .nav-user-shell {{
+                        display: none;
+                    }}
+
+                    .kpi-promises-head {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 24px;
+                        margin-bottom: 20px;
+                    }}
+
+                    .kpi-promises-head h2 {{
+                        margin: 0;
+                        font-size: 26px;
+                    }}
+
+                    .kpi-dashboard-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 20px;
+                        align-items: start;
+                    }}
+
+                    .kpi-section-title {{
+                        display: flex;
+                        align-items: center;
+                        gap: 10px;
+                    }}
+
+                    .kpi-section-title h2 {{
+                        margin: 0;
+                        font-size: 26px;
+                    }}
+
+                    .kpi-section-mark {{
+                        width: 7px;
+                        height: 30px;
+                        border-radius: 999px;
+                        background: linear-gradient(180deg, #245cff, #6b8cff);
+                        box-shadow: 0 5px 14px rgba(36, 92, 255, 0.28);
+                    }}
+
+                    .kpi-section-mark.visits {{
+                        background: linear-gradient(180deg, #00a884, #49c9ad);
+                        box-shadow: 0 5px 14px rgba(0, 168, 132, 0.25);
+                    }}
+
+                    .kpi-section-mark.production {{
+                        background: linear-gradient(180deg, #8b5cf6, #b69cff);
+                        box-shadow: 0 5px 14px rgba(139, 92, 246, 0.25);
+                    }}
+
+                    .kpi-dashboard-actions {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: flex-end;
+                        gap: 12px;
+                        flex-wrap: wrap;
+                    }}
+
+                    .kpi-promises-panel {{
+                        padding: 24px;
+                        border-top: 4px solid #245cff;
+                    }}
+
+                    .kpi-production-panel {{
+                        grid-column: 1 / -1;
+                        padding: 24px;
+                        border-top: 4px solid #8b5cf6;
+                    }}
+
+                    .kpi-production-head {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 20px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .kpi-production-head h2,
+                    .kpi-production-head p {{
+                        margin: 0;
+                    }}
+
+                    .kpi-production-head p {{
+                        margin-top: 3px;
+                    }}
+
+                    .kpi-production-mtd-grid {{
+                        margin-bottom: 0;
+                    }}
+
+                    .kpi-summary-grid {{
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 16px;
+                        margin: 0 0 20px;
+                    }}
+
+                    .kpi-summary-grid div {{
+                        padding: 18px 20px;
+                    }}
+
+                    .kpi-summary-grid strong {{
+                        margin-top: 4px;
+                        font-size: 40px;
+                        line-height: 1;
+                    }}
+
+                    .kpi-summary-grid div:nth-child(1) {{
+                        border-color: #b9cbff;
+                        background: linear-gradient(145deg, #f2f6ff, #ffffff);
+                    }}
+
+                    .kpi-summary-grid div:nth-child(2) {{
+                        border-color: #c9d9eb;
+                        background: linear-gradient(145deg, #f6f9fc, #ffffff);
+                    }}
+
+                    .kpi-summary-grid div:nth-child(3) {{
+                        border-color: #bce8dc;
+                        background: linear-gradient(145deg, #effbf7, #ffffff);
+                    }}
+
+                    .kpi-summary-grid div:nth-child(4) {{
+                        border-color: #f1d8a5;
+                        background: linear-gradient(145deg, #fff9eb, #ffffff);
+                    }}
+
+                    .kpi-promises-table-wrap {{
+                        max-height: none;
+                    }}
+
+                    .contacts-table.kpi-promises-table {{
+                        table-layout: fixed;
+                        width: 100%;
+                        min-width: 0;
+                    }}
+
+                    .kpi-promises-table .kpi-customer-column {{
+                        width: 40%;
+                    }}
+
+                    .kpi-promises-table .kpi-promise-column {{
+                        width: 60%;
+                    }}
+
+                    .contacts-table.kpi-promises-table th:first-child,
+                    .contacts-table.kpi-promises-table td:first-child {{
+                        width: 40%;
+                        min-width: 0;
+                    }}
+
+                    .contacts-table.kpi-promises-table th:nth-child(2),
+                    .contacts-table.kpi-promises-table td:nth-child(2) {{
+                        width: 60%;
+                        min-width: 0;
+                    }}
+
+                    .kpi-promises-table td:first-child a {{
+                        display: inline;
+                        color: var(--blue);
+                        text-decoration: none;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .kpi-promises-table th,
+                    .kpi-promises-table td {{
+                        padding: 13px 15px;
+                        font-size: 15px;
+                        line-height: 1.35;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .kpi-promises-table tbody tr:nth-child(even) {{
+                        background: #f8fbff;
+                    }}
+
+                    .kpi-promises-table tbody tr:hover {{
+                        background: #eef4ff;
+                    }}
+
+                    .kpi-planned-visits-panel {{
+                        min-height: 500px;
+                        padding: 24px;
+                        border-top: 4px solid #00a884;
+                    }}
+
+                    .kpi-coming-soon {{
+                        min-height: 390px;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        justify-content: center;
+                        gap: 8px;
+                        color: #6b7e90;
+                        text-align: center;
+                        border: 2px dashed #cce8e1;
+                        border-radius: 16px;
+                        background: linear-gradient(145deg, #f5fcfa, #fbfdff);
+                    }}
+
+                    .kpi-coming-soon svg {{
+                        width: 68px;
+                        height: 68px;
+                        margin-bottom: 8px;
+                        fill: none;
+                        stroke: #00a884;
+                        stroke-width: 1.5;
+                        stroke-linecap: round;
+                        stroke-linejoin: round;
+                    }}
+
+                    .kpi-coming-soon strong {{
+                        color: #24445b;
+                        font-size: 22px;
+                    }}
+
+                    main.production-analysis-main {{
+                        max-width: 1560px;
+                    }}
+
+                    .production-analysis-toolbar {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: flex-end;
+                        gap: 20px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .production-analysis-toolbar h2 {{
+                        margin: 5px 0 2px;
+                        font-size: 30px;
+                    }}
+
+                    .production-toolbar-actions,
+                    .production-period-control {{
+                        display: flex;
+                        align-items: center;
+                        gap: 8px;
+                    }}
+
+                    .production-toolbar-actions {{
+                        flex-wrap: nowrap;
+                        white-space: nowrap;
+                    }}
+
+                    .production-period-control {{
+                        flex-wrap: nowrap;
+                    }}
+
+                    .production-report-form {{
+                        display: flex;
+                        flex: 0 0 auto;
+                        margin: 0;
+                    }}
+
+                    .production-toolbar-actions .small-button {{
+                        flex: 0 0 auto;
+                    }}
+
+                    .production-period-control {{
+                        padding: 5px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        background: #ffffff;
+                    }}
+
+                    .production-period-chip {{
+                        padding: 6px 10px;
+                        border-radius: 8px;
+                        color: #52677d;
+                        font-size: 12px;
+                        font-weight: 700;
+                        text-decoration: none;
+                    }}
+
+                    .production-period-chip.active {{
+                        color: #ffffff;
+                        background: var(--blue);
+                    }}
+
+                    .production-kpi-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(6, minmax(0, 1fr));
+                        gap: 12px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .production-kpi-grid > div {{
+                        padding: 16px;
+                        border: 1px solid var(--border);
+                        border-top: 4px solid #245cff;
+                        border-radius: 14px;
+                        background: linear-gradient(145deg, #f5f8ff, #ffffff);
+                        box-shadow: var(--shadow-card);
+                    }}
+
+                    .production-kpi-grid > div:nth-child(2) {{ border-top-color: #00a884; }}
+                    .production-kpi-grid > div:nth-child(3) {{ border-top-color: #f59e0b; }}
+                    .production-kpi-grid > div:nth-child(4) {{ border-top-color: #8b5cf6; }}
+                    .production-kpi-grid > div:nth-child(5) {{ border-top-color: #e05757; background: linear-gradient(145deg, #fff6f6, #ffffff); }}
+                    .production-kpi-grid > div:nth-child(6) {{ border-top-color: #2e829f; }}
+
+                    .production-kpi-grid span,
+                    .production-kpi-grid small {{
+                        display: block;
+                        color: var(--muted);
+                        font-size: 12px;
+                    }}
+
+                    .production-kpi-grid strong {{
+                        display: block;
+                        margin: 5px 0 3px;
+                        font-size: 28px;
+                        line-height: 1.05;
+                    }}
+
+                    .production-analysis-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        gap: 16px;
+                    }}
+
+                    .production-analysis-grid > .panel {{
+                        margin: 0;
+                    }}
+
+                    .production-analysis-grid h2 {{
+                        margin: 5px 0 14px;
+                    }}
+
+                    .production-span-2 {{ grid-column: span 2; }}
+                    .production-span-full {{ grid-column: 1 / -1; }}
+
+                    .production-chart-legend {{
+                        display: flex;
+                        justify-content: flex-end;
+                        gap: 14px;
+                        margin-bottom: 4px;
+                    }}
+
+                    .production-chart-legend-button {{
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 5px;
+                        width: auto;
+                        min-width: 0;
+                        height: auto;
+                        padding: 4px 7px;
+                        border: 1px solid transparent;
+                        border-radius: 999px;
+                        background: transparent;
+                        color: var(--muted);
+                        font-size: 11px;
+                        font-weight: 700;
+                        line-height: 1;
+                    }}
+
+                    .production-chart-legend-button:hover,
+                    .production-chart-legend-button:focus-visible {{
+                        border-color: var(--border-strong);
+                        background: #f7faff;
+                    }}
+
+                    .production-chart-legend-button.active {{
+                        border-color: #9cb6ff;
+                        background: #edf3ff;
+                        color: var(--text);
+                    }}
+
+                    .production-chart-legend-button.muted {{
+                        opacity: 0.38;
+                    }}
+
+                    .production-chart-legend-button i {{ width: 9px; height: 9px; border-radius: 50%; }}
+
+                    .production-chart-series {{
+                        transition: opacity 160ms ease;
+                    }}
+
+                    .production-chart-note {{
+                        margin: 0 0 4px;
+                        color: var(--muted);
+                        font-size: 10px;
+                        text-align: right;
+                    }}
+
+                    .production-trend-chart {{ width: 100%; min-height: 240px; }}
+                    .production-chart-axis {{ fill: #718096; font-size: 10px; }}
+
+                    .production-flow-list {{ display: grid; gap: 18px; }}
+                    .production-flow-row {{ display: grid; grid-template-columns: 50px 1fr; gap: 6px 10px; align-items: center; }}
+                    .production-flow-track {{ height: 9px; overflow: hidden; border-radius: 999px; background: #edf2f7; }}
+                    .production-flow-track span {{ display: block; height: 100%; border-radius: inherit; }}
+                    .production-flow-values {{ grid-column: 2; display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }}
+                    .production-flow-values span {{ color: var(--muted); }}
+                    .production-flow-values small {{ color: var(--muted); font-size: 10px; font-weight: 600; }}
+
+                    .production-press-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
+                    .production-press-card {{ padding: 16px; border: 1px solid var(--border); border-radius: 13px; background: #fbfdff; }}
+                    .production-press-head {{ display: flex; justify-content: space-between; align-items: center; }}
+                    .production-press-head strong {{ font-size: 22px; }}
+                    .production-press-head > div small {{ display: block; margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 600; }}
+                    .production-press-head span {{ padding: 4px 8px; border-radius: 999px; color: #245cff; background: #edf3ff; font-weight: 800; }}
+                    .production-press-metrics {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 15px 0; }}
+                    .production-press-metrics span {{ color: var(--muted); font-size: 11px; }}
+                    .production-press-metrics b {{ display: block; color: var(--text); font-size: 20px; }}
+                    .production-press-card small {{ color: var(--muted); }}
+
+                    .production-recook-chart {{ height: 190px; display: flex; align-items: flex-end; gap: 4px; padding: 16px 8px 0; border-bottom: 1px solid var(--border); background: linear-gradient(180deg, #fff8f8, #ffffff); }}
+                    .production-recook-bar {{ flex: 1 1 0; min-width: 3px; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #ef7777, #d94b4b); }}
+                    .production-recook-axis {{ display: flex; justify-content: space-between; margin-top: 6px; color: var(--muted); font-size: 10px; }}
+
+                    .production-operator-table {{ width: 100%; border-collapse: collapse; }}
+                    .production-operator-table th,
+                    .production-operator-table td {{ padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; }}
+                    .production-operator-table th {{ color: #3f5870; background: #edf4fa; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }}
+                    .production-operator-table tbody tr:nth-child(even) {{ background: #f9fbfd; }}
+
+                    .production-table-sort {{
+                        display: inline-flex;
+                        justify-content: flex-start;
+                        width: auto;
+                        min-width: 0;
+                        height: auto;
+                        padding: 0;
+                        border: 0;
+                        border-radius: 0;
+                        background: transparent;
+                        color: inherit;
+                        font-size: inherit;
+                        font-weight: 800;
+                        letter-spacing: inherit;
+                        line-height: 1.2;
+                        text-transform: inherit;
+                    }}
+
+                    .production-table-sort:hover,
+                    .production-table-sort:focus-visible {{
+                        color: var(--blue);
+                        text-decoration: underline;
+                        text-underline-offset: 3px;
+                    }}
+
+                    .production-operator-table th[aria-sort="ascending"] .production-table-sort::after {{ content: "▲"; font-size: 8px; }}
+                    .production-operator-table th[aria-sort="descending"] .production-table-sort::after {{ content: "▼"; font-size: 8px; }}
 
                     .home-focus-history-stack {{
                         display: grid;
@@ -24168,12 +25156,51 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 980px) {{
+                        .production-kpi-grid {{
+                            grid-template-columns: repeat(3, minmax(0, 1fr));
+                        }}
+
+                        .production-analysis-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .production-span-2,
+                        .production-span-full {{
+                            grid-column: auto;
+                        }}
+
+                        .kpi-dashboard-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
                         .home-focus-work-layout {{
                             grid-template-columns: 1fr;
                         }}
                     }}
 
                     @media (max-width: 720px) {{
+                        .production-analysis-toolbar {{
+                            display: grid;
+                            align-items: start;
+                        }}
+
+                        .production-toolbar-actions {{
+                            flex-wrap: wrap;
+                            white-space: normal;
+                        }}
+
+                        .production-period-control {{
+                            flex-wrap: wrap;
+                        }}
+
+                        .production-kpi-grid {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .production-press-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
                         .user-accounts-table {{
                             font-size: 12px;
                             min-width: 860px;
@@ -24525,6 +25552,28 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             min-height: 180px;
                         }}
 
+                        .home-focus-call-number-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .kpi-dashboard-actions {{
+                            justify-content: flex-start;
+                        }}
+
+                        .kpi-summary-grid {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .kpi-promises-head {{
+                            align-items: flex-start;
+                            display: grid;
+                        }}
+
+                        .kpi-production-head {{
+                            align-items: flex-start;
+                            display: grid;
+                        }}
+
                         .home-focus-history-stack {{
                             gap: 10px;
                         }}
@@ -24689,7 +25738,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
                     }}
                 </style>
-            </head>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23064493'/%3E%3Cpath d='M14 20h36v22L32 52 14 42z' fill='none' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M17 36l15 8 15-8' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23064493'/%3E%3Cpath d='M14 20h36v22L32 52 14 42z' fill='none' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M17 36l15 8 15-8' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+</head>
             <body>
                 <main class="{main_class}">
                     {top_row_html}
