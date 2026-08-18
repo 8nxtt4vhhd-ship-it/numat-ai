@@ -79,6 +79,22 @@ class OutreachStyleTests(unittest.TestCase):
         )
         self.assertIn("You previously mentioned collecting wavy mats for edge repair", fallback["email_body"])
 
+    def test_salesperson_conditional_question_does_not_become_a_customer_fact(self):
+        fact = select_primary_outreach_fact([
+            {
+                "direction": "Outbound",
+                "preview": "If you have any damaged or wavy mats, we can repair them.",
+                "later_order_recorded": False,
+            }
+        ])
+        self.assertEqual(fact["speech_act"], "salesperson_question")
+        fallback = build_primary_fact_fallback_email(
+            {"primary_contact": {"name": "Greg Smith"}}, fact
+        )
+        self.assertIn("Do you have any damaged or wavy mats that need repair?", fallback["email_body"])
+        self.assertNotIn("you mentioned", fallback["email_body"].lower())
+        self.assertNotIn("I had noted", fallback["email_body"])
+
     def test_repair_signal_is_not_reused_after_later_order(self):
         fact = select_primary_outreach_fact([
             {
