@@ -9,8 +9,23 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-07-order-sequencing-11"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-american-direct-style-12"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
+
+OUTREACH_EMAIL_STYLE_GUIDANCE = (
+    "Write the customer email in concise American business English. Use ASD-STE100-inspired principles for clarity, "
+    "but do not imitate a technical manual or claim strict STE compliance. Use short sentences, active voice, common words, "
+    "and concrete facts. Be factual and straightforward, not sales-pitchy. Remove soft British constructions such as "
+    "'I wondered whether', 'I was hoping', 'would you be able to', and 'it would be great'. Avoid vague location language "
+    "such as 'in your area', 'near you', or 'in the region'. If the supplied evidence names Chicago, say Chicago. "
+    "Never invent a city, trip, visit, date, customer meeting, or reason for travel. Every opening fact must lead naturally "
+    "to the reason for writing. Use this logical structure when a trigger exists: specific trigger, why it relates to this "
+    "customer, then one direct low-pressure question. For example, connect 'I was visiting customers in Chicago' to "
+    "'it reminded me that it has been a while since your last repair order' before asking about current repair needs. "
+    "Do not use that example unless Chicago and the visit are supplied facts. Do not place unrelated facts next to each other. Prefer 45 to 85 words, "
+    "and use fewer words when the evidence is sparse. Do not use promotional phrases such as 'unlock value', 'exciting opportunity', "
+    "'partner with you', 'tailored solution', or 'help take your business to the next level'."
+)
 
 RECENT_REPLY_ANCHOR_DAYS = 30
 RECENT_OUTREACH_ANCHOR_DAYS = 30
@@ -41,6 +56,25 @@ def draft_looks_like_active_logistics(text):
         "help get things moving",
     ]
     return any(phrase in lowered for phrase in logistics_phrases)
+
+
+def draft_violates_outreach_style(text):
+    lowered = str(text or "").strip().lower()
+    disallowed_phrases = [
+        "in your area",
+        "near you",
+        "in the region",
+        "i wondered whether",
+        "i was hoping",
+        "would you be able to",
+        "it would be great",
+        "unlock value",
+        "exciting opportunity",
+        "partner with you",
+        "tailored solution",
+        "take your business to the next level",
+    ]
+    return any(phrase in lowered for phrase in disallowed_phrases)
 
 
 def get_outreach_context_path():
@@ -406,7 +440,7 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
         # CRM notes. Keep it useful without quoting fragments back to the customer.
         paragraphs = [
             "Do you have any mats that need repairing at the moment?",
-            "If so, let me know and I can arrange the next step.",
+            "If so, send me an approximate quantity and I can confirm the next step.",
         ]
     elif (
         len(recent_signals) >= 2
@@ -416,7 +450,7 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
     ):
         paragraphs = [
             "Is there anything from our last visit that still needs sorting?",
-            "If so, let me know and I can arrange the next step.",
+            "If so, send me the details and I can confirm the next step.",
         ]
     elif outbound_count >= 3 and inbound_count == 0 and recent_signals:
         paragraphs = [
@@ -427,31 +461,30 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
     elif has_recent_sales_activity and latest_sales_signal and latest_sales_days is not None and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS:
         paragraphs = [
             "Does this still need any action from us?",
-            "If so, let me know and I can arrange the next step.",
+            "If so, send me the details and I can confirm the next step.",
         ]
     elif is_stale and latest_sales_signal:
         paragraphs = [
             "It has been a while since we last worked with you on repairs.",
-            "Do you have anything coming up that you would like us to look at?",
-            "If so, send me a quick update and I can suggest the next step.",
+            "Do you have any mats that need repair now?",
+            "If so, send me an approximate quantity and I can confirm the next step.",
         ]
     elif is_stale:
         paragraphs = [
-            "It has been quiet on repairs for a while.",
-            "Are you setting any damaged mats aside at the moment?",
-            "If you need us, I can get things moving.",
+            "It has been a while since your last repair order.",
+            "Do you have any mats that need repair now?",
         ]
     elif isinstance(days_since_last_order, (int, float)):
         elapsed_label = format_elapsed_time_label(days_since_last_order)
         paragraphs = [
-            f"It looks like it has been {elapsed_label} since we last worked with {customer_name}.",
+            f"It has been {elapsed_label} since the last repair order for {customer_name}.",
             "Do you have any repair work coming up?",
-            "If so, let me know and I can suggest the next step.",
+            "If so, send me an approximate quantity and I can confirm the next step.",
         ]
     else:
         paragraphs = [
             "Do you have any mats that need repairing at the moment?",
-            "If so, let me know and I can suggest the next step.",
+            "If so, send me an approximate quantity and I can confirm the next step.",
         ]
 
     return "\n\n".join([greeting, *paragraphs, "Thanks,"])
@@ -744,7 +777,8 @@ def generate_outreach_prep(context):
                         "observed_reply_count, approx_response_rate, last_reply_date, likely_preferred_mode, observed_pattern, "
                         "evidence_strength, customer_services_present, recommended_contact_name, recommended_contact_email, targeting_note, email_subject, email_body, call_objective, call_talking_points, voicemail_draft, suggested_text_message. "
                         "rationale_bullets and call_talking_points must be arrays of short strings. "
-                        "Do not invent facts or channels not supported by the history."
+                        "Do not invent facts or channels not supported by the history. "
+                        + OUTREACH_EMAIL_STYLE_GUIDANCE
                     ),
                 },
                 {
@@ -795,6 +829,9 @@ def generate_outreach_prep(context):
                 "Previous repair logistics contact appears historical rather than active, "
                 "so the outreach should check whether there is any current repair need instead of assuming pickup is still being arranged."
             )
+        if draft_violates_outreach_style(result.get("email_body", "")):
+            result["email_body"] = fallback["email_body"]
+            result["targeting_note"] = "The generated draft used vague, overly soft, or promotional language, so a direct factual fallback was used."
 
         cache_outreach_prep(cache_key, result)
         return result
@@ -878,7 +915,8 @@ def generate_action_plan_email_draft(context):
                         "Use 2 to 4 short body sentences and one clear question or next step. Format email_body as a normal email with a blank line after the greeting and a blank line before the final 'Thanks,'. "
                         "Never quote or mechanically join CRM note fragments. Do not use 'touch base', 'reach out', 'circle back', 'just checking in', or vague 'Checking in' subjects. "
                         "Do not add pallet minimums, weights, pricing, sustainability claims, guides, process claims, or pickup promises unless directly required by a current message. "
-                        "Use a short practical subject. Do not include the full customer/location label or 'Following up on [customer]'."
+                        "Use a short practical subject. Do not include the full customer/location label or 'Following up on [customer]'. "
+                        + OUTREACH_EMAIL_STYLE_GUIDANCE
                     ),
                 },
                 {"role": "user", "content": json.dumps(draft_context, indent=2)},
@@ -908,6 +946,11 @@ def generate_action_plan_email_draft(context):
             raise ValueError("Email-only response was missing subject or body")
         if draft_reuses_expired_relative_timing(context, subject, body):
             return build_expired_timing_safe_email(context)
+        if draft_violates_outreach_style(body):
+            return {
+                "email_subject": fallback["email_subject"],
+                "email_body": fallback["email_body"],
+            }
         result = {"email_subject": subject, "email_body": body}
         cache_outreach_prep(cache_key, result)
         return result
