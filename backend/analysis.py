@@ -125,6 +125,14 @@ def get_analysis_today():
     return datetime.strptime(today, "%Y-%m-%d")
 
 
+def get_limited_history_follow_up_days():
+    raw_days = str(os.getenv("ACTION_PLAN_LIMITED_HISTORY_FOLLOW_UP_DAYS", "60") or "60").strip()
+    try:
+        return max(1, int(raw_days))
+    except ValueError:
+        return 60
+
+
 def parse_date(value):
     if not value:
         return None
@@ -247,16 +255,46 @@ def find_late_customers(customers, today=None):
     for name, orders in customers.items():
         cycle = analyze_order_cycle(orders)
         avg_gap = cycle["cycle_days"]
-
-        if not avg_gap:
-            continue
-
-        last_order = max([
+        valid_order_dates = [
             datetime.strptime(o["order_date"], "%Y-%m-%d")
             for o in orders
-        ])
-
+            if o.get("order_date")
+        ]
+        if not valid_order_dates:
+            continue
+        last_order = max(valid_order_dates)
         days_since_last = (today - last_order).days
+
+        if not avg_gap:
+            follow_up_days = get_limited_history_follow_up_days()
+            if days_since_last < follow_up_days:
+                continue
+
+            value_metrics = calculate_order_value_metrics(orders)
+            base_priority = max(1.5, (days_since_last / follow_up_days) * 1.5)
+            priority = apply_value_weight_to_priority(base_priority, value_metrics)
+            last_activity = get_last_activity_info(orders)
+            last_activity_date = last_activity["date"] if last_activity else None
+            results.append({
+                "customer": name,
+                "avg_gap": None,
+                "cycle_pattern": "limited_history",
+                "cycle_pattern_label": "Limited order history",
+                "cycle_consistency": "unknown",
+                "days_since_last": days_since_last,
+                "priority_score": round(priority, 2),
+                "order_count": value_metrics["order_count"],
+                "total_spend_value": value_metrics["total_spend_value"],
+                "average_order_value_value": value_metrics["average_order_value"],
+                "action": "Reconnect for another order",
+                "last_activity_date": last_activity_date.strftime("%Y-%m-%d") if last_activity_date else None,
+                "last_activity_content": last_activity["content"] if last_activity else "",
+                "days_since_last_activity": ((today.date() - last_activity_date.date()).days if last_activity_date else None),
+                "limited_history": True,
+                "follow_up_threshold_days": follow_up_days,
+                "status": "needs_attention",
+            })
+            continue
 
         if days_since_last > avg_gap:
             base_priority = days_since_last / avg_gap

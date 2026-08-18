@@ -10743,6 +10743,7 @@ def build_attention_cache_key(order_result, crm_result):
         crm_result.get("cache_updated_at", ""),
         crm_result.get("counts", {}).get("kept_rows", 0),
         should_add_ai_explanations(),
+        os.getenv("ACTION_PLAN_LIMITED_HISTORY_FOLLOW_UP_DAYS", "60").strip(),
     )
 
 
@@ -10799,6 +10800,14 @@ def build_attention_explanation(customer):
 
     if explanation:
         return explanation
+
+    if customer.get("limited_history"):
+        return (
+            f"{customer.get('customer', 'This customer')} has only "
+            f"{customer.get('order_count', 0)} previous order{'s' if customer.get('order_count') != 1 else ''}, "
+            f"so there is not yet a reliable ordering cycle. It has been "
+            f"{customer.get('days_since_last', '0')} days since the last order and is ready for a sales follow-up."
+        )
 
     return (
         f"{customer.get('customer', 'This customer')} needs attention because it has been "
@@ -15404,6 +15413,10 @@ def build_home_why_now(customer, outbound_count=0, inbound_count=0, contact_poli
     if str(contact_policy.get("why_override") or "").strip():
         return str(contact_policy.get("why_override") or "").strip()
 
+    if customer.get("limited_history"):
+        order_count = int(customer.get("order_count") or 0)
+        return f"{order_count} previous order{'s' if order_count != 1 else ''} • {days_since_last} days since last order"
+
     if inbound_count:
         return f"Reply history exists • {days_since_last} days since last order"
     if outbound_count >= 3:
@@ -16618,7 +16631,7 @@ def render_action_plan_item(customer):
     summary_bits = [
         f"Priority {customer.get('priority_score')}",
         f"{customer.get('days_since_last')} days since last order",
-        f"Avg cycle {customer.get('avg_gap')} days",
+        ("Limited order history" if customer.get("limited_history") else f"Avg cycle {customer.get('avg_gap')} days"),
     ]
 
     if customer.get("last_activity_date"):
