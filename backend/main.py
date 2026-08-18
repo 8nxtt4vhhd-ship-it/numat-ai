@@ -5824,7 +5824,7 @@ def render_calendar_event_form(event, month_start):
             <button class="button danger" type="submit">Delete event</button>
         </form>'''
     return f'''
-        <aside class="panel calendar-editor-panel">
+        <aside class="panel calendar-editor-panel" id="calendar-event-editor">
             <div class="calendar-editor-head"><h2>{heading}</h2>{f'<a href="/calendar-view?month={month_start.strftime("%Y-%m")}">Close</a>' if editing else ''}</div>
             {recurring_note}
             <form class="calendar-event-form" method="post" action="{action}">
@@ -5885,6 +5885,7 @@ def get_calendar_view(month: str = "", view: str = "month", edit: str = "", refr
                         <a class="button secondary" href="/calendar-view?month={following_month}&view={selected_view}">Next</a>
                         <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view={'agenda' if selected_view == 'month' else 'month'}">{'Agenda' if selected_view == 'month' else 'Month'}</a>
                         <a class="button secondary" href="/calendar-view?month={month_start.strftime('%Y-%m')}&view={selected_view}&refresh=true">Refresh</a>
+                        <a class="button calendar-add-jump" href="#calendar-event-editor">Add event</a>
                     </div>
                 </div>
                 {content}
@@ -21623,6 +21624,97 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .calendar-agenda-event span,
                     .calendar-agenda-event small {{
                         color: var(--muted);
+                    }}
+
+                    @media (max-width: 900px) {{
+                        main.calendar-main {{
+                            padding-inline: 10px;
+                        }}
+
+                        .calendar-page-layout {{
+                            grid-template-columns: minmax(0, 1fr);
+                            gap: 14px;
+                        }}
+
+                        .calendar-main-panel,
+                        .calendar-editor-panel {{
+                            min-width: 0;
+                            padding: 14px;
+                        }}
+
+                        .calendar-editor-panel {{
+                            position: static;
+                        }}
+
+                        .calendar-toolbar {{
+                            align-items: flex-start;
+                            flex-direction: column;
+                        }}
+
+                        .calendar-toolbar-actions {{
+                            width: 100%;
+                            max-width: 100%;
+                            justify-content: flex-start;
+                            overflow-x: auto;
+                            padding-bottom: 4px;
+                            scrollbar-width: thin;
+                        }}
+
+                        .calendar-month-grid {{
+                            min-width: 720px;
+                        }}
+
+                        .calendar-main-panel {{
+                            overflow-x: auto;
+                            -webkit-overflow-scrolling: touch;
+                        }}
+
+                        .calendar-day {{
+                            min-height: 108px;
+                        }}
+
+                        .calendar-form-row {{
+                            grid-template-columns: minmax(0, 1fr);
+                        }}
+
+                        .calendar-agenda-day {{
+                            grid-template-columns: minmax(0, 1fr);
+                        }}
+
+                        .calendar-agenda-event {{
+                            grid-template-columns: 78px minmax(0, 1fr);
+                        }}
+
+                        .calendar-agenda-event small {{
+                            grid-column: 2;
+                        }}
+                    }}
+
+                    @media (max-width: 520px) {{
+                        .calendar-toolbar-actions {{
+                            gap: 6px;
+                        }}
+
+                        .calendar-toolbar-actions .button {{
+                            height: 32px;
+                            padding: 5px 9px;
+                            font-size: 11px;
+                        }}
+
+                        .calendar-editor-head h2 {{
+                            font-size: 22px;
+                        }}
+
+                        .calendar-form-actions {{
+                            align-items: stretch;
+                            flex-direction: column;
+                        }}
+
+                        .calendar-form-actions button,
+                        .calendar-form-actions .button,
+                        .calendar-delete-form button {{
+                            width: 100%;
+                        }}
                     }}
 
                     .kpi-coming-soon {{
