@@ -5818,7 +5818,7 @@ def render_calendar_event_form(event, month_start):
     recurring_note = "<p class='small muted'>This is an occurrence in a recurring series. Changes apply to this occurrence.</p>" if event.get("series_master_id") else ""
     delete_form = ""
     if editing:
-        delete_form = f'''<form method="post" action="/calendar/events/delete" onsubmit="return confirm('Delete this event? Attendees may receive a cancellation.');">
+        delete_form = f'''<form class="calendar-delete-form" method="post" action="/calendar/events/delete" onsubmit="return confirm('Delete this event? Attendees may receive a cancellation.');">
             <input type="hidden" name="event_id" value="{escape(str(event.get('id') or ''))}">
             <input type="hidden" name="month" value="{month_start.strftime('%Y-%m')}">
             <button class="button danger" type="submit">Delete event</button>
@@ -21548,6 +21548,30 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .calendar-event-form input::placeholder,
                     .calendar-event-form textarea::placeholder {{
                         font-size: 12px;
+                    }}
+
+                    .calendar-form-actions {{
+                        justify-content: flex-start;
+                        flex-wrap: wrap;
+                    }}
+
+                    .calendar-form-actions button,
+                    .calendar-form-actions .button,
+                    .calendar-delete-form button {{
+                        width: auto;
+                        height: 34px;
+                        padding: 6px 11px;
+                        font-size: 12px;
+                    }}
+
+                    .calendar-delete-form {{
+                        margin-top: 10px;
+                    }}
+
+                    .calendar-delete-form .danger {{
+                        border-color: #d54c4c;
+                        background: #ffffff;
+                        color: #b83232;
                     }}
 
                     .calendar-form-row {{
