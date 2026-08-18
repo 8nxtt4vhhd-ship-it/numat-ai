@@ -21661,12 +21661,12 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .calendar-month-grid {{
-                            min-width: 720px;
+                            width: 100%;
+                            min-width: 0;
                         }}
 
                         .calendar-main-panel {{
-                            overflow-x: auto;
-                            -webkit-overflow-scrolling: touch;
+                            overflow-x: hidden;
                         }}
 
                         .calendar-day {{
@@ -21691,6 +21691,46 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 520px) {{
+                        .calendar-weekday {{
+                            padding: 7px 2px;
+                            font-size: 9px;
+                        }}
+
+                        .calendar-day {{
+                            min-width: 0;
+                            min-height: 82px;
+                            padding: 3px;
+                        }}
+
+                        .calendar-day-number {{
+                            margin-bottom: 3px;
+                            font-size: 10px;
+                        }}
+
+                        .calendar-day-events {{
+                            gap: 2px;
+                        }}
+
+                        .calendar-event-chip {{
+                            min-width: 0;
+                            padding: 3px;
+                            border-left-width: 2px;
+                            font-size: 8px;
+                        }}
+
+                        .calendar-event-chip span {{
+                            display: none;
+                        }}
+
+                        .calendar-event-chip strong {{
+                            max-width: 100%;
+                            font-size: 8px;
+                        }}
+
+                        .calendar-more {{
+                            font-size: 8px;
+                        }}
+
                         .calendar-toolbar-actions {{
                             gap: 6px;
                         }}
