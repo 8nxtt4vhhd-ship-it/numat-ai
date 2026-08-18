@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-american-direct-style-12"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-single-thread-style-13"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 OUTREACH_EMAIL_STYLE_GUIDANCE = (
@@ -24,7 +24,12 @@ OUTREACH_EMAIL_STYLE_GUIDANCE = (
     "'it reminded me that it has been a while since your last repair order' before asking about current repair needs. "
     "Do not use that example unless Chicago and the visit are supplied facts. Do not place unrelated facts next to each other. Prefer 45 to 85 words, "
     "and use fewer words when the evidence is sparse. Do not use promotional phrases such as 'unlock value', 'exciting opportunity', "
-    "'partner with you', 'tailored solution', or 'help take your business to the next level'."
+    "'partner with you', 'tailored solution', or 'help take your business to the next level'. Choose one historical thread only. "
+    "Do not combine a missed visit, an old repair note, an order gap, and a general check-in merely because they are all available. "
+    "Use the single fact that best supports today's question. State it plainly in no more than two short sentences, then ask one direct question. "
+    "If a missed visit is the chosen thread, say 'We missed each other' or 'We didn't get a chance to meet'. Never say 'due to schedule a visit' "
+    "or 'due to be in the area'. Do not use 'I wanted to check'. Do not offer to arrange pickup or start logistics until the customer confirms "
+    "a current repair need or a batch ready for collection."
 )
 
 RECENT_REPLY_ANCHOR_DAYS = 30
@@ -68,13 +73,16 @@ def draft_violates_outreach_style(text):
         "i was hoping",
         "would you be able to",
         "it would be great",
+        "due to schedule a visit",
+        "due to be in the area",
+        "i wanted to check",
         "unlock value",
         "exciting opportunity",
         "partner with you",
         "tailored solution",
         "take your business to the next level",
     ]
-    return any(phrase in lowered for phrase in disallowed_phrases)
+    return any(phrase in lowered for phrase in disallowed_phrases) or str(text or "").count("?") > 1
 
 
 def get_outreach_context_path():
@@ -736,7 +744,7 @@ def generate_outreach_prep(context):
                         "If the account previously replied or ordered regularly but has gone quiet, write as an existing supplier relationship, not as a cold prospect and not as though a transaction is currently active. "
                         "When an older reply records a blocker, acknowledge it without interrogating the customer or listing possible causes. Ask only whether the situation has changed or who now owns the decision. "
                         "Write for busy operational people who may be moving between the office and production floor. "
-                        "Keep emails concise and specific. Prefer 2 to 4 short sentences plus greeting and sign-off. "
+                        "Keep emails concise and specific. Prefer 2 or 3 short sentences plus greeting and sign-off. Use exactly one question or next step. "
                         "For dormant existing customers, usually keep the body between 45 and 85 words unless a current customer question needs a different length. "
                         "Anchor each email to one concrete point, not several. "
                         "End with one clear ask or next step. "
@@ -866,6 +874,8 @@ def generate_action_plan_email_draft(context):
         "primary_activity_type",
         "likely_preferred_mode",
         "is_cold_outreach",
+        "stale_logistics_signal",
+        "later_order_recorded",
         "recent_sales_context",
         "primary_contact",
     ]
@@ -901,7 +911,7 @@ def generate_action_plan_email_draft(context):
                         "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
                         "Treat analysis_date as today. Every CRM item's date and age_days determine when its wording was true. Relative phrases inside an old item—such as 'tomorrow', 'this week', 'next week', 'later this month', or 'next month'—are relative to that item's date, not analysis_date. "
                         "Sequence CRM activity against last_order_date. If a note anticipated mats, a repair order, or a pickup and later_order_recorded is true, treat that anticipated need as fulfilled by the later order unless a newer record explicitly says otherwise. Do not ask for those same mats or describe that old plan as still pending. You may refer to the later order itself when useful. "
-                        "For an expired scheduling proposal with no later recorded outcome, assume the proposed visit or meeting did not take place. You may acknowledge that naturally (for example, 'We didn't manage to connect when I was due to be in the area') and suggest arranging another time when that is the most useful next step. Never ask the customer whether the visit happened, imply that it did happen, or invent a reason it was missed. "
+                        "For an expired scheduling proposal with no later recorded outcome, assume the proposed visit or meeting did not take place. If that missed meeting is the single best reason to write, say simply 'We missed each other' or 'We didn't get a chance to meet', then ask one direct question about arranging another time. Do not combine it with an unrelated old repair note. Never ask whether the visit happened, imply that it did happen, or invent why it was missed. "
                         "Do not invent a new visit date, travel plan, meeting, or availability. You may ask whether the customer would like to arrange a new time, but only state specific new timing when the supplied current context explicitly supports it. "
                         "Sound simple, purposeful, sincere, familiar, and plainspoken—not polished sales copy. Match usable outbound style without copying errors. "
                         "Choose one purpose: answer a live update; address a recorded blocker; continue an agreed action; close the loop after unanswered attempts; re-open a responsive relationship; identify the right contact; or check for a current repair need. "
@@ -912,7 +922,7 @@ def generate_action_plan_email_draft(context):
                         "A recorded blocker should normally produce 2 or 3 useful body sentences: acknowledge the blocker, say briefly how NuMat can help if it has changed, then ask one direct question. Do not reduce it to only 'has the situation changed?' "
                         "Use only one conversational ask. Do not ask whether the situation changed and who the right contact is in the same email. Choose the question that best fits the evidence. "
                         "Avoid empty offers such as 'we can help if you are ready'. When a useful offer is supported, name it plainly—for example reviewing likely repair candidates or comparing repair with replacement—without turning it into a pitch. "
-                        "Use 2 to 4 short body sentences and one clear question or next step. Format email_body as a normal email with a blank line after the greeting and a blank line before the final 'Thanks,'. "
+                        "Use 2 or 3 short body sentences and exactly one clear question or next step. When the context is simple, prefer the pattern: one factual sentence followed by one direct question. Format email_body as a normal email with a blank line after the greeting and a blank line before the final 'Thanks,'. "
                         "Never quote or mechanically join CRM note fragments. Do not use 'touch base', 'reach out', 'circle back', 'just checking in', or vague 'Checking in' subjects. "
                         "Do not add pallet minimums, weights, pricing, sustainability claims, guides, process claims, or pickup promises unless directly required by a current message. "
                         "Use a short practical subject. Do not include the full customer/location label or 'Following up on [customer]'. "
@@ -946,6 +956,11 @@ def generate_action_plan_email_draft(context):
             raise ValueError("Email-only response was missing subject or body")
         if draft_reuses_expired_relative_timing(context, subject, body):
             return build_expired_timing_safe_email(context)
+        if has_stale_logistics_signal(context) and draft_looks_like_active_logistics(body):
+            return {
+                "email_subject": fallback["email_subject"],
+                "email_body": fallback["email_body"],
+            }
         if draft_violates_outreach_style(body):
             return {
                 "email_subject": fallback["email_subject"],
@@ -1009,8 +1024,8 @@ def build_expired_timing_safe_email(context):
         "email_subject": "Current repair needs",
         "email_body": (
             f"{greeting}\n\n"
-            "It has been a while since the last repair order. "
-            "Do you have any mats that would be useful for us to review at the moment?\n\n"
+            "It has been a while since your last repair order. "
+            "Do you have any mats that need repair now?\n\n"
             "Thanks,"
         ),
     }
