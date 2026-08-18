@@ -21536,6 +21536,18 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .calendar-event-form input,
                     .calendar-event-form textarea {{
                         width: 100%;
+                        padding: 8px 9px;
+                        font-size: 13px;
+                        line-height: 1.35;
+                    }}
+
+                    .calendar-event-form input[type="datetime-local"] {{
+                        font-size: 12px;
+                    }}
+
+                    .calendar-event-form input::placeholder,
+                    .calendar-event-form textarea::placeholder {{
+                        font-size: 12px;
                     }}
 
                     .calendar-form-row {{
