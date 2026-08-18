@@ -5743,7 +5743,19 @@ def render_calendar_month_grid(events, month_start):
     grid_start = month_start - timedelta(days=first_weekday)
     grouped = defaultdict(list)
     for event in events:
-        grouped[str(event.get("start_date") or "")].append(event)
+        start = calendar_event_datetime(event, "start")
+        end = calendar_event_datetime(event, "end")
+        if not start:
+            continue
+        first_day = start.date()
+        last_day = (end or start).date()
+        if end and end > start and end.hour == 0 and end.minute == 0 and end.second == 0:
+            last_day -= timedelta(days=1)
+        last_day = max(first_day, last_day)
+        day = first_day
+        while day <= last_day:
+            grouped[day.isoformat()].append(event)
+            day += timedelta(days=1)
     headers = "".join(f"<div class='calendar-weekday'>{label}</div>" for label in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
     cells = []
     for offset in range(42):
@@ -21399,6 +21411,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         margin-bottom: 18px;
                     }}
 
+                    .calendar-toolbar > div:first-child {{
+                        flex: 1 1 auto;
+                        min-width: 0;
+                    }}
+
                     .calendar-toolbar h2,
                     .calendar-toolbar p,
                     .calendar-editor-head h2 {{
@@ -21406,8 +21423,18 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .calendar-toolbar-actions {{
-                        flex-wrap: wrap;
+                        flex: 0 0 auto;
+                        flex-wrap: nowrap;
                         justify-content: flex-end;
+                        white-space: nowrap;
+                    }}
+
+                    .calendar-toolbar-actions .button {{
+                        width: auto;
+                        min-width: 0;
+                        height: 34px;
+                        padding: 6px 11px;
+                        font-size: 12px;
                     }}
 
                     .calendar-month-grid {{
