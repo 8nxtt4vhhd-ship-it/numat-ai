@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-single-thread-style-13"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-commercial-fact-ranking-14"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 OUTREACH_EMAIL_STYLE_GUIDANCE = (
@@ -852,6 +852,12 @@ def generate_outreach_prep(context):
 def generate_action_plan_email_draft(context):
     """Generate only the two fields needed by the Action Plan focus view."""
     fallback = build_outreach_prep_fallback(context)
+    prepared_sales_context = redact_expired_scheduling_notes(context.get("recent_sales_context"))
+    prepared_sales_context = redact_intent_resolved_by_later_order(prepared_sales_context)
+    primary_fact = select_primary_outreach_fact(prepared_sales_context)
+    primary_fact_fallback = build_primary_fact_fallback_email(context, primary_fact)
+    if primary_fact_fallback:
+        fallback = {**fallback, **primary_fact_fallback}
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return {
@@ -880,12 +886,8 @@ def generate_action_plan_email_draft(context):
         "primary_contact",
     ]
     draft_context = {key: context.get(key) for key in payload_keys}
-    draft_context["recent_sales_context"] = redact_expired_scheduling_notes(
-        draft_context.get("recent_sales_context")
-    )
-    draft_context["recent_sales_context"] = redact_intent_resolved_by_later_order(
-        draft_context.get("recent_sales_context")
-    )
+    draft_context["recent_sales_context"] = prepared_sales_context
+    draft_context["primary_outreach_fact"] = primary_fact
     cache_key = (
         "action-plan-email-only",
         _OUTREACH_PREP_PROMPT_VERSION,
@@ -909,6 +911,7 @@ def generate_action_plan_email_draft(context):
                         "Write one short customer email for NuMat, which repairs damaged mats for industrial laundry and mat-service customers. "
                         "Return strict JSON with only email_subject and email_body. Use only supplied facts. "
                         "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
+                        "Use primary_outreach_fact as the default subject of the email. It was selected by a deterministic commercial-priority step. A specific unresolved repair signal or recorded blocker outranks years since the last order, general account dormancy, and expired scheduling. Depart from it only when a later order clearly resolved it or using it would contradict a newer customer message. "
                         "Treat analysis_date as today. Every CRM item's date and age_days determine when its wording was true. Relative phrases inside an old item—such as 'tomorrow', 'this week', 'next week', 'later this month', or 'next month'—are relative to that item's date, not analysis_date. "
                         "Sequence CRM activity against last_order_date. If a note anticipated mats, a repair order, or a pickup and later_order_recorded is true, treat that anticipated need as fulfilled by the later order unless a newer record explicitly says otherwise. Do not ask for those same mats or describe that old plan as still pending. You may refer to the later order itself when useful. "
                         "For an expired scheduling proposal with no later recorded outcome, assume the proposed visit or meeting did not take place. If that missed meeting is the single best reason to write, say simply 'We missed each other' or 'We didn't get a chance to meet', then ask one direct question about arranging another time. Do not combine it with an unrelated old repair note. Never ask whether the visit happened, imply that it did happen, or invent why it was missed. "
@@ -1038,14 +1041,78 @@ def redact_expired_scheduling_notes(items):
             continue
         cleaned = dict(item)
         if cleaned.get("relative_timing_expired"):
-            cleaned["subject"] = "Expired scheduling proposal"
-            cleaned["preview"] = (
-                "The proposed timing has passed and there is no later CRM note confirming that it happened. "
-                "Assume it did not take place. It may be acknowledged as a missed connection, but do not ask "
-                "whether it happened, claim that it happened, or invent why it was missed."
+            cleaned["timing_status"] = "expired"
+            cleaned["timing_instruction"] = (
+                "Any relative date or proposed visit timing in this note has expired. Preserve useful commercial facts, "
+                "but do not repeat the old timing, claim the visit happened, or ask whether it happened."
             )
         redacted.append(cleaned)
     return redacted
+
+
+def select_primary_outreach_fact(items):
+    """Rank usable CRM facts before drafting so order age is only a fallback."""
+    ranked = []
+    repair_terms = (
+        "wavy mat", "edge repair", "mats for repair", "mats ready", "setting aside",
+        "set aside", "collecting mats", "repair candidates", "damaged mats",
+    )
+    blocker_terms = ("price", "freight", "budget", "approval", "decision", "replacement")
+
+    for index, item in enumerate(items or []):
+        if not isinstance(item, dict) or item.get("later_order_recorded"):
+            continue
+        text = " ".join(str(item.get(key) or "") for key in ("subject", "preview")).strip()
+        lowered = text.lower()
+        if not text:
+            continue
+        score = max(0, 20 - index)
+        fact_type = "conversation"
+        reason = "Most recent usable sales context"
+        if any(term in lowered for term in repair_terms):
+            score += 100
+            fact_type = "unresolved_repair_signal"
+            reason = "Specific unresolved repair need outranks general order age or a missed visit"
+        elif any(term in lowered for term in blocker_terms):
+            score += 75
+            fact_type = "recorded_blocker"
+            reason = "A recorded commercial blocker is more useful than general order age"
+        elif item.get("likely_order_intent"):
+            score += 65
+            fact_type = "order_intent"
+            reason = "Unresolved order intent is more useful than general order age"
+        if str(item.get("direction") or "").lower() == "inbound":
+            score += 25
+        if item.get("timing_status") == "expired" and fact_type == "conversation":
+            score -= 20
+            fact_type = "expired_scheduling"
+            reason = "Use only if no stronger current commercial fact exists"
+        ranked.append((score, {"type": fact_type, "reason": reason, "date": item.get("date"), "subject": item.get("subject"), "preview": item.get("preview")}))
+
+    return max(ranked, key=lambda value: value[0])[1] if ranked else {}
+
+
+def build_primary_fact_fallback_email(context, primary_fact):
+    if str(primary_fact.get("type") or "") != "unresolved_repair_signal":
+        return None
+    primary_contact = context.get("primary_contact") or {}
+    first_name = get_contact_first_name(primary_contact.get("name"))
+    greeting = f"Hi {first_name}," if first_name else "Hi,"
+    text = " ".join(str(primary_fact.get(key) or "") for key in ("subject", "preview")).lower()
+    repair_description = "mats for repair"
+    if "wavy" in text and "edge repair" in text:
+        repair_description = "wavy mats for edge repair"
+    elif "wavy" in text:
+        repair_description = "wavy mats"
+    return {
+        "email_subject": "Mats for repair",
+        "email_body": (
+            f"{greeting}\n\n"
+            f"You previously mentioned collecting {repair_description}. "
+            "Are you still setting those aside?\n\n"
+            "Thanks,"
+        ),
+    }
 
 
 def redact_intent_resolved_by_later_order(items):
