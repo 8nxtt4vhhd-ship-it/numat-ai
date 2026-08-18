@@ -57,12 +57,27 @@ class OutreachStyleTests(unittest.TestCase):
         ])
         fact = select_primary_outreach_fact(items)
         self.assertEqual(fact["type"], "unresolved_repair_signal")
+        self.assertEqual(fact["direction"], "Outbound")
         self.assertIn("wavy mats", fact["preview"])
         fallback = build_primary_fact_fallback_email(
             {"primary_contact": {"name": "Greg Smith"}}, fact
         )
-        self.assertIn("wavy mats for edge repair", fallback["email_body"])
-        self.assertIn("Are you still setting those aside?", fallback["email_body"])
+        self.assertIn("I had noted possible wavy mats for edge repair", fallback["email_body"])
+        self.assertNotIn("You previously mentioned", fallback["email_body"])
+        self.assertIn("Are you still seeing those?", fallback["email_body"])
+
+    def test_inbound_repair_fact_is_attributed_to_customer(self):
+        fact = select_primary_outreach_fact([
+            {
+                "direction": "Inbound",
+                "preview": "We are collecting wavy mats for edge repair.",
+                "later_order_recorded": False,
+            }
+        ])
+        fallback = build_primary_fact_fallback_email(
+            {"primary_contact": {"name": "Greg Smith"}}, fact
+        )
+        self.assertIn("You previously mentioned collecting wavy mats for edge repair", fallback["email_body"])
 
     def test_repair_signal_is_not_reused_after_later_order(self):
         fact = select_primary_outreach_fact([

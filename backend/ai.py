@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-commercial-fact-ranking-14"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-fact-provenance-15"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
 
 OUTREACH_EMAIL_STYLE_GUIDANCE = (
@@ -734,6 +734,7 @@ def generate_outreach_prep(context):
                         "The team's standard is simple and purposeful. The draft must feel sincere, familiar, and written by a real salesperson who has read the conversation. It must never feel distant, performative, over-polished, or like generic sales copy. "
                         "Avoid sales filler such as 'I wanted to touch base', 'reach out', 'circle back', 'connect', or 'whenever you have a moment'. Start with the useful point. "
                         "Read recent_sales_context as a conversation in date order: inbound items are the customer's words and must be answered or acknowledged when they are still relevant; outbound items are examples of how the Numat salesperson naturally writes. "
+                        "Preserve attribution exactly. Never rewrite a fact from an outbound salesperson note as something the customer mentioned or said. Use 'you mentioned' only for an inbound customer statement. Use 'I had noted' for a salesperson's own recorded observation, and use 'we discussed' only when the records clearly show a two-way discussion. "
                         "Adapt to the salesperson's established level of formality, sentence length, greeting, sign-off, and vocabulary when there are usable outbound email examples. Match the voice, but do not copy whole sentences or reproduce typos. "
                         "CRM entries may be shorthand notes rather than customer-facing prose. Never paste, quote, or mechanically join note fragments in the draft. In particular, do not write constructions such as 'our notes around X and Y'. First understand the underlying point, then respond in normal language—or omit it if its meaning is unclear. "
                         "Continue the actual conversation rather than merely announcing a follow-up. If the customer asked a question or gave an update, address it directly before making the next ask. Do not claim to answer something unless the supplied history supports the answer. "
@@ -911,7 +912,7 @@ def generate_action_plan_email_draft(context):
                         "Write one short customer email for NuMat, which repairs damaged mats for industrial laundry and mat-service customers. "
                         "Return strict JSON with only email_subject and email_body. Use only supplied facts. "
                         "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
-                        "Use primary_outreach_fact as the default subject of the email. It was selected by a deterministic commercial-priority step. A specific unresolved repair signal or recorded blocker outranks years since the last order, general account dormancy, and expired scheduling. Depart from it only when a later order clearly resolved it or using it would contradict a newer customer message. "
+                        "Use primary_outreach_fact as the default subject of the email. It was selected by a deterministic commercial-priority step. A specific unresolved repair signal or recorded blocker outranks years since the last order, general account dormancy, and expired scheduling. Depart from it only when a later order clearly resolved it or using it would contradict a newer customer message. A brief acknowledgement of the latest inbound message may precede the primary fact when it connects naturally—for example, acknowledge that you missed each other in Chicago, then state the salesperson's note about possible wavy mats. Preserve the fact's provenance: direction Inbound means the customer said it; direction Outbound means the NuMat salesperson wrote or recorded it. Never turn an outbound note into 'you mentioned', 'you said', or another claim that the customer supplied the fact. For an outbound note use factual first-person wording such as 'I had noted possible wavy mats for edge repair' when supported. Use 'we discussed' only when the records clearly show a two-way discussion. "
                         "Treat analysis_date as today. Every CRM item's date and age_days determine when its wording was true. Relative phrases inside an old item—such as 'tomorrow', 'this week', 'next week', 'later this month', or 'next month'—are relative to that item's date, not analysis_date. "
                         "Sequence CRM activity against last_order_date. If a note anticipated mats, a repair order, or a pickup and later_order_recorded is true, treat that anticipated need as fulfilled by the later order unless a newer record explicitly says otherwise. Do not ask for those same mats or describe that old plan as still pending. You may refer to the later order itself when useful. "
                         "For an expired scheduling proposal with no later recorded outcome, assume the proposed visit or meeting did not take place. If that missed meeting is the single best reason to write, say simply 'We missed each other' or 'We didn't get a chance to meet', then ask one direct question about arranging another time. Do not combine it with an unrelated old repair note. Never ask whether the visit happened, imply that it did happen, or invent why it was missed. "
@@ -1087,7 +1088,14 @@ def select_primary_outreach_fact(items):
             score -= 20
             fact_type = "expired_scheduling"
             reason = "Use only if no stronger current commercial fact exists"
-        ranked.append((score, {"type": fact_type, "reason": reason, "date": item.get("date"), "subject": item.get("subject"), "preview": item.get("preview")}))
+        ranked.append((score, {
+            "type": fact_type,
+            "reason": reason,
+            "date": item.get("date"),
+            "direction": item.get("direction"),
+            "subject": item.get("subject"),
+            "preview": item.get("preview"),
+        }))
 
     return max(ranked, key=lambda value: value[0])[1] if ranked else {}
 
@@ -1104,12 +1112,17 @@ def build_primary_fact_fallback_email(context, primary_fact):
         repair_description = "wavy mats for edge repair"
     elif "wavy" in text:
         repair_description = "wavy mats"
+    direction = str(primary_fact.get("direction") or "").strip().lower()
+    if direction == "inbound":
+        fact_sentence = f"You previously mentioned collecting {repair_description}."
+    else:
+        fact_sentence = f"I had noted possible {repair_description}."
     return {
         "email_subject": "Mats for repair",
         "email_body": (
             f"{greeting}\n\n"
-            f"You previously mentioned collecting {repair_description}. "
-            "Are you still setting those aside?\n\n"
+            f"{fact_sentence} "
+            "Are you still seeing those?\n\n"
             "Thanks,"
         ),
     }
