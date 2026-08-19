@@ -1,0 +1,10 @@
+[Unit]
+Description=Send NuMat Daily Dash PDF each evening
+
+[Timer]
+OnCalendar=*-*-* 18:00:00 America/Chicago
+Persistent=true
+Unit=numat-daily-dash-report.service
+
+[Install]
+WantedBy=timers.target

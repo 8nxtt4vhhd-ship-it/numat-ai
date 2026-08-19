@@ -10,3 +10,4 @@ backend/data/action_plan_dismissals.json
 backend/data/filemaker_crm_cache.json
 backend/data/filemaker_orders_cache.json
 backend/data/*.csv
+backend/data/app_settings.json

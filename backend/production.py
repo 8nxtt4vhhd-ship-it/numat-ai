@@ -64,6 +64,7 @@ def normalize_production_record(record):
     }
     numeric_fields = {
         "accumulated_revenue_target": "Accumulated Daily Revenue Target",
+        "aged_debtor_days": "Aged debtor days",
         "backlog_grind": "Backlog at Grind",
         "backlog_press": "Backlog at Press",
         "backlog_sort": "Backlog at Sort",
@@ -108,6 +109,7 @@ def normalize_production_record(record):
             "utilisation": "Production Time as decimal",
             "revenue": "Revenue",
             "avg_lf_cycle": "Avg LF per cycle",
+            "avg_revenue_cycle": "Avg dollar per cycle",
         }.items():
             normalized[prefix + key] = number(value(filemaker_prefix + suffix))
     press_totals = [normalized.get(f"ff{press}_lf") for press in (1, 2, 3)]
@@ -158,9 +160,9 @@ def deduplicate_production_days(rows):
     return sorted(latest_by_date.values(), key=lambda item: item["date"])
 
 
-def fetch_production_analysis_data(force_refresh=False):
+def fetch_production_analysis_data(force_refresh=False, include_today=False):
     now = time.time()
-    if not force_refresh and _PRODUCTION_CACHE["result"] is not None and _PRODUCTION_CACHE["expires_at"] > now:
+    if not include_today and not force_refresh and _PRODUCTION_CACHE["result"] is not None and _PRODUCTION_CACHE["expires_at"] > now:
         return _PRODUCTION_CACHE["result"]
 
     sort = [{"fieldName": "Date", "sortOrder": "ascend"}]
@@ -170,10 +172,13 @@ def fetch_production_analysis_data(force_refresh=False):
     production_rows = [normalize_production_record(item) for item in production_result.get("records", [])]
     operator_rows = [normalize_operator_record(item) for item in operator_result.get("records", [])]
     today = datetime.now().strftime("%Y-%m-%d")
-    production_rows = [item for item in production_rows if item.get("date") and item["date"] < today]
-    operator_rows = [item for item in operator_rows if item.get("date") and item["date"] < today]
+    date_limit = (lambda value: value <= today) if include_today else (lambda value: value < today)
+    production_rows = [item for item in production_rows if item.get("date") and date_limit(item["date"])]
+    operator_rows = [item for item in operator_rows if item.get("date") and date_limit(item["date"])]
     production_rows = deduplicate_production_days(production_rows)
+    plant_operator_rows = list(operator_rows)
     operator_rows = [item for item in operator_rows if not item.get("excluded")]
+    plant_operator_rows.sort(key=lambda item: (item["date"], item["name"]))
     operator_rows.sort(key=lambda item: (item["date"], item["name"]))
     status = "ok" if statuses == {"ok"} else "partial" if "ok" in statuses else next(iter(statuses), "error")
     warning = ""
@@ -188,11 +193,12 @@ def fetch_production_analysis_data(force_refresh=False):
         "production_status": production_result.get("status"),
         "operator_status": operator_result.get("status"),
         "production_rows": production_rows,
+        "plant_operator_rows": plant_operator_rows,
         "operator_rows": operator_rows,
         "synced_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     cache_seconds = get_production_cache_seconds()
-    if cache_seconds:
+    if cache_seconds and not include_today:
         _PRODUCTION_CACHE["result"] = result
         _PRODUCTION_CACHE["expires_at"] = now + cache_seconds
     return result
@@ -235,13 +241,27 @@ def build_operator_summary(operator_rows):
 def build_production_kpi_payload(result=None, days=90):
     result = result or fetch_production_analysis_data()
     rows, operators = filter_production_period(result, days=days)
+    plant_operators = result.get("plant_operator_rows", operators)
+    if rows:
+        period_start = rows[0]["date"]
+        period_end = rows[-1]["date"]
+        plant_operators = [
+            item for item in plant_operators
+            if period_start <= str(item.get("date") or "") <= period_end
+        ]
     latest = rows[-1] if rows else {}
     operator_summary = build_operator_summary(operators)
     active_operator_rows = [item for item in operators if (item.get("clocked_hours") or 0) > 0]
     productivity_values = [item["productivity"] for item in active_operator_rows if item.get("productivity") is not None]
     target_values = [item["target_achieved"] for item in active_operator_rows if item.get("target_achieved") is not None]
-    total_booked_hours = sum(item.get("booked_hours") or 0 for item in active_operator_rows)
-    total_clocked_hours = sum(item.get("clocked_hours") or 0 for item in active_operator_rows)
+    # Plant productivity includes every operator clocking. Exclusions apply to
+    # the individual operator-performance table only; applying them here removes
+    # genuine plant hours and overstates the result.
+    active_plant_operator_rows = [
+        item for item in plant_operators if (item.get("clocked_hours") or 0) > 0
+    ]
+    total_booked_hours = sum(item.get("booked_hours") or 0 for item in active_plant_operator_rows)
+    total_clocked_hours = sum(item.get("clocked_hours") or 0 for item in active_plant_operator_rows)
     press_throughput_values = [
         item["press_throughput"]
         for item in rows

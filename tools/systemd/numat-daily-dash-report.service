@@ -1,0 +1,10 @@
+[Unit]
+Description=Send NuMat Daily Dash PDF
+After=network-online.target numat-ai.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=numatadmin
+WorkingDirectory=/srv/numat-ai/backend
+ExecStart=/srv/numat-ai/backend/venv/bin/python /srv/numat-ai/backend/daily_reports.py --today --recipient kbainbridge@numatsystems.com

@@ -45,6 +45,7 @@ from analysis import (
     group_by_customer,
     find_late_customers,
 )
+from app_settings import calculate_elapsed_invoice_target, get_daily_invoice_target, set_daily_invoice_target
 from data_sources import (
     MAX_SAMPLE_ROWS,
     get_orders_for_analysis,
@@ -85,6 +86,7 @@ from filemaker import (
     has_filemaker_config,
     update_layout_record,
 )
+from finance import fetch_aged_debt_summary
 from m365 import (
     build_m365_authorize_url,
     delete_m365_token_record,
@@ -4855,6 +4857,68 @@ def logout(request: Request):
     return RedirectResponse(url="/login", status_code=303)
 
 
+@app.get("/admin-settings", response_class=HTMLResponse)
+def get_admin_settings_page(message: str = "", error: str = ""):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return render_page(
+            title="System Settings",
+            body="<p class='status error'>You do not have permission to manage system settings.</p>",
+        )
+    daily_target = get_daily_invoice_target()
+    through_date = (datetime.now() - timedelta(days=1)).date()
+    elapsed_target = calculate_elapsed_invoice_target(through_date, daily_target)
+    status_markup = f"<p class='status ok'>{escape(message)}</p>" if message else f"<p class='status error'>{escape(error)}</p>" if error else ""
+    body = f"""
+        <section class="panel user-accounts-panel">
+            <h2>System settings</h2>
+            <p class="subtle">Admin-only settings used by the KPI dashboard and scheduled reports.</p>
+            {status_markup}
+            <div class="action-columns user-account-columns">
+                <div class="action-column">
+                    <h3>Invoiced-sales target</h3>
+                    <form method="post" action="/admin-settings/invoice-target" class="login-form">
+                        <label>
+                            <span class="label">Daily target</span>
+                            <input type="number" name="daily_invoice_target" min="0" step="0.01" value="{daily_target:.2f}" required />
+                        </label>
+                        <p class="subtle">The elapsed MTD target is this amount multiplied by each completed Monday, Tuesday, Wednesday and Thursday in the current month. Today is excluded.</p>
+                        <button class="button" type="submit">Save target</button>
+                    </form>
+                </div>
+                <div class="action-column">
+                    <h3>Current calculation</h3>
+                    <div class="summary compact-summary">
+                        <div><span class="label">Daily target</span><strong>{format_production_number(daily_target, currency=True)}</strong></div>
+                        <div><span class="label">Calculated through</span><strong>{escape(through_date.strftime('%d/%m/%Y'))}</strong></div>
+                        <div><span class="label">Elapsed target</span><strong>{format_production_number(elapsed_target, currency=True)}</strong></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    """
+    return render_page(title="System Settings", body=body)
+
+
+@app.post("/admin-settings/invoice-target")
+def post_admin_invoice_target(daily_invoice_target: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to change system settings."), status_code=303)
+    try:
+        target = set_daily_invoice_target(daily_invoice_target)
+    except ValueError as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)), status_code=303)
+    record_audit_event(
+        "settings-update",
+        target="Daily invoiced-sales target",
+        details=f"Set to ${target:,.2f} per elapsed Monday-Thursday workday.",
+        user=current_user,
+        area="system-settings",
+    )
+    return RedirectResponse(url="/admin-settings?message=" + quote("Daily invoiced-sales target updated."), status_code=303)
+
+
 @app.get("/user-accounts", response_class=HTMLResponse)
 def get_user_accounts_page(setup: str = "", message: str = "", error: str = "", edit: str = ""):
     current_user = get_current_session_user()
@@ -6076,6 +6140,7 @@ def build_current_month_production_payload(production_result=None, today=None):
     month_result = {
         **production_result,
         "production_rows": [item for item in production_result.get("production_rows", []) if month_start <= str(item.get("date") or "") < today_key],
+        "plant_operator_rows": [item for item in production_result.get("plant_operator_rows", production_result.get("operator_rows", [])) if month_start <= str(item.get("date") or "") < today_key],
         "operator_rows": [item for item in production_result.get("operator_rows", []) if month_start <= str(item.get("date") or "") < today_key],
     }
     payload = build_production_kpi_payload(month_result, days=0)
@@ -6092,7 +6157,7 @@ def build_current_month_production_payload(production_result=None, today=None):
     return payload
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None):
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None):
     if crm_result is None:
         crm_result = fetch_promise_of_order_activities()
         if crm_result.get("status") != "ok":
@@ -6137,6 +6202,10 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
         calendar_result = fetch_calendar_events(calendar_start, calendar_start + timedelta(days=14))
     planned_visits = calendar_result.get("events", []) if calendar_result.get("status") == "ok" else []
+    finance_result = finance_result or fetch_aged_debt_summary()
+    daily_invoice_target = get_daily_invoice_target()
+    elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
+    invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
 
     return {
         "status": crm_result.get("status", "error"),
@@ -6148,6 +6217,13 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         "calendar_status": calendar_result.get("status", "error"),
         "calendar_error": calendar_result.get("error_message", ""),
         "calendar_synced_at": calendar_result.get("synced_at", ""),
+        "accounts": {
+            **finance_result,
+            "invoiced_revenue_mtd": invoiced_revenue_mtd,
+            "daily_invoice_target": daily_invoice_target,
+            "elapsed_invoice_target": elapsed_invoice_target,
+            "invoice_target_pct": (invoiced_revenue_mtd / elapsed_invoice_target * 100) if elapsed_invoice_target else None,
+        },
         "summary": {
             "open_count": len(promises),
             "customer_count": customer_count,
@@ -6216,6 +6292,7 @@ def get_weekly_kpi_dashboard():
     production_mtd = payload.get("production_mtd", {})
     production_summary = production_mtd.get("summary", {})
     production_latest = production_mtd.get("latest", {})
+    accounts = payload.get("accounts", {})
     oldest_days = summary.get("oldest_days")
     oldest_label = (
         f"{oldest_days} day{'s' if oldest_days != 1 else ''}"
@@ -6273,6 +6350,29 @@ def get_weekly_kpi_dashboard():
                     <div><span>Re-cook activity</span><strong>{format_production_number(production_summary.get('recook_lf'))}</strong><small>LF month to date</small></div>
                     <div><span>Labour %</span><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong><small>MTD labour cost ÷ invoiced revenue</small></div>
                 </div>
+            </section>
+
+            <section class="panel kpi-accounts-panel">
+                <div class="kpi-production-head">
+                    <div class="kpi-section-title">
+                        <span class="kpi-section-mark accounts" aria-hidden="true"></span>
+                        <div><h2>Accounts MTD</h2><p class="small muted">Invoiced sales and aged receivables from FileMaker</p></div>
+                    </div>
+                    <span class="small muted">Aged debt refreshed {escape(str(accounts.get('last_refreshed') or 'Not available'))}</span>
+                </div>
+                <div class="production-kpi-grid kpi-accounts-grid">
+                    <div><span>Invoiced sales MTD</span><strong>{format_production_number(accounts.get('invoiced_revenue_mtd') or 0, currency=True)}</strong><small>current calendar month</small></div>
+                    <div><span>Elapsed invoice target</span><strong>{format_production_number(accounts.get('elapsed_invoice_target'), currency=True)}</strong><small>{format_production_number(accounts.get('daily_invoice_target'), currency=True)} × elapsed Mon–Thu workdays</small></div>
+                    <div><span>Invoice target achieved</span><strong>{format_production_number(accounts.get('invoice_target_pct'), '%', decimals=1)}</strong><small>MTD invoiced sales ÷ elapsed target</small></div>
+                    <div><span>Total outstanding</span><strong>{format_production_number(accounts.get('total_outstanding'), currency=True)}</strong><small>all receivables</small></div>
+                    <div><span>Current</span><strong>{format_production_number(accounts.get('current'), currency=True)}</strong><small>not yet overdue</small></div>
+                    <div><span>0–30 days</span><strong>{format_production_number(accounts.get('zero_thirty'), currency=True)}</strong><small>aged receivables</small></div>
+                    <div><span>31–60 days</span><strong>{format_production_number(accounts.get('thirtyone_sixty'), currency=True)}</strong><small>aged receivables</small></div>
+                    <div><span>61–90 days</span><strong>{format_production_number(accounts.get('sixtyone_ninety'), currency=True)}</strong><small>aged receivables</small></div>
+                    <div><span>90+ days</span><strong>{format_production_number(accounts.get('ninety_plus'), currency=True)}</strong><small>aged receivables</small></div>
+                    <div><span>Average debtor days</span><strong>{format_production_number(accounts.get('average_debtor_days'), decimals=1)}</strong><small>days</small></div>
+                </div>
+                {f'<p class="status warning">{escape(str(accounts.get("warning") or "Aged debt data is currently unavailable."))}</p>' if accounts.get('status') != 'ok' else ''}
             </section>
         </div>
     """
@@ -20448,6 +20548,7 @@ def render_global_nav(title):
                 <a href="/enrichment-view">Customer Enrichment</a>
                 <a href="/pdl-branch-view">PDL Enrichment Test</a>
                 <a href="/user-accounts">User Accounts</a>
+                <a href="/admin-settings">System Settings</a>
                 <a href="/admin-audit-log">Audit Log</a>
                 <a href="/dismissed-customers-view">Dismissed Customers</a>
                 <a href="/filemaker-health">FileMaker Health</a>
@@ -21371,6 +21472,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: 0 5px 14px rgba(139, 92, 246, 0.25);
                     }}
 
+                    .kpi-section-mark.accounts {{
+                        background: linear-gradient(180deg, #0f7896, #55b5cc);
+                        box-shadow: 0 5px 14px rgba(15, 120, 150, 0.25);
+                    }}
+
                     .kpi-dashboard-actions {{
                         display: flex;
                         align-items: center;
@@ -21388,6 +21494,17 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         grid-column: 1 / -1;
                         padding: 24px;
                         border-top: 4px solid #8b5cf6;
+                    }}
+
+                    .kpi-accounts-panel {{
+                        grid-column: 1 / -1;
+                        padding: 24px;
+                        border-top: 4px solid #0f7896;
+                    }}
+
+                    .kpi-accounts-grid {{
+                        grid-template-columns: repeat(5, minmax(0, 1fr));
+                        margin-bottom: 0;
                     }}
 
                     .kpi-production-head {{
@@ -26290,6 +26407,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .kpi-dashboard-grid {{
                             grid-template-columns: 1fr;
+                        }}
+
+                        .kpi-accounts-grid {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
                         }}
 
                         .home-focus-work-layout {{
