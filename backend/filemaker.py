@@ -46,6 +46,7 @@ def get_filemaker_config():
             "FILEMAKER_CUSTOMERS_ACTIVITY_STATUS_FIELD", "Activity Status"
         ).strip(),
         "customers_type_field": os.getenv("FILEMAKER_CUSTOMERS_TYPE_FIELD", "Type").strip(),
+        "customers_priority_field": os.getenv("FILEMAKER_CUSTOMERS_PRIORITY_FIELD", "a_Priority Rating").strip(),
         "contacts_layout": os.getenv("FILEMAKER_CONTACTS_LAYOUT", "").strip(),
         "contacts_key_field": os.getenv("FILEMAKER_CONTACTS_KEY_FIELD", "PrimaryKey").strip(),
         "contacts_customer_ref_field": os.getenv(
@@ -784,6 +785,7 @@ def build_filemaker_master_data_cache_key():
         config["customers_zip_field"],
         config["customers_activity_status_field"],
         config["customers_type_field"],
+        config["customers_priority_field"],
         config["contacts_layout"],
         config["contacts_key_field"],
         config["contacts_customer_ref_field"],
@@ -839,6 +841,9 @@ def map_filemaker_customer_master_record(record):
         ),
         "type": normalize_text_value(
             get_field_value(field_data, config["customers_type_field"])
+        ),
+        "priority": normalize_text_value(
+            get_field_value(field_data, config["customers_priority_field"])
         ),
     }
 

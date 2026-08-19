@@ -6157,20 +6157,22 @@ def build_current_month_production_payload(production_result=None, today=None):
     return payload
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None):
-    if crm_result is None:
-        crm_result = fetch_promise_of_order_activities()
-        if crm_result.get("status") != "ok":
-            crm_result = fetch_crm_activities()
+def is_priority_one_customer(customer):
+    value = str((customer or {}).get("priority") or "").strip()
+    try:
+        return float(value) == 1
+    except ValueError:
+        return value.casefold() in {"priority 1", "p1"}
+
+
+def build_open_promises(crm_result):
     activities = crm_result.get("activities", []) if crm_result.get("status") == "ok" else []
     promises = []
-
     for activity in activities:
         if str(activity.get("crm_type") or "").strip().casefold() != "promise of order":
             continue
         if bool(activity.get("crm_is_complete")):
             continue
-
         created_at = parse_crm_datetime(activity.get("date_created"))
         age_days = max((datetime.now() - created_at).days, 0) if created_at else None
         customer = str(
@@ -6190,11 +6192,29 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
             "owner": str(activity.get("sender_email") or "Owner not recorded").strip(),
             "completion": str(activity.get("crm_complete") or "").strip(),
         })
+    promises.sort(key=lambda item: parse_crm_datetime(item.get("created_at")) or datetime.min, reverse=True)
+    return promises
 
-    promises.sort(
-        key=lambda item: parse_crm_datetime(item.get("created_at")) or datetime.min,
-        reverse=True,
-    )
+
+def get_priority_one_customers(master_data_result=None):
+    master_data_result = master_data_result or fetch_filemaker_master_data()
+    if master_data_result.get("status") != "ok":
+        return [], master_data_result
+    customers = [
+        customer for customer in master_data_result.get("companies", [])
+        if str(customer.get("type") or "").strip().casefold() == "customer"
+        and is_priority_one_customer(customer)
+    ]
+    customers.sort(key=lambda item: str(item.get("company") or "").casefold())
+    return customers, master_data_result
+
+
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None):
+    if crm_result is None:
+        crm_result = fetch_promise_of_order_activities()
+        if crm_result.get("status") != "ok":
+            crm_result = fetch_crm_activities()
+    promises = build_open_promises(crm_result)
     customer_count = len({item["customer"].casefold() for item in promises if item["customer"]})
     aged_promises = [item for item in promises if item.get("age_days") is not None]
     production_mtd = build_current_month_production_payload(production_result=production_result)
@@ -6206,6 +6226,7 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     daily_invoice_target = get_daily_invoice_target()
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
+    priority_customers, priority_result = get_priority_one_customers(master_data_result)
 
     return {
         "status": crm_result.get("status", "error"),
@@ -6224,6 +6245,8 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
             "elapsed_invoice_target": elapsed_invoice_target,
             "invoice_target_pct": (invoiced_revenue_mtd / elapsed_invoice_target * 100) if elapsed_invoice_target else None,
         },
+        "priority_customers": priority_customers,
+        "priority_status": priority_result.get("status", "error"),
         "summary": {
             "open_count": len(promises),
             "customer_count": customer_count,
@@ -6277,6 +6300,20 @@ def render_open_promises_table(promises):
     """
 
 
+def render_priority_customer_comms(activities):
+    if not activities:
+        return "<span class='muted'>No linked CRM communications</span>"
+    items = []
+    for activity in activities[:2]:
+        date_label = format_optional_datetime(activity.get("date_created"))
+        direction = str(activity.get("direction") or "Communication").strip().title()
+        detail = clean_activity_content(activity.get("subject")) or clean_activity_content(activity.get("body"))
+        items.append(
+            f"<li><strong>{escape(date_label)}</strong> · {escape(direction)} · {escape(truncate_text(detail, 150) or 'No summary recorded')}</li>"
+        )
+    return f"<ul class='kpi-brief-comms'>{''.join(items)}</ul>"
+
+
 @app.get("/api/weekly-kpis")
 def get_weekly_kpis():
     return build_weekly_kpi_dashboard_payload()
@@ -6293,6 +6330,7 @@ def get_weekly_kpi_dashboard():
     production_summary = production_mtd.get("summary", {})
     production_latest = production_mtd.get("latest", {})
     accounts = payload.get("accounts", {})
+    priority_count = len(payload.get("priority_customers", []))
     oldest_days = summary.get("oldest_days")
     oldest_label = (
         f"{oldest_days} day{'s' if oldest_days != 1 else ''}"
@@ -6319,7 +6357,22 @@ def get_weekly_kpi_dashboard():
                     {render_simple_summary_item("Added in last 7 days", str(summary.get("new_last_7_days", 0)))}
                     {render_simple_summary_item("Oldest open promise", oldest_label)}
                 </div>
-                {render_open_promises_table(payload.get("open_promises", []))}
+                <a class="button kpi-detail-button" href="/weekly-kpi-promises" target="_blank" rel="noopener">View promised orders</a>
+            </section>
+
+            <section class="panel kpi-priority-panel">
+                <div class="kpi-promises-head">
+                    <div class="kpi-section-title">
+                        <span class="kpi-section-mark priority" aria-hidden="true"></span>
+                        <h2>Priority 1 Customers</h2>
+                    </div>
+                </div>
+                <a class="kpi-priority-count-tile" href="/priority-customers-view" target="_blank" rel="noopener">
+                    <span>Priority 1 customers</span>
+                    <strong>{priority_count}</strong>
+                    <small>Open detailed customer and communications view</small>
+                </a>
+                {f'<p class="status warning">Customer priority data is currently unavailable from FileMaker.</p>' if payload.get('priority_status') != 'ok' else ''}
             </section>
 
             <section class="panel kpi-planned-visits-panel" aria-label="Planned Visits">
@@ -6377,6 +6430,164 @@ def get_weekly_kpi_dashboard():
         </div>
     """
     return render_page(title="Weekly KPI Dashboard", body=body, main_class="kpi-dashboard-main")
+
+
+@app.get("/weekly-kpi-promises", response_class=HTMLResponse)
+def get_weekly_kpi_promises_page():
+    crm_result = fetch_promise_of_order_activities()
+    if crm_result.get("status") != "ok":
+        crm_result = fetch_crm_activities()
+    promises = build_open_promises(crm_result)
+    rows = []
+    for item in promises:
+        customer = str(item.get("customer") or "Customer not identified")
+        rows.append(f"""
+            <tr>
+                <td data-label="Date">{escape(item.get('created_label') or 'Date unavailable')}</td>
+                <td data-label="Customer"><a href="/customer-view?customer={quote(customer)}"><strong>{escape(customer)}</strong></a></td>
+                <td data-label="Promise">{escape(str(item.get('promise') or ''))}</td>
+                <td data-label="Age">{escape(str(item.get('age_days')) + ' days' if item.get('age_days') is not None else '—')}</td>
+                <td data-label="Owner">{escape(str(item.get('owner') or ''))}</td>
+            </tr>
+        """)
+    table = (
+        f"<div class='table-wrap'><table class='contacts-table'><thead><tr><th>Date</th><th>Customer</th><th>Promise</th><th>Age</th><th>Owner</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        if rows else "<p class='empty-action'>No open promises of order were found.</p>"
+    )
+    body = f"""
+        <section class="panel">
+            <div class="kpi-production-head"><div><h2>Open Promises of Order</h2><p class="muted">Detailed list including the date each promise was created.</p></div><a class="button secondary small-button" href="/weekly-kpi-dashboard">Back to KPI dashboard</a></div>
+            {table}
+        </section>
+    """
+    return render_page(title="Promised Orders", body=body)
+
+
+@app.get("/priority-customers-view", response_class=HTMLResponse)
+def get_priority_customers_page():
+    customers, master_result = get_priority_one_customers()
+    crm_result = fetch_crm_activities()
+    activity_map = crm_result.get("activity_map", {}) if crm_result.get("status") == "ok" else {}
+    rows = []
+    for customer in customers:
+        customer_name = str(customer.get("company") or "Customer not identified")
+        customer_key = str(customer.get("primary_key") or "").strip()
+        location = ", ".join(bit for bit in (str(customer.get("city") or "").strip(), str(customer.get("state") or "").strip()) if bit) or "—"
+        rows.append(f"""
+            <tr>
+                <td data-label="Customer"><a href="/customer-profile-view?customer_primary_key={quote(customer_key)}&customer={quote(customer_name)}"><strong>{escape(customer_name)}</strong></a></td>
+                <td data-label="Location">{escape(location)}</td>
+                <td data-label="Recent communications">{render_priority_customer_comms(get_sales_outreach_activities(activity_map.get(customer_key, [])))}</td>
+            </tr>
+        """)
+    if rows:
+        content = f"<div class='table-wrap'><table class='contacts-table priority-customers-table'><thead><tr><th>Customer</th><th>Location</th><th>Recent sales outreach</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    elif master_result.get("status") != "ok":
+        content = "<p class='status error'>The FileMaker customer layout is currently unavailable.</p>"
+    else:
+        content = "<p class='empty-action'>No Priority 1 customers were found. Add the Priority field to the customer API layout and set the relevant customers to 1.</p>"
+    body = f"""
+        <section class="panel">
+            <div class="kpi-production-head"><div><h2>Priority 1 Customers</h2><p class="muted">FileMaker priority customers with a brief view of their latest sales-related outreach. Customer-service and operational messages are excluded.</p></div><a class="button secondary small-button" href="/weekly-kpi-dashboard">Back to KPI dashboard</a></div>
+            {content}
+        </section>
+    """
+    return render_page(title="Priority 1 Customers", body=body)
+
+
+@app.get("/customer-profile-view", response_class=HTMLResponse)
+def get_customer_profile_view(
+    customer_primary_key: str = "",
+    customer: str = "",
+    crm_limit: int = 12,
+    crm_page: int = 1,
+    crm_direction: str = "",
+    crm_category: str = "",
+):
+    master_result = fetch_filemaker_master_data()
+    customer_key = str(customer_primary_key or "").strip()
+    customer_name = str(customer or "").strip()
+    customer_record = {}
+    if master_result.get("status") == "ok":
+        customer_record = master_result.get("customers_by_key", {}).get(customer_key, {}) if customer_key else {}
+        if not customer_record and customer_name:
+            customer_record = next(
+                (item for item in master_result.get("companies", []) if str(item.get("company") or "").strip().casefold() == customer_name.casefold()),
+                {},
+            )
+        customer_key = str(customer_record.get("primary_key") or customer_key).strip()
+        customer_name = str(customer_record.get("company") or customer_name or "Customer not identified").strip()
+
+    crm_result = fetch_crm_activities()
+    crm_activities = crm_result.get("activity_map", {}).get(customer_key, []) if crm_result.get("status") == "ok" and customer_key else []
+    sales_crm_activities = get_sales_outreach_activities(crm_activities)
+    filtered_crm = filter_customer_crm_activities(sales_crm_activities, direction=crm_direction, category=crm_category)
+    contacts = master_result.get("contacts_by_customer_key", {}).get(customer_key, []) if master_result.get("status") == "ok" else []
+
+    order_result = get_orders_for_analysis()
+    customer_orders = []
+    if order_result.get("status") == "ok":
+        for order in order_result.get("orders", []):
+            order_key = str(get_order_primary_key(order) or "").strip()
+            order_name = str(order.get("customer") or "").strip()
+            if (customer_key and order_key == customer_key) or (customer_name and order_name.casefold() == customer_name.casefold()):
+                customer_orders.append(order)
+    customer_orders = sort_orders(customer_orders, sort_key="order_date", direction="desc")
+
+    location = ", ".join(
+        part for part in (
+            str(customer_record.get("city") or "").strip(),
+            str(customer_record.get("state") or "").strip(),
+            str(customer_record.get("country") or "").strip(),
+        ) if part
+    ) or "—"
+    latest_crm = sales_crm_activities[0] if sales_crm_activities else None
+    summary = f"""
+        <div class="summary customer-summary">
+            <div><span class="label">Priority rating</span><strong>{escape(str(customer_record.get('priority') or '—'))}</strong></div>
+            <div><span class="label">Activity status</span><strong>{escape(str(customer_record.get('activity_status') or '—'))}</strong></div>
+            <div><span class="label">Location</span><strong>{escape(location)}</strong></div>
+            <div><span class="label">Sales communications</span><strong>{len(sales_crm_activities)}</strong></div>
+            <div><span class="label">Latest sales communication</span><strong>{escape(format_optional_datetime(latest_crm.get('date_created') if latest_crm else ''))}</strong></div>
+            <div><span class="label">Orders</span><strong>{len(customer_orders)}</strong></div>
+        </div>
+    """
+
+    contact_rows = "".join(f"""
+        <tr>
+            <td>{escape(str(item.get('name') or '—'))}</td>
+            <td>{escape(str(item.get('position') or '—'))}</td>
+            <td>{escape(str(item.get('email') or '—'))}</td>
+            <td>{escape(str(item.get('phone') or '—'))}</td>
+            <td>{escape(str(item.get('cell') or '—'))}</td>
+        </tr>
+    """ for item in contacts)
+    contacts_markup = (
+        f"<section class='panel'><h2>Contacts</h2><div class='table-wrap'><table><thead><tr><th>Name</th><th>Position</th><th>Email</th><th>Phone</th><th>Cell</th></tr></thead><tbody>{contact_rows}</tbody></table></div></section>"
+        if contact_rows else "<section class='panel'><h2>Contacts</h2><p class='empty-action'>No active contacts are linked to this customer.</p></section>"
+    )
+
+    order_rows = "".join(render_customer_order_row(order) for order in customer_orders)
+    orders_markup = (
+        f"<section class='panel'><h2>Order history</h2><div class='table-wrap tall-table'><table><thead><tr><th>Record</th><th>Customer</th><th>Order Date</th><th>Amount</th><th>Order No</th><th>Status</th><th>Price List</th><th>State</th><th>Territory</th></tr></thead><tbody>{order_rows}</tbody></table></div></section>"
+        if order_rows else "<section class='panel'><h2>Order history</h2><p class='empty-action'>No orders have been recorded for this customer yet.</p></section>"
+    )
+
+    crm_rows = "".join(render_customer_crm_activity(activity) for activity in filtered_crm[:50])
+    crm_markup = (
+        f"<section class='panel'><h2>Sales outreach history</h2><p class='muted'>Showing the latest {min(len(filtered_crm), 50)} of {len(filtered_crm)} sales-related CRM communications. Customer-service and operational messages are excluded.</p><div class='table-wrap tall-table crm-timeline-wrap'><table class='crm-timeline-table'><thead><tr><th>Date</th><th>Direction</th><th>Subject</th><th>From / To</th><th>Preview</th></tr></thead><tbody>{crm_rows}</tbody></table></div></section>"
+        if crm_rows else "<section class='panel'><h2>Sales outreach history</h2><p class='empty-action'>No sales-related CRM communications are linked to this customer yet.</p></section>"
+    )
+
+    body = f"""
+        <div class="customer-detail-page">
+            {summary}
+            {contacts_markup}
+            {crm_markup}
+            {orders_markup}
+        </div>
+    """
+    return render_page(title=f"Customer: {customer_name}", body=body)
 
 
 @app.post("/strategic-contacts/delete", response_class=HTMLResponse)
@@ -21436,9 +21647,20 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 26px;
                     }}
 
+                    .kpi-promises-panel .kpi-promises-head {{
+                        align-items: flex-start;
+                        flex-direction: column;
+                        gap: 12px;
+                    }}
+
+                    .kpi-promises-panel .kpi-dashboard-actions {{
+                        width: 100%;
+                        justify-content: space-between;
+                    }}
+
                     .kpi-dashboard-grid {{
                         display: grid;
-                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
                         gap: 20px;
                         align-items: start;
                     }}
@@ -21477,6 +21699,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: 0 5px 14px rgba(15, 120, 150, 0.25);
                     }}
 
+                    .kpi-section-mark.priority {{
+                        background: linear-gradient(180deg, #f59e0b, #f7c65b);
+                        box-shadow: 0 5px 14px rgba(245, 158, 11, 0.25);
+                    }}
+
                     .kpi-dashboard-actions {{
                         display: flex;
                         align-items: center;
@@ -21486,9 +21713,63 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-promises-panel {{
+                        min-height: 360px;
                         padding: 24px;
                         border-top: 4px solid #245cff;
                     }}
+
+                    .kpi-priority-panel {{
+                        min-height: 360px;
+                        padding: 24px;
+                        border-top: 4px solid #f59e0b;
+                    }}
+
+                    .kpi-detail-button {{
+                        width: 100%;
+                        margin-top: 2px;
+                        text-align: center;
+                    }}
+
+                    .kpi-priority-count-tile {{
+                        display: flex;
+                        min-height: 178px;
+                        padding: 22px;
+                        border: 1px solid #f1d8a5;
+                        border-radius: 16px;
+                        background: linear-gradient(145deg, #fff9eb, #ffffff);
+                        color: var(--text);
+                        text-decoration: none;
+                        flex-direction: column;
+                        justify-content: center;
+                        transition: transform .16s ease, box-shadow .16s ease;
+                    }}
+
+                    .kpi-priority-count-tile:hover {{
+                        transform: translateY(-2px);
+                        box-shadow: 0 16px 34px rgba(83, 99, 123, 0.14);
+                    }}
+
+                    .kpi-priority-count-tile span,
+                    .kpi-priority-count-tile small {{
+                        color: var(--muted);
+                    }}
+
+                    .kpi-priority-count-tile strong {{
+                        margin: 10px 0;
+                        font-size: 58px;
+                        line-height: 1;
+                    }}
+
+                    .kpi-brief-comms {{
+                        display: grid;
+                        gap: 7px;
+                        margin: 0;
+                        padding-left: 18px;
+                    }}
+
+                    .priority-customers-table th:nth-child(1) {{ width: 25%; }}
+                    .priority-customers-table th:nth-child(2) {{ width: 15%; }}
+                    .priority-customers-table th:nth-child(3) {{ width: 60%; }}
 
                     .kpi-production-panel {{
                         grid-column: 1 / -1;
@@ -21618,7 +21899,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-planned-visits-panel {{
-                        min-height: 500px;
+                        min-height: 360px;
                         padding: 24px;
                         border-top: 4px solid #00a884;
                     }}
@@ -21633,7 +21914,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .kpi-visits-list {{
                         display: grid;
                         gap: 8px;
+                        max-height: 250px;
                         margin-top: 16px;
+                        overflow-y: auto;
                     }}
 
                     .kpi-visit-card {{
@@ -26407,6 +26690,12 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .kpi-dashboard-grid {{
                             grid-template-columns: 1fr;
+                        }}
+
+                        .kpi-promises-panel,
+                        .kpi-priority-panel,
+                        .kpi-planned-visits-panel {{
+                            min-height: 0;
                         }}
 
                         .kpi-accounts-grid {{
