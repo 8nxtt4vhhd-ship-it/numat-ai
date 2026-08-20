@@ -7517,6 +7517,7 @@ def get_action_plan_view(
     selected_customer: str = "",
     view: str = "focus",
     group: str = "all",
+    territory: str = "all",
     dismiss_customer: str = "",
     message: str = "",
     error: str = "",
@@ -7525,6 +7526,7 @@ def get_action_plan_view(
         selected_customer=selected_customer,
         view=view,
         group=group,
+        territory=territory,
         dismiss_customer=dismiss_customer,
         message=message,
         error=error,
@@ -7831,7 +7833,7 @@ def post_action_plan_restore(
     return RedirectResponse(url=return_to or "/action-plan-view#action-plan", status_code=303)
 
 
-def render_home_page(selected_customer="", view="focus", group="all", dismiss_customer="", message="", error=""):
+def render_home_page(selected_customer="", view="focus", group="all", territory="all", dismiss_customer="", message="", error=""):
     home_started_at = time.perf_counter()
 
     def load_home_source(label, loader):
@@ -7877,6 +7879,7 @@ def render_home_page(selected_customer="", view="focus", group="all", dismiss_cu
     orders = order_result["orders"]
     attention_customers = attention_result["late_customers"]
     normalized_group = normalize_action_plan_group_filter(group)
+    normalized_territory = normalize_action_plan_territory_filter(territory)
 
     stage_started_at = time.perf_counter()
     grouped_orders = group_by_customer(orders)
@@ -7907,6 +7910,7 @@ def render_home_page(selected_customer="", view="focus", group="all", dismiss_cu
         crm_activity_map,
         attention_result.get("dismissed_customers", []),
         group_filter=normalized_group,
+        territory_filter=normalized_territory,
         customers_by_key=customers_by_key,
     )
     log_perf_metric("home.build_action_plan", stage_started_at)
@@ -7956,7 +7960,7 @@ def render_home_page(selected_customer="", view="focus", group="all", dismiss_cu
     body = f"""
         {render_data_availability_banner(order_result, crm_result)}
         {status_markup}
-        {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, group_filter=normalized_group, customer_options=customer_options, dismiss_customer=dismiss_customer)}
+        {render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, group_filter=normalized_group, territory_filter=normalized_territory, customer_options=customer_options, dismiss_customer=dismiss_customer)}
     """
 
     log_perf_metric("home.total", home_started_at)
@@ -8295,6 +8299,12 @@ ACTION_PLAN_GROUP_FILTERS = {
     "C": {"label": "Cintas / UniFirst"},
     "D": {"label": "CSC"},
     "E": {"label": "Independents"},
+}
+
+ACTION_PLAN_TERRITORY_FILTERS = {
+    "all": {"label": "All territories"},
+    "east": {"label": "East"},
+    "west": {"label": "West"},
 }
 
 NON_CITY_LOCATION_WORDS = {
@@ -15011,11 +15021,13 @@ def build_home_action_plan(
     crm_activity_map,
     dismissed_customers=None,
     group_filter="all",
+    territory_filter="all",
     customers_by_key=None,
 ):
     due_today_customers = []
     dismissed_customers = dismissed_customers or []
     normalized_group_filter = normalize_action_plan_group_filter(group_filter)
+    normalized_territory_filter = normalize_action_plan_territory_filter(territory_filter)
     customers_by_key = customers_by_key or {}
 
     for customer in attention_customers:
@@ -15032,6 +15044,13 @@ def build_home_action_plan(
         if normalized_group_filter != "all" and customer_group != normalized_group_filter:
             continue
 
+        territory = get_customer_territory(customer_orders)
+        if (
+            normalized_territory_filter != "all"
+            and normalize_customer_territory(territory) != normalized_territory_filter
+        ):
+            continue
+
         crm_activities = crm_activity_map.get(customer_primary_key, [])
         crm_activities = merge_recent_sent_emails_with_crm(customer_name, crm_activities)
         sales_activities = get_sales_outreach_activities(crm_activities)
@@ -15040,7 +15059,6 @@ def build_home_action_plan(
             if str(activity.get("direction") or "").strip().lower() == "outbound"
         ]
         contact_policy = build_action_plan_contact_policy(outbound_sales, customer_name=customer_name)
-        territory = get_customer_territory(customer_orders).lower()
         enriched_customer = dict(customer)
         enriched_customer["territory"] = territory.title() if territory else "Unassigned"
         enriched_customer["last_order"] = (
@@ -15080,6 +15098,15 @@ def get_customer_territory(customer_orders):
         if str(get_order_territory(order) or "").strip()
     )
     return territories.most_common(1)[0][0] if territories else ""
+
+
+def normalize_customer_territory(value):
+    territory = str(value or "").strip().lower()
+    if re.search(r"\beast\b", territory):
+        return "east"
+    if re.search(r"\bwest\b", territory):
+        return "west"
+    return ""
 
 
 def get_action_plan_dismissals_path():
@@ -15373,7 +15400,7 @@ def render_home_action_plan(action_plan):
     """
 
 
-def render_home_add_customer_form(customer_options, selected_customer="", home_view="focus", group_filter="all"):
+def render_home_add_customer_form(customer_options, selected_customer="", home_view="focus", group_filter="all", territory_filter="all"):
     options_markup = "".join(
         f"<option value=\"{escape(str(customer_name or ''))}\"></option>"
         for customer_name in customer_options
@@ -15383,6 +15410,7 @@ def render_home_add_customer_form(customer_options, selected_customer="", home_v
         <form class="home-add-customer-form" method="get" action="/action-plan-view">
             <input type="hidden" name="view" value="{escape(str(home_view or 'focus'))}">
             <input type="hidden" name="group" value="{escape(str(group_filter or 'all'))}">
+            <input type="hidden" name="territory" value="{escape(str(territory_filter or 'all'))}">
             <label class="sr-only" for="home-add-customer">Add customer</label>
             <input
                 id="home-add-customer"
@@ -15414,7 +15442,12 @@ def normalize_action_plan_group_filter(group):
     return "all"
 
 
-def render_action_plan_group_toggle(selected_customer="", home_view="focus", group_filter="all"):
+def normalize_action_plan_territory_filter(territory):
+    normalized = str(territory or "all").strip().lower()
+    return normalized if normalized in ACTION_PLAN_TERRITORY_FILTERS else "all"
+
+
+def render_action_plan_group_toggle(selected_customer="", home_view="focus", group_filter="all", territory_filter="all"):
     normalized_group = normalize_action_plan_group_filter(group_filter)
 
     chips = []
@@ -15424,6 +15457,7 @@ def render_action_plan_group_toggle(selected_customer="", home_view="focus", gro
             selected_customer="",
             view=home_view,
             group=group_key,
+            territory=territory_filter,
             anchor="",
         )
         chips.append(f'<a class="{class_name}" href="{href}">{escape(str(meta.get("label") or group_key))}</a>')
@@ -15435,12 +15469,27 @@ def render_action_plan_group_toggle(selected_customer="", home_view="focus", gro
     """
 
 
-def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, group_filter="all", customer_options=None, dismiss_customer=""):
+def render_action_plan_territory_toggle(home_view="focus", group_filter="all", territory_filter="all"):
+    normalized_territory = normalize_action_plan_territory_filter(territory_filter)
+    chips = []
+    for territory_key, meta in ACTION_PLAN_TERRITORY_FILTERS.items():
+        class_name = "toggle-chip active" if territory_key == normalized_territory else "toggle-chip"
+        href = build_home_selection_href(
+            view=home_view,
+            group=group_filter,
+            territory=territory_key,
+        )
+        chips.append(f'<a class="{class_name}" href="{href}">{escape(str(meta.get("label") or territory_key))}</a>')
+    return f'<div class="home-view-toggle home-territory-toggle">{"".join(chips)}</div>'
+
+
+def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, home_view, group_filter="all", territory_filter="all", customer_options=None, dismiss_customer=""):
     customer_options = customer_options or []
     queue_rows = "".join(
         render_home_queue_row(
             summary,
             group_filter=group_filter,
+            territory_filter=territory_filter,
             is_selected=(
                 home_view == "focus"
                 and selected_preview
@@ -15461,12 +15510,13 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
         <section class="home-workspace">
             <div class="home-workspace-topbar">
                 <div class="home-topbar-filters">
-                    {render_action_plan_group_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view=home_view, group_filter=group_filter)}
-                    {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view, group_filter=group_filter)}
+                    {render_action_plan_territory_toggle(home_view=home_view, group_filter=group_filter, territory_filter=territory_filter)}
+                    {render_action_plan_group_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view=home_view, group_filter=group_filter, territory_filter=territory_filter)}
+                    {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view, group_filter=group_filter, territory_filter=territory_filter)}
                 </div>
-                {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view, group_filter=group_filter)}
+                {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view, group_filter=group_filter, territory_filter=territory_filter)}
             </div>
-            {render_home_focus_preview(selected_preview, group_filter=group_filter, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
+            {render_home_focus_preview(selected_preview, group_filter=group_filter, territory_filter=territory_filter, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
 
             <section class="panel home-queue-panel" id="home-queue">
                 <div class="panel-head home-queue-head">
@@ -15492,17 +15542,19 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
     """
 
 
-def render_home_view_toggle(selected_customer, home_view, group_filter="all"):
+def render_home_view_toggle(selected_customer, home_view, group_filter="all", territory_filter="all"):
     focus_href = build_home_selection_href(
         selected_customer=selected_customer,
         view="focus",
         group=group_filter,
+        territory=territory_filter,
         anchor="focus-preview",
     )
     list_href = build_home_selection_href(
         selected_customer=selected_customer,
         view="list",
         group=group_filter,
+        territory=territory_filter,
         anchor="home-queue",
     )
     focus_class = "toggle-chip active" if home_view == "focus" else "toggle-chip"
@@ -15516,7 +15568,7 @@ def render_home_view_toggle(selected_customer, home_view, group_filter="all"):
     """
 
 
-def build_home_selection_href(selected_customer="", view="focus", group="all", anchor=""):
+def build_home_selection_href(selected_customer="", view="focus", group="all", territory="all", anchor=""):
     params = {}
 
     if selected_customer:
@@ -15528,6 +15580,10 @@ def build_home_selection_href(selected_customer="", view="focus", group="all", a
     normalized_group = normalize_action_plan_group_filter(group)
     if normalized_group in ACTION_PLAN_GROUP_FILTERS and normalized_group != "all":
         params["group"] = normalized_group
+
+    normalized_territory = normalize_action_plan_territory_filter(territory)
+    if normalized_territory != "all":
+        params["territory"] = normalized_territory
 
     query = urlencode(params)
     href = "/action-plan-view"
@@ -16767,7 +16823,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     """
 
 
-def render_home_focus_preview(preview, group_filter="all", dismiss_open=False):
+def render_home_focus_preview(preview, group_filter="all", territory_filter="all", dismiss_open=False):
     if not preview:
         return """
             <section class="panel home-focus-panel" id="focus-preview">
@@ -16784,6 +16840,7 @@ def render_home_focus_preview(preview, group_filter="all", dismiss_open=False):
         selected_customer=customer_name,
         view="focus",
         group=group_filter,
+        territory=territory_filter,
         anchor="focus-preview",
     )
     outreach_prep_href = build_outreach_prep_href(
@@ -16809,7 +16866,7 @@ def render_home_focus_preview(preview, group_filter="all", dismiss_open=False):
             <form method="post" action="/action-plan-dismiss" class="home-dismiss-form">
                 <input type="hidden" name="customer" value="{escape(customer_name)}">
                 <input type="hidden" name="last_order" value="{escape(str(queue_summary.get('last_order', '')))}">
-                <input type="hidden" name="return_to" value="{escape(build_home_selection_href(view='focus', group=group_filter, anchor='home-queue'))}">
+                <input type="hidden" name="return_to" value="{escape(build_home_selection_href(view='focus', group=group_filter, territory=territory_filter, anchor='home-queue'))}">
                 <div class="home-dismiss-presets">
                     <button type="submit" name="reason_preset" value="No damaged mats ready" class="home-dismiss-chip">No damaged mats ready</button>
                     <button type="submit" name="reason_preset" value="Waiting on manager decision" class="home-dismiss-chip">Waiting on manager decision</button>
@@ -16854,12 +16911,13 @@ def render_home_focus_preview(preview, group_filter="all", dismiss_open=False):
     """
 
 
-def render_home_queue_row(summary, group_filter="all", is_selected=False):
+def render_home_queue_row(summary, group_filter="all", territory_filter="all", is_selected=False):
     customer_name = str(summary.get("customer", ""))
     select_href = build_home_selection_href(
         selected_customer=customer_name,
         view="focus",
         group=group_filter,
+        territory=territory_filter,
         anchor="focus-preview",
     )
     outreach_prep_href = build_outreach_prep_href(
