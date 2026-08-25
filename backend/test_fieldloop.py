@@ -39,6 +39,13 @@ class FieldLoopTests(unittest.TestCase):
         self.assertEqual(result["status"], "invalid")
         self.assertEqual(len(result["errors"]), 2)
 
+    def test_sender_allow_list_is_case_insensitive_and_fails_closed(self):
+        with patch.dict(os.environ, {"FIELDLOOP_ALLOWED_SENDERS": "one@example.com, TWO@example.com"}):
+            self.assertTrue(fieldloop.is_fieldloop_sender_allowed("two@example.com"))
+            self.assertFalse(fieldloop.is_fieldloop_sender_allowed("other@example.com"))
+        with patch.dict(os.environ, {"FIELDLOOP_ALLOWED_SENDERS": ""}):
+            self.assertFalse(fieldloop.is_fieldloop_sender_allowed("one@example.com"))
+
     def test_filemaker_mapping_uses_utc_timestamp_and_fixed_crm_values(self):
         values = fieldloop.validate_visit_note_payload(self.valid_payload())["values"]
         result = fieldloop.build_filemaker_field_data(

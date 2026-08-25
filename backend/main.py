@@ -93,6 +93,7 @@ from fieldloop import (
     build_filemaker_field_data,
     check_fieldloop_rate_limit,
     get_fieldloop_config,
+    is_fieldloop_sender_allowed,
     validate_visit_note_payload,
 )
 from finance import fetch_aged_debt_summary
@@ -7718,6 +7719,17 @@ async def post_fieldloop_visit_note(request: Request):
         return JSONResponse(validation, status_code=400)
 
     values = validation["values"]
+    if not is_fieldloop_sender_allowed(values["sender_email"]):
+        record_audit_event(
+            "fieldloop_sender_rejected",
+            target=values["customer_id"],
+            details=f"Rejected sender: {values['sender_email']}",
+            user={"username": values["sender_email"], "display_name": values["sender_name"]},
+            area="fieldloop",
+            status="error",
+        )
+        return JSONResponse({"status": "sender_not_allowed"}, status_code=403)
+
     config = get_fieldloop_config()
     layout = config["layout"]
     if not layout:

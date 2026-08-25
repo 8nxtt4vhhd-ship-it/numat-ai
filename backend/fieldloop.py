@@ -18,6 +18,11 @@ def get_fieldloop_config():
         "api_key": os.getenv("FIELDLOOP_API_KEY", "").strip(),
         "layout": os.getenv("FILEMAKER_FIELDLOOP_LAYOUT", "ai_fieldLoopCRM").strip(),
         "requests_per_minute": get_positive_int_env("FIELDLOOP_REQUESTS_PER_MINUTE", 30),
+        "allowed_senders": {
+            item.strip().lower()
+            for item in os.getenv("FIELDLOOP_ALLOWED_SENDERS", "").split(",")
+            if item.strip()
+        },
     }
 
 
@@ -53,6 +58,11 @@ def authenticate_fieldloop_request(authorization):
     if not supplied_key or not secrets.compare_digest(supplied_key, expected_key):
         return "unauthorized"
     return "ok"
+
+
+def is_fieldloop_sender_allowed(sender_email):
+    allowed_senders = get_fieldloop_config()["allowed_senders"]
+    return str(sender_email or "").strip().lower() in allowed_senders
 
 
 def normalize_text(value, maximum):
