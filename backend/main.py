@@ -82,9 +82,18 @@ from filemaker import (
     create_layout_record,
     fetch_filemaker_master_data,
     fetch_order_records,
+    find_layout_records,
     get_filemaker_config,
     has_filemaker_config,
     update_layout_record,
+)
+from fieldloop import (
+    FIELDLOOP_VISIT_NOTE_PATH,
+    authenticate_fieldloop_request,
+    build_filemaker_field_data,
+    check_fieldloop_rate_limit,
+    get_fieldloop_config,
+    validate_visit_note_payload,
 )
 from finance import fetch_aged_debt_summary
 from m365 import (
@@ -189,6 +198,7 @@ CURRENT_SESSION_USER = ContextVar("CURRENT_SESSION_USER", default=None)
 PREVIEW_AUTH_EXEMPT_PATHS = {
     "/health",
     "/filemaker-health",
+    FIELDLOOP_VISIT_NOTE_PATH,
 }
 APP_LOGIN_EXEMPT_PATHS = {
     "/health",
@@ -199,6 +209,7 @@ APP_LOGIN_EXEMPT_PATHS = {
     "/logout",
     "/home-logo.png",
     "/m365/callback",
+    FIELDLOOP_VISIT_NOTE_PATH,
 }
 
 
@@ -6157,6 +6168,114 @@ def build_current_month_production_payload(production_result=None, today=None):
     return payload
 
 
+def build_kpi_comparison(current, average, period_label, higher_is_better=True, comparison_available=True, unit="%"):
+    return {
+        "current": current,
+        "average": average,
+        "period_label": period_label,
+        "higher_is_better": higher_is_better,
+        "comparison_available": bool(comparison_available and current is not None and average is not None),
+        "unit": unit,
+    }
+
+
+def build_kpi_historical_comparisons(production_result, production_mtd, accounts, today=None):
+    today = today or datetime.now()
+    today_key = today.strftime("%Y-%m-%d")
+    current_month = today.strftime("%Y-%m")
+
+    operators_by_month = defaultdict(list)
+    for item in production_result.get("plant_operator_rows", production_result.get("operator_rows", [])):
+        month = str(item.get("date") or "")[:7]
+        if month and month < current_month and (item.get("clocked_hours") or 0) > 0:
+            operators_by_month[month].append(item)
+    plant_months = sorted(operators_by_month)[-6:]
+    plant_rows = [item for month in plant_months for item in operators_by_month[month]]
+    plant_booked = sum(float(item.get("booked_hours") or 0) for item in plant_rows)
+    plant_clocked = sum(float(item.get("clocked_hours") or 0) for item in plant_rows)
+    plant_average = (plant_booked / plant_clocked * 100) if plant_clocked else None
+
+    production_by_month = defaultdict(list)
+    for item in production_result.get("production_rows", []):
+        month = str(item.get("date") or "")[:7]
+        if month and month < current_month:
+            production_by_month[month].append(item)
+    labour_months = []
+    labour_cost_total = 0.0
+    invoiced_total = 0.0
+    for month in sorted(production_by_month, reverse=True):
+        rows = production_by_month[month]
+        costs = [float(item["labour_cost"]) for item in rows if item.get("labour_cost") is not None]
+        invoiced = next((float(item["invoiced_revenue_mtd"]) for item in reversed(rows) if item.get("invoiced_revenue_mtd") is not None), None)
+        if not costs or not invoiced or invoiced <= 0:
+            continue
+        labour_months.append(month)
+        labour_cost_total += sum(costs)
+        invoiced_total += invoiced
+        if len(labour_months) == 6:
+            break
+    labour_average = (labour_cost_total / invoiced_total * 100) if invoiced_total else None
+
+    debtor_valid_from = os.getenv("KPI_DEBTOR_HISTORY_VALID_FROM", "2026-08-03").strip()
+    debtor_values = [
+        float(item["aged_debtor_days"])
+        for item in production_result.get("production_rows", [])
+        if item.get("aged_debtor_days") is not None
+        and debtor_valid_from <= str(item.get("date") or "") < today_key
+    ]
+    debtor_average = sum(debtor_values) / len(debtor_values) if debtor_values else None
+    current_invoice = float(production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0)
+
+    return {
+        "plant_productivity": build_kpi_comparison(
+            production_mtd.get("summary", {}).get("plant_productivity"),
+            plant_average,
+            f"{len(plant_months)}-mo avg" if plant_months else "History unavailable",
+            higher_is_better=True,
+        ),
+        "labour_percentage": build_kpi_comparison(
+            production_mtd.get("summary", {}).get("labour_percentage_mtd"),
+            labour_average,
+            f"{len(labour_months)}-mo avg" if labour_months else "History unavailable",
+            higher_is_better=False,
+            comparison_available=current_invoice > 0,
+        ),
+        "debtor_days": build_kpi_comparison(
+            accounts.get("average_debtor_days"),
+            debtor_average,
+            f"{len(debtor_values)}-day avg" if debtor_values else "Building history",
+            higher_is_better=False,
+            unit="days",
+        ),
+    }
+
+
+def render_kpi_trend(comparison):
+    comparison = comparison or {}
+    average = comparison.get("average")
+    label = str(comparison.get("period_label") or "History unavailable")
+    unit = str(comparison.get("unit") or "%")
+    value_suffix = "%" if unit == "%" else f" {unit}"
+    delta_suffix = "pp" if unit == "%" else unit
+    if average is None:
+        return f'<span class="kpi-trend neutral"><span class="kpi-trend-copy"><b>{escape(label)}</b><small>No comparison yet</small></span></span>'
+    if not comparison.get("comparison_available"):
+        return f'<span class="kpi-trend neutral"><span class="kpi-trend-copy"><b>{escape(label)} {float(average):.1f}{escape(value_suffix)}</b><small>Awaiting invoiced revenue</small></span></span>'
+    delta = float(comparison.get("current") or 0) - float(average)
+    if abs(delta) < 0.05:
+        arrow, direction, trend_class = "→", "in line", "neutral"
+    else:
+        arrow = "↑" if delta > 0 else "↓"
+        direction = "above" if delta > 0 else "below"
+        improved = (delta > 0) if comparison.get("higher_is_better") else (delta < 0)
+        trend_class = "good" if improved else "bad"
+    return (
+        f'<span class="kpi-trend {trend_class}"><span class="kpi-trend-arrow">{arrow}</span>'
+        f'<span class="kpi-trend-copy"><b>{escape(label)} {float(average):.1f}{escape(value_suffix)}</b>'
+        f'<small>{abs(delta):.1f} {escape(delta_suffix)} {direction}</small></span></span>'
+    )
+
+
 def is_priority_one_customer(customer):
     value = str((customer or {}).get("priority") or "").strip()
     try:
@@ -6217,6 +6336,7 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     promises = build_open_promises(crm_result)
     customer_count = len({item["customer"].casefold() for item in promises if item["customer"]})
     aged_promises = [item for item in promises if item.get("age_days") is not None]
+    production_result = production_result or fetch_production_analysis_data()
     production_mtd = build_current_month_production_payload(production_result=production_result)
     if calendar_result is None:
         calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -6227,6 +6347,13 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
     priority_customers, priority_result = get_priority_one_customers(master_data_result)
+    account_payload = {
+        **finance_result,
+        "invoiced_revenue_mtd": invoiced_revenue_mtd,
+        "daily_invoice_target": daily_invoice_target,
+        "elapsed_invoice_target": elapsed_invoice_target,
+        "invoice_target_pct": (invoiced_revenue_mtd / elapsed_invoice_target * 100) if elapsed_invoice_target else None,
+    }
 
     return {
         "status": crm_result.get("status", "error"),
@@ -6238,13 +6365,8 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         "calendar_status": calendar_result.get("status", "error"),
         "calendar_error": calendar_result.get("error_message", ""),
         "calendar_synced_at": calendar_result.get("synced_at", ""),
-        "accounts": {
-            **finance_result,
-            "invoiced_revenue_mtd": invoiced_revenue_mtd,
-            "daily_invoice_target": daily_invoice_target,
-            "elapsed_invoice_target": elapsed_invoice_target,
-            "invoice_target_pct": (invoiced_revenue_mtd / elapsed_invoice_target * 100) if elapsed_invoice_target else None,
-        },
+        "accounts": account_payload,
+        "comparisons": build_kpi_historical_comparisons(production_result, production_mtd, account_payload),
         "priority_customers": priority_customers,
         "priority_status": priority_result.get("status", "error"),
         "summary": {
@@ -6330,6 +6452,7 @@ def get_weekly_kpi_dashboard():
     production_summary = production_mtd.get("summary", {})
     production_latest = production_mtd.get("latest", {})
     accounts = payload.get("accounts", {})
+    comparisons = payload.get("comparisons", {})
     priority_count = len(payload.get("priority_customers", []))
     oldest_days = summary.get("oldest_days")
     oldest_label = (
@@ -6397,11 +6520,11 @@ def get_weekly_kpi_dashboard():
                 </div>
                 <div class="production-kpi-grid kpi-production-mtd-grid">
                     <div><span>Average press throughput</span><strong>{format_production_number(production_summary.get('average_press_throughput'))}</strong><small>FF1 + FF2 + FF3 LF per completed day</small></div>
-                    <div><span>Plant productivity</span><strong>{format_production_number(production_summary.get('plant_productivity'), '%', decimals=1)}</strong><small>MTD · total booked ÷ clocked</small></div>
+                    <div><span>Plant productivity</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('plant_productivity'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('plant_productivity'))}</div><small>MTD · total booked ÷ clocked</small></div>
                     <div><span>Current backlog</span><strong>{format_production_number(production_latest.get('backlog_weeks'), decimals=1)}</strong><small>weeks · latest completed day</small></div>
                     <div><span>Average daily production value</span><strong>{format_production_number(production_summary.get('average_production_revenue'), currency=True)}</strong><small>per completed recorded day</small></div>
                     <div><span>Re-cook activity</span><strong>{format_production_number(production_summary.get('recook_lf'))}</strong><small>LF month to date</small></div>
-                    <div><span>Labour %</span><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong><small>MTD labour cost ÷ invoiced revenue</small></div>
+                    <div><span>Labour %</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('labour_percentage'))}</div><small>MTD labour cost ÷ invoiced revenue</small></div>
                 </div>
             </section>
 
@@ -6423,7 +6546,7 @@ def get_weekly_kpi_dashboard():
                     <div><span>31–60 days</span><strong>{format_production_number(accounts.get('thirtyone_sixty'), currency=True)}</strong><small>aged receivables</small></div>
                     <div><span>61–90 days</span><strong>{format_production_number(accounts.get('sixtyone_ninety'), currency=True)}</strong><small>aged receivables</small></div>
                     <div><span>90+ days</span><strong>{format_production_number(accounts.get('ninety_plus'), currency=True)}</strong><small>aged receivables</small></div>
-                    <div><span>Average debtor days</span><strong>{format_production_number(accounts.get('average_debtor_days'), decimals=1)}</strong><small>days</small></div>
+                    <div><span>Average debtor days</span><div class="kpi-value-trend"><strong>{format_production_number(accounts.get('average_debtor_days'), decimals=1)}</strong>{render_kpi_trend(comparisons.get('debtor_days'))}</div><small>days · lower is better</small></div>
                 </div>
                 {f'<p class="status warning">{escape(str(accounts.get("warning") or "Aged debt data is currently unavailable."))}</p>' if accounts.get('status') != 'ok' else ''}
             </section>
@@ -7560,6 +7683,106 @@ def post_action_plan_draft(draft_token: str = Form("")):
         "status": "ok",
         "email_subject": str(result.get("email_subject") or "").strip(),
         "email_body": str(result.get("email_body") or "").strip(),
+    }
+
+
+@app.post(FIELDLOOP_VISIT_NOTE_PATH)
+async def post_fieldloop_visit_note(request: Request):
+    auth_status = authenticate_fieldloop_request(request.headers.get("Authorization", ""))
+    if auth_status == "missing_config":
+        return JSONResponse({"status": "service_not_configured"}, status_code=503)
+    if auth_status != "ok":
+        return JSONResponse(
+            {"status": "unauthorized"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not check_fieldloop_rate_limit():
+        return JSONResponse(
+            {"status": "rate_limited"},
+            status_code=429,
+            headers={"Retry-After": "60"},
+        )
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            {"status": "invalid", "errors": ["The request body must contain valid JSON."]},
+            status_code=400,
+        )
+
+    validation = validate_visit_note_payload(payload)
+    if validation.get("status") != "ok":
+        return JSONResponse(validation, status_code=400)
+
+    values = validation["values"]
+    config = get_fieldloop_config()
+    layout = config["layout"]
+    if not layout:
+        return JSONResponse({"status": "service_not_configured"}, status_code=503)
+
+    audit_user = {
+        "username": values["sender_email"],
+        "display_name": values["sender_name"],
+    }
+    duplicate_result = find_layout_records(
+        layout,
+        query=[{"idempotency_key": f"=={values['idempotency_key']}"}],
+        limit=1,
+    )
+    if duplicate_result.get("status") != "ok":
+        record_audit_event(
+            "fieldloop_meeting_failed",
+            target=values["customer_id"],
+            details=f"Duplicate check failed: {duplicate_result.get('status', 'error')}",
+            user=audit_user,
+            area="fieldloop",
+            status="error",
+        )
+        return JSONResponse({"status": "filemaker_unavailable"}, status_code=502)
+
+    existing_records = duplicate_result.get("records") or []
+    if existing_records:
+        existing_record_id = str(existing_records[0].get("recordId") or "").strip()
+        record_audit_event(
+            "fieldloop_meeting_duplicate",
+            target=values["customer_id"],
+            details=f"Existing FileMaker record {existing_record_id or 'found'}; no new record created.",
+            user=audit_user,
+            area="fieldloop",
+        )
+        return {
+            "status": "ok",
+            "duplicate": True,
+            "record_id": existing_record_id,
+        }
+
+    write_result = create_layout_record(layout, build_filemaker_field_data(values))
+    if write_result.get("status") != "ok":
+        record_audit_event(
+            "fieldloop_meeting_failed",
+            target=values["customer_id"],
+            details=f"FileMaker create failed: {write_result.get('status', 'error')}",
+            user=audit_user,
+            area="fieldloop",
+            status="error",
+        )
+        return JSONResponse({"status": "filemaker_write_failed"}, status_code=502)
+
+    record_id = str(write_result.get("record_id") or "").strip()
+    record_audit_event(
+        "fieldloop_meeting_created",
+        target=values["customer_id"],
+        details=f"FileMaker record {record_id or 'created'} for {values['customer_name']}.",
+        user=audit_user,
+        area="fieldloop",
+    )
+    return {
+        "status": "ok",
+        "duplicate": False,
+        "record_id": record_id,
     }
 
 
@@ -22697,6 +22920,74 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         margin: 5px 0 3px;
                         font-size: 28px;
                         line-height: 1.05;
+                    }}
+
+                    .production-kpi-grid .kpi-value-trend {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 4px;
+                        min-width: 0;
+                    }}
+
+                    .production-kpi-grid .kpi-value-trend > strong {{
+                        flex: 0 1 auto;
+                        font-size: 25px;
+                    }}
+
+                    .production-kpi-grid .kpi-trend {{
+                        display: flex;
+                        flex: 0 1 auto;
+                        flex-direction: column;
+                        align-items: center;
+                        justify-content: center;
+                        gap: 1px;
+                        min-width: 0;
+                        max-width: 104px;
+                        padding: 5px 6px;
+                        border-radius: 10px;
+                        background: #f2f5f8;
+                    }}
+
+                    .production-kpi-grid .kpi-trend.good {{
+                        color: #08795f;
+                        background: #e8f8f2;
+                    }}
+
+                    .production-kpi-grid .kpi-trend.bad {{
+                        color: #b33a3a;
+                        background: #fff0f0;
+                    }}
+
+                    .production-kpi-grid .kpi-trend.neutral {{
+                        color: #64748b;
+                        background: #f1f5f9;
+                    }}
+
+                    .production-kpi-grid .kpi-trend-arrow {{
+                        color: currentColor;
+                        font-size: 25px;
+                        font-weight: 800;
+                        line-height: 0.85;
+                    }}
+
+                    .production-kpi-grid .kpi-trend-copy {{
+                        display: grid;
+                        gap: 1px;
+                        color: currentColor;
+                        text-align: center;
+                    }}
+
+                    .production-kpi-grid .kpi-trend-copy b,
+                    .production-kpi-grid .kpi-trend-copy small {{
+                        color: currentColor;
+                        font-size: 8px;
+                        line-height: 1.2;
+                        white-space: nowrap;
+                    }}
+
+                    .production-kpi-grid .kpi-trend-copy b {{
+                        font-weight: 800;
                     }}
 
                     .production-analysis-grid {{
