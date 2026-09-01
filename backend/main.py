@@ -6144,16 +6144,37 @@ def post_calendar_event_delete(event_id: str = Form(""), month: str = Form("")):
     return calendar_write_redirect(month, result, "Calendar event deleted.")
 
 
-def build_current_month_production_payload(production_result=None, today=None):
-    production_result = production_result or fetch_production_analysis_data()
+def get_weekly_kpi_review_period(today=None):
     today = today or datetime.now()
-    month_start = today.replace(day=1).strftime("%Y-%m-%d")
-    today_key = today.strftime("%Y-%m-%d")
+    current_month_start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    reviewing_previous_month = today.day <= 7
+    if reviewing_previous_month:
+        period_end_exclusive = current_month_start
+        period_start = (current_month_start - timedelta(days=1)).replace(day=1)
+    else:
+        period_start = current_month_start
+        period_end_exclusive = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "period_start": period_start,
+        "period_end_exclusive": period_end_exclusive,
+        "period_end": period_end_exclusive - timedelta(days=1),
+        "is_previous_month": reviewing_previous_month,
+        "month_label": period_start.strftime("%B %Y"),
+        "period_label": f"{period_start.strftime('%B %Y')} month end" if reviewing_previous_month else f"{period_start.strftime('%B %Y')} month to date",
+    }
+
+
+def build_production_period_payload(production_result=None, period_start=None, period_end_exclusive=None):
+    production_result = production_result or fetch_production_analysis_data()
+    period_start = period_start or datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    period_end_exclusive = period_end_exclusive or datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    period_start_key = period_start.strftime("%Y-%m-%d")
+    period_end_key = period_end_exclusive.strftime("%Y-%m-%d")
     month_result = {
         **production_result,
-        "production_rows": [item for item in production_result.get("production_rows", []) if month_start <= str(item.get("date") or "") < today_key],
-        "plant_operator_rows": [item for item in production_result.get("plant_operator_rows", production_result.get("operator_rows", [])) if month_start <= str(item.get("date") or "") < today_key],
-        "operator_rows": [item for item in production_result.get("operator_rows", []) if month_start <= str(item.get("date") or "") < today_key],
+        "production_rows": [item for item in production_result.get("production_rows", []) if period_start_key <= str(item.get("date") or "") < period_end_key],
+        "plant_operator_rows": [item for item in production_result.get("plant_operator_rows", production_result.get("operator_rows", [])) if period_start_key <= str(item.get("date") or "") < period_end_key],
+        "operator_rows": [item for item in production_result.get("operator_rows", []) if period_start_key <= str(item.get("date") or "") < period_end_key],
     }
     payload = build_production_kpi_payload(month_result, days=0)
     month_rows = payload.get("rows", [])
@@ -6164,9 +6185,18 @@ def build_current_month_production_payload(production_result=None, today=None):
         "invoiced_revenue_mtd": invoiced_revenue,
         "labour_percentage_mtd": ((sum(labour_costs) / invoiced_revenue) * 100 if labour_costs and invoiced_revenue and invoiced_revenue > 0 else 0.0),
     })
-    payload["period_start"] = month_start
-    payload["period_end"] = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    payload["period_start"] = period_start_key
+    payload["period_end"] = (period_end_exclusive - timedelta(days=1)).strftime("%Y-%m-%d")
     return payload
+
+
+def build_current_month_production_payload(production_result=None, today=None):
+    today = today or datetime.now()
+    return build_production_period_payload(
+        production_result=production_result,
+        period_start=today.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+        period_end_exclusive=today.replace(hour=0, minute=0, second=0, microsecond=0),
+    )
 
 
 def build_kpi_comparison(current, average, period_label, higher_is_better=True, comparison_available=True, unit="%"):
@@ -6180,10 +6210,11 @@ def build_kpi_comparison(current, average, period_label, higher_is_better=True, 
     }
 
 
-def build_kpi_historical_comparisons(production_result, production_mtd, accounts, today=None):
+def build_kpi_historical_comparisons(production_result, production_mtd, accounts, today=None, comparison_month=None, history_end=None):
     today = today or datetime.now()
-    today_key = today.strftime("%Y-%m-%d")
-    current_month = today.strftime("%Y-%m")
+    history_end = history_end or today
+    today_key = history_end.strftime("%Y-%m-%d")
+    current_month = comparison_month or today.strftime("%Y-%m")
 
     operators_by_month = defaultdict(list)
     for item in production_result.get("plant_operator_rows", production_result.get("operator_rows", [])):
@@ -6329,7 +6360,9 @@ def get_priority_one_customers(master_data_result=None):
     return customers, master_data_result
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None):
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, today=None):
+    today = today or datetime.now()
+    review_period = get_weekly_kpi_review_period(today)
     if crm_result is None:
         crm_result = fetch_promise_of_order_activities()
         if crm_result.get("status") != "ok":
@@ -6338,7 +6371,11 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     customer_count = len({item["customer"].casefold() for item in promises if item["customer"]})
     aged_promises = [item for item in promises if item.get("age_days") is not None]
     production_result = production_result or fetch_production_analysis_data()
-    production_mtd = build_current_month_production_payload(production_result=production_result)
+    production_mtd = build_production_period_payload(
+        production_result=production_result,
+        period_start=review_period["period_start"],
+        period_end_exclusive=review_period["period_end_exclusive"],
+    )
     if calendar_result is None:
         calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
         calendar_result = fetch_calendar_events(calendar_start, calendar_start + timedelta(days=14))
@@ -6348,6 +6385,14 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
     priority_customers, priority_result = get_priority_one_customers(master_data_result)
+    period_debtor_days = next(
+        (
+            item.get("aged_debtor_days")
+            for item in reversed(production_mtd.get("rows", []))
+            if item.get("aged_debtor_days") is not None
+        ),
+        None,
+    )
     account_payload = {
         **finance_result,
         "invoiced_revenue_mtd": invoiced_revenue_mtd,
@@ -6355,6 +6400,9 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         "elapsed_invoice_target": elapsed_invoice_target,
         "invoice_target_pct": (invoiced_revenue_mtd / elapsed_invoice_target * 100) if elapsed_invoice_target else None,
     }
+    if review_period["is_previous_month"] and period_debtor_days is not None:
+        account_payload["average_debtor_days"] = period_debtor_days
+        account_payload["debtor_days_is_historical"] = True
 
     return {
         "status": crm_result.get("status", "error"),
@@ -6367,7 +6415,21 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         "calendar_error": calendar_result.get("error_message", ""),
         "calendar_synced_at": calendar_result.get("synced_at", ""),
         "accounts": account_payload,
-        "comparisons": build_kpi_historical_comparisons(production_result, production_mtd, account_payload),
+        "comparisons": build_kpi_historical_comparisons(
+            production_result,
+            production_mtd,
+            account_payload,
+            today=today,
+            comparison_month=review_period["period_start"].strftime("%Y-%m"),
+            history_end=review_period["period_end_exclusive"],
+        ),
+        "review_period": {
+            "period_start": review_period["period_start"].strftime("%Y-%m-%d"),
+            "period_end": review_period["period_end"].strftime("%Y-%m-%d"),
+            "is_previous_month": review_period["is_previous_month"],
+            "month_label": review_period["month_label"],
+            "period_label": review_period["period_label"],
+        },
         "priority_customers": priority_customers,
         "priority_status": priority_result.get("status", "error"),
         "summary": {
@@ -6454,6 +6516,14 @@ def get_weekly_kpi_dashboard():
     production_latest = production_mtd.get("latest", {})
     accounts = payload.get("accounts", {})
     comparisons = payload.get("comparisons", {})
+    review_period = payload.get("review_period", {})
+    review_month = str(review_period.get("month_label") or "Current month")
+    reviewing_previous_month = bool(review_period.get("is_previous_month"))
+    production_heading = f"Production — {review_month} month end" if reviewing_previous_month else "Production MTD"
+    accounts_heading = f"Accounts — {review_month} month end" if reviewing_previous_month else "Accounts MTD"
+    production_period_note = f"Completed {review_month} · month-end review" if reviewing_previous_month else "Current calendar month through yesterday · today excluded"
+    invoice_period_note = f"{review_month} invoiced sales" if reviewing_previous_month else "current calendar month"
+    debtor_period_note = f"{review_month} month end · lower is better" if accounts.get("debtor_days_is_historical") else "days · lower is better"
     priority_count = len(payload.get("priority_customers", []))
     oldest_days = summary.get("oldest_days")
     oldest_label = (
@@ -6515,17 +6585,17 @@ def get_weekly_kpi_dashboard():
                 <div class="kpi-production-head">
                     <div class="kpi-section-title">
                         <span class="kpi-section-mark production" aria-hidden="true"></span>
-                        <div><h2>Production MTD</h2><p class="small muted">Current calendar month through yesterday · today excluded</p></div>
+                        <div><h2>{escape(production_heading)}</h2><p class="small muted">{escape(production_period_note)}</p></div>
                     </div>
                     <span class="small muted">Data through {escape(format_optional_datetime(production_latest.get('date')) if production_latest else 'No completed production day this month')}</span>
                 </div>
                 <div class="production-kpi-grid kpi-production-mtd-grid">
                     <div><span>Average press throughput</span><strong>{format_production_number(production_summary.get('average_press_throughput'))}</strong><small>FF1 + FF2 + FF3 LF per completed day</small></div>
-                    <div><span>Plant productivity</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('plant_productivity'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('plant_productivity'))}</div><small>MTD · total booked ÷ clocked</small></div>
+                    <div><span>Plant productivity</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('plant_productivity'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('plant_productivity'))}</div><small>{escape(review_month + ' · total booked ÷ clocked' if reviewing_previous_month else 'MTD · total booked ÷ clocked')}</small></div>
                     <div><span>Current backlog</span><strong>{format_production_number(production_latest.get('backlog_weeks'), decimals=1)}</strong><small>weeks · latest completed day</small></div>
                     <div><span>Average daily production value</span><strong>{format_production_number(production_summary.get('average_production_revenue'), currency=True)}</strong><small>per completed recorded day</small></div>
-                    <div><span>Re-cook activity</span><strong>{format_production_number(production_summary.get('recook_lf'))}</strong><small>LF month to date</small></div>
-                    <div><span>Labour %</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('labour_percentage'))}</div><small>MTD labour cost ÷ invoiced revenue</small></div>
+                    <div><span>Re-cook activity</span><strong>{format_production_number(production_summary.get('recook_lf'))}</strong><small>{escape('LF in ' + review_month if reviewing_previous_month else 'LF month to date')}</small></div>
+                    <div><span>Labour %</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('labour_percentage'))}</div><small>{escape(review_month + ' labour cost ÷ invoiced revenue' if reviewing_previous_month else 'MTD labour cost ÷ invoiced revenue')}</small></div>
                 </div>
             </section>
 
@@ -6533,21 +6603,21 @@ def get_weekly_kpi_dashboard():
                 <div class="kpi-production-head">
                     <div class="kpi-section-title">
                         <span class="kpi-section-mark accounts" aria-hidden="true"></span>
-                        <div><h2>Accounts MTD</h2><p class="small muted">Invoiced sales and aged receivables from FileMaker</p></div>
+                        <div><h2>{escape(accounts_heading)}</h2><p class="small muted">{escape(review_month + ' sales · aged receivable balances are the latest FileMaker snapshot' if reviewing_previous_month else 'Invoiced sales and aged receivables from FileMaker')}</p></div>
                     </div>
                     <span class="small muted">Aged debt refreshed {escape(str(accounts.get('last_refreshed') or 'Not available'))}</span>
                 </div>
                 <div class="production-kpi-grid kpi-accounts-grid">
-                    <div><span>Invoiced sales MTD</span><strong>{format_production_number(accounts.get('invoiced_revenue_mtd') or 0, currency=True)}</strong><small>current calendar month</small></div>
+                    <div><span>{escape(review_month + ' invoiced sales' if reviewing_previous_month else 'Invoiced sales MTD')}</span><strong>{format_production_number(accounts.get('invoiced_revenue_mtd') or 0, currency=True)}</strong><small>{escape(invoice_period_note)}</small></div>
                     <div><span>Elapsed invoice target</span><strong>{format_production_number(accounts.get('elapsed_invoice_target'), currency=True)}</strong><small>{format_production_number(accounts.get('daily_invoice_target'), currency=True)} × elapsed Mon–Thu workdays</small></div>
-                    <div><span>Invoice target achieved</span><strong>{format_production_number(accounts.get('invoice_target_pct'), '%', decimals=1)}</strong><small>MTD invoiced sales ÷ elapsed target</small></div>
+                    <div><span>Invoice target achieved</span><strong>{format_production_number(accounts.get('invoice_target_pct'), '%', decimals=1)}</strong><small>{escape(review_month + ' invoiced sales ÷ full-month target' if reviewing_previous_month else 'MTD invoiced sales ÷ elapsed target')}</small></div>
                     <div><span>Total outstanding</span><strong>{format_production_number(accounts.get('total_outstanding'), currency=True)}</strong><small>all receivables</small></div>
                     <div><span>Current</span><strong>{format_production_number(accounts.get('current'), currency=True)}</strong><small>not yet overdue</small></div>
                     <div><span>0–30 days</span><strong>{format_production_number(accounts.get('zero_thirty'), currency=True)}</strong><small>aged receivables</small></div>
                     <div><span>31–60 days</span><strong>{format_production_number(accounts.get('thirtyone_sixty'), currency=True)}</strong><small>aged receivables</small></div>
                     <div><span>61–90 days</span><strong>{format_production_number(accounts.get('sixtyone_ninety'), currency=True)}</strong><small>aged receivables</small></div>
                     <div><span>90+ days</span><strong>{format_production_number(accounts.get('ninety_plus'), currency=True)}</strong><small>aged receivables</small></div>
-                    <div><span>Average debtor days</span><div class="kpi-value-trend"><strong>{format_production_number(accounts.get('average_debtor_days'), decimals=1)}</strong>{render_kpi_trend(comparisons.get('debtor_days'))}</div><small>days · lower is better</small></div>
+                    <div><span>Average debtor days</span><div class="kpi-value-trend"><strong>{format_production_number(accounts.get('average_debtor_days'), decimals=1)}</strong>{render_kpi_trend(comparisons.get('debtor_days'))}</div><small>{escape(debtor_period_note)}</small></div>
                 </div>
                 {f'<p class="status warning">{escape(str(accounts.get("warning") or "Aged debt data is currently unavailable."))}</p>' if accounts.get('status') != 'ok' else ''}
             </section>
@@ -8969,12 +9039,14 @@ def render_home_dashboard_sidebar():
         ("Customer Map", "/customer-map-view", "map"),
         ("Strategic Contacts", "/strategic-contacts-view", "org"),
     ]
+    shared_items = [
+        ("Dismissed Customers", "/dismissed-customers-view", "archive"),
+        ("CRM Activities", "/crm-activities-view", "clock"),
+    ]
     admin_items = [
         ("User Accounts", "/user-accounts", "key"),
         ("Audit Log", "/admin-audit-log", "clock"),
-        ("Dismissed Customers", "/dismissed-customers-view", "archive"),
         ("PDL Enrichment Test", "/pdl-branch-view", "search"),
-        ("CRM Activities", "/crm-activities-view", "clock"),
         ("FileMaker Health", "/filemaker-health", "shield"),
         ("API", "/api", "code"),
     ]
@@ -8992,9 +9064,9 @@ def render_home_dashboard_sidebar():
         render_item(label, href, icon, current=(label == "Home"))
         for label, href, icon in primary_items
     )
-    admin_html = ""
+    secondary_html = "".join(render_item(label, href, icon) for label, href, icon in shared_items)
     if can_manage_user_accounts(current_user):
-        admin_html = "".join(render_item(label, href, icon) for label, href, icon in admin_items)
+        secondary_html += "".join(render_item(label, href, icon) for label, href, icon in admin_items)
     account_html = ""
     if current_display_name:
         account_html = (
@@ -9011,7 +9083,7 @@ def render_home_dashboard_sidebar():
                     {primary_html}
                 </div>
                 <div class="home-side-group">
-                    {admin_html}
+                    {secondary_html}
                 </div>
                 {account_html}
             </nav>
