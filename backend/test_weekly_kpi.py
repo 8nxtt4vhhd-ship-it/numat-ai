@@ -2,9 +2,25 @@ import unittest
 from datetime import datetime
 
 import main
+from crm import normalize_crm_row
 
 
 class WeeklyKpiPeriodTests(unittest.TestCase):
+    def test_promise_status_received_or_cancelled_is_closed(self):
+        for status in ("Received", "Cancelled"):
+            activity = normalize_crm_row({
+                "CRM Type": "Promise of Order",
+                "Promise of Order Cancelled": status,
+            }, index=1)
+            self.assertTrue(activity["crm_is_complete"])
+
+    def test_blank_promise_status_remains_open(self):
+        activity = normalize_crm_row({
+            "CRM Type": "Promise of Order",
+            "Promise of Order Cancelled": "",
+        }, index=1)
+        self.assertFalse(activity["crm_is_complete"])
+
     def test_first_seven_days_review_previous_completed_month(self):
         period = main.get_weekly_kpi_review_period(datetime(2026, 9, 7, 9, 0))
 

@@ -198,6 +198,13 @@ def get_filemaker_crm_complete_field():
     return os.getenv("FILEMAKER_CRM_COMPLETE_FIELD", "Complete").strip()
 
 
+def get_filemaker_promise_status_field():
+    return os.getenv(
+        "FILEMAKER_PROMISE_STATUS_FIELD",
+        "Promise of Order Cancelled",
+    ).strip()
+
+
 def get_filemaker_crm_type_field():
     return os.getenv("FILEMAKER_CRM_TYPE_FIELD", "CRM Type").strip()
 
@@ -1103,6 +1110,8 @@ def normalize_crm_row(row, index):
     completion_value = str(
         get_row_value(
             row,
+            get_filemaker_promise_status_field(),
+            f"emails::{get_filemaker_promise_status_field()}",
             get_filemaker_crm_complete_field(),
             f"emails::{get_filemaker_crm_complete_field()}",
             "Complete",
