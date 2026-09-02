@@ -8,7 +8,12 @@ from pathlib import Path
 
 from dateutil import parser
 from dotenv import load_dotenv
-from filemaker import fetch_layout_records, find_layout_records, get_filemaker_config
+from filemaker import (
+    fetch_filemaker_master_data,
+    fetch_layout_records,
+    find_layout_records,
+    get_filemaker_config,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CRM_SAMPLE_CSV_PATH = Path(
@@ -291,23 +296,60 @@ def fetch_crm_activities():
     cached_result = get_cached_crm_result(cache_key)
 
     if cached_result is not None:
-        return cached_result
+        return filter_inactive_filemaker_customer_activities(cached_result, source)
 
     if source == "filemaker":
         if get_filemaker_crm_use_sync_cache():
             cached_sync_result = read_filemaker_crm_sync_cache()
 
             if cached_sync_result is not None:
-                cache_crm_result(cache_key, cached_sync_result)
-                return cached_sync_result
+                filtered_sync_result = filter_inactive_filemaker_customer_activities(
+                    cached_sync_result,
+                    source,
+                )
+                cache_crm_result(cache_key, filtered_sync_result)
+                return filtered_sync_result
 
         result = build_filemaker_crm_result()
     else:
         path = get_crm_sample_csv_path()
         result = build_csv_crm_result(path)
 
+    result = filter_inactive_filemaker_customer_activities(result, source)
+
     cache_crm_result(cache_key, result)
     return result
+
+
+def filter_inactive_filemaker_customer_activities(result, source):
+    if source != "filemaker" or result.get("status") != "ok":
+        return result
+
+    master_data = fetch_filemaker_master_data()
+    if master_data.get("status") != "ok":
+        return result
+
+    inactive_customer_keys = set(master_data.get("inactive_customer_keys") or [])
+    inactive_customer_names = set(master_data.get("inactive_customer_names") or [])
+    customers_by_key = master_data.get("customers_by_key") or {}
+    activities = [
+        activity for activity in result.get("activities", [])
+        if (
+            str(activity.get("customer_primary_key") or "").strip() not in inactive_customer_keys
+            and str(activity.get("customer") or "").strip().casefold() not in inactive_customer_names
+        )
+    ]
+    for activity in activities:
+        customer_key = str(activity.get("customer_primary_key") or "").strip()
+        current_name = str(
+            (customers_by_key.get(customer_key) or {}).get("company") or ""
+        ).strip()
+        if current_name:
+            activity["customer"] = current_name
+    filtered_result = dict(result)
+    filtered_result["activities"] = activities
+    filtered_result["activity_map"] = build_activity_map(activities)
+    return filtered_result
 
 
 def get_cached_crm_result(cache_key):

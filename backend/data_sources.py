@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from analysis import orders as mock_orders
 from filemaker import (
     fetch_order_records,
+    fetch_filemaker_master_data,
     get_field_value,
     get_filemaker_config,
     map_filemaker_record_to_order,
@@ -40,10 +41,30 @@ def get_orders_for_analysis():
 
     if source == "filemaker":
         result = fetch_cached_filemaker_orders()
+        orders = result["orders"]
+        master_data = fetch_filemaker_master_data()
+        if master_data.get("status") == "ok":
+            inactive_customer_keys = set(master_data.get("inactive_customer_keys") or [])
+            inactive_customer_names = set(master_data.get("inactive_customer_names") or [])
+            customers_by_key = master_data.get("customers_by_key") or {}
+            orders = [
+                order for order in orders
+                if (
+                    get_order_customer_primary_key(order) not in inactive_customer_keys
+                    and str(order.get("customer") or "").strip().casefold() not in inactive_customer_names
+                )
+            ]
+            for order in orders:
+                customer_key = get_order_customer_primary_key(order)
+                current_name = str(
+                    (customers_by_key.get(customer_key) or {}).get("company") or ""
+                ).strip()
+                if current_name:
+                    order["customer"] = current_name
         return {
             "source": "filemaker",
             "status": result["status"],
-            "orders": result["orders"],
+            "orders": orders,
             "stale": result.get("stale", False),
             "cache_updated_at": result.get("cache_updated_at", ""),
             "warning": result.get("warning", ""),
@@ -54,6 +75,16 @@ def get_orders_for_analysis():
         "status": "ok",
         "orders": mock_orders,
     }
+
+
+def get_order_customer_primary_key(order):
+    extra = (order or {}).get("extra") or {}
+    return str(
+        extra.get("Companies 4::PrimaryKey")
+        or extra.get("Customer Ref")
+        or (order or {}).get("customer_primary_key")
+        or ""
+    ).strip()
 
 
 def get_filemaker_order_limit():

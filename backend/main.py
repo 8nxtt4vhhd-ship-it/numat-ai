@@ -17369,20 +17369,78 @@ def render_dismissed_action_plan_items(
         return ""
 
     rows = "".join(
-        render_dismissed_action_plan_item(customer, return_to=return_to)
+        render_dismissed_action_plan_item(
+            customer,
+            return_to=return_to,
+            section_id=section_id,
+        )
         for customer in customers
     )
+
+    storage_key = f"dismissed-list-position:{section_id}"
 
     return f"""
         <details class="dismissed-panel" id="{escape(section_id)}">
             <summary>{escape(summary_label)} ({len(customers)})</summary>
             <ul class="dismissed-list">{rows}</ul>
         </details>
+        <script>
+            (function () {{
+                const panel = document.getElementById({json.dumps(section_id)});
+                const storageKey = {json.dumps(storage_key)};
+                if (!panel) return;
+
+                try {{
+                    const saved = JSON.parse(window.sessionStorage.getItem(storageKey) || "null");
+                    window.sessionStorage.removeItem(storageKey);
+                    if (saved) {{
+                        panel.open = true;
+                        window.requestAnimationFrame(() => {{
+                            const anchor = saved.anchorId
+                                ? document.getElementById(saved.anchorId)
+                                : null;
+                            if (anchor && Number.isFinite(saved.anchorTop)) {{
+                                const delta = anchor.getBoundingClientRect().top - saved.anchorTop;
+                                window.scrollBy({{ top: delta, behavior: "auto" }});
+                            }} else if (Number.isFinite(saved.windowY)) {{
+                                window.scrollTo({{ top: saved.windowY, behavior: "auto" }});
+                            }}
+                        }});
+                    }}
+                }} catch (error) {{
+                    // Ignore unavailable or malformed session storage.
+                }}
+
+                panel.querySelectorAll('form[action="/action-plan-restore"]').forEach((form) => {{
+                    form.addEventListener("submit", () => {{
+                        const row = form.closest("li");
+                        const anchor = row
+                            ? (row.nextElementSibling || row.previousElementSibling)
+                            : null;
+                        try {{
+                            window.sessionStorage.setItem(storageKey, JSON.stringify({{
+                                anchorId: anchor ? anchor.id : "",
+                                anchorTop: anchor ? anchor.getBoundingClientRect().top : null,
+                                windowY: window.scrollY || window.pageYOffset || 0
+                            }}));
+                        }} catch (error) {{
+                            // Ignore unavailable session storage.
+                        }}
+                    }});
+                }});
+            }})();
+        </script>
     """
 
 
-def render_dismissed_action_plan_item(customer, return_to="/action-plan-view#action-plan"):
+def render_dismissed_action_plan_item(
+    customer,
+    return_to="/action-plan-view#action-plan",
+    section_id="dismissed-urgency",
+):
     customer_name = str(customer.get("customer", ""))
+    row_token = hashlib.sha256(customer_name.casefold().encode("utf-8")).hexdigest()[:12]
+    row_id = f"{section_id}-customer-{row_token}"
     customer_url = f"/customer-view?customer={quote(customer_name)}"
     summary_bits = [
         f"Priority {customer.get('priority_score')}",
@@ -17392,7 +17450,7 @@ def render_dismissed_action_plan_item(customer, return_to="/action-plan-view#act
     dismiss_reason = str(customer.get("dismiss_reason") or "").strip()
 
     return f"""
-        <li>
+        <li id="{escape(row_id)}">
             <div class="action-item dismissed-action-item">
                 <a class="action-main" href="{customer_url}">
                     <strong>{escape(customer_name)}</strong>

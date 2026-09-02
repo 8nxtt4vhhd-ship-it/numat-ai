@@ -43,7 +43,7 @@ def get_filemaker_config():
         "customers_country_field": os.getenv("FILEMAKER_CUSTOMERS_COUNTRY_FIELD", "Country").strip(),
         "customers_zip_field": os.getenv("FILEMAKER_CUSTOMERS_ZIP_FIELD", "ZIP Code").strip(),
         "customers_activity_status_field": os.getenv(
-            "FILEMAKER_CUSTOMERS_ACTIVITY_STATUS_FIELD", "Activity Status"
+            "FILEMAKER_CUSTOMERS_ACTIVE_FIELD", "Active"
         ).strip(),
         "customers_type_field": os.getenv("FILEMAKER_CUSTOMERS_TYPE_FIELD", "Type").strip(),
         "customers_priority_field": os.getenv("FILEMAKER_CUSTOMERS_PRIORITY_FIELD", "a_Priority Rating").strip(),
@@ -703,6 +703,9 @@ def map_filemaker_record_to_order(record):
         for field_name in config["extra_fields"]
     }
 
+    customer_primary_key = normalize_text_value(
+        extra.get("Companies 4::PrimaryKey") or extra.get("Customer Ref")
+    )
     return {
         "filemaker_record_id": record.get("recordId"),
         "customer": get_field_value(field_data, config["customer_field"]),
@@ -710,6 +713,7 @@ def map_filemaker_record_to_order(record):
             get_field_value(field_data, config["order_date_field"])
         ),
         "amount": get_field_value(field_data, config["amount_field"]),
+        "customer_primary_key": customer_primary_key,
         "extra": extra,
     }
 
@@ -808,6 +812,8 @@ def build_empty_filemaker_master_data(status):
         "all_contacts": [],
         "contacts_by_customer_key": {},
         "contacts_by_email": {},
+        "inactive_customer_keys": [],
+        "inactive_customer_names": [],
     }
 
 
@@ -848,6 +854,10 @@ def map_filemaker_customer_master_record(record):
     }
 
 
+def is_inactive_filemaker_customer(customer):
+    return str((customer or {}).get("activity_status") or "").strip().lower() == "inactive"
+
+
 def fetch_filemaker_company_directory():
     config = get_filemaker_config()
     if not config["customers_layout"]:
@@ -873,6 +883,8 @@ def fetch_filemaker_company_directory():
     for raw_record in customers_result.get("records", []):
         company = map_filemaker_customer_master_record(raw_record)
         company["filemaker_record_id"] = str(raw_record.get("recordId") or "").strip()
+        if is_inactive_filemaker_customer(company):
+            continue
         companies.append(company)
 
     return {
@@ -978,10 +990,20 @@ def fetch_filemaker_master_data(force_refresh=False):
     contacts_by_customer_key = {}
     contacts_by_email = {}
     unsubscribed_emails = set()
+    inactive_customer_keys = set()
+    inactive_customer_names = set()
 
     for raw_record in customers_result.get("records", []):
         customer = map_filemaker_customer_master_record(raw_record)
         customer["filemaker_record_id"] = str(raw_record.get("recordId") or "").strip()
+
+        if is_inactive_filemaker_customer(customer):
+            if customer["primary_key"]:
+                inactive_customer_keys.add(customer["primary_key"])
+            if customer["company"]:
+                inactive_customer_names.add(customer["company"].casefold())
+            continue
+
         companies.append(customer)
 
         if customer["type"].lower() != "customer":
@@ -996,6 +1018,9 @@ def fetch_filemaker_master_data(force_refresh=False):
         contact = map_filemaker_contact_master_record(raw_record)
 
         if not contact["customer_ref"]:
+            continue
+
+        if contact["customer_ref"] in inactive_customer_keys:
             continue
 
         all_contacts.append(contact)
@@ -1038,6 +1063,8 @@ def fetch_filemaker_master_data(force_refresh=False):
         "contacts_by_customer_key": contacts_by_customer_key,
         "contacts_by_email": contacts_by_email,
         "unsubscribed_emails": sorted(unsubscribed_emails),
+        "inactive_customer_keys": sorted(inactive_customer_keys),
+        "inactive_customer_names": sorted(inactive_customer_names),
     }
 
     if cache_seconds:
@@ -1080,6 +1107,24 @@ def fetch_order_records(limit=100, offset=1):
         map_filemaker_record_to_order(record)
         for record in result["records"]
     ]
+
+    master_data = fetch_filemaker_master_data()
+    if master_data.get("status") == "ok":
+        inactive_customer_keys = set(master_data.get("inactive_customer_keys") or [])
+        inactive_customer_names = set(master_data.get("inactive_customer_names") or [])
+        customers_by_key = master_data.get("customers_by_key") or {}
+        orders = [
+            order for order in orders
+            if (
+                str(order.get("customer_primary_key") or "").strip() not in inactive_customer_keys
+                and str(order.get("customer") or "").strip().casefold() not in inactive_customer_names
+            )
+        ]
+        for order in orders:
+            customer_key = str(order.get("customer_primary_key") or "").strip()
+            current_name = str((customers_by_key.get(customer_key) or {}).get("company") or "").strip()
+            if current_name:
+                order["customer"] = current_name
 
     return {
         "connected": True,
