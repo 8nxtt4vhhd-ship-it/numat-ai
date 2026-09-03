@@ -137,6 +137,7 @@ def summarize_rows(rows, operator_rows):
 
 def build_ai_report_facts(result, days):
     current_rows, current_operators = filter_production_period(result, days=days)
+    plant_operator_rows = result.get("plant_operator_rows", result.get("operator_rows", []))
     if current_rows:
         current_end = datetime.strptime(current_rows[-1]["date"], "%Y-%m-%d")
         current_start = current_end - timedelta(days=max(1, days) - 1)
@@ -144,20 +145,23 @@ def build_ai_report_facts(result, days):
         previous_start = previous_end - timedelta(days=max(1, days) - 1)
         previous_rows = [item for item in result.get("production_rows", []) if previous_start.strftime("%Y-%m-%d") <= item["date"] <= previous_end.strftime("%Y-%m-%d")]
         previous_operators = [item for item in result.get("operator_rows", []) if previous_start.strftime("%Y-%m-%d") <= item["date"] <= previous_end.strftime("%Y-%m-%d")]
+        current_plant_operators = [item for item in plant_operator_rows if current_start.strftime("%Y-%m-%d") <= item["date"] <= current_end.strftime("%Y-%m-%d")]
+        previous_plant_operators = [item for item in plant_operator_rows if previous_start.strftime("%Y-%m-%d") <= item["date"] <= previous_end.strftime("%Y-%m-%d")]
     else:
         current_start = current_end = previous_start = previous_end = None
         previous_rows, previous_operators = [], []
+        current_plant_operators, previous_plant_operators = [], []
     operators = build_operator_summary(current_operators)
     facts = {
         "period": {"start": current_start.strftime("%Y-%m-%d") if current_start else "", "end": current_end.strftime("%Y-%m-%d") if current_end else "", "rolling_days": days},
-        "current": summarize_rows(current_rows, current_operators),
-        "previous_period": {"start": previous_start.strftime("%Y-%m-%d") if previous_start else "", "end": previous_end.strftime("%Y-%m-%d") if previous_end else "", **summarize_rows(previous_rows, previous_operators)},
+        "current": summarize_rows(current_rows, current_plant_operators),
+        "previous_period": {"start": previous_start.strftime("%Y-%m-%d") if previous_start else "", "end": previous_end.strftime("%Y-%m-%d") if previous_end else "", **summarize_rows(previous_rows, previous_plant_operators)},
         "operators": [{key: safe_number(value) if isinstance(value, float) else value for key, value in item.items()} for item in operators],
         "business_context": {
             "preferred_backlog_weeks": 2.0,
             "backlog_interpretation": "Backlog below approximately two weeks means production has less new-order repair work available and should prompt sales activity to secure more orders. Growth toward two weeks is positive, not a turnaround concern. A low backlog normally enables faster-than-usual customer turnaround.",
         },
-        "data_notes": ["Today is excluded.", "Backlog contains new customer orders awaiting their first repair only; re-cook work is never included in backlog.", "The preferred backlog is approximately two weeks. A backlog below that level can constrain production because only received customer mats can be repaired, and should prompt the sales team to secure more orders.", "Backlog growth that remains below approximately two weeks is movement toward a healthier workload and must not be described as harming turnaround. Low backlog normally means orders can be returned faster than usual.", "Re-cook activity is a separate quality measure and is separate from press throughput.", "Press throughput is FF1 + FF2 + FF3 total LF.", "Trudy Dunlap, Kelly Bainbridge, Lois Horace, Temp1 and Temp2 are excluded from operator analysis."],
+        "data_notes": ["Today is excluded.", "Plant productivity is total booked productive hours divided by total plant clocked hours and includes all plant clockings.", "Backlog contains new customer orders awaiting their first repair only; re-cook work is never included in backlog.", "The preferred backlog is approximately two weeks. A backlog below that level can constrain production because only received customer mats can be repaired, and should prompt the sales team to secure more orders.", "Backlog growth that remains below approximately two weeks is movement toward a healthier workload and must not be described as harming turnaround. Low backlog normally means orders can be returned faster than usual.", "Re-cook activity is a separate quality measure and is separate from press throughput.", "Press throughput is FF1 + FF2 + FF3 total LF.", "Trudy Dunlap, Kelly Bainbridge, Lois Horace, Temp1 and Temp2 are excluded only from the individual operator analysis; their plant clockings remain included in overall plant productivity."],
     }
     return facts
 
@@ -171,10 +175,13 @@ def build_ai_report_facts_for_calendar_period(result, period_start, period_end, 
 
     production_rows = result.get("production_rows", [])
     operator_rows = result.get("operator_rows", [])
+    plant_operator_rows = result.get("plant_operator_rows", operator_rows)
     current_rows = within(production_rows, period_start, period_end)
     current_operators = within(operator_rows, period_start, period_end)
+    current_plant_operators = within(plant_operator_rows, period_start, period_end)
     previous_rows = within(production_rows, previous_start, previous_end)
     previous_operators = within(operator_rows, previous_start, previous_end)
+    previous_plant_operators = within(plant_operator_rows, previous_start, previous_end)
     operators = build_operator_summary(current_operators)
     return {
         "period": {
@@ -183,11 +190,11 @@ def build_ai_report_facts_for_calendar_period(result, period_start, period_end, 
             "rolling_days": None,
             "calendar_month": True,
         },
-        "current": summarize_rows(current_rows, current_operators),
+        "current": summarize_rows(current_rows, current_plant_operators),
         "previous_period": {
             "start": previous_start,
             "end": previous_end,
-            **summarize_rows(previous_rows, previous_operators),
+            **summarize_rows(previous_rows, previous_plant_operators),
         },
         "operators": [
             {key: safe_number(value) if isinstance(value, float) else value for key, value in item.items()}
@@ -200,12 +207,13 @@ def build_ai_report_facts_for_calendar_period(result, period_start, period_end, 
         "data_notes": [
             "The current and previous periods are complete calendar months.",
             "Today is excluded.",
+            "Plant productivity is total booked productive hours divided by total plant clocked hours and includes all plant clockings.",
             "Backlog contains new customer orders awaiting their first repair only; re-cook work is never included in backlog.",
             "The preferred backlog is approximately two weeks. A backlog below that level can constrain production because only received customer mats can be repaired, and should prompt the sales team to secure more orders.",
             "Backlog growth that remains below approximately two weeks is movement toward a healthier workload and must not be described as harming turnaround. Low backlog normally means orders can be returned faster than usual.",
             "Re-cook activity is a separate quality measure and is separate from press throughput.",
             "Press throughput is FF1 + FF2 + FF3 total LF.",
-            "Trudy Dunlap, Kelly Bainbridge, Lois Horace, Temp1 and Temp2 are excluded from operator analysis.",
+            "Trudy Dunlap, Kelly Bainbridge, Lois Horace, Temp1 and Temp2 are excluded only from the individual operator analysis; their plant clockings remain included in overall plant productivity.",
         ],
     }
 

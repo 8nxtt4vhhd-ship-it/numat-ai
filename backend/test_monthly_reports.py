@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import monthly_reports
 import m365
+from production_reports import build_ai_report_facts_for_calendar_period
 
 
 class FakeResponse:
@@ -25,6 +26,29 @@ class FakeResponse:
 
 
 class MonthlyReportTests(unittest.TestCase):
+    def test_analysis_plant_productivity_uses_all_plant_clockings(self):
+        result = {
+            "production_rows": [{"date": "2026-08-31"}],
+            "operator_rows": [
+                {"date": "2026-08-31", "name": "Included operator", "booked_hours": 9, "clocked_hours": 10},
+            ],
+            "plant_operator_rows": [
+                {"date": "2026-08-31", "name": "Included operator", "booked_hours": 9, "clocked_hours": 10},
+                {"date": "2026-08-31", "name": "Plant manager", "booked_hours": 3, "clocked_hours": 10, "excluded": True},
+            ],
+        }
+
+        facts = build_ai_report_facts_for_calendar_period(
+            result,
+            "2026-08-01",
+            "2026-08-31",
+            "2026-07-01",
+            "2026-07-31",
+        )
+
+        self.assertEqual(facts["current"]["plant_productivity"], 60)
+        self.assertEqual(len(facts["operators"]), 1)
+
     def test_previous_calendar_month_and_prior_month(self):
         start, end = monthly_reports.previous_calendar_month(monthly_reports.date(2026, 8, 18))
         self.assertEqual((start.isoformat(), end.isoformat()), ("2026-07-01", "2026-07-31"))
