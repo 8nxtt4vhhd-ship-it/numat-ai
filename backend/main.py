@@ -8897,7 +8897,6 @@ def render_dashboard_home(ask="", ask_run=""):
                 <div class="home-dashboard-header">
                     <div class="home-dashboard-brandline">
                         <img class="home-dashboard-brand-logo" src="/home-logo.png" alt="NuMat logo">
-                        <h2>Sales Focus</h2>
                     </div>
                 </div>
 
@@ -23972,7 +23971,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .home-dashboard-brandline {{
                         display: flex;
                         align-items: center;
-                        gap: 18px;
+                        justify-content: flex-start;
                     }}
 
                     .home-dashboard-brand-logo {{
@@ -23981,13 +23980,6 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         height: auto;
                         flex-shrink: 0;
                         object-fit: contain;
-                    }}
-
-                    .home-dashboard-header h2 {{
-                        margin: 0;
-                        color: var(--text);
-                        font-size: 40px;
-                        line-height: 1.05;
                     }}
 
                     .home-dashboard-main {{
@@ -27293,14 +27285,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             padding: 0;
                         }}
 
-                        .home-dashboard-header h2 {{
-                            font-size: 26px;
-                            line-height: 1.08;
-                        }}
-
                         .home-dashboard-brandline {{
                             align-items: center;
-                            gap: 12px;
+                            justify-content: flex-start;
                         }}
 
                         .home-dashboard-brand-logo {{
