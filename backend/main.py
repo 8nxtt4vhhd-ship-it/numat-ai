@@ -11350,6 +11350,14 @@ def get_home_queue_summaries_cache_seconds():
         return 300
 
 
+def get_action_plan_recent_contact_days():
+    raw_days = os.getenv("ACTION_PLAN_RECENT_CONTACT_DAYS", "14").strip()
+    try:
+        return max(0, int(raw_days))
+    except ValueError:
+        return 14
+
+
 def get_customer_summaries_cache_seconds():
     raw_seconds = os.getenv("CUSTOMER_SUMMARIES_CACHE_SECONDS", "300").strip()
 
@@ -11372,6 +11380,7 @@ def build_attention_cache_key(order_result, crm_result):
         crm_result.get("counts", {}).get("kept_rows", 0),
         should_add_ai_explanations(),
         os.getenv("ACTION_PLAN_LIMITED_HISTORY_FOLLOW_UP_DAYS", "60").strip(),
+        get_action_plan_recent_contact_days(),
     )
 
 
@@ -11516,12 +11525,11 @@ def build_customers_needing_attention_response(order_result=None, crm_result=Non
             crm_activities=crm_matches,
         )
         customer["display_last_contact"] = display_last_contact
-        if customer.get("days_since_last_activity") is None and crm_recent_days is not None:
-            customer["days_since_last_activity"] = crm_recent_days
-            customer["last_activity_date"] = (
-                latest_sales_crm_activity.get("date_created", "")[:10]
-                if latest_sales_crm_activity else None
-            )
+        apply_newer_crm_activity_to_customer(
+            customer,
+            latest_sales_crm_activity,
+            crm_recent_days,
+        )
 
         dismissal = get_action_plan_dismissal(
             customer.get("customer", ""),
@@ -14892,7 +14900,7 @@ class ActivityHTMLToText(HTMLParser):
 def has_recent_activity(days_since_activity):
     return (
         days_since_activity is not None
-        and days_since_activity <= 14
+        and days_since_activity <= get_action_plan_recent_contact_days()
         and days_since_activity >= 0
     )
 
@@ -15532,6 +15540,26 @@ def get_crm_days_since_latest_activity(latest_crm_activity):
     return (get_analysis_today().date() - activity_date.date()).days
 
 
+def apply_newer_crm_activity_to_customer(customer, latest_crm_activity, crm_recent_days):
+    if crm_recent_days is None:
+        return
+
+    current_recent_days = customer.get("days_since_last_activity")
+    try:
+        current_recent_days = int(current_recent_days) if current_recent_days is not None else None
+    except (TypeError, ValueError):
+        current_recent_days = None
+
+    if current_recent_days is not None and crm_recent_days >= current_recent_days:
+        return
+
+    customer["days_since_last_activity"] = crm_recent_days
+    customer["last_activity_date"] = (
+        latest_crm_activity.get("date_created", "")[:10]
+        if latest_crm_activity else None
+    )
+
+
 def has_expired_relative_timing(text, age_days):
     """Return true when relative scheduling language is no longer current."""
     if not isinstance(age_days, (int, float)) or age_days < 0:
@@ -15611,8 +15639,9 @@ def build_action_plan_contact_policy(outbound_sales, customer_name=""):
     has_email = latest_email_days is not None
     has_call = latest_call_days is not None
     has_direct_touch = latest_direct_touch_days is not None
-    recent_contact_hold = latest_contact_days is not None and latest_contact_days <= 7
-    email_follow_up_window = latest_email_days is not None and 7 < latest_email_days < 30
+    recent_contact_days = get_action_plan_recent_contact_days()
+    recent_contact_hold = latest_contact_days is not None and latest_contact_days <= recent_contact_days
+    email_follow_up_window = latest_email_days is not None and recent_contact_days < latest_email_days < 30
     direct_touch_cooloff_hold = (
         has_email
         and has_direct_touch
@@ -15637,7 +15666,7 @@ def build_action_plan_contact_policy(outbound_sales, customer_name=""):
         mode_override = "Hold"
         why_override = "Email and call/text already logged • wait until 30 days since the latest direct follow-up"
     elif recent_contact_hold:
-        hold_reason = "Recent contact already logged in the last 7 days"
+        hold_reason = f"Recent contact already logged in the last {recent_contact_days} days"
         mode_override = "Hold"
         why_override = f"Recent contact logged {latest_contact_days} days ago • avoid duplicate follow-up"
     elif email_follow_up_window:

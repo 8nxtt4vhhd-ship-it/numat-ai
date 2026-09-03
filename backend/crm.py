@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+from threading import Lock, Thread
 import time
 from pathlib import Path
 
@@ -32,6 +33,9 @@ _PROMISE_OF_ORDER_CACHE = {
     "expires_at": 0,
     "result": None,
 }
+_RECENT_CRM_REFRESH_LOCK = Lock()
+_RECENT_CRM_REFRESH_RUNNING = False
+_RECENT_CRM_REFRESH_LAST_STARTED_AT = 0.0
 
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
@@ -303,11 +307,18 @@ def fetch_crm_activities():
             cached_sync_result = read_filemaker_crm_sync_cache()
 
             if cached_sync_result is not None:
+                recent_result = read_filemaker_crm_recent_cache()
+                if recent_result is not None:
+                    cached_sync_result = merge_crm_activity_results(
+                        cached_sync_result,
+                        recent_result,
+                    )
                 filtered_sync_result = filter_inactive_filemaker_customer_activities(
                     cached_sync_result,
                     source,
                 )
                 cache_crm_result(cache_key, filtered_sync_result)
+                trigger_recent_crm_refresh()
                 return filtered_sync_result
 
         result = build_filemaker_crm_result()
@@ -319,6 +330,35 @@ def fetch_crm_activities():
 
     cache_crm_result(cache_key, result)
     return result
+
+
+def trigger_recent_crm_refresh():
+    global _RECENT_CRM_REFRESH_RUNNING, _RECENT_CRM_REFRESH_LAST_STARTED_AT
+    now = time.time()
+    refresh_interval = max(30, get_crm_cache_seconds())
+    with _RECENT_CRM_REFRESH_LOCK:
+        if _RECENT_CRM_REFRESH_RUNNING:
+            return False
+        if now - _RECENT_CRM_REFRESH_LAST_STARTED_AT < refresh_interval:
+            return False
+        _RECENT_CRM_REFRESH_RUNNING = True
+        _RECENT_CRM_REFRESH_LAST_STARTED_AT = now
+
+    Thread(target=refresh_recent_crm_cache_in_background, daemon=True).start()
+    return True
+
+
+def refresh_recent_crm_cache_in_background():
+    global _RECENT_CRM_REFRESH_RUNNING
+    try:
+        result = build_filemaker_crm_result()
+        if result.get("status") == "ok":
+            clear_crm_cache()
+    except Exception:
+        pass
+    finally:
+        with _RECENT_CRM_REFRESH_LOCK:
+            _RECENT_CRM_REFRESH_RUNNING = False
 
 
 def filter_inactive_filemaker_customer_activities(result, source):
@@ -350,6 +390,27 @@ def filter_inactive_filemaker_customer_activities(result, source):
     filtered_result["activities"] = activities
     filtered_result["activity_map"] = build_activity_map(activities)
     return filtered_result
+
+
+def merge_crm_activity_results(base_result, recent_result):
+    merged_by_key = {
+        build_crm_activity_dedupe_key(activity): activity
+        for activity in base_result.get("activities", [])
+    }
+    for activity in recent_result.get("activities", []):
+        merged_by_key[build_crm_activity_dedupe_key(activity)] = activity
+
+    activities = sort_crm_activities(list(merged_by_key.values()))
+    activity_map = build_activity_map(activities)
+    result = dict(base_result)
+    result["activities"] = activities
+    result["activity_map"] = activity_map
+    result["recent_updated_at"] = recent_result.get("updated_at", "")
+    counts = dict(base_result.get("counts") or {})
+    counts["kept_rows"] = len(activities)
+    counts["customer_count"] = len(activity_map)
+    result["counts"] = counts
+    return result
 
 
 def get_cached_crm_result(cache_key):
