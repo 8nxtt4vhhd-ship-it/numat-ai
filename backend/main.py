@@ -59,6 +59,7 @@ from crm import (
     fetch_crm_activities,
     fetch_promise_of_order_activities,
     get_crm_data_source,
+    get_filemaker_emails_layout,
     get_filemaker_crm_cache_path,
     get_filemaker_crm_use_sync_cache,
     is_customer_service_activity,
@@ -9305,6 +9306,108 @@ def post_m365_send_email(
     )
 
 
+def build_filemaker_phone_call_fields(sender_email, recipient, subject, body, crm_category=""):
+    return {
+        "body": str(body or "").strip(),
+        "subject": str(subject or "").strip(),
+        "CRM Category": str(crm_category or "").strip(),
+        "CRM Type": "Telephone Call",
+        "sender_email": str(sender_email or "").strip(),
+        "To": str(recipient or "").strip(),
+    }
+
+
+@app.post("/filemaker/record-call", response_class=HTMLResponse)
+def post_filemaker_record_call(
+    customer: str = Form(""),
+    return_to: str = Form("/action-plan-view"),
+    to: str = Form(""),
+    subject: str = Form(""),
+    body: str = Form(""),
+    crm_category: str = Form(""),
+):
+    current_user = get_current_session_user()
+    if not current_user:
+        return RedirectResponse(url="/login?next=%2Faction-plan-view", status_code=303)
+
+    customer_name = str(customer or "").strip()
+    recipient = str(to or "").strip()
+    subject_text = str(subject or "").strip()
+    body_text = str(body or "").strip()
+    connection_state = get_m365_connection_state(current_user)
+    sender_email = str(
+        connection_state.get("mailbox")
+        or current_user.get("m365_email")
+        or current_user.get("email")
+        or ""
+    ).strip()
+
+    if not customer_name or not recipient or not subject_text or not body_text or not sender_email:
+        record_audit_event(
+            "record-call",
+            target=customer_name,
+            details="Call was not recorded because customer, recipient, subject, notes, or sender was missing.",
+            area="customer-call",
+            status="failed",
+        )
+        return RedirectResponse(
+            url=append_message_to_url(
+                return_to or "/action-plan-view",
+                error="Customer, contact email, subject and call notes are required.",
+            ),
+            status_code=303,
+        )
+
+    write_result = create_layout_record(
+        get_filemaker_emails_layout(),
+        build_filemaker_phone_call_fields(
+            sender_email,
+            recipient,
+            subject_text,
+            body_text,
+            crm_category=crm_category,
+        ),
+    )
+    if write_result.get("status") != "ok":
+        error_text = str(
+            write_result.get("error_message")
+            or write_result.get("status")
+            or "FileMaker could not create the call record."
+        )
+        record_audit_event(
+            "record-call",
+            target=customer_name,
+            details=f"FileMaker call record failed for {recipient}: {error_text}",
+            area="customer-call",
+            status="failed",
+        )
+        return RedirectResponse(
+            url=append_message_to_url(
+                return_to or "/action-plan-view",
+                error=f"Call notes were not recorded: {error_text}",
+            ),
+            status_code=303,
+        )
+
+    record_audit_event(
+        "record-call",
+        target=customer_name,
+        details=f"Telephone Call recorded for {recipient} • FileMaker record {write_result.get('record_id') or 'created'}",
+        area="customer-call",
+        status="success",
+    )
+    clear_attention_response_cache()
+    clear_home_queue_summaries_cache()
+    clear_customer_summaries_cache()
+    return RedirectResponse(
+        url=append_message_to_url(
+            clear_home_selection_from_url(return_to or "/action-plan-view"),
+            message="Telephone call recorded in FileMaker.",
+        ),
+        status_code=303,
+    )
+
+
 @app.get("/sample-data", response_class=HTMLResponse)
 def get_sample_data_page():
     return render_sample_data_page()
@@ -16721,6 +16824,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     call_status_id = f"home-focus-call-status-{slug}"
     call_phone_card_id = f"home-focus-call-phone-card-{slug}"
     call_cell_card_id = f"home-focus-call-cell-card-{slug}"
+    call_to_id = f"home-focus-call-to-{slug}"
     latest_outreach_subject = str(context.get("latest_sales_outreach_subject") or "").strip()
     latest_outreach_preview = str(context.get("latest_sales_outreach_preview") or "").strip()
     latest_outreach_date = format_optional_datetime(context.get("latest_sales_outreach") or "")
@@ -17005,6 +17109,21 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                                 <p class="home-focus-call-missing" id="{call_phone_card_id}-missing" {'hidden' if current_call_phone or current_call_cell else ''}>No phone or cell number available</p>
                             </div>
                             <ul class="home-focus-call-points">{call_points_markup}</ul>
+                            <form method="post" action="/filemaker/record-call" class="home-focus-call-log-form">
+                                <input type="hidden" name="customer" value="{escape(customer_name)}">
+                                <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
+                                <input type="hidden" name="crm_category" value="">
+                                <input type="hidden" name="to" id="{call_to_id}" value="{escape(target_email)}">
+                                <label>
+                                    <span class="label">Call subject</span>
+                                    <input type="text" name="subject" value="Telephone call — {escape(customer_name)}" required>
+                                </label>
+                                <label>
+                                    <span class="label">Call notes</span>
+                                    <textarea name="body" rows="4" placeholder="Record who you spoke to, what was discussed and the agreed next step." required></textarea>
+                                </label>
+                                <button type="submit" class="button home-focus-record-call-button">Record call in FileMaker</button>
+                            </form>
                         </div>
                     </div>
                 </div>
@@ -17075,6 +17194,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         const phoneCard = document.getElementById(`home-focus-call-phone-card-${{slug}}`);
                         const cellCard = document.getElementById(`home-focus-call-cell-card-${{slug}}`);
                         const missingState = document.getElementById(`home-focus-call-phone-card-${{slug}}-missing`);
+                        const callToField = document.getElementById(`home-focus-call-to-${{slug}}`);
                         const name = selected.dataset.name || selected.value || 'Best known contact';
                         const title = selected.dataset.title || 'Likely sales contact';
                         const phone = selected.dataset.phone || '';
@@ -17097,6 +17217,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             cellCard.href = cell ? `tel:${{cell}}` : '#';
                         }}
                         if (missingState) missingState.hidden = !!(phone || cell);
+                        if (callToField) callToField.value = selected.value || '';
                     }}
                     async function loadHomeFocusDraft(slug) {{
                         const form = document.getElementById(`home-focus-send-form-${{slug}}`);
@@ -22061,6 +22182,48 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .home-focus-call-points li + li {{
                         margin-top: 8px;
+                    }}
+
+                    .home-focus-call-log-form {{
+                        display: grid;
+                        gap: 10px;
+                        margin-top: 2px;
+                        padding-top: 14px;
+                        border-top: 1px solid var(--border);
+                    }}
+
+                    .home-focus-call-log-form label {{
+                        display: grid;
+                        gap: 5px;
+                    }}
+
+                    .home-focus-call-log-form input,
+                    .home-focus-call-log-form textarea {{
+                        width: 100%;
+                        box-sizing: border-box;
+                        border: 1px solid #c7d8e8;
+                        border-radius: 9px;
+                        background: #fff;
+                        color: var(--text);
+                        font: inherit;
+                        font-size: 14px;
+                    }}
+
+                    .home-focus-call-log-form input {{
+                        min-height: 42px;
+                        padding: 9px 11px;
+                    }}
+
+                    .home-focus-call-log-form textarea {{
+                        min-height: 96px;
+                        padding: 10px 11px;
+                        resize: vertical;
+                    }}
+
+                    .home-focus-record-call-button {{
+                        width: fit-content;
+                        min-width: 220px;
+                        justify-content: center;
                     }}
 
                     .home-focus-call-missing {{
