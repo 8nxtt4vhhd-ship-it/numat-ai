@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import json
 import time
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -10,7 +11,46 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
 _OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-recent-thread-first-17"
-_STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-07-21-openai-strategic-discovery-1"
+_STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-09-03-openai-strategic-discovery-2"
+
+
+def _canonical_evidence_url(value):
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url.lstrip('/')}"
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    host = str(parsed.hostname or "").lower().removeprefix("www.")
+    path = str(parsed.path or "/").rstrip("/") or "/"
+    return f"{host}{path}" if host else ""
+
+
+def _collect_response_source_urls(response):
+    try:
+        payload = response.model_dump()
+    except (AttributeError, TypeError, ValueError):
+        return {}
+
+    sources = {}
+
+    def visit(value):
+        if isinstance(value, dict):
+            url = str(value.get("url") or "").strip()
+            canonical = _canonical_evidence_url(url)
+            if canonical and canonical not in sources:
+                sources[canonical] = url
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload.get("output") or [])
+    return sources
 
 OUTREACH_EMAIL_STYLE_GUIDANCE = (
     "Write the customer email in concise American business English. Use ASD-STE100-inspired principles for clarity, "
@@ -189,10 +229,15 @@ def discover_strategic_contacts_with_openai(
         "Include regional directors and other regional leadership when they clearly sit above branch level. "
         "Prefer uniform-services leadership only. Avoid HR, recruiting, talent, marketing, finance, retail, medical, sports, entertainment, education, foodservice, and unrelated divisions unless the requested function clearly asks for them. "
         "If you are not reasonably confident a person belongs to the requested organisation, leave them out. "
-        "Prefer candidates with at least one verifiable signal such as a work email, phone number, or LinkedIn profile. "
-        "When enough plausible candidates exist, fill the requested limit instead of stopping early. "
+        "Only include a candidate when you know both a specific current title and the organisation they work for; never return a name by itself. "
+        "Prefer candidates with a useful verification signal such as a work email, phone number, or LinkedIn profile URL, but do not omit an otherwise strong named candidate solely because those details are unavailable. "
+        "Never guess or construct an email address, phone number, or LinkedIn URL. Use an empty string when a detail is not known. "
+        "Do not return a person based on a name alone or with a vague or missing title. "
+        "Use web search to verify each candidate. Include the best public source URL that supports the person's current title and organisation. "
+        "Prefer an official company leadership page, company announcement, or a real LinkedIn profile. Do not use a search-results URL as the source. "
+        "Return exactly the requested number when that many qualifying candidates are known; otherwise return fewer rather than adding weak candidates. "
         "Return strict JSON only with this shape: "
-        "{\"results\":[{\"name\":\"...\",\"title\":\"...\",\"organization_name\":\"...\",\"city\":\"...\",\"region\":\"...\",\"country\":\"...\",\"email\":\"...\",\"phone\":\"...\",\"linkedin_url\":\"...\",\"reason\":\"...\"}]}. "
+        "{\"results\":[{\"name\":\"...\",\"title\":\"...\",\"organization_name\":\"...\",\"city\":\"...\",\"region\":\"...\",\"country\":\"...\",\"email\":\"...\",\"phone\":\"...\",\"linkedin_url\":\"...\",\"source_url\":\"...\",\"reason\":\"...\"}]}. "
         "Use empty strings for unknown fields. "
         "Do not include markdown. "
         "Do not include commentary outside the JSON."
@@ -207,6 +252,44 @@ def discover_strategic_contacts_with_openai(
             "Find likely strategic contacts for this organisation. "
             "Bias toward uniform-services leadership and practical decision-makers."
         ),
+    }
+    result_fields = {
+        field: {"type": "string"}
+        for field in [
+            "name",
+            "title",
+            "organization_name",
+            "city",
+            "region",
+            "country",
+            "email",
+            "phone",
+            "linkedin_url",
+            "source_url",
+            "reason",
+        ]
+    }
+    output_format = {
+        "type": "json_schema",
+        "name": "strategic_contact_discovery",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "maxItems": limit,
+                    "items": {
+                        "type": "object",
+                        "properties": result_fields,
+                        "required": list(result_fields),
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["results"],
+            "additionalProperties": False,
+        },
     }
 
     try:
@@ -225,10 +308,17 @@ def discover_strategic_contacts_with_openai(
                     "content": json.dumps(user_payload, indent=2),
                 },
             ],
-            max_output_tokens=3600,
+            max_output_tokens=4000,
+            temperature=0.1,
+            tools=[{"type": "web_search_preview", "search_context_size": "low"}],
+            tool_choice="required",
+            max_tool_calls=3,
+            text={"format": output_format},
+            include=["web_search_call.action.sources"],
         )
 
         raw_text = response.output_text.strip()
+        response_source_urls = _collect_response_source_urls(response)
         if not raw_text:
             return {
                 "status": "error",
@@ -262,6 +352,11 @@ def discover_strategic_contacts_with_openai(
             title = str(item.get("title") or "").strip()
             if not name or not title:
                 continue
+            proposed_source_url = str(item.get("source_url") or "").strip()
+            source_url = response_source_urls.get(
+                _canonical_evidence_url(proposed_source_url),
+                "",
+            )
             cleaned.append(
                 {
                     "name": name,
@@ -273,6 +368,7 @@ def discover_strategic_contacts_with_openai(
                     "email": str(item.get("email") or "").strip(),
                     "phone": str(item.get("phone") or "").strip(),
                     "linkedin_url": str(item.get("linkedin_url") or "").strip(),
+                    "source_url": source_url,
                     "reason": str(item.get("reason") or "").strip(),
                 }
             )

@@ -2651,7 +2651,7 @@ def strategic_pdl_person_matches_focus(organization_name, person, allowed_domain
     if normalized_function and normalized_function != "Executive" and required_terms:
         if not any(term in title_text or term in headline_text for term in required_terms):
             return False
-    elif not normalized_function or normalized_function == "Other":
+    elif normalized_function == "Other":
         default_strategic_focus_terms = [
             "operations",
             "production",
@@ -3287,13 +3287,19 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
     needs_verification_results = []
     for item in filtered_results:
         has_email = bool(str(item.get("email") or "").strip())
+        has_phone = bool(str(item.get("phone") or "").strip())
         has_linkedin = bool(str(item.get("linkedin_url") or "").strip())
-        if has_email or has_linkedin:
+        has_source = bool(str(item.get("source_url") or "").strip())
+        if has_email or has_phone or has_linkedin or has_source:
             contact_ready_results.append(item)
         else:
             needs_verification_results.append(item)
 
     for item in contact_ready_results + needs_verification_results:
+        has_email = bool(str(item.get("email") or "").strip())
+        has_phone = bool(str(item.get("phone") or "").strip())
+        has_linkedin = bool(str(item.get("linkedin_url") or "").strip())
+        has_source = bool(str(item.get("source_url") or "").strip())
         location_bits = [
             str(item.get("city") or "").strip(),
             str(item.get("region") or "").strip(),
@@ -3308,12 +3314,31 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
             else "<span class='status-pill'>Not in FileMaker</span>"
         )
         linkedin_url = str(item.get("linkedin_url") or "").strip()
+        linkedin_search_url = "https://www.linkedin.com/search/results/people/?" + urlencode(
+            {
+                "keywords": " ".join(
+                    part
+                    for part in [
+                        str(item.get("name") or "").strip(),
+                        str(item.get("organization_name") or organization_name).strip(),
+                        str(item.get("title") or "").strip(),
+                    ]
+                    if part
+                )
+            }
+        )
         linkedin_html = (
-            f"<a href=\"{escape(linkedin_url)}\" target=\"_blank\" rel=\"noreferrer\">LinkedIn</a>"
-            if linkedin_url else ""
+            f"<a href=\"{escape(linkedin_url)}\" target=\"_blank\" rel=\"noreferrer\">LinkedIn profile</a>"
+            if linkedin_url
+            else f"<a href=\"{escape(linkedin_search_url)}\" target=\"_blank\" rel=\"noreferrer\">Search LinkedIn</a>"
+        )
+        source_url = str(item.get("source_url") or "").strip()
+        source_html = (
+            f"<a href=\"{escape(source_url)}\" target=\"_blank\" rel=\"noreferrer\">Public evidence</a>"
+            if source_url else ""
         )
         save_button = ""
-        if not item.get("already_saved"):
+        if not item.get("already_saved") and (has_email or has_phone or has_linkedin):
             save_button = f"""
                 <form method="post" action="/strategic-contacts/import-pdl" class="inline-form strategic-save-form">
                     <input type="hidden" name="organization" value="{escape(organization_name)}" />
@@ -3359,12 +3384,13 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
                 <p class="small muted">{escape(str(item.get("scope_type") or ""))} | {escape(str(item.get("function") or ""))} | {escape(str(item.get("influence_level") or ""))}</p>
                 <p class="small muted">{escape(str((item.get("detail_status") or {}).get("label") or "Matched, limited detail"))}</p>
                 <div class="strategic-pdl-actions">
+                    {source_html}
                     {linkedin_html}
                     {save_button}
                 </div>
             </article>
         """
-        if has_email or has_linkedin:
+        if has_email or has_phone or has_linkedin or has_source:
             primary_rows.append(card_markup)
         else:
             verification_rows.append(card_markup)
@@ -3374,7 +3400,7 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
         verification_section = f"""
             <details class="apollo-rejected-details strategic-weaker-results">
                 <summary>Needs verification ({len(verification_rows)})</summary>
-                <p class="small muted">These names do not yet have an email address or LinkedIn link, so they are harder to verify before saving.</p>
+                <p class="small muted">These names do not yet have an email address, phone number, or LinkedIn link, so they are harder to verify before saving.</p>
                 <div class="strategic-contact-grid">{''.join(verification_rows)}</div>
             </details>
         """
@@ -3404,12 +3430,18 @@ def render_strategic_pdl_results(payload, organization_name="", region="", funct
     """
 
 
-def search_openai_strategic_contacts(organization_name, region="", function="", force_refresh=False):
+def search_openai_strategic_contacts(
+    organization_name,
+    region="",
+    function="",
+    force_refresh=False,
+):
     organization_name = str(organization_name or "").strip()
     region = str(region or "").strip()
     function = str(function or "").strip()
-    discovery_limit = 50
-    enrich_limit = 30
+    discovery_limit = 30
+    result_limit = 24
+    enrich_limit = 24
 
     if not organization_name:
         return {
@@ -3491,6 +3523,8 @@ def search_openai_strategic_contacts(organization_name, region="", function="", 
     enriched_count = 0
     shortlisted = []
     skipped_without_contact_signal = 0
+    skipped_duplicates = 0
+    seen_candidates = set()
 
     for item in openai_result.get("results") or []:
         organization_value = str(item.get("organization_name") or organization_name).strip() or organization_name
@@ -3500,6 +3534,9 @@ def search_openai_strategic_contacts(organization_name, region="", function="", 
         city = str(item.get("city") or "").strip()
         candidate_region = str(item.get("region") or region).strip()
         country = str(item.get("country") or "").strip()
+        source_url = normalize_external_url(item.get("source_url") or "")
+        # Model-supplied profile URLs are not trusted as direct links. Only an
+        # enriched provider match can supply a direct LinkedIn profile URL.
         linkedin_url = ""
         person = {
             "job_title": title,
@@ -3540,12 +3577,23 @@ def search_openai_strategic_contacts(organization_name, region="", function="", 
             phone = str(get_pdl_person_phone(enriched_person) or phone).strip()
             city, candidate_region, country = get_pdl_location_parts(enriched_person)
             organization_value = get_pdl_company_name(enriched_person) or organization_value
-            linkedin_url = normalize_external_url(enriched_person.get("linkedin_url") or "")
+            linkedin_url = normalize_external_url(enriched_person.get("linkedin_url") or linkedin_url)
 
-        has_usable_signal = bool(email or phone or linkedin_url)
+        has_usable_signal = bool(email or phone or linkedin_url or source_url)
         if not has_usable_signal:
             skipped_without_contact_signal += 1
-            preview_only = True
+
+        candidate_key = (
+            email,
+            normalize_external_url(linkedin_url).lower(),
+            normalize_apollo_location_value(item.get("name")),
+            normalize_apollo_location_value(organization_value),
+            normalize_apollo_location_value(title),
+        )
+        if candidate_key in seen_candidates:
+            skipped_duplicates += 1
+            continue
+        seen_candidates.add(candidate_key)
 
         already_saved = bool(email and email.lower() in strategic_existing_keys)
         filemaker_presence = assess_filemaker_contact_presence(
@@ -3567,6 +3615,7 @@ def search_openai_strategic_contacts(organization_name, region="", function="", 
                 "phone": phone,
                 "title": title,
                 "linkedin_url": linkedin_url,
+                "source_url": source_url,
                 "organization_name": organization_value,
                 "organization_domain": "",
                 "region": candidate_region,
@@ -3586,7 +3635,18 @@ def search_openai_strategic_contacts(organization_name, region="", function="", 
             }
         )
 
-    shortlisted = shortlisted[:24]
+    shortlisted = sorted(
+        shortlisted,
+        key=lambda item: (
+            0 if item.get("already_saved") else 1,
+            1 if item.get("email") else 0,
+            1 if item.get("linkedin_url") else 0,
+            1 if item.get("phone") else 0,
+            rank_contact_position(item.get("title") or ""),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )[:result_limit]
     diagnostics = {
         "raw_people": len(openai_result.get("results") or []),
         "returned": len(shortlisted),
@@ -3600,6 +3660,7 @@ def search_openai_strategic_contacts(organization_name, region="", function="", 
             if not str(item.get("email") or "").strip() and not str(item.get("phone") or "").strip()
         ),
         "skipped_without_contact_signal": skipped_without_contact_signal,
+        "skipped_duplicates": skipped_duplicates,
         "preview_only_returned": sum(1 for item in shortlisted if item.get("preview_only")),
         "enriched_count": enriched_count,
         "enrich_attempts": enrich_attempts,
@@ -5410,8 +5471,10 @@ def get_strategic_contacts_page(
     discovery_payload = None
     current_user = get_current_session_user()
     discover_org = str(discover_org or "").strip()
-    discover_region = str(discover_region or "").strip()
-    discover_function = str(discover_function or "").strip()
+    # Strategic discovery intentionally searches every region and function.
+    # Keep accepting the legacy form fields so old links and clients do not fail.
+    discover_region = ""
+    discover_function = ""
     cache_key = build_strategic_discovery_cache_key(
         current_user,
         discover_org,
@@ -5438,32 +5501,11 @@ def get_strategic_contacts_page(
                     <span class="label">Organisation</span>
                     <input type="text" name="discover_org" value="{escape(discover_org)}" placeholder="Cintas / Vestis / UniFirst" required />
                 </label>
-                <div class="strategic-contact-form-row">
-                    <label>
-                        <span class="label">Region</span>
-                        <input type="text" name="discover_region" value="{escape(discover_region)}" placeholder="Optional" />
-                    </label>
-                    <label>
-                        <span class="label">Function</span>
-                        <select name="discover_function">
-                            <option value="">Any likely function</option>
-                            {render_select_options({value: value for value in STRATEGIC_CONTACT_FUNCTION_OPTIONS}, discover_function)}
-                        </select>
-                    </label>
-                </div>
                 <div class="m365-status-actions strategic-discovery-actions">
                     <button class="button secondary strategic-discovery-submit" type="submit">Find strategic contacts</button>
                     <a class="button secondary small-button" href="/organisation-chart-view">Organisation view</a>
                     <a class="button secondary small-button" href="/strategic-contacts-view">Clear</a>
-                    {f'''
-                    <form method="post" action="/strategic-contacts/search" class="inline-form">
-                        <input type="hidden" name="discover_org" value="{escape(discover_org)}" />
-                        <input type="hidden" name="discover_region" value="{escape(discover_region)}" />
-                        <input type="hidden" name="discover_function" value="{escape(discover_function)}" />
-                        <input type="hidden" name="discover_refresh" value="1" />
-                        <button class="button secondary small-button" type="submit">Refresh search</button>
-                    </form>
-                    ''' if discover_org else ''}
+                    {f'<button class="button secondary small-button" type="submit" name="discover_refresh" value="1">Refresh search</button>' if discover_org else ''}
                 </div>
             </form>
         </section>
@@ -5509,8 +5551,9 @@ def post_strategic_contacts_search(
         )
 
     discover_org = str(discover_org or "").strip()
-    discover_region = str(discover_region or "").strip()
-    discover_function = str(discover_function or "").strip()
+    # Legacy clients may still submit these fields, but discovery is deliberately broad.
+    discover_region = ""
+    discover_function = ""
     if not discover_org:
         return RedirectResponse(
             url=f"/strategic-contacts-view?error={quote('Please enter an organisation to search.')}",
@@ -5518,17 +5561,17 @@ def post_strategic_contacts_search(
         )
 
     force_refresh = str(discover_refresh or "").strip().lower() in {"1", "true", "yes", "on"}
-    pdl_payload = search_openai_strategic_contacts(
-        discover_org,
-        region=discover_region,
-        function=discover_function,
-        force_refresh=force_refresh,
-    )
     cache_key = build_strategic_discovery_cache_key(
         current_user,
         discover_org,
         discover_region,
         discover_function,
+    )
+    pdl_payload = search_openai_strategic_contacts(
+        discover_org,
+        region=discover_region,
+        function=discover_function,
+        force_refresh=force_refresh,
     )
     set_cached_strategic_discovery_result(cache_key, pdl_payload)
 
