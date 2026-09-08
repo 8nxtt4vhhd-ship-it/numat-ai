@@ -827,7 +827,9 @@ ORG_CHART_FILEMAKER_COMPANY_LABELS = {
 
 
 def can_manage_strategic_contacts(user):
-    return can_manage_user_accounts(user)
+    if not get_app_login_enabled():
+        return True
+    return bool(user and bool(user.get("active", True)))
 
 
 def can_search_strategic_contacts(user):
@@ -7316,7 +7318,7 @@ def handle_enrichment_sync_filemaker(
     state: str = "",
 ):
     current_user = get_current_session_user()
-    if not can_manage_strategic_contacts(current_user):
+    if not can_manage_user_accounts(current_user):
         return render_page(
             title="Customer Enrichment",
             body="<p class='status error'>You do not have permission to send enrichment contacts to FileMaker.</p>",
@@ -7365,7 +7367,7 @@ def handle_enrichment_mark_moved_on(
     source_label: str = "PDL enrichment",
 ):
     current_user = get_current_session_user()
-    if not can_manage_strategic_contacts(current_user):
+    if not can_manage_user_accounts(current_user):
         return render_page(
             title="Customer Enrichment",
             body="<p class='status error'>You do not have permission to update enrichment contacts in FileMaker.</p>",
@@ -7413,7 +7415,7 @@ def handle_enrichment_move_branch(
     source_label: str = "PDL enrichment branch move",
 ):
     current_user = get_current_session_user()
-    if not can_manage_strategic_contacts(current_user):
+    if not can_manage_user_accounts(current_user):
         return render_page(
             title="Customer Enrichment",
             body="<p class='status error'>You do not have permission to update enrichment contacts in FileMaker.</p>",
