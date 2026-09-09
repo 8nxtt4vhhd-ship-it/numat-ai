@@ -53,6 +53,7 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             calendar_result={"status": "ok", "events": []},
             finance_result={"status": "ok", "average_debtor_days": 24.0},
             master_data_result={"status": "ok", "companies": []},
+            order_result={"status": "ok", "orders": []},
             today=datetime(2026, 9, 1, 9, 0),
         )
 
@@ -60,6 +61,44 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         self.assertEqual(payload["accounts"]["invoiced_revenue_mtd"], 100000)
         self.assertEqual(payload["accounts"]["average_debtor_days"], 22.0)
         self.assertTrue(payload["accounts"]["debtor_days_is_historical"])
+
+    def test_identifies_first_ever_and_return_after_two_year_gap(self):
+        order_result = {
+            "status": "ok",
+            "orders": [
+                {"customer": "Brand New Co", "customer_primary_key": "new-1", "order_date": "2026-09-03"},
+                {"customer": "Returning Co", "customer_primary_key": "return-1", "order_date": "2023-08-01"},
+                {"customer": "Returning Co", "customer_primary_key": "return-1", "order_date": "2026-09-04"},
+                {"customer": "Regular Co", "customer_primary_key": "regular-1", "order_date": "2026-01-01"},
+                {"customer": "Regular Co", "customer_primary_key": "regular-1", "order_date": "2026-09-05"},
+            ],
+        }
+
+        results = main.build_new_and_returning_customers(
+            order_result,
+            datetime(2026, 9, 1),
+            datetime(2026, 10, 1),
+        )
+
+        self.assertEqual([item["customer"] for item in results], ["Returning Co", "Brand New Co"])
+        self.assertEqual(results[0]["category"], "Lost & lapsed return")
+        self.assertEqual(results[1]["category"], "New")
+
+    def test_customer_is_only_listed_once_in_review_period(self):
+        results = main.build_new_and_returning_customers(
+            {
+                "status": "ok",
+                "orders": [
+                    {"customer": "New Co", "customer_primary_key": "new-1", "order_date": "2026-09-02"},
+                    {"customer": "New Co", "customer_primary_key": "new-1", "order_date": "2026-09-08"},
+                ],
+            },
+            datetime(2026, 9, 1),
+            datetime(2026, 10, 1),
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["order_date"], "2026-09-02")
 
 
 if __name__ == "__main__":

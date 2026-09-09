@@ -6406,7 +6406,54 @@ def get_priority_one_customers(master_data_result=None):
     return customers, master_data_result
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, today=None):
+def build_new_and_returning_customers(order_result, period_start, period_end_exclusive):
+    if (order_result or {}).get("status") != "ok":
+        return []
+
+    orders_by_customer = defaultdict(list)
+    for order in order_result.get("orders", []):
+        order_date = parse_iso_date(order.get("order_date"))
+        customer_name = str(order.get("customer") or "").strip()
+        customer_key = str(order.get("customer_primary_key") or get_order_primary_key(order) or "").strip()
+        identity = customer_key or customer_name.casefold()
+        if not identity or not customer_name or not order_date:
+            continue
+        orders_by_customer[identity].append((order_date, order, customer_name, customer_key))
+
+    results = []
+    for customer_orders in orders_by_customer.values():
+        customer_orders.sort(key=lambda item: item[0])
+        for index, (order_date, _order, customer_name, customer_key) in enumerate(customer_orders):
+            if not (period_start.date() <= order_date.date() < period_end_exclusive.date()):
+                continue
+            if index == 0:
+                results.append({
+                    "customer": customer_name,
+                    "customer_primary_key": customer_key,
+                    "order_date": order_date.strftime("%Y-%m-%d"),
+                    "order_date_label": order_date.strftime("%d %b %Y"),
+                    "category": "New",
+                    "detail": "First-ever order",
+                })
+                break
+            previous_date = customer_orders[index - 1][0]
+            gap_days = (order_date.date() - previous_date.date()).days
+            if gap_days >= 730:
+                results.append({
+                    "customer": customer_name,
+                    "customer_primary_key": customer_key,
+                    "order_date": order_date.strftime("%Y-%m-%d"),
+                    "order_date_label": order_date.strftime("%d %b %Y"),
+                    "category": "Lost & lapsed return",
+                    "detail": f"First order in {gap_days / 365.25:.1f} years",
+                })
+                break
+
+    results.sort(key=lambda item: (item["order_date"], item["customer"].casefold()), reverse=True)
+    return results
+
+
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, today=None):
     today = today or datetime.now()
     review_period = get_weekly_kpi_review_period(today)
     if crm_result is None:
@@ -6431,6 +6478,12 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
     priority_customers, priority_result = get_priority_one_customers(master_data_result)
+    order_result = order_result or get_orders_for_analysis()
+    new_and_returning_customers = build_new_and_returning_customers(
+        order_result,
+        review_period["period_start"],
+        review_period["period_end_exclusive"],
+    )
     period_debtor_days = next(
         (
             item.get("aged_debtor_days")
@@ -6478,6 +6531,8 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         },
         "priority_customers": priority_customers,
         "priority_status": priority_result.get("status", "error"),
+        "new_and_returning_customers": new_and_returning_customers,
+        "new_and_returning_status": order_result.get("status", "error"),
         "summary": {
             "open_count": len(promises),
             "customer_count": customer_count,
@@ -6545,6 +6600,25 @@ def render_priority_customer_comms(activities):
     return f"<ul class='kpi-brief-comms'>{''.join(items)}</ul>"
 
 
+def render_new_and_returning_customers(customers):
+    if not customers:
+        return "<p class='kpi-customer-movement-empty'>No qualifying customers in this period.</p>"
+    rows = []
+    for item in customers[:6]:
+        customer = str(item.get("customer") or "Customer not identified")
+        customer_key = str(item.get("customer_primary_key") or "").strip()
+        href = f"/customer-profile-view?customer_primary_key={quote(customer_key)}&customer={quote(customer)}"
+        category_class = "new" if item.get("category") == "New" else "returned"
+        rows.append(f'''
+            <a class="kpi-customer-movement-row" href="{escape(href)}">
+                <span class="kpi-customer-movement-badge {category_class}">{escape(str(item.get('category') or ''))}</span>
+                <span class="kpi-customer-movement-copy"><strong>{escape(customer)}</strong><small>{escape(str(item.get('order_date_label') or ''))} · {escape(str(item.get('detail') or ''))}</small></span>
+            </a>
+        ''')
+    more = f"<p class='small muted kpi-customer-movement-more'>Showing 6 of {len(customers)}</p>" if len(customers) > 6 else ""
+    return f"<div class='kpi-customer-movement-list'>{''.join(rows)}</div>{more}"
+
+
 @app.get("/api/weekly-kpis")
 def get_weekly_kpis():
     return build_weekly_kpi_dashboard_payload()
@@ -6588,7 +6662,7 @@ def get_weekly_kpi_dashboard():
                     </div>
                     <div class="kpi-dashboard-actions">
                         <span class="small muted">Updated {escape(refresh_label)}</span>
-                        <button class="button secondary small-button" type="button" onclick="document.documentElement.requestFullscreen?.()">Presentation mode</button>
+                        <button class="button secondary small-button" type="button" onclick="document.documentElement.classList.add('kpi-presentation-mode'); document.documentElement.onfullscreenchange=()=>document.fullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); document.documentElement.onwebkitfullscreenchange=()=>document.webkitFullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement)">Presentation mode</button>
                     </div>
                 </div>
                 <div class="summary compact-summary kpi-summary-grid">
@@ -6625,6 +6699,15 @@ def get_weekly_kpi_dashboard():
                 </div>
                 <p class="small muted">Next 14 days · Shared NuMat Calendar</p>
                 {render_kpi_planned_visits(payload.get('planned_visits', []), payload.get('calendar_status'), payload.get('calendar_error'))}
+            </section>
+
+            <section class="panel kpi-customer-movement-panel">
+                <div class="kpi-section-title">
+                    <span class="kpi-section-mark customer-movement" aria-hidden="true"></span>
+                    <div><h2>New and returning customers</h2><p class="small muted">{escape(review_month)} · first-ever orders or first order after 2+ years</p></div>
+                </div>
+                {render_new_and_returning_customers(payload.get('new_and_returning_customers', []))}
+                {f'<p class="status warning">Order history is currently unavailable.</p>' if payload.get('new_and_returning_status') != 'ok' else ''}
             </section>
 
             <section class="panel kpi-production-panel">
@@ -22363,6 +22446,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: 0 5px 14px rgba(245, 158, 11, 0.25);
                     }}
 
+                    .kpi-section-mark.customer-movement {{
+                        background: linear-gradient(180deg, #e14f63, #f28a98);
+                        box-shadow: 0 5px 14px rgba(225, 79, 99, 0.22);
+                    }}
+
                     .kpi-dashboard-actions {{
                         display: flex;
                         align-items: center;
@@ -22381,6 +22469,85 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-height: 360px;
                         padding: 24px;
                         border-top: 4px solid #f59e0b;
+                    }}
+
+                    .kpi-customer-movement-panel {{
+                        grid-column: 1 / -1;
+                        padding: 20px 24px;
+                        border-top: 4px solid #e14f63;
+                    }}
+
+                    .kpi-customer-movement-panel .kpi-section-title {{
+                        align-items: flex-start;
+                        margin-bottom: 14px;
+                    }}
+
+                    .kpi-customer-movement-panel .kpi-section-title h2 {{
+                        font-size: 21px;
+                    }}
+
+                    .kpi-customer-movement-panel .kpi-section-title p {{
+                        margin: 3px 0 0;
+                    }}
+
+                    .kpi-customer-movement-list {{
+                        display: grid;
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        gap: 7px;
+                    }}
+
+                    .kpi-customer-movement-row {{
+                        display: grid;
+                        grid-template-columns: auto minmax(0, 1fr);
+                        align-items: center;
+                        gap: 10px;
+                        padding: 9px 10px;
+                        border-radius: 11px;
+                        background: #f7f9fc;
+                        color: var(--text);
+                        text-decoration: none;
+                    }}
+
+                    .kpi-customer-movement-row:hover {{
+                        background: #eef3fb;
+                    }}
+
+                    .kpi-customer-movement-copy {{
+                        min-width: 0;
+                    }}
+
+                    .kpi-customer-movement-copy strong,
+                    .kpi-customer-movement-copy small {{
+                        display: block;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                        white-space: nowrap;
+                    }}
+
+                    .kpi-customer-movement-copy small {{
+                        margin-top: 2px;
+                        color: var(--muted);
+                    }}
+
+                    .kpi-customer-movement-badge {{
+                        padding: 4px 7px;
+                        border-radius: 999px;
+                        background: #e7f8f1;
+                        color: #08765f;
+                        font-size: 11px;
+                        font-weight: 800;
+                        white-space: nowrap;
+                    }}
+
+                    .kpi-customer-movement-badge.returned {{
+                        background: #fff0e8;
+                        color: #a54517;
+                    }}
+
+                    .kpi-customer-movement-empty,
+                    .kpi-customer-movement-more {{
+                        margin: 0;
+                        color: var(--muted);
                     }}
 
                     .kpi-detail-button {{
@@ -22561,6 +22728,229 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-height: 360px;
                         padding: 24px;
                         border-top: 4px solid #00a884;
+                    }}
+
+                    html:fullscreen body {{
+                        overflow: hidden;
+                    }}
+
+                    html:fullscreen main.kpi-dashboard-main {{
+                        box-sizing: border-box;
+                        width: 100%;
+                        max-width: none;
+                        height: 100vh;
+                        padding: 10px 14px;
+                        overflow: hidden;
+                    }}
+
+                    html:fullscreen .kpi-dashboard-main > .top-row {{
+                        display: none;
+                    }}
+
+                    html:fullscreen .kpi-dashboard-main > h1 {{
+                        margin-bottom: 8px;
+                        font-size: 22px;
+                    }}
+
+                    html:fullscreen .kpi-dashboard-grid {{
+                        gap: 10px;
+                    }}
+
+                    html:fullscreen .kpi-promises-panel,
+                    html:fullscreen .kpi-priority-panel,
+                    html:fullscreen .kpi-planned-visits-panel {{
+                        min-height: 0;
+                        height: 210px;
+                        padding: 12px 14px;
+                    }}
+
+                    html:fullscreen .kpi-promises-head {{
+                        gap: 6px;
+                        margin-bottom: 8px;
+                    }}
+
+                    html:fullscreen .kpi-promises-panel .kpi-promises-head {{
+                        flex-direction: row;
+                        align-items: center;
+                    }}
+
+                    html:fullscreen .kpi-promises-panel .kpi-dashboard-actions {{
+                        width: auto;
+                        margin-left: auto;
+                        gap: 8px;
+                    }}
+
+                    html:fullscreen .kpi-dashboard-actions .button,
+                    html:fullscreen .kpi-visits-head .button,
+                    html:fullscreen .kpi-detail-button {{
+                        min-height: 32px;
+                        padding: 7px 11px;
+                        font-size: 12px;
+                    }}
+
+                    html:fullscreen .kpi-section-title h2,
+                    html:fullscreen .kpi-promises-head h2 {{
+                        font-size: 18px;
+                    }}
+
+                    html:fullscreen .kpi-section-mark {{
+                        width: 5px;
+                        height: 23px;
+                    }}
+
+                    html:fullscreen .kpi-summary-grid {{
+                        gap: 7px;
+                        margin-bottom: 8px;
+                    }}
+
+                    html:fullscreen .kpi-summary-grid div {{
+                        padding: 7px 10px;
+                    }}
+
+                    html:fullscreen .kpi-summary-grid strong {{
+                        font-size: 23px;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-promises-head {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr) auto;
+                        align-items: center;
+                        gap: 8px;
+                        margin-bottom: 7px;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-section-title h2 {{
+                        font-size: 18px;
+                        white-space: nowrap;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-section-mark {{
+                        width: 5px;
+                        height: 23px;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-dashboard-actions {{
+                        width: auto;
+                        gap: 7px;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-dashboard-actions .button {{
+                        min-height: 30px;
+                        padding: 6px 9px;
+                        font-size: 11px;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-dashboard-actions .small {{
+                        font-size: 10px;
+                        white-space: nowrap;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-summary-grid {{
+                        gap: 6px;
+                        margin: 0 0 7px;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-summary-grid > div {{
+                        min-height: 0;
+                        padding: 6px 9px;
+                        border-radius: 10px;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-summary-grid span {{
+                        font-size: 10px;
+                        line-height: 1.15;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-summary-grid strong {{
+                        margin-top: 2px;
+                        font-size: 21px;
+                        line-height: 1;
+                    }}
+
+                    html.kpi-presentation-mode .kpi-promises-panel .kpi-detail-button {{
+                        min-height: 29px;
+                        margin: 0;
+                        padding: 5px 9px;
+                        font-size: 11px;
+                    }}
+
+                    html:fullscreen .kpi-priority-count-tile {{
+                        min-height: 128px;
+                        padding: 12px 16px;
+                    }}
+
+                    html:fullscreen .kpi-priority-count-tile strong {{
+                        margin: 4px 0;
+                        font-size: 39px;
+                    }}
+
+                    html:fullscreen .kpi-planned-visits-panel > p {{
+                        margin: 4px 0 0;
+                    }}
+
+                    html:fullscreen .kpi-visits-list {{
+                        max-height: 132px;
+                        margin-top: 7px;
+                        gap: 5px;
+                    }}
+
+                    html:fullscreen .kpi-visit-card {{
+                        grid-template-columns: 74px minmax(0, 1fr);
+                        padding: 6px 9px;
+                    }}
+
+                    html:fullscreen .kpi-customer-movement-panel {{
+                        padding: 10px 14px;
+                    }}
+
+                    html:fullscreen .kpi-customer-movement-panel .kpi-section-title {{
+                        margin-bottom: 7px;
+                    }}
+
+                    html:fullscreen .kpi-customer-movement-panel .kpi-section-title h2 {{
+                        font-size: 18px;
+                    }}
+
+                    html:fullscreen .kpi-customer-movement-row {{
+                        padding: 6px 8px;
+                    }}
+
+                    html:fullscreen .kpi-production-panel,
+                    html:fullscreen .kpi-accounts-panel {{
+                        padding: 10px 14px;
+                    }}
+
+                    html:fullscreen .kpi-production-head {{
+                        margin-bottom: 7px;
+                    }}
+
+                    html:fullscreen .kpi-production-head h2 {{
+                        font-size: 18px;
+                    }}
+
+                    html:fullscreen .production-kpi-grid {{
+                        gap: 7px;
+                    }}
+
+                    html:fullscreen .production-kpi-grid > div {{
+                        padding: 8px 10px;
+                    }}
+
+                    html:fullscreen .production-kpi-grid strong {{
+                        margin: 3px 0 2px;
+                        font-size: 22px;
+                    }}
+
+                    html:fullscreen .production-kpi-grid .kpi-value-trend > strong {{
+                        font-size: 21px;
+                    }}
+
+                    html:fullscreen .production-kpi-grid .kpi-trend {{
+                        padding: 5px 7px;
+                    }}
+
+                    html:fullscreen .production-kpi-grid .kpi-trend-arrow {{
+                        font-size: 19px;
                     }}
 
                     .kpi-visits-head {{
@@ -27428,6 +27818,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 720px) {{
+                        .kpi-customer-movement-list {{
+                            grid-template-columns: 1fr;
+                        }}
+
                         .production-analysis-toolbar {{
                             display: grid;
                             align-items: start;
