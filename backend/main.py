@@ -463,8 +463,6 @@ def user_requires_email_mfa(user):
         return False
     if not user or not bool(user.get("active", True)):
         return False
-    if normalize_username(user.get("username")) == get_login_mfa_sender_username():
-        return False
     return True
 
 
