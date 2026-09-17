@@ -6360,7 +6360,42 @@ def is_priority_one_customer(customer):
         return value.casefold() in {"priority 1", "p1"}
 
 
-def build_open_promises(crm_result):
+def resolve_current_promise_customer(activity, master_data_result=None):
+    fallback_customer = str(
+        activity.get("customer_company")
+        or activity.get("customer_label")
+        or activity.get("recipient_company")
+        or activity.get("sender_company")
+        or "Customer not identified"
+    ).strip()
+    fallback_key = str(activity.get("customer_primary_key") or "").strip()
+    if (master_data_result or {}).get("status") != "ok":
+        return fallback_customer, fallback_key
+
+    candidate_emails = []
+    sender_email = str(activity.get("sender_email") or "").strip().lower()
+    if is_external_email_address(sender_email):
+        candidate_emails.append(sender_email)
+    candidate_emails.extend(
+        email.strip().lower()
+        for email in extract_emails(str(activity.get("to") or ""))
+        if is_external_email_address(email)
+    )
+
+    contacts_by_email = master_data_result.get("contacts_by_email", {}) or {}
+    customers_by_key = master_data_result.get("customers_by_key", {}) or {}
+    for email in dict.fromkeys(candidate_emails):
+        contact = contacts_by_email.get(email) or {}
+        current_customer_key = str(contact.get("customer_ref") or "").strip()
+        current_customer = customers_by_key.get(current_customer_key) or {}
+        current_customer_name = str(current_customer.get("company") or "").strip()
+        if current_customer_key and current_customer_name:
+            return current_customer_name, current_customer_key
+
+    return fallback_customer, fallback_key
+
+
+def build_open_promises(crm_result, master_data_result=None):
     activities = crm_result.get("activities", []) if crm_result.get("status") == "ok" else []
     promises = []
     for activity in activities:
@@ -6370,16 +6405,13 @@ def build_open_promises(crm_result):
             continue
         created_at = parse_crm_datetime(activity.get("date_created"))
         age_days = max((datetime.now() - created_at).days, 0) if created_at else None
-        customer = str(
-            activity.get("customer_company")
-            or activity.get("customer_label")
-            or activity.get("recipient_company")
-            or activity.get("sender_company")
-            or "Customer not identified"
-        ).strip()
+        customer, customer_primary_key = resolve_current_promise_customer(
+            activity,
+            master_data_result,
+        )
         promises.append({
             "customer": customer,
-            "customer_primary_key": str(activity.get("customer_primary_key") or "").strip(),
+            "customer_primary_key": customer_primary_key,
             "promise": str(activity.get("subject") or activity.get("body") or "Promise details not recorded").strip(),
             "created_at": str(activity.get("date_created") or "").strip(),
             "created_label": format_optional_datetime(activity.get("date_created")),
@@ -6451,32 +6483,57 @@ def build_new_and_returning_customers(order_result, period_start, period_end_exc
     return results
 
 
+def fetch_weekly_kpi_crm_result():
+    result = fetch_promise_of_order_activities()
+    if result.get("status") != "ok":
+        result = fetch_crm_activities()
+    return result
+
+
 def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, today=None):
+    started_at = time.perf_counter()
     today = today or datetime.now()
     review_period = get_weekly_kpi_review_period(today)
-    if crm_result is None:
-        crm_result = fetch_promise_of_order_activities()
-        if crm_result.get("status") != "ok":
-            crm_result = fetch_crm_activities()
-    promises = build_open_promises(crm_result)
+    calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
+    loaders = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        if crm_result is None:
+            loaders["crm_result"] = executor.submit(fetch_weekly_kpi_crm_result)
+        if production_result is None:
+            loaders["production_result"] = executor.submit(fetch_production_analysis_data)
+        if calendar_result is None:
+            loaders["calendar_result"] = executor.submit(
+                fetch_calendar_events,
+                calendar_start,
+                calendar_start + timedelta(days=14),
+            )
+        if finance_result is None:
+            loaders["finance_result"] = executor.submit(fetch_aged_debt_summary)
+        if master_data_result is None:
+            loaders["master_data_result"] = executor.submit(fetch_filemaker_master_data)
+        loaded = {name: future.result() for name, future in loaders.items()}
+
+    crm_result = crm_result if crm_result is not None else loaded["crm_result"]
+    production_result = production_result if production_result is not None else loaded["production_result"]
+    calendar_result = calendar_result if calendar_result is not None else loaded["calendar_result"]
+    finance_result = finance_result if finance_result is not None else loaded["finance_result"]
+    master_data_result = master_data_result if master_data_result is not None else loaded["master_data_result"]
+    log_perf_metric("weekly_kpi.load_data_sources_parallel", started_at)
+
+    promises = build_open_promises(crm_result, master_data_result)
     customer_count = len({item["customer"].casefold() for item in promises if item["customer"]})
     aged_promises = [item for item in promises if item.get("age_days") is not None]
-    production_result = production_result or fetch_production_analysis_data()
     production_mtd = build_production_period_payload(
         production_result=production_result,
         period_start=review_period["period_start"],
         period_end_exclusive=review_period["period_end_exclusive"],
     )
-    if calendar_result is None:
-        calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
-        calendar_result = fetch_calendar_events(calendar_start, calendar_start + timedelta(days=14))
     planned_visits = calendar_result.get("events", []) if calendar_result.get("status") == "ok" else []
-    finance_result = finance_result or fetch_aged_debt_summary()
     daily_invoice_target = get_daily_invoice_target()
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
     priority_customers, priority_result = get_priority_one_customers(master_data_result)
-    order_result = order_result or get_orders_for_analysis()
+    order_result = order_result if order_result is not None else get_orders_for_analysis()
     new_and_returning_customers = build_new_and_returning_customers(
         order_result,
         review_period["period_start"],
@@ -6501,7 +6558,7 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         account_payload["average_debtor_days"] = period_debtor_days
         account_payload["debtor_days_is_historical"] = True
 
-    return {
+    payload = {
         "status": crm_result.get("status", "error"),
         "source": crm_result.get("source", ""),
         "synced_at": crm_result.get("synced_at") or crm_result.get("cache_updated_at") or "",
@@ -6538,6 +6595,8 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
             "oldest_days": max((item["age_days"] for item in aged_promises), default=None),
         },
     }
+    log_perf_metric("weekly_kpi.total", started_at)
+    return payload
 
 
 def render_kpi_planned_visits(events, calendar_status="ok", calendar_error=""):
@@ -6565,7 +6624,8 @@ def render_open_promises_table(promises):
     rows = []
     for item in promises:
         customer = str(item.get("customer") or "Customer not identified")
-        customer_href = f"/customer-view?customer={quote(customer)}"
+        customer_key = str(item.get("customer_primary_key") or "").strip()
+        customer_href = f"/customer-profile-view?customer_primary_key={quote(customer_key)}&customer={quote(customer)}"
         rows.append(f"""
             <tr>
                 <td data-label="Customer"><a href="{escape(customer_href)}"><strong>{escape(customer)}</strong></a></td>
@@ -6624,10 +6684,7 @@ def get_weekly_kpis():
 
 @app.get("/weekly-kpi-dashboard", response_class=HTMLResponse)
 def get_weekly_kpi_dashboard():
-    crm_result = fetch_promise_of_order_activities()
-    if crm_result.get("status") != "ok":
-        crm_result = fetch_crm_activities()
-    payload = build_weekly_kpi_dashboard_payload(crm_result=crm_result)
+    payload = build_weekly_kpi_dashboard_payload()
     summary = payload["summary"]
     production_mtd = payload.get("production_mtd", {})
     production_summary = production_mtd.get("summary", {})
@@ -6758,14 +6815,16 @@ def get_weekly_kpi_promises_page():
     crm_result = fetch_promise_of_order_activities()
     if crm_result.get("status") != "ok":
         crm_result = fetch_crm_activities()
-    promises = build_open_promises(crm_result)
+    master_data_result = fetch_filemaker_master_data()
+    promises = build_open_promises(crm_result, master_data_result)
     rows = []
     for item in promises:
         customer = str(item.get("customer") or "Customer not identified")
+        customer_key = str(item.get("customer_primary_key") or "").strip()
         rows.append(f"""
             <tr>
                 <td data-label="Date">{escape(item.get('created_label') or 'Date unavailable')}</td>
-                <td data-label="Customer"><a href="/customer-view?customer={quote(customer)}"><strong>{escape(customer)}</strong></a></td>
+                <td data-label="Customer"><a href="/customer-profile-view?customer_primary_key={quote(customer_key)}&customer={quote(customer)}"><strong>{escape(customer)}</strong></a></td>
                 <td data-label="Promise">{escape(str(item.get('promise') or ''))}</td>
                 <td data-label="Age">{escape(str(item.get('age_days')) + ' days' if item.get('age_days') is not None else '—')}</td>
                 <td data-label="Owner">{escape(str(item.get('owner') or ''))}</td>
