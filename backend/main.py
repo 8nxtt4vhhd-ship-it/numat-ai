@@ -48,6 +48,7 @@ from analysis import (
 from app_settings import calculate_elapsed_invoice_target, get_daily_invoice_target, set_daily_invoice_target
 from data_sources import (
     MAX_SAMPLE_ROWS,
+    clear_filemaker_orders_cache,
     get_orders_for_analysis,
     get_sample_csv_path,
     validate_sample_csv_content,
@@ -4968,6 +4969,13 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                         <div><span class="label">Elapsed target</span><strong>{format_production_number(elapsed_target, currency=True)}</strong></div>
                     </div>
                 </div>
+                <div class="action-column">
+                    <h3>Weekly KPI data</h3>
+                    <p class="subtle">Force the dashboard to retrieve fresh data from FileMaker, Microsoft 365 and the other connected sources. Use this after correcting a source value that is still showing on the dashboard.</p>
+                    <form method="post" action="/admin-settings/refresh-weekly-kpi">
+                        <button class="button" type="submit">Refresh KPI dashboard data</button>
+                    </form>
+                </div>
             </div>
         </section>
     """
@@ -4991,6 +4999,27 @@ def post_admin_invoice_target(daily_invoice_target: str = Form("")):
         area="system-settings",
     )
     return RedirectResponse(url="/admin-settings?message=" + quote("Daily invoiced-sales target updated."), status_code=303)
+
+
+@app.post("/admin-settings/refresh-weekly-kpi")
+def post_admin_refresh_weekly_kpi():
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(
+            url="/admin-settings?error=" + quote("You do not have permission to refresh KPI data."),
+            status_code=303,
+        )
+    record_audit_event(
+        "kpi-refresh",
+        target="Weekly KPI Dashboard",
+        details="Requested a forced refresh of all dashboard data sources.",
+        user=current_user,
+        area="system-settings",
+    )
+    return RedirectResponse(
+        url="/weekly-kpi-dashboard?refresh=true&message=" + quote("Weekly KPI data refreshed from the connected sources."),
+        status_code=303,
+    )
 
 
 @app.get("/user-accounts", response_class=HTMLResponse)
@@ -6483,14 +6512,14 @@ def build_new_and_returning_customers(order_result, period_start, period_end_exc
     return results
 
 
-def fetch_weekly_kpi_crm_result():
-    result = fetch_promise_of_order_activities()
+def fetch_weekly_kpi_crm_result(force_refresh=False):
+    result = fetch_promise_of_order_activities(force_refresh=force_refresh)
     if result.get("status") != "ok":
         result = fetch_crm_activities()
     return result
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, today=None):
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, today=None, force_refresh=False):
     started_at = time.perf_counter()
     today = today or datetime.now()
     review_period = get_weekly_kpi_review_period(today)
@@ -6498,19 +6527,20 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     loaders = {}
     with ThreadPoolExecutor(max_workers=5) as executor:
         if crm_result is None:
-            loaders["crm_result"] = executor.submit(fetch_weekly_kpi_crm_result)
+            loaders["crm_result"] = executor.submit(fetch_weekly_kpi_crm_result, force_refresh=force_refresh)
         if production_result is None:
-            loaders["production_result"] = executor.submit(fetch_production_analysis_data)
+            loaders["production_result"] = executor.submit(fetch_production_analysis_data, force_refresh=force_refresh)
         if calendar_result is None:
             loaders["calendar_result"] = executor.submit(
                 fetch_calendar_events,
                 calendar_start,
                 calendar_start + timedelta(days=14),
+                force_refresh=force_refresh,
             )
         if finance_result is None:
-            loaders["finance_result"] = executor.submit(fetch_aged_debt_summary)
+            loaders["finance_result"] = executor.submit(fetch_aged_debt_summary, force_refresh=force_refresh)
         if master_data_result is None:
-            loaders["master_data_result"] = executor.submit(fetch_filemaker_master_data)
+            loaders["master_data_result"] = executor.submit(fetch_filemaker_master_data, force_refresh=force_refresh)
         loaded = {name: future.result() for name, future in loaders.items()}
 
     crm_result = crm_result if crm_result is not None else loaded["crm_result"]
@@ -6533,6 +6563,8 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
     priority_customers, priority_result = get_priority_one_customers(master_data_result)
+    if order_result is None and force_refresh:
+        clear_filemaker_orders_cache()
     order_result = order_result if order_result is not None else get_orders_for_analysis()
     new_and_returning_customers = build_new_and_returning_customers(
         order_result,
@@ -6683,8 +6715,11 @@ def get_weekly_kpis():
 
 
 @app.get("/weekly-kpi-dashboard", response_class=HTMLResponse)
-def get_weekly_kpi_dashboard():
-    payload = build_weekly_kpi_dashboard_payload()
+def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
+    current_user = get_current_session_user()
+    refresh_requested = str(refresh or "").strip().casefold() in {"1", "true", "yes", "on"}
+    force_refresh = bool(refresh_requested and can_manage_user_accounts(current_user))
+    payload = build_weekly_kpi_dashboard_payload(force_refresh=force_refresh)
     summary = payload["summary"]
     production_mtd = payload.get("production_mtd", {})
     production_summary = production_mtd.get("summary", {})
@@ -6707,7 +6742,16 @@ def get_weekly_kpi_dashboard():
     )
     refresh_label = format_optional_datetime(payload.get("synced_at")) if payload.get("synced_at") else "Current CRM cache"
 
+    refresh_status = (
+        f'<p class="status ok">{escape(message or "Weekly KPI data refreshed from the connected sources.")}</p>'
+        if force_refresh else
+        '<p class="status error">You do not have permission to force-refresh KPI data.</p>'
+        if refresh_requested else
+        ""
+    )
+
     body = f"""
+        {refresh_status}
         <div class="kpi-dashboard-grid">
             <section class="panel kpi-promises-panel">
                 <div class="kpi-promises-head">

@@ -29,6 +29,35 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         for loader in (crm_loader, production_loader, calendar_loader, finance_loader, master_loader, order_loader):
             loader.assert_called_once()
 
+    def test_forced_dashboard_refresh_bypasses_source_caches(self):
+        production = {"status": "ok", "production_rows": [], "operator_rows": [], "plant_operator_rows": []}
+        calendar = {"status": "ok", "events": []}
+        finance = {"status": "ok", "average_debtor_days": 20.0}
+        master = {"status": "ok", "companies": [], "contacts_by_email": {}, "customers_by_key": {}}
+        orders = {"status": "ok", "orders": []}
+        crm = {"status": "ok", "activities": []}
+
+        with (
+            patch.object(main, "fetch_weekly_kpi_crm_result", return_value=crm) as crm_loader,
+            patch.object(main, "fetch_production_analysis_data", return_value=production) as production_loader,
+            patch.object(main, "fetch_calendar_events", return_value=calendar) as calendar_loader,
+            patch.object(main, "fetch_aged_debt_summary", return_value=finance) as finance_loader,
+            patch.object(main, "fetch_filemaker_master_data", return_value=master) as master_loader,
+            patch.object(main, "clear_filemaker_orders_cache") as clear_orders,
+            patch.object(main, "get_orders_for_analysis", return_value=orders),
+        ):
+            main.build_weekly_kpi_dashboard_payload(
+                today=datetime(2026, 10, 1, 9, 0),
+                force_refresh=True,
+            )
+
+        crm_loader.assert_called_once_with(force_refresh=True)
+        production_loader.assert_called_once_with(force_refresh=True)
+        finance_loader.assert_called_once_with(force_refresh=True)
+        master_loader.assert_called_once_with(force_refresh=True)
+        self.assertTrue(calendar_loader.call_args.kwargs["force_refresh"])
+        clear_orders.assert_called_once_with()
+
     def test_promise_status_received_or_cancelled_is_closed(self):
         for status in ("Received", "Cancelled"):
             activity = normalize_crm_row({

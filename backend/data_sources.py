@@ -105,6 +105,12 @@ def get_filemaker_cache_seconds():
         return 120
 
 
+def clear_filemaker_orders_cache():
+    _FILEMAKER_ORDER_CACHE["key"] = None
+    _FILEMAKER_ORDER_CACHE["expires_at"] = 0
+    _FILEMAKER_ORDER_CACHE["result"] = None
+
+
 def fetch_cached_filemaker_orders():
     limit = get_filemaker_order_limit()
     cache_seconds = get_filemaker_cache_seconds()
