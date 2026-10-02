@@ -858,6 +858,11 @@ def is_inactive_filemaker_customer(customer):
     return str((customer or {}).get("activity_status") or "").strip().lower() == "inactive"
 
 
+def is_supported_filemaker_customer_type(customer):
+    customer_type = str((customer or {}).get("type") or "").strip().casefold()
+    return customer_type in {"customer", "corporate"}
+
+
 def fetch_filemaker_company_directory():
     config = get_filemaker_config()
     if not config["customers_layout"]:
@@ -1006,7 +1011,7 @@ def fetch_filemaker_master_data(force_refresh=False):
 
         companies.append(customer)
 
-        if customer["type"].lower() != "customer":
+        if not is_supported_filemaker_customer_type(customer):
             continue
 
         if not customer["primary_key"]:

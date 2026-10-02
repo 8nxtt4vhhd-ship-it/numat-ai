@@ -21,6 +21,13 @@ class InactiveCustomerFilteringTests(unittest.TestCase):
 
         self.assertTrue(filemaker.is_inactive_filemaker_customer(customer))
 
+    def test_customer_and_corporate_types_are_available_for_contact_mapping(self):
+        self.assertTrue(filemaker.is_supported_filemaker_customer_type({"type": "Customer"}))
+        self.assertTrue(filemaker.is_supported_filemaker_customer_type({"type": "Corporate"}))
+        self.assertTrue(filemaker.is_supported_filemaker_customer_type({"type": " corporate "}))
+        self.assertFalse(filemaker.is_supported_filemaker_customer_type({"type": "Prospect"}))
+        self.assertFalse(filemaker.is_supported_filemaker_customer_type({"type": ""}))
+
     def test_filemaker_orders_exclude_inactive_customer_key(self):
         orders = [
             {"customer": "Active Co", "extra": {"Customer Ref": "A1"}},
