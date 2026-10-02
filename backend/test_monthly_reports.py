@@ -111,6 +111,22 @@ class MonthlyReportTests(unittest.TestCase):
 
 
 class ReportingMailTests(unittest.TestCase):
+    def test_delegated_sender_supports_attachment(self):
+        with patch.object(m365.requests, "post", return_value=FakeResponse(202, None)) as request:
+            result = m365.send_m365_mail(
+                "test-token",
+                "kelly@example.com",
+                "Report",
+                "Attached",
+                attachments=[{"name": "report.pdf", "content_type": "application/pdf", "content": b"pdf"}],
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("/me/sendMail", request.call_args.args[0])
+        payload = request.call_args.kwargs["json"]
+        self.assertEqual(payload["message"]["attachments"][0]["contentBytes"], "cGRm")
+        self.assertEqual(payload["message"]["attachments"][0]["contentType"], "application/pdf")
+
     def test_app_only_sender_uses_configured_mailbox_and_attachment(self):
         environment = {
             "M365_REPORTING_ENABLED": "true",

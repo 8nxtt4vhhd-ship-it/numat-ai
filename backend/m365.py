@@ -439,7 +439,7 @@ def ensure_valid_access_token(username):
     }
 
 
-def send_m365_mail(access_token, recipient, subject, body):
+def send_m365_mail(access_token, recipient, subject, body, attachments=None):
     headers = {
         "Authorization": f"Bearer {str(access_token or '').strip()}",
         "Content-Type": "application/json",
@@ -454,6 +454,16 @@ def send_m365_mail(access_token, recipient, subject, body):
             },
             "toRecipients": [
                 {"emailAddress": {"address": str(recipient or "").strip()}}
+            ],
+            "attachments": [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": str(item.get("name") or "attachment"),
+                    "contentType": str(item.get("content_type") or "application/octet-stream"),
+                    "contentBytes": base64.b64encode(item.get("content") or b"").decode("ascii"),
+                }
+                for item in (attachments or [])
+                if item.get("content") is not None
             ],
         },
         "saveToSentItems": True,

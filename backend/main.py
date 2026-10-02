@@ -109,10 +109,12 @@ from m365 import (
     get_m365_token_record,
     has_m365_config,
     send_m365_mail,
+    send_m365_reporting_mail,
     set_m365_token_record,
 )
 from production import build_production_kpi_payload, fetch_production_analysis_data
 from production_reports import build_ai_analysis_docx, build_ai_report_facts, build_anomaly_workbook, clean_filename
+from strategic_contacts_report import build_strategic_contacts_pdf
 from pdl import (
     check_pdl_connection,
     enrich_pdl_person,
@@ -732,6 +734,8 @@ def normalize_strategic_contact_record(item):
         "filemaker_sync_status": str(item.get("filemaker_sync_status") or "").strip(),
         "filemaker_sync_error": str(item.get("filemaker_sync_error") or "").strip(),
         "filemaker_synced_at": str(item.get("filemaker_synced_at") or "").strip(),
+        "enrichment_source": str(item.get("enrichment_source") or "").strip(),
+        "enriched_at": str(item.get("enriched_at") or "").strip(),
         "name": str(item.get("name") or "").strip(),
         "position": str(item.get("position") or "").strip(),
         "email": str(item.get("email") or "").strip(),
@@ -760,6 +764,14 @@ def find_strategic_contact(contact_id):
         if str(item.get("id") or "").strip() == normalized_id:
             return item
     return None
+
+
+def is_placeholder_contact_email(email):
+    normalized = str(email or "").strip().casefold()
+    if not normalized:
+        return True
+    local_part = normalized.split("@", 1)[0]
+    return local_part in {"tbc", "tbd", "unknown", "none", "na", "n/a"}
 
 
 STRATEGIC_CONTACT_SCOPE_OPTIONS = [
@@ -2149,7 +2161,7 @@ def render_organisation_geo_map(rows, selected_group):
     """
 
 
-def render_organisation_chart(items, selected_group, filemaker_presence_map=None):
+def render_organisation_chart(items, selected_group, filemaker_presence_map=None, contact_activity_map=None):
     selected_config = ORG_CHART_GROUPS.get(selected_group) or next(iter(ORG_CHART_GROUPS.values()))
     filtered = [
         item for item in items
@@ -2209,6 +2221,11 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                 filemaker_sync_status = str(item.get("filemaker_sync_status") or "").strip().lower()
                 filemaker_sync_error = str(item.get("filemaker_sync_error") or "").strip()
                 filemaker_presence = (filemaker_presence_map or {}).get(item_id) or {}
+                recent_contact = (contact_activity_map or {}).get(item_id) or {}
+                recent_contact_date = str(recent_contact.get("date_label") or "").strip()
+                recent_contact_subject = str(recent_contact.get("subject") or "").strip()
+                recent_contact_preview = str(recent_contact.get("preview") or "").strip()
+                contact_history_class = get_strategic_contact_recency_class(recent_contact)
                 presence_badge = (
                     f"<span class='status-pill warning'>{escape(str(filemaker_presence.get('label') or 'Already in FileMaker'))}</span>"
                     if filemaker_presence.get("exists")
@@ -2229,12 +2246,22 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     sync_status_markup = f"<p class='small muted' style='color:#b42318;'>{escape(filemaker_sync_error)}</p>"
                 actions = ""
                 if can_manage_strategic_contacts(current_user):
-                    actions = f"""
-                        <div class="strategic-card-actions">
+                    sync_action = ""
+                    if not filemaker_presence.get("exists"):
+                        sync_action = f"""
                             <form method="post" action="/strategic-contacts/sync-filemaker">
                                 <input type="hidden" name="contact_id" value="{escape(str(item.get('id') or ''))}">
                                 <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
                                 <button class="button secondary small-button" type="submit">Sync to FileMaker</button>
+                            </form>
+                        """
+                    actions = f"""
+                        <div class="strategic-card-actions">
+                            {sync_action}
+                            <form method="post" action="/strategic-contacts/enrich">
+                                <input type="hidden" name="contact_id" value="{escape(str(item.get('id') or ''))}">
+                                <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
+                                <button class="button secondary small-button" type="submit">Enrich</button>
                             </form>
                             <a class="button secondary small-button" href="/strategic-contacts-view?edit={quote(str(item.get('id') or ''))}">Edit</a>
                             <form method="post" action="/strategic-contacts/delete" onsubmit="return confirm('Remove this contact from the organisation view?');">
@@ -2246,7 +2273,7 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     """
                 cards.append(
                     f"""
-                        <article class="panel strategic-contact-card org-chart-contact-card">
+                        <article class="panel strategic-contact-card org-chart-contact-card{contact_history_class}">
                             <div class="org-chart-contact-node">
                                 <div class="org-chart-contact-main">
                                 <div class="org-chart-contact-title-row">
@@ -2256,6 +2283,14 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                                     </div>
                                 </div>
                                 <p class="org-chart-contact-preview-role">{escape(position)}</p>
+                                <div class="org-chart-recent-contact">
+                                    <div class="org-chart-recent-contact-head">
+                                        <span>Most recent contact</span>
+                                        <strong>{escape(recent_contact_date or 'No contact recorded')}</strong>
+                                    </div>
+                                    {f'<p class="org-chart-recent-contact-subject">{escape(recent_contact_subject)}</p>' if recent_contact_subject else ''}
+                                    <p>{escape(recent_contact_preview or 'No recent CRM communication was found for this email address.')}</p>
+                                </div>
                             </div>
                         </div>
                             <details class="org-chart-contact-details">
@@ -2349,10 +2384,10 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     </div>
                 </div>
             </section>
-            {render_organisation_geo_map(map_rows, selected_group)}
             <section class="org-chart-levels">
                 {''.join(sections)}
             </section>
+            {render_organisation_geo_map(map_rows, selected_group)}
         </section>
     """
 
@@ -2910,6 +2945,123 @@ def build_strategic_contact_filemaker_presence_map(items):
     return presence_map
 
 
+def build_strategic_contact_activity_map(items, crm_result=None):
+    tracked_contacts = {}
+    for item in items or []:
+        contact_id = str(item.get("id") or "").strip()
+        email = str(item.get("email") or "").strip().lower()
+        if not contact_id or is_placeholder_contact_email(email) or "@" not in email:
+            continue
+        tracked_contacts.setdefault(email, []).append(contact_id)
+
+    if not tracked_contacts:
+        return {}
+
+    crm_result = crm_result or fetch_crm_activities()
+    if crm_result.get("status") != "ok":
+        return {}
+
+    activity_map = {}
+    for activity in crm_result.get("activities") or []:
+        participant_emails = {
+            str(activity.get("sender_email") or "").strip().lower(),
+            *(
+                str(email or "").strip().lower()
+                for email in extract_emails(str(activity.get("to") or ""))
+            ),
+        }
+        matched_emails = participant_emails.intersection(tracked_contacts)
+        if not matched_emails:
+            continue
+
+        activity_date_raw = str(activity.get("date_created") or "").strip()
+        activity_date = parse_crm_datetime(activity_date_raw)
+        if not activity_date:
+            continue
+        subject = str(activity.get("subject") or "").strip()
+        preview = truncate_text(
+            clean_activity_content(activity.get("body", "")) or subject,
+            180,
+        )
+        for email in matched_emails:
+            for contact_id in tracked_contacts[email]:
+                current = activity_map.get(contact_id) or {}
+                current_date = parse_crm_datetime(current.get("date_raw", ""))
+                if current_date and current_date >= activity_date:
+                    continue
+                activity_map[contact_id] = {
+                    "date_raw": activity_date_raw,
+                    "date_label": format_optional_datetime(activity_date_raw),
+                    "subject": subject,
+                    "preview": preview,
+                    "full_body": clean_activity_content(activity.get("body", "")) or subject,
+                    "direction": str(activity.get("direction") or "").strip(),
+                    "sender_email": str(activity.get("sender_email") or "").strip(),
+                    "to": str(activity.get("to") or "").strip(),
+                }
+
+    return activity_map
+
+
+def get_strategic_contact_recency_class(recent_contact, today=None):
+    activity_date = parse_crm_datetime(
+        str((recent_contact or {}).get("date_raw") or "").strip()
+    )
+    if not activity_date:
+        return ""
+    comparison_date = today or get_analysis_today()
+    return (
+        " contact-recent"
+        if activity_date >= comparison_date - timedelta(days=60)
+        else " contact-older"
+    )
+
+
+def build_strategic_contacts_report_payload(items, selected_group, contact_activity_map=None, now=None):
+    selected_config = ORG_CHART_GROUPS.get(selected_group) or next(iter(ORG_CHART_GROUPS.values()))
+    generated_at = now or datetime.now()
+    rows = []
+    for item in items or []:
+        if get_org_chart_group_key(item.get("organization")) != selected_group:
+            continue
+        contact_id = str(item.get("id") or "").strip()
+        activity = (contact_activity_map or {}).get(contact_id) or {}
+        recency_class = get_strategic_contact_recency_class(activity, today=generated_at)
+        rows.append(
+            {
+                "id": contact_id,
+                "name": str(item.get("name") or "").strip(),
+                "position": str(item.get("position") or "").strip(),
+                "organization": str(item.get("organization") or "").strip(),
+                "scope_type": str(item.get("scope_type") or "").strip() or infer_strategic_scope_type(
+                    item.get("position"), region=str(item.get("region") or "").strip()
+                ),
+                "region": str(item.get("region") or "").strip() or "Shared / Unassigned",
+                "email": str(item.get("email") or "").strip(),
+                "phone": str(item.get("phone") or "").strip() or str(item.get("cell") or "").strip(),
+                "activity_state": "recent" if recency_class == " contact-recent" else "older" if recency_class == " contact-older" else "none",
+                "last_contact_date": str(activity.get("date_label") or "").strip(),
+                "direction": str(activity.get("direction") or "").strip(),
+                "subject": str(activity.get("subject") or "").strip(),
+                "full_body": str(activity.get("full_body") or "").strip(),
+            }
+        )
+    scope_order = ["Corporate", "National Account", "Regional", "Division"]
+    rows.sort(
+        key=lambda item: (
+            scope_order.index(item["scope_type"]) if item["scope_type"] in scope_order else 99,
+            item["region"].casefold(),
+            item["name"].casefold(),
+        )
+    )
+    return {
+        "group": selected_group,
+        "group_label": selected_config["label"],
+        "generated_at": generated_at.strftime("%d %B %Y %H:%M"),
+        "contacts": rows,
+    }
+
+
 def build_saved_strategic_contact_sets(existing_contacts):
     email_keys = set()
     composite_keys = set()
@@ -2984,6 +3136,116 @@ def get_saved_strategic_contact_id(email, phone, name, organization, position, e
         if matched:
             return matched
     return ""
+
+
+def enrich_saved_strategic_contact(contact_id, force_refresh=True):
+    contact = find_strategic_contact(contact_id)
+    if not contact:
+        return {"ok": False, "message": "", "error": "Strategic contact not found."}
+
+    current_email = str(contact.get("email") or "").strip().lower()
+    current_phone = str(contact.get("phone") or "").strip()
+    current_cell = str(contact.get("cell") or "").strip()
+    needs_email = is_placeholder_contact_email(current_email)
+    needs_phone = not (current_phone or current_cell)
+    if not needs_email and not needs_phone:
+        return {
+            "ok": True,
+            "message": "This contact already has an email address and telephone number.",
+            "error": "",
+        }
+
+    name = str(contact.get("name") or "").strip()
+    organization = str(contact.get("organization") or "").strip()
+    region = str(contact.get("region") or "").strip()
+    found_email = ""
+    found_phone = ""
+    sources = []
+
+    pdl_result = enrich_pdl_person(
+        email="" if needs_email else current_email,
+        full_name=name,
+        organization_name=organization,
+        region=region,
+        force_refresh=force_refresh,
+    )
+    pdl_person = pdl_result.get("result") or {}
+    if pdl_person:
+        candidate_email = str(get_pdl_person_email(pdl_person) or "").strip().lower()
+        candidate_phone = str(get_pdl_person_phone(pdl_person) or "").strip()
+        if candidate_email and not is_placeholder_contact_email(candidate_email):
+            found_email = candidate_email
+        if candidate_phone:
+            found_phone = candidate_phone
+        if found_email or found_phone:
+            sources.append("PDL")
+
+    if (needs_email and not found_email) or (needs_phone and not found_phone):
+        openai_result = discover_strategic_contacts_with_openai(
+            organization,
+            region=region,
+            function=str(contact.get("position") or "").strip(),
+            contact_name=name,
+            limit=5,
+        )
+        normalized_name = normalize_apollo_location_value(name)
+        openai_person = next(
+            (
+                item
+                for item in openai_result.get("results") or []
+                if normalize_apollo_location_value(item.get("name")) == normalized_name
+            ),
+            {},
+        )
+        if openai_person:
+            candidate_email = str(openai_person.get("email") or "").strip().lower()
+            candidate_phone = str(openai_person.get("phone") or "").strip()
+            if not found_email and candidate_email and not is_placeholder_contact_email(candidate_email):
+                found_email = candidate_email
+            if not found_phone and candidate_phone:
+                found_phone = candidate_phone
+            if (candidate_email and not is_placeholder_contact_email(candidate_email)) or candidate_phone:
+                sources.append("OpenAI")
+
+    email_update = found_email if needs_email else ""
+    phone_update = found_phone if needs_phone else ""
+    if not email_update and not phone_update:
+        return {
+            "ok": False,
+            "message": "",
+            "error": "No new email address or telephone number was found for this contact.",
+        }
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updated_items = []
+    for item in load_strategic_contacts():
+        if str(item.get("id") or "").strip() != str(contact_id or "").strip():
+            updated_items.append(item)
+            continue
+        updated_items.append(
+            normalize_strategic_contact_record(
+                {
+                    **item,
+                    "email": email_update or item.get("email"),
+                    "phone": phone_update or item.get("phone"),
+                    "enrichment_source": " + ".join(dict.fromkeys(sources)),
+                    "enriched_at": timestamp,
+                    "updated_at": timestamp,
+                }
+            )
+        )
+    save_strategic_contacts(updated_items)
+
+    found_labels = []
+    if email_update:
+        found_labels.append("email address")
+    if phone_update:
+        found_labels.append("telephone number")
+    return {
+        "ok": True,
+        "message": f"Enriched {name}: found {' and '.join(found_labels)}.",
+        "error": "",
+    }
 
 
 def build_strategic_discovery_cache_key(user, organization_name, region="", function=""):
@@ -5621,6 +5883,7 @@ def get_organisation_chart_view(group: str = "vestis-aramark", message: str = ""
     selected_group = group if group in ORG_CHART_GROUPS else "vestis-aramark"
     items = [item for item in load_strategic_contacts() if bool(item.get("active", True))]
     filemaker_presence_map = build_strategic_contact_filemaker_presence_map(items)
+    contact_activity_map = build_strategic_contact_activity_map(items)
     status_markup = ""
     if message:
         status_markup = f"<p class='status ok'>{escape(message)}</p>"
@@ -5638,12 +5901,116 @@ def get_organisation_chart_view(group: str = "vestis-aramark", message: str = ""
                 <div class="org-chart-segmented-control">
                     {render_org_chart_group_selector(selected_group)}
                 </div>
-                <a class="button secondary small-button org-chart-back-link" href="/strategic-contacts-view">Back to Strategic Contacts</a>
+                <div class="org-chart-report-actions">
+                    <form method="post" action="/organisation-chart/report/send">
+                        <input type="hidden" name="group" value="{escape(selected_group)}">
+                        <button class="button small-button" type="submit">Send report</button>
+                    </form>
+                    <a class="button secondary small-button org-chart-back-link" href="/strategic-contacts-view">Back to Strategic Contacts</a>
+                </div>
             </div>
         </section>
-        {render_organisation_chart(items, selected_group, filemaker_presence_map=filemaker_presence_map)}
+        {render_organisation_chart(
+            items,
+            selected_group,
+            filemaker_presence_map=filemaker_presence_map,
+            contact_activity_map=contact_activity_map,
+        )}
     """
-    return render_page(title="Organisation View", body=body)
+    return render_page(title="Organisation View", body=body, main_class="organisation-chart-main")
+
+
+@app.post("/organisation-chart/report/send", response_class=HTMLResponse)
+def post_organisation_chart_report_send(group: str = Form("vestis-aramark")):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Organisation View",
+            body="<p class='status error'>You must be signed in to send an organisation report.</p>",
+        )
+
+    selected_group = group if group in ORG_CHART_GROUPS else "vestis-aramark"
+    recipient = str((current_user or {}).get("m365_email") or "").strip().lower()
+    if "@" not in recipient:
+        return RedirectResponse(
+            url=f"/organisation-chart-view?group={quote(selected_group)}&error={quote('Your user account does not have a Microsoft 365 email address configured.')}",
+            status_code=303,
+        )
+
+    items = [item for item in load_strategic_contacts() if bool(item.get("active", True))]
+    contact_activity_map = build_strategic_contact_activity_map(items)
+    payload = build_strategic_contacts_report_payload(items, selected_group, contact_activity_map)
+    try:
+        pdf_content = build_strategic_contacts_pdf(payload)
+    except Exception as error:
+        record_audit_event(
+            "strategic-report-send",
+            target=payload["group_label"],
+            details=f"PDF generation failed: {error}",
+            user=current_user,
+            area="strategic-contacts",
+            status="failed",
+        )
+        return RedirectResponse(
+            url=f"/organisation-chart-view?group={quote(selected_group)}&error={quote('The organisation report could not be generated.')}",
+            status_code=303,
+        )
+
+    report_date = datetime.now().strftime("%Y-%m-%d")
+    filename = f"{selected_group}-strategic-contact-report-{report_date}.pdf"
+    subject = f"{payload['group_label']} strategic contact report - {report_date}"
+    message_body = (
+        f"Attached is the latest {payload['group_label']} strategic contact report from Sales Focus.\n\n"
+        "Page one contains the condensed organisation chart. The remaining pages contain the latest matched CRM activity for each contact."
+    )
+    attachments = [
+        {
+            "name": filename,
+            "content_type": "application/pdf",
+            "content": pdf_content,
+        }
+    ]
+    token_result = ensure_valid_access_token(str((current_user or {}).get("username") or ""))
+    if token_result.get("status") == "ok":
+        send_result = send_m365_mail(
+            token_result.get("access_token"),
+            recipient,
+            subject,
+            message_body,
+            attachments=attachments,
+        )
+    else:
+        send_result = send_m365_reporting_mail(
+            [recipient],
+            subject,
+            message_body,
+            attachments=attachments,
+        )
+    sent = send_result.get("status") == "ok"
+    detail = (
+        f"Sent {filename} to {recipient}."
+        if sent
+        else f"Send failed: {send_result.get('error_message') or send_result.get('status') or 'unknown error'}"
+    )
+    record_audit_event(
+        "strategic-report-send",
+        target=payload["group_label"],
+        details=detail,
+        user=current_user,
+        area="strategic-contacts",
+        status="success" if sent else "failed",
+    )
+    return RedirectResponse(
+        url=append_message_to_url(
+            f"/organisation-chart-view?group={quote(selected_group)}",
+            message=f"Report sent to {recipient}." if sent else "",
+            error=(
+                "The report was generated, but Microsoft 365 could not send it. Reconnect Microsoft 365 and try again."
+                if not sent else ""
+            ),
+        ),
+        status_code=303,
+    )
 
 
 @app.get("/production-analysis-view", response_class=HTMLResponse)
@@ -7091,6 +7458,37 @@ def post_strategic_contact_sync_filemaker(
             return_to or "/organisation-chart-view",
             message=result["message"] if result["ok"] else "",
             error=result["error"] if not result["ok"] else "",
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/strategic-contacts/enrich", response_class=HTMLResponse)
+def post_strategic_contact_enrich(
+    contact_id: str = Form(""),
+    return_to: str = Form("/organisation-chart-view"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return render_page(
+            title="Strategic Contacts",
+            body="<p class='status error'>You do not have permission to enrich strategic contacts.</p>",
+        )
+
+    result = enrich_saved_strategic_contact(contact_id, force_refresh=True)
+    strategic_contact = find_strategic_contact(contact_id) or {}
+    record_audit_event(
+        "strategic-enrich",
+        target=str(strategic_contact.get("name") or contact_id),
+        details=result["message"] if result.get("ok") else result.get("error"),
+        area="strategic-contacts",
+        status="success" if result.get("ok") else "failed",
+    )
+    return RedirectResponse(
+        url=append_message_to_url(
+            return_to or "/organisation-chart-view",
+            message=result["message"] if result.get("ok") else "",
+            error=result["error"] if not result.get("ok") else "",
         ),
         status_code=303,
     )
@@ -21680,6 +22078,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         padding: 18px 18px 28px;
                     }}
 
+                    main.organisation-chart-main {{
+                        max-width: 1660px;
+                        padding: 20px 24px 40px;
+                    }}
+
                     h1 {{
                         margin: 0 0 18px;
                         font-size: var(--type-page-title);
@@ -25223,8 +25626,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-lanes {{
                         display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                        gap: 12px;
+                        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                        gap: 16px;
                     }}
 
                     .org-chart-lane {{
@@ -25299,18 +25702,46 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-contact-card {{
                         margin-bottom: 0;
-                        padding: 8px 10px;
+                        padding: 14px 16px;
                         background: #fff;
-                        border-radius: 10px;
-                        min-height: 84px;
-                        height: auto;
+                        border-radius: 12px;
+                        min-height: 250px;
+                        height: 250px;
+                        box-sizing: border-box;
                         display: grid;
-                        align-content: start;
+                        grid-template-rows: minmax(0, 1fr) auto;
+                        align-content: stretch;
+                    }}
+
+                    .org-chart-contact-card:has(.org-chart-contact-details[open]) {{
+                        height: auto;
+                    }}
+
+                    .org-chart-contact-card.contact-recent {{
+                        border-color: #cfe6d5;
+                        background: #f7fcf8;
+                        box-shadow: 0 10px 24px rgba(31, 122, 69, 0.06);
+                    }}
+
+                    .org-chart-contact-card.contact-recent .org-chart-recent-contact {{
+                        border-color: #d5eadb;
+                        background: #f0f9f3;
+                    }}
+
+                    .org-chart-contact-card.contact-older {{
+                        border-color: #edd9bd;
+                        background: #fffaf3;
+                        box-shadow: 0 10px 24px rgba(180, 104, 22, 0.05);
+                    }}
+
+                    .org-chart-contact-card.contact-older .org-chart-recent-contact {{
+                        border-color: #f0dfc8;
+                        background: #fff6e9;
                     }}
 
                     .org-chart-contact-card h4 {{
-                        font-size: 12px;
-                        font-weight: 400;
+                        font-size: 15px;
+                        font-weight: 600;
                     }}
 
                     .org-chart-contact-card .strategic-contact-card-head {{
@@ -25341,11 +25772,65 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .org-chart-contact-preview-role {{
-                        margin: 1px 0 0;
+                        display: -webkit-box;
+                        min-height: 32px;
+                        margin: 3px 0 0;
+                        overflow: hidden;
                         color: #52606d;
-                        font-size: 10px;
+                        font-size: 12px;
                         font-weight: 400;
-                        line-height: 1.25;
+                        line-height: 1.35;
+                        -webkit-box-orient: vertical;
+                        -webkit-line-clamp: 2;
+                    }}
+
+                    .org-chart-recent-contact {{
+                        display: grid;
+                        height: 96px;
+                        gap: 4px;
+                        margin-top: 12px;
+                        padding: 10px 12px;
+                        box-sizing: border-box;
+                        border: 1px solid #e3ebf7;
+                        border-radius: 10px;
+                        background: #f8fbff;
+                    }}
+
+                    .org-chart-recent-contact-head {{
+                        display: flex;
+                        align-items: baseline;
+                        justify-content: space-between;
+                        gap: 10px;
+                        color: var(--muted);
+                        font-size: 10px;
+                        font-weight: 700;
+                        letter-spacing: 0.03em;
+                        text-transform: uppercase;
+                    }}
+
+                    .org-chart-recent-contact-head strong {{
+                        color: #29415f;
+                        font-size: 11px;
+                        letter-spacing: 0;
+                        text-align: right;
+                        text-transform: none;
+                    }}
+
+                    .org-chart-recent-contact p {{
+                        display: -webkit-box;
+                        margin: 0;
+                        overflow: hidden;
+                        color: #53657a;
+                        font-size: 11px;
+                        line-height: 1.4;
+                        -webkit-box-orient: vertical;
+                        -webkit-line-clamp: 2;
+                    }}
+
+                    .org-chart-recent-contact .org-chart-recent-contact-subject {{
+                        color: var(--text);
+                        font-weight: 600;
+                        -webkit-line-clamp: 1;
                     }}
 
                     .org-chart-contact-role {{
@@ -25365,16 +25850,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .org-chart-contact-details {{
-                        margin-top: 4px;
+                        margin-top: 10px;
                         border-top: 1px solid #e6eef7;
-                        padding-top: 4px;
+                        padding-top: 7px;
                     }}
 
                     .org-chart-contact-details summary {{
                         cursor: pointer;
                         list-style: none;
                         color: #245cff;
-                        font-size: 10px;
+                        font-size: 11px;
                         font-weight: 700;
                         user-select: none;
                     }}
@@ -25473,6 +25958,18 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         align-items: center;
                         justify-content: space-between;
                         gap: 10px;
+                    }}
+
+                    .org-chart-report-actions {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        justify-content: flex-end;
+                        gap: 8px;
+                    }}
+
+                    .org-chart-report-actions form {{
+                        margin: 0;
                     }}
 
                     .org-chart-segmented-control {{

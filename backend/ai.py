@@ -11,7 +11,7 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
 _OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-recent-thread-first-17"
-_STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-09-03-openai-strategic-discovery-2"
+_STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-10-02-openai-strategic-discovery-3"
 
 
 def _canonical_evidence_url(value):
@@ -208,11 +208,13 @@ def discover_strategic_contacts_with_openai(
     *,
     region="",
     function="",
+    contact_name="",
     limit=20,
 ):
     organization_name = str(organization_name or "").strip()
     region = str(region or "").strip()
     function = str(function or "").strip()
+    contact_name = str(contact_name or "").strip()
     limit = max(1, min(int(limit or 20), 50))
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
 
@@ -247,9 +249,13 @@ def discover_strategic_contacts_with_openai(
         "organization_name": organization_name,
         "region": region,
         "function": function,
+        "contact_name": contact_name,
         "limit": limit,
         "goal": (
-            "Find likely strategic contacts for this organisation. "
+            f"Find public, verifiable professional contact details for {contact_name} at this organisation. "
+            "Return that named person only; return no results if the identity cannot be verified."
+            if contact_name
+            else "Find likely strategic contacts for this organisation. "
             "Bias toward uniform-services leadership and practical decision-makers."
         ),
     }
