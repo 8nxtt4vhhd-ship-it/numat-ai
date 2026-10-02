@@ -16,6 +16,75 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
         self.assertTrue(main.is_placeholder_contact_email(""))
         self.assertFalse(main.is_placeholder_contact_email("person@vestis.com"))
 
+    def test_placeholder_emails_do_not_link_different_strategic_contacts(self):
+        bill = {
+            "id": "bill-id",
+            "name": "Bill Seward",
+            "organization": "Vestis Corporate",
+            "position": "Vice President",
+            "email": "tbc@vestis.com",
+        }
+        kenny = {
+            "id": "kenny-id",
+            "name": "Kenny Moorehead",
+            "organization": "Vestis Corporate",
+            "position": "Vice President",
+            "email": "tbc@vestis.com",
+        }
+        lookup = main.build_saved_strategic_contact_sets([bill, kenny])
+
+        self.assertNotIn("tbc@vestis.com", lookup[0])
+        self.assertEqual(
+            main.get_saved_strategic_contact_id(
+                "tbc@vestis.com",
+                "",
+                "Bill Seward",
+                "Vestis Corporate",
+                "Vice President",
+                lookup,
+            ),
+            "bill-id",
+        )
+        self.assertEqual(
+            main.get_saved_strategic_contact_id(
+                "tbc@vestis.com",
+                "",
+                "Kenny Moorehead",
+                "Vestis Corporate",
+                "Vice President",
+                lookup,
+            ),
+            "kenny-id",
+        )
+
+    def test_report_outreach_removes_signature_disclaimer_and_quoted_thread(self):
+        content = """Hi Brandon,
+
+Thank you for reaching out. I have copied the new plant manager.
+
+Brandon D. Angeles
+General Manager | West Region
+4700 Havana Street, Denver, CO 80239
+From: Peter Binnington <pbinnington@numatsystems.com>
+Sent: Tuesday, April 8, 2025 8:55 AM
+To: Brandon Angeles <brandon.angeles@vestis.com>
+Subject: Vestis Mat Repair Program
+
+CAUTION: This email was sent from outside of Vestis.
+
+This older quoted message should not appear.
+"""
+
+        cleaned = main.clean_report_outreach_content(content, contact_name="Brandon Angeles")
+
+        self.assertEqual(
+            cleaned,
+            "Hi Brandon,\n\nThank you for reaching out. I have copied the new plant manager.",
+        )
+        self.assertNotIn("From:", cleaned)
+        self.assertNotIn("CAUTION", cleaned)
+        self.assertNotIn("General Manager", cleaned)
+
     def test_existing_filemaker_contact_hides_sync_and_shows_enrich(self):
         contact = main.normalize_strategic_contact_record(
             {

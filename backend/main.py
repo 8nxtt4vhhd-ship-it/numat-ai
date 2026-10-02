@@ -2458,7 +2458,7 @@ def get_saved_strategic_search_exclusions(organization_name):
         if not item_org or not company_family_matches(organization_name, item_org):
             continue
         email = str(item.get("email") or "").strip().lower()
-        if email and email not in seen:
+        if email and not is_placeholder_contact_email(email) and email not in seen:
             excluded_emails.append(email)
             seen.add(email)
     return excluded_emails[:25]
@@ -3043,7 +3043,10 @@ def build_strategic_contacts_report_payload(items, selected_group, contact_activ
                 "last_contact_date": str(activity.get("date_label") or "").strip(),
                 "direction": str(activity.get("direction") or "").strip(),
                 "subject": str(activity.get("subject") or "").strip(),
-                "full_body": str(activity.get("full_body") or "").strip(),
+                "full_body": clean_report_outreach_content(
+                    activity.get("full_body"),
+                    contact_name=item.get("name"),
+                ),
             }
         )
     scope_order = ["Corporate", "National Account", "Regional", "Division"]
@@ -3075,7 +3078,7 @@ def build_saved_strategic_contact_sets(existing_contacts):
         organization = normalize_apollo_location_value(item.get("organization"))
         position = normalize_apollo_location_value(item.get("position"))
 
-        if email:
+        if email and not is_placeholder_contact_email(email):
             email_keys.add(email)
             if contact_id:
                 record_ids.setdefault(("email", email), contact_id)
@@ -3101,7 +3104,7 @@ def is_saved_strategic_contact(email, phone, name, organization, position, exist
         normalize_apollo_location_value(position),
     )
 
-    if email_key and email_key in existing_keys:
+    if email_key and not is_placeholder_contact_email(email_key) and email_key in existing_keys:
         return True
     if phone_key and f"phone:{phone_key}" in existing_keys:
         return True
@@ -3123,7 +3126,7 @@ def get_saved_strategic_contact_id(email, phone, name, organization, position, e
         normalize_apollo_location_value(position),
     )
 
-    if email_key:
+    if email_key and not is_placeholder_contact_email(email_key):
         matched = str(record_ids.get(("email", email_key)) or "").strip()
         if matched:
             return matched
@@ -7714,7 +7717,10 @@ def post_strategic_contact_import_pdl(
     for item in existing:
         existing_email = str(item.get("email") or "").strip().lower()
         if (
-            ((email and existing_email == email) or (phone and str(item.get("phone") or "").strip() == phone))
+            (
+                (email and not is_placeholder_contact_email(email) and existing_email == email)
+                or (phone and str(item.get("phone") or "").strip() == phone)
+            )
             or (
                 normalize_apollo_location_value(item.get("name")) == normalize_apollo_location_value(name)
                 and normalize_apollo_location_value(item.get("organization")) == normalize_apollo_location_value(organization)
@@ -7836,7 +7842,11 @@ def post_strategic_contact_import_contact(
     for item in existing:
         existing_email = str(item.get("email") or "").strip().lower()
         if (
-            ((email and existing_email == email) or (phone and str(item.get("phone") or "").strip() == phone) or (cell and str(item.get("cell") or "").strip() == cell))
+            (
+                (email and not is_placeholder_contact_email(email) and existing_email == email)
+                or (phone and str(item.get("phone") or "").strip() == phone)
+                or (cell and str(item.get("cell") or "").strip() == cell)
+            )
             or (
                 normalize_apollo_location_value(item.get("name")) == normalize_apollo_location_value(name)
                 and normalize_apollo_location_value(item.get("organization")) == normalize_apollo_location_value(company)
@@ -14987,6 +14997,99 @@ def clean_activity_content(content):
 
     content = tidy_activity_text(content)
     return strip_activity_noise(content)
+
+
+def clean_report_outreach_content(content, contact_name=""):
+    cleaned = clean_activity_content(content)
+    if not cleaned:
+        return ""
+
+    lines = cleaned.split("\n")
+    quoted_start = None
+    for index, line in enumerate(lines):
+        lowered = line.strip().lower()
+        if index and (
+            lowered.startswith(("-----original message-----", "begin forwarded message:"))
+            or (lowered.startswith("on ") and lowered.endswith(" wrote:"))
+        ):
+            quoted_start = index
+            break
+        if index and lowered.startswith("from:"):
+            nearby = [
+                candidate.strip().lower()
+                for candidate in lines[index + 1:index + 7]
+                if candidate.strip()
+            ]
+            if any(candidate.startswith(("sent:", "to:", "subject:")) for candidate in nearby):
+                quoted_start = index
+                break
+    if quoted_start is not None:
+        lines = lines[:quoted_start]
+
+    caution_markers = (
+        "caution: this email",
+        "this email was sent from outside",
+        "external email:",
+    )
+    disclaimer_markers = (
+        "confidentiality notice",
+        "this message and any attachments",
+        "the information contained in this email",
+        "this email and any files transmitted",
+        "intended solely for the addressee",
+        "intended only for the person or entity",
+    )
+    filtered_lines = []
+    for line in lines:
+        lowered = line.strip().lower()
+        if any(marker in lowered for marker in caution_markers):
+            continue
+        if any(marker in lowered for marker in disclaimer_markers):
+            break
+        filtered_lines.append(line)
+    lines = filtered_lines
+
+    signoffs = {
+        "best,",
+        "best regards,",
+        "best wishes",
+        "best wishes,",
+        "kind regards,",
+        "many thanks,",
+        "regards,",
+        "sincerely,",
+        "thank you,",
+        "thanks,",
+        "warm regards,",
+    }
+    normalized_contact_name = normalize_apollo_location_value(contact_name)
+    contact_name_parts = normalized_contact_name.split()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        lowered = stripped.lower()
+        normalized_line = normalize_apollo_location_value(stripped)
+        if index and lowered in signoffs:
+            lines = lines[:index]
+            break
+        if (
+            index
+            and normalized_contact_name
+            and (
+                normalized_line == normalized_contact_name
+                or normalized_line.startswith(f"{normalized_contact_name} ")
+                or (
+                    len(contact_name_parts) >= 2
+                    and bool(normalized_line)
+                    and len(normalized_line.split()) <= 5
+                    and normalized_line.split()[0] == contact_name_parts[0]
+                    and normalized_line.split()[-1] == contact_name_parts[-1]
+                )
+            )
+        ):
+            lines = lines[:index]
+            break
+
+    return tidy_activity_text("\n".join(lines))
 
 
 def get_internal_email_domains():
