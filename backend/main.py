@@ -35,6 +35,7 @@ from ai import discover_strategic_contacts_with_openai
 from ai import generate_data_question_answer
 from ai import generate_production_analysis_report
 from ai import generate_action_plan_email_draft
+from ai import generate_meeting_actions_from_audio
 from ai import generate_outreach_prep
 from analysis import (
     analyze_order_cycle,
@@ -50,9 +51,22 @@ from data_sources import (
     MAX_SAMPLE_ROWS,
     clear_filemaker_orders_cache,
     get_orders_for_analysis,
+    get_filemaker_order_limit,
     get_sample_csv_path,
     validate_sample_csv_content,
     validate_sample_csv_path,
+)
+from data_comparison import (
+    ComparisonUploadError,
+    build_pricing_scenario,
+    build_results_workbook,
+    compare_company_rows,
+    interpret_analysis_request,
+    load_analysis_run,
+    parse_uploaded_dataset,
+    parse_uploaded_table,
+    save_analysis_run,
+    summarize_results,
 )
 from crm import (
     MAX_CRM_SAMPLE_ROWS,
@@ -123,6 +137,9 @@ from pdl import (
 )
 
 APP_SESSION_COOKIE_NAME = "numat_session"
+DEFAULT_COMPANY_ANALYSIS_REQUEST = (
+    "Identify matching customers, show their associated price list, and include how much each company has spent with us all time."
+)
 app = FastAPI()
 app.add_middleware(
     SessionMiddleware,
@@ -192,11 +209,15 @@ DEFAULT_RECENT_SENT_EMAILS_PATH = BASE_DIR / "data" / "recent_sent_emails.json"
 DEFAULT_STRATEGIC_CONTACTS_PATH = BASE_DIR / "data" / "strategic_contacts.json"
 DEFAULT_LOGIN_MFA_CHALLENGES_PATH = BASE_DIR / "data" / "login_mfa_challenges.json"
 DEFAULT_AUDIT_LOG_PATH = BASE_DIR / "data" / "audit_log.json"
+DEFAULT_WEEKLY_KPI_TODOS_PATH = BASE_DIR / "data" / "weekly_kpi_todos.json"
+DEFAULT_WEEKLY_KPI_MEETINGS_PATH = BASE_DIR / "data" / "weekly_kpi_meetings.json"
 APP_USERS_LOCK = Lock()
 RECENT_SENT_EMAILS_LOCK = Lock()
 STRATEGIC_CONTACTS_LOCK = Lock()
 LOGIN_MFA_CHALLENGES_LOCK = Lock()
 AUDIT_LOG_LOCK = Lock()
+WEEKLY_KPI_TODOS_LOCK = Lock()
+WEEKLY_KPI_MEETINGS_LOCK = Lock()
 CURRENT_SESSION_USER = ContextVar("CURRENT_SESSION_USER", default=None)
 
 
@@ -600,6 +621,113 @@ def get_audit_log_path():
         return Path(raw_path).expanduser()
 
     return DEFAULT_AUDIT_LOG_PATH
+
+
+def get_weekly_kpi_todos_path():
+    raw_path = os.getenv("WEEKLY_KPI_TODOS_PATH", "").strip()
+    return Path(raw_path).expanduser() if raw_path else DEFAULT_WEEKLY_KPI_TODOS_PATH
+
+
+def load_weekly_kpi_todos():
+    path = get_weekly_kpi_todos_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with WEEKLY_KPI_TODOS_LOCK:
+        if not path.exists():
+            path.write_text("[]\n", encoding="utf-8")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+    return [item for item in payload if isinstance(item, dict) and str(item.get("id") or "").strip()]
+
+
+def save_weekly_kpi_todos(items):
+    path = get_weekly_kpi_todos_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with WEEKLY_KPI_TODOS_LOCK:
+        path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def get_weekly_kpi_meetings_path():
+    raw_path = os.getenv("WEEKLY_KPI_MEETINGS_PATH", "").strip()
+    return Path(raw_path).expanduser() if raw_path else DEFAULT_WEEKLY_KPI_MEETINGS_PATH
+
+
+def load_weekly_kpi_meetings():
+    path = get_weekly_kpi_meetings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with WEEKLY_KPI_MEETINGS_LOCK:
+        if not path.exists():
+            path.write_text("[]\n", encoding="utf-8")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+    records = [item for item in payload if isinstance(item, dict) and str(item.get("id") or "").strip()]
+    return sorted(records, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+
+def save_weekly_kpi_meetings(items):
+    path = get_weekly_kpi_meetings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with WEEKLY_KPI_MEETINGS_LOCK:
+        path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def get_weekly_kpi_meeting(meeting_id):
+    meeting_id = str(meeting_id or "").strip()
+    return next((item for item in load_weekly_kpi_meetings() if str(item.get("id") or "") == meeting_id), None)
+
+
+def update_weekly_kpi_meeting_actions(meeting_id, approved_actions):
+    meeting_id = str(meeting_id or "").strip()
+    records = load_weekly_kpi_meetings()
+    updated = None
+    for record in records:
+        if str(record.get("id") or "") == meeting_id:
+            record["approved_actions"] = approved_actions
+            record["finalized_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            updated = record
+            break
+    if updated:
+        save_weekly_kpi_meetings(records)
+    return updated
+
+
+def parse_dashboard_datetime(value):
+    return parse_crm_datetime(value) if value else None
+
+
+def build_strategic_contact_kpi_summary(items=None, crm_result=None, now=None):
+    now = now or datetime.now()
+    cutoff = now - timedelta(days=7)
+    active_items = [item for item in (items if items is not None else load_strategic_contacts()) if bool(item.get("active", True))]
+    added = sum(
+        1 for item in active_items
+        if (parse_dashboard_datetime(item.get("created_at")) or datetime.min) >= cutoff
+    )
+    tracked = defaultdict(set)
+    for item in active_items:
+        email = str(item.get("email") or "").strip().casefold()
+        if email and "@" in email and not is_placeholder_contact_email(email):
+            tracked[email].add(str(item.get("id") or "").strip())
+    reached_ids = set()
+    if (crm_result or {}).get("status") == "ok":
+        for activity in crm_result.get("activities", []):
+            activity_date = parse_dashboard_datetime(activity.get("date_created"))
+            is_outbound = (
+                str(activity.get("direction") or "").strip().casefold() == "outbound"
+                or str(activity.get("sender_email") or "").strip().casefold().endswith("@numatsystems.com")
+            )
+            if not activity_date or activity_date < cutoff or not is_outbound:
+                continue
+            for email in extract_emails(str(activity.get("to") or "")):
+                reached_ids.update(tracked.get(str(email).strip().casefold(), set()))
+    return {
+        "total": len(active_items),
+        "added_last_7_days": added,
+        "reached_last_7_days": len(reached_ids),
+    }
 
 
 def ensure_strategic_contacts_file():
@@ -6889,13 +7017,86 @@ def fetch_weekly_kpi_crm_result(force_refresh=False):
     return result
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, today=None, force_refresh=False):
+_WEEKLY_KPI_PAYLOAD_CACHE = {
+    "date_key": "",
+    "expires_at": 0.0,
+    "payload": None,
+    "refreshing": False,
+}
+_WEEKLY_KPI_PAYLOAD_CACHE_LOCK = Lock()
+
+
+def get_weekly_kpi_payload_cache_seconds():
+    try:
+        return max(0, int(os.getenv("WEEKLY_KPI_PAYLOAD_CACHE_SECONDS", "120")))
+    except ValueError:
+        return 120
+
+
+def store_weekly_kpi_payload(payload, date_key=None):
+    cache_seconds = get_weekly_kpi_payload_cache_seconds()
+    date_key = date_key or datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d")
+    with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
+        _WEEKLY_KPI_PAYLOAD_CACHE.update({
+            "date_key": date_key,
+            "expires_at": time.time() + cache_seconds,
+            "payload": payload,
+            "refreshing": False,
+        })
+    return payload
+
+
+def refresh_weekly_kpi_payload_in_background(date_key):
+    try:
+        payload = build_weekly_kpi_dashboard_payload()
+        store_weekly_kpi_payload(payload, date_key=date_key)
+    except Exception:
+        traceback.print_exc()
+        with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
+            _WEEKLY_KPI_PAYLOAD_CACHE["refreshing"] = False
+
+
+def get_cached_weekly_kpi_dashboard_payload(force_refresh=False):
+    date_key = datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d")
+    now = time.time()
+
+    if force_refresh:
+        return store_weekly_kpi_payload(
+            build_weekly_kpi_dashboard_payload(force_refresh=True),
+            date_key=date_key,
+        )
+
+    with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
+        cached_payload = _WEEKLY_KPI_PAYLOAD_CACHE.get("payload")
+        same_day = _WEEKLY_KPI_PAYLOAD_CACHE.get("date_key") == date_key
+        cache_is_fresh = _WEEKLY_KPI_PAYLOAD_CACHE.get("expires_at", 0) > now
+        if cached_payload is not None and same_day and cache_is_fresh:
+            return cached_payload
+        if cached_payload is not None and same_day:
+            if not _WEEKLY_KPI_PAYLOAD_CACHE.get("refreshing"):
+                _WEEKLY_KPI_PAYLOAD_CACHE["refreshing"] = True
+                Thread(
+                    target=refresh_weekly_kpi_payload_in_background,
+                    args=(date_key,),
+                    daemon=True,
+                ).start()
+            return cached_payload
+
+    return store_weekly_kpi_payload(
+        build_weekly_kpi_dashboard_payload(),
+        date_key=date_key,
+    )
+
+
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, strategic_crm_result=None, today=None, force_refresh=False):
     started_at = time.perf_counter()
     today = today or datetime.now()
+    if strategic_crm_result is None and crm_result is not None:
+        strategic_crm_result = crm_result
     review_period = get_weekly_kpi_review_period(today)
     calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
     loaders = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         if crm_result is None:
             loaders["crm_result"] = executor.submit(fetch_weekly_kpi_crm_result, force_refresh=force_refresh)
         if production_result is None:
@@ -6911,6 +7112,8 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
             loaders["finance_result"] = executor.submit(fetch_aged_debt_summary, force_refresh=force_refresh)
         if master_data_result is None:
             loaders["master_data_result"] = executor.submit(fetch_filemaker_master_data, force_refresh=force_refresh)
+        if strategic_crm_result is None:
+            loaders["strategic_crm_result"] = executor.submit(fetch_crm_activities)
         loaded = {name: future.result() for name, future in loaders.items()}
 
     crm_result = crm_result if crm_result is not None else loaded["crm_result"]
@@ -6918,6 +7121,7 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     calendar_result = calendar_result if calendar_result is not None else loaded["calendar_result"]
     finance_result = finance_result if finance_result is not None else loaded["finance_result"]
     master_data_result = master_data_result if master_data_result is not None else loaded["master_data_result"]
+    strategic_crm_result = strategic_crm_result if strategic_crm_result is not None else loaded["strategic_crm_result"]
     log_perf_metric("weekly_kpi.load_data_sources_parallel", started_at)
 
     promises = build_open_promises(crm_result, master_data_result)
@@ -6940,6 +7144,10 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         order_result,
         review_period["period_start"],
         review_period["period_end_exclusive"],
+    )
+    strategic_summary = build_strategic_contact_kpi_summary(
+        crm_result=strategic_crm_result,
+        now=today,
     )
     period_debtor_days = next(
         (
@@ -6990,6 +7198,7 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         "priority_status": priority_result.get("status", "error"),
         "new_and_returning_customers": new_and_returning_customers,
         "new_and_returning_status": order_result.get("status", "error"),
+        "strategic_contacts_summary": strategic_summary,
         "summary": {
             "open_count": len(promises),
             "customer_count": customer_count,
@@ -7050,12 +7259,15 @@ def render_priority_customer_comms(activities):
     if not activities:
         return "<span class='muted'>No linked CRM communications</span>"
     items = []
+    cutoff = datetime.now() - timedelta(days=7)
     for activity in activities[:2]:
         date_label = format_optional_datetime(activity.get("date_created"))
         direction = str(activity.get("direction") or "Communication").strip().title()
         detail = clean_activity_content(activity.get("subject")) or clean_activity_content(activity.get("body"))
+        activity_date = parse_crm_datetime(activity.get("date_created"))
+        recent_class = " class='priority-recent-outreach'" if activity_date and activity_date >= cutoff else ""
         items.append(
-            f"<li><strong>{escape(date_label)}</strong> · {escape(direction)} · {escape(truncate_text(detail, 150) or 'No summary recorded')}</li>"
+            f"<li{recent_class}><strong>{escape(date_label)}</strong> · {escape(direction)} · {escape(truncate_text(detail, 150) or 'No summary recorded')}</li>"
         )
     return f"<ul class='kpi-brief-comms'>{''.join(items)}</ul>"
 
@@ -7069,9 +7281,10 @@ def render_new_and_returning_customers(customers):
         customer_key = str(item.get("customer_primary_key") or "").strip()
         href = f"/customer-profile-view?customer_primary_key={quote(customer_key)}&customer={quote(customer)}"
         category_class = "new" if item.get("category") == "New" else "returned"
+        category_label = "New" if category_class == "new" else "L&L"
         rows.append(f'''
             <a class="kpi-customer-movement-row" href="{escape(href)}">
-                <span class="kpi-customer-movement-badge {category_class}">{escape(str(item.get('category') or ''))}</span>
+                <span class="kpi-customer-movement-badge {category_class}">{category_label}</span>
                 <span class="kpi-customer-movement-copy"><strong>{escape(customer)}</strong><small>{escape(str(item.get('order_date_label') or ''))} · {escape(str(item.get('detail') or ''))}</small></span>
             </a>
         ''')
@@ -7079,9 +7292,165 @@ def render_new_and_returning_customers(customers):
     return f"<div class='kpi-customer-movement-list'>{''.join(rows)}</div>{more}"
 
 
+def render_weekly_kpi_todos(items):
+    active = sorted(
+        [item for item in items if not item.get("completed_at")],
+        key=lambda item: str(item.get("created_at") or ""),
+    )
+    completed = sorted(
+        [item for item in items if item.get("completed_at")],
+        key=lambda item: str(item.get("completed_at") or ""),
+        reverse=True,
+    )[:4]
+    rows = []
+    for item in [*active, *completed]:
+        item_id = escape(str(item.get("id") or ""))
+        is_done = bool(item.get("completed_at"))
+        owner = str(item.get("owner") or "").strip()
+        rows.append(f"""
+            <div class="kpi-todo-row{' completed' if is_done else ''}">
+                <form class="kpi-todo-toggle-form" method="post" action="/weekly-kpi/todos/toggle">
+                    <input type="hidden" name="todo_id" value="{item_id}">
+                    <button class="kpi-todo-check" type="submit" aria-label="{'Reopen' if is_done else 'Complete'} action">{'✓' if is_done else ''}</button>
+                </form>
+                <div><strong>{escape(str(item.get('text') or ''))}</strong>{f'<small>{escape(owner)}</small>' if owner else ''}</div>
+                <form method="post" action="/weekly-kpi/todos/delete" onsubmit="return confirm('Remove this action?');">
+                    <input type="hidden" name="todo_id" value="{item_id}"><button class="kpi-todo-delete" type="submit">×</button>
+                </form>
+            </div>
+        """)
+    return "".join(rows) or "<p class='small muted kpi-todo-empty'>No meeting actions yet.</p>"
+
+
+def render_meeting_record_list(items, empty_message="None recorded."):
+    values = [str(item or "").strip() for item in (items or []) if str(item or "").strip()]
+    if not values:
+        return f"<p class='small muted'>{escape(empty_message)}</p>"
+    return "<ul class='meeting-record-list'>" + "".join(f"<li>{escape(item)}</li>" for item in values) + "</ul>"
+
+
+def render_meeting_action_list(items):
+    values = [item for item in (items or []) if isinstance(item, dict) and str(item.get("text") or "").strip()]
+    if not values:
+        return "<p class='small muted'>No actions were approved from this meeting.</p>"
+    rows = []
+    for item in values:
+        owner = str(item.get("owner") or "").strip()
+        owner_html = f' <span class="muted">— {escape(owner)}</span>' if owner else ""
+        rows.append(f"<li><strong>{escape(str(item.get('text') or ''))}</strong>{owner_html}</li>")
+    return "<ul class='meeting-record-list'>" + "".join(rows) + "</ul>"
+
+
+@app.post("/weekly-kpi/todos/create")
+def post_weekly_kpi_todo_create(text: str = Form(""), owner: str = Form("")):
+    text = str(text or "").strip()
+    if text:
+        current_user = get_current_session_user() or {}
+        items = load_weekly_kpi_todos()
+        items.append({
+            "id": secrets.token_urlsafe(10), "text": text[:500], "owner": str(owner or "").strip()[:120],
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed_at": "",
+            "created_by": str(current_user.get("display_name") or current_user.get("username") or "").strip(), "source": "manual",
+        })
+        save_weekly_kpi_todos(items)
+        record_audit_event("meeting-action-create", target=text[:120], area="weekly-kpi")
+    return RedirectResponse(url="/weekly-kpi-dashboard#weekly-actions", status_code=303)
+
+
+@app.post("/weekly-kpi/todos/toggle")
+def post_weekly_kpi_todo_toggle(todo_id: str = Form(""), ajax: str = ""):
+    items = load_weekly_kpi_todos()
+    changed = None
+    for item in items:
+        if str(item.get("id") or "") == str(todo_id or ""):
+            item["completed_at"] = "" if item.get("completed_at") else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            changed = item
+            break
+    save_weekly_kpi_todos(items)
+    if changed:
+        record_audit_event("meeting-action-toggle", target=str(changed.get("text") or "")[:120], area="weekly-kpi")
+    if str(ajax or "").strip().casefold() in {"1", "true", "yes"}:
+        return JSONResponse({
+            "status": "ok" if changed else "not_found",
+            "todo_id": str(todo_id or ""),
+            "completed": bool(changed and changed.get("completed_at")),
+        }, status_code=200 if changed else 404)
+    return RedirectResponse(url="/weekly-kpi-dashboard#weekly-actions", status_code=303)
+
+
+@app.post("/weekly-kpi/todos/delete")
+def post_weekly_kpi_todo_delete(todo_id: str = Form("")):
+    items = load_weekly_kpi_todos()
+    removed = next((item for item in items if str(item.get("id") or "") == str(todo_id or "")), None)
+    save_weekly_kpi_todos([item for item in items if str(item.get("id") or "") != str(todo_id or "")])
+    if removed:
+        record_audit_event("meeting-action-delete", target=str(removed.get("text") or "")[:120], area="weekly-kpi")
+    return RedirectResponse(url="/weekly-kpi-dashboard#weekly-actions", status_code=303)
+
+
+@app.post("/api/weekly-kpi/todos/from-audio")
+async def post_weekly_kpi_todos_from_audio(audio: UploadFile = File(...)):
+    content = await audio.read()
+    if len(content) > 25 * 1024 * 1024:
+        return JSONResponse({"status": "too_large", "error_message": "Recording must be smaller than 25 MB."}, status_code=413)
+    result = generate_meeting_actions_from_audio(content, filename=audio.filename or "meeting.webm")
+    if result.get("status") == "ok":
+        current_user = get_current_session_user() or {}
+        now = datetime.now(UK_TIMEZONE)
+        meeting_id = secrets.token_urlsafe(12)
+        record = {
+            "id": meeting_id,
+            "title": f"Weekly management meeting — {now.strftime('%d %b %Y')}",
+            "meeting_date": now.strftime("%Y-%m-%d"),
+            "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "recorded_by": str(current_user.get("display_name") or current_user.get("username") or "").strip(),
+            "summary": str(result.get("summary") or "").strip(),
+            "decisions": list(result.get("decisions") or []),
+            "updates": list(result.get("updates") or []),
+            "proposed_actions": list(result.get("actions") or []),
+            "approved_actions": [],
+            "transcript": str(result.get("transcript") or "").strip(),
+            "finalized_at": "",
+        }
+        records = load_weekly_kpi_meetings()
+        records.append(record)
+        save_weekly_kpi_meetings(records)
+        record_audit_event("meeting-record-create", target=record["title"], area="weekly-kpi")
+        result["meeting_id"] = meeting_id
+        result.pop("transcript", None)
+    return JSONResponse(result, status_code=200 if result.get("status") == "ok" else 400)
+
+
+@app.post("/api/weekly-kpi/todos/batch")
+async def post_weekly_kpi_todos_batch(request: Request):
+    payload = await request.json()
+    proposed = payload.get("actions", []) if isinstance(payload, dict) else []
+    meeting_id = str(payload.get("meeting_id") or "").strip() if isinstance(payload, dict) else ""
+    current_user = get_current_session_user() or {}
+    items = load_weekly_kpi_todos()
+    created = 0
+    approved_actions = []
+    for action in proposed[:25]:
+        text = str((action or {}).get("text") or "").strip()
+        if not text:
+            continue
+        items.append({
+            "id": secrets.token_urlsafe(10), "text": text[:500], "owner": str((action or {}).get("owner") or "").strip()[:120],
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed_at": "",
+            "created_by": str(current_user.get("display_name") or current_user.get("username") or "").strip(), "source": "meeting-audio-ai",
+        })
+        approved_actions.append({"text": text[:500], "owner": str((action or {}).get("owner") or "").strip()[:120]})
+        created += 1
+    save_weekly_kpi_todos(items)
+    record_audit_event("meeting-actions-ai-create", target=f"{created} actions", area="weekly-kpi")
+    if meeting_id:
+        update_weekly_kpi_meeting_actions(meeting_id, approved_actions)
+    return {"status": "ok", "created": created, "meeting_id": meeting_id}
+
+
 @app.get("/api/weekly-kpis")
 def get_weekly_kpis():
-    return build_weekly_kpi_dashboard_payload()
+    return get_cached_weekly_kpi_dashboard_payload()
 
 
 @app.get("/weekly-kpi-dashboard", response_class=HTMLResponse)
@@ -7089,7 +7458,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
     current_user = get_current_session_user()
     refresh_requested = str(refresh or "").strip().casefold() in {"1", "true", "yes", "on"}
     force_refresh = bool(refresh_requested and can_manage_user_accounts(current_user))
-    payload = build_weekly_kpi_dashboard_payload(force_refresh=force_refresh)
+    payload = get_cached_weekly_kpi_dashboard_payload(force_refresh=force_refresh)
     summary = payload["summary"]
     production_mtd = payload.get("production_mtd", {})
     production_summary = production_mtd.get("summary", {})
@@ -7105,6 +7474,10 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
     invoice_period_note = f"{review_month} invoiced sales" if reviewing_previous_month else "current calendar month"
     debtor_period_note = f"{review_month} month end · lower is better" if accounts.get("debtor_days_is_historical") else "days · lower is better"
     priority_count = len(payload.get("priority_customers", []))
+    strategic_summary = payload.get("strategic_contacts_summary", {})
+    weekly_todos = load_weekly_kpi_todos()
+    meeting_records = load_weekly_kpi_meetings()
+    latest_meeting = meeting_records[0] if meeting_records else None
     oldest_days = summary.get("oldest_days")
     oldest_label = (
         f"{oldest_days} day{'s' if oldest_days != 1 else ''}"
@@ -7122,16 +7495,16 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
 
     body = f"""
         {refresh_status}
+        <div class="kpi-page-toolbar">
+            <span class="small muted">Dashboard updated {escape(refresh_label)}</span>
+            <button class="button secondary small-button" type="button" onclick="document.documentElement.classList.add('kpi-presentation-mode'); document.documentElement.onfullscreenchange=()=>document.fullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); document.documentElement.onwebkitfullscreenchange=()=>document.webkitFullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement)">Presentation mode</button>
+        </div>
         <div class="kpi-dashboard-grid">
             <section class="panel kpi-promises-panel">
                 <div class="kpi-promises-head">
                     <div class="kpi-section-title">
                         <span class="kpi-section-mark" aria-hidden="true"></span>
                         <h2>Open Promises of Order</h2>
-                    </div>
-                    <div class="kpi-dashboard-actions">
-                        <span class="small muted">Updated {escape(refresh_label)}</span>
-                        <button class="button secondary small-button" type="button" onclick="document.documentElement.classList.add('kpi-presentation-mode'); document.documentElement.onfullscreenchange=()=>document.fullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); document.documentElement.onwebkitfullscreenchange=()=>document.webkitFullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement)">Presentation mode</button>
                     </div>
                 </div>
                 <div class="summary compact-summary kpi-summary-grid">
@@ -7143,20 +7516,28 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                 <a class="button kpi-detail-button" href="/weekly-kpi-promises" target="_blank" rel="noopener">View promised orders</a>
             </section>
 
-            <section class="panel kpi-priority-panel">
-                <div class="kpi-promises-head">
+            <div class="kpi-sales-stack">
+                <section class="panel kpi-strategic-panel">
                     <div class="kpi-section-title">
-                        <span class="kpi-section-mark priority" aria-hidden="true"></span>
-                        <h2>Priority 1 Customers</h2>
+                        <span class="kpi-section-mark strategic" aria-hidden="true"></span>
+                        <h2>Strategic contacts</h2>
                     </div>
-                </div>
-                <a class="kpi-priority-count-tile" href="/priority-customers-view" target="_blank" rel="noopener">
-                    <span>Priority 1 customers</span>
-                    <strong>{priority_count}</strong>
-                    <small>Open detailed customer and communications view</small>
-                </a>
-                {f'<p class="status warning">Customer priority data is currently unavailable from FileMaker.</p>' if payload.get('priority_status') != 'ok' else ''}
-            </section>
+                    <div class="kpi-strategic-stats">
+                        <div><strong>{int(strategic_summary.get('added_last_7_days') or 0)}</strong><span>new this week</span></div>
+                        <div><strong>{int(strategic_summary.get('reached_last_7_days') or 0)}</strong><span>reached this week</span></div>
+                    </div>
+                    <a class="button secondary small-button" href="/organisation-chart-view" target="_blank" rel="noopener">Open organisation view</a>
+                </section>
+                <section class="panel kpi-priority-panel">
+                    <div class="kpi-promises-head">
+                        <div class="kpi-section-title"><span class="kpi-section-mark priority" aria-hidden="true"></span><h2>Priority 1 Customers</h2></div>
+                    </div>
+                    <a class="kpi-priority-count-tile" href="/priority-customers-view" target="_blank" rel="noopener">
+                        <span>Priority 1 customers</span><strong>{priority_count}</strong><small>Open detailed customer and communications view</small>
+                    </a>
+                    {f'<p class="status warning">Customer priority data is currently unavailable from FileMaker.</p>' if payload.get('priority_status') != 'ok' else ''}
+                </section>
+            </div>
 
             <section class="panel kpi-planned-visits-panel" aria-label="Planned Visits">
                 <div class="kpi-visits-head">
@@ -7177,6 +7558,23 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                 </div>
                 {render_new_and_returning_customers(payload.get('new_and_returning_customers', []))}
                 {f'<p class="status warning">Order history is currently unavailable.</p>' if payload.get('new_and_returning_status') != 'ok' else ''}
+            </section>
+
+            <section class="panel kpi-todo-panel" id="weekly-actions">
+                <div class="kpi-todo-head">
+                    <div class="kpi-section-title"><span class="kpi-section-mark todo" aria-hidden="true"></span><div><h2>Weekly meeting actions</h2><p class="small muted">Shared checklist for this meeting and the next.</p></div></div>
+                    <details class="kpi-meeting-ai" id="meeting-ai-panel"><summary>AI meeting notes</summary><div class="kpi-meeting-ai-body">
+                        <div class="kpi-meeting-ai-panel-head"><p class="small muted">Record the meeting, then review the proposed actions before adding them.</p><button class="kpi-meeting-ai-close" type="button" id="meeting-ai-close" aria-label="Close AI meeting notes">×</button></div>
+                        <div class="kpi-record-actions"><button class="button secondary small-button" type="button" id="meeting-record-start">Start recording</button><button class="button secondary small-button" type="button" id="meeting-record-stop" disabled>Stop & analyse</button><span class="small muted" id="meeting-record-status"></span></div>
+                        <div id="meeting-action-proposals"></div>
+                    </div></details>
+                </div>
+                <div class="kpi-meeting-history-links">
+                    <a href="/weekly-kpi-meetings">Meeting history</a>
+                    {f'<a href="/weekly-kpi-meetings/{quote(str(latest_meeting.get("id") or ""))}">Latest summary · {escape(str(latest_meeting.get("meeting_date") or ""))}</a>' if latest_meeting else '<span class="small muted">No saved meetings yet</span>'}
+                </div>
+                <form class="kpi-todo-create" method="post" action="/weekly-kpi/todos/create"><input name="text" required maxlength="500" placeholder="Add an action…"><input name="owner" maxlength="120" placeholder="Owner (optional)"><button class="button small-button" type="submit">Add</button></form>
+                <div class="kpi-todo-list">{render_weekly_kpi_todos(weekly_todos)}</div>
             </section>
 
             <section class="panel kpi-production-panel">
@@ -7205,10 +7603,12 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                     </div>
                     <span class="small muted">Aged debt refreshed {escape(str(accounts.get('last_refreshed') or 'Not available'))}</span>
                 </div>
-                <div class="production-kpi-grid kpi-accounts-grid">
+                <div class="production-kpi-grid kpi-accounts-grid kpi-accounts-sales-grid">
                     <div><span>{escape(review_month + ' invoiced sales' if reviewing_previous_month else 'Invoiced sales MTD')}</span><strong>{format_production_number(accounts.get('invoiced_revenue_mtd') or 0, currency=True)}</strong><small>{escape(invoice_period_note)}</small></div>
                     <div><span>Elapsed invoice target</span><strong>{format_production_number(accounts.get('elapsed_invoice_target'), currency=True)}</strong><small>{format_production_number(accounts.get('daily_invoice_target'), currency=True)} × elapsed Mon–Thu workdays</small></div>
                     <div><span>Invoice target achieved</span><strong>{format_production_number(accounts.get('invoice_target_pct'), '%', decimals=1)}</strong><small>{escape(review_month + ' invoiced sales ÷ full-month target' if reviewing_previous_month else 'MTD invoiced sales ÷ elapsed target')}</small></div>
+                </div>
+                <div class="production-kpi-grid kpi-accounts-grid kpi-accounts-aged-grid">
                     <div><span>Total outstanding</span><strong>{format_production_number(accounts.get('total_outstanding'), currency=True)}</strong><small>all receivables</small></div>
                     <div><span>Current</span><strong>{format_production_number(accounts.get('current'), currency=True)}</strong><small>not yet overdue</small></div>
                     <div><span>0–30 days</span><strong>{format_production_number(accounts.get('zero_thirty'), currency=True)}</strong><small>aged receivables</small></div>
@@ -7221,7 +7621,133 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
             </section>
         </div>
     """
+    body += """
+        <script>
+        (() => {
+            const start = document.getElementById('meeting-record-start');
+            const stop = document.getElementById('meeting-record-stop');
+            const status = document.getElementById('meeting-record-status');
+            const proposals = document.getElementById('meeting-action-proposals');
+            const aiPanel = document.getElementById('meeting-ai-panel');
+            const aiClose = document.getElementById('meeting-ai-close');
+            aiClose?.addEventListener('click', () => { aiPanel.open = false; });
+            document.addEventListener('keydown', event => { if (event.key === 'Escape' && aiPanel?.open) aiPanel.open = false; });
+            document.addEventListener('click', event => {
+                if (aiPanel?.open && !aiPanel.contains(event.target)) aiPanel.open = false;
+            });
+            document.querySelectorAll('.kpi-todo-toggle-form').forEach(form => {
+                form.addEventListener('submit', async event => {
+                    event.preventDefault();
+                    const button = form.querySelector('.kpi-todo-check');
+                    const row = form.closest('.kpi-todo-row');
+                    if (!button || !row || button.disabled) return;
+                    button.disabled = true;
+                    try {
+                        const response = await fetch('/weekly-kpi/todos/toggle?ajax=1', {
+                            method: 'POST',
+                            body: new FormData(form),
+                            headers: {'Accept': 'application/json'},
+                        });
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.error_message || 'The action could not be updated.');
+                        row.classList.toggle('completed', Boolean(data.completed));
+                        button.textContent = data.completed ? '✓' : '';
+                        button.setAttribute('aria-label', data.completed ? 'Reopen action' : 'Complete action');
+                    } catch (error) {
+                        window.alert(error.message || 'The action could not be updated.');
+                    } finally {
+                        button.disabled = false;
+                    }
+                });
+            });
+            if (!start || !navigator.mediaDevices || !window.MediaRecorder) return;
+            let recorder, chunks = [], stream;
+            start.addEventListener('click', async () => {
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({audio: true});
+                    chunks = []; recorder = new MediaRecorder(stream);
+                    recorder.ondataavailable = event => event.data.size && chunks.push(event.data);
+                    recorder.start(); start.disabled = true; stop.disabled = false; status.textContent = 'Recording…';
+                } catch (error) { status.textContent = 'Microphone permission was not granted.'; }
+            });
+            stop.addEventListener('click', () => {
+                stop.disabled = true; status.textContent = 'Transcribing and finding actions…'; recorder.stop();
+                recorder.onstop = async () => {
+                    stream.getTracks().forEach(track => track.stop());
+                    const blob = new Blob(chunks, {type: recorder.mimeType || 'audio/webm'});
+                    const form = new FormData(); form.append('audio', blob, 'weekly-meeting.webm');
+                    try {
+                        const response = await fetch('/api/weekly-kpi/todos/from-audio', {method: 'POST', body: form});
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.error_message || 'Analysis failed');
+                        const actions = data.actions || [];
+                        const list = items => (items || []).length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '<p class="small muted">None recorded.</p>';
+                        const summary = `<div class="kpi-meeting-result"><h3>Meeting summary</h3><p>${escapeHtml(data.summary || 'No summary was produced.')}</p><h3>Key decisions</h3>${list(data.decisions)}<h3>Notable updates</h3>${list(data.updates)}<p><a href="/weekly-kpi-meetings/${encodeURIComponent(data.meeting_id)}" target="_blank" rel="noopener">Open saved meeting record</a></p></div>`;
+                        const actionMarkup = actions.length ? actions.map((action, index) => `<label class="kpi-proposal"><input type="checkbox" checked data-index="${index}"><span><strong>${escapeHtml(action.text)}</strong>${action.owner ? `<small>${escapeHtml(action.owner)}</small>` : ''}</span></label>`).join('') + '<button class="button small-button" type="button" id="meeting-actions-add">Add selected actions</button>' : '<p class="small muted">No explicit actions were found.</p>';
+                        proposals.innerHTML = summary + '<h3>Proposed actions</h3>' + actionMarkup;
+                        proposals.dataset.actions = JSON.stringify(actions); status.textContent = 'Review the proposed actions.';
+                        document.getElementById('meeting-actions-add')?.addEventListener('click', async () => {
+                            const selected = actions.filter((_, index) => proposals.querySelector(`input[data-index="${index}"]`)?.checked);
+                            const saved = await fetch('/api/weekly-kpi/todos/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({actions:selected, meeting_id:data.meeting_id})});
+                            if (saved.ok) location.href = '/weekly-kpi-dashboard#weekly-actions';
+                        });
+                    } catch (error) { status.textContent = error.message; }
+                    start.disabled = false;
+                };
+            });
+            function escapeHtml(value) { const el = document.createElement('span'); el.textContent = value || ''; return el.innerHTML; }
+        })();
+        </script>
+    """
     return render_page(title="Weekly KPI Dashboard", body=body, main_class="kpi-dashboard-main")
+
+
+@app.get("/weekly-kpi-meetings", response_class=HTMLResponse)
+def get_weekly_kpi_meetings_page():
+    records = load_weekly_kpi_meetings()
+    cards = []
+    for record in records:
+        meeting_id = quote(str(record.get("id") or ""))
+        approved_count = len(record.get("approved_actions") or [])
+        cards.append(f"""
+            <a class="meeting-history-card" href="/weekly-kpi-meetings/{meeting_id}">
+                <div><strong>{escape(str(record.get('title') or 'Weekly management meeting'))}</strong><span>{escape(str(record.get('created_at') or ''))}{f' · Recorded by {escape(str(record.get("recorded_by") or ""))}' if record.get('recorded_by') else ''}</span></div>
+                <p>{escape(truncate_text(str(record.get('summary') or 'No summary recorded.'), 280))}</p>
+                <small>{approved_count} approved action{'s' if approved_count != 1 else ''}</small>
+            </a>
+        """)
+    body = f"""
+        <section class="panel meeting-history-panel">
+            <div class="kpi-production-head"><div><h2>Weekly meeting history</h2><p class="muted">Saved summaries, decisions, updates, actions and transcripts.</p></div><a class="button secondary small-button" href="/weekly-kpi-dashboard#weekly-actions">Back to KPI dashboard</a></div>
+            <div class="meeting-history-grid">{''.join(cards) if cards else '<p class="empty-action">No meeting records have been saved yet.</p>'}</div>
+        </section>
+    """
+    return render_page(title="Meeting History", body=body)
+
+
+@app.get("/weekly-kpi-meetings/{meeting_id}", response_class=HTMLResponse)
+def get_weekly_kpi_meeting_page(meeting_id: str):
+    record = get_weekly_kpi_meeting(meeting_id)
+    if not record:
+        return render_page(title="Meeting Record", body="<p class='status error'>That meeting record could not be found.</p>")
+    actions = record.get("approved_actions") or []
+    proposed_note = ""
+    if not record.get("finalized_at") and record.get("proposed_actions"):
+        actions = record.get("proposed_actions") or []
+        proposed_note = "<p class='small muted'>These actions were proposed by AI but were not yet confirmed from the dashboard.</p>"
+    body = f"""
+        <section class="panel meeting-record-panel">
+            <div class="kpi-production-head"><div><h2>{escape(str(record.get('title') or 'Weekly management meeting'))}</h2><p class="muted">{escape(str(record.get('created_at') or ''))}{f' · Recorded by {escape(str(record.get("recorded_by") or ""))}' if record.get('recorded_by') else ''}</p></div><div class="meeting-record-actions"><a class="button secondary small-button" href="/weekly-kpi-meetings">Meeting history</a><a class="button secondary small-button" href="/weekly-kpi-dashboard#weekly-actions">KPI dashboard</a></div></div>
+            <div class="meeting-record-section"><h3>Summary</h3><p>{escape(str(record.get('summary') or 'No summary recorded.'))}</p></div>
+            <div class="meeting-record-columns">
+                <div class="meeting-record-section"><h3>Key decisions</h3>{render_meeting_record_list(record.get('decisions'))}</div>
+                <div class="meeting-record-section"><h3>Notable updates</h3>{render_meeting_record_list(record.get('updates'))}</div>
+            </div>
+            <div class="meeting-record-section"><h3>Actions</h3>{proposed_note}{render_meeting_action_list(actions)}</div>
+            <details class="meeting-transcript"><summary>View transcript</summary><div>{escape(str(record.get('transcript') or 'No transcript recorded.'))}</div></details>
+        </section>
+    """
+    return render_page(title="Meeting Record", body=body)
 
 
 @app.get("/weekly-kpi-promises", response_class=HTMLResponse)
@@ -7262,18 +7788,24 @@ def get_priority_customers_page():
     customers, master_result = get_priority_one_customers()
     crm_result = fetch_crm_activities()
     activity_map = crm_result.get("activity_map", {}) if crm_result.get("status") == "ok" else {}
-    rows = []
+    customer_rows = []
     for customer in customers:
         customer_name = str(customer.get("company") or "Customer not identified")
         customer_key = str(customer.get("primary_key") or "").strip()
         location = ", ".join(bit for bit in (str(customer.get("city") or "").strip(), str(customer.get("state") or "").strip()) if bit) or "—"
-        rows.append(f"""
+        sales_activities = sort_sales_activities_by_date(
+            get_sales_outreach_activities(activity_map.get(customer_key, []))
+        )
+        latest_outreach = parse_crm_datetime(sales_activities[0].get("date_created")) if sales_activities else datetime.min
+        customer_rows.append((latest_outreach, customer_name.casefold(), f"""
             <tr>
                 <td data-label="Customer"><a href="/customer-profile-view?customer_primary_key={quote(customer_key)}&customer={quote(customer_name)}"><strong>{escape(customer_name)}</strong></a></td>
                 <td data-label="Location">{escape(location)}</td>
-                <td data-label="Recent communications">{render_priority_customer_comms(get_sales_outreach_activities(activity_map.get(customer_key, [])))}</td>
+                <td data-label="Recent communications">{render_priority_customer_comms(sales_activities)}</td>
             </tr>
-        """)
+        """))
+    customer_rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    rows = [item[2] for item in customer_rows]
     if rows:
         content = f"<div class='table-wrap'><table class='contacts-table priority-customers-table'><thead><tr><th>Customer</th><th>Location</th><th>Recent sales outreach</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
     elif master_result.get("status") != "ok":
@@ -9641,6 +10173,14 @@ def render_dashboard_home(ask="", ask_run=""):
                         </span>
                         <strong>Shared Calendar</strong>
                     </a>
+                    <a class="home-launch-card" href="/ai-analysis-view">
+                        <span class="home-launch-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <path d="M5 7h5M5 12h8M5 17h11M15 5l4 4-4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </span>
+                        <strong>AI Analysis</strong>
+                    </a>
                 </div>
             </section>
         </div>
@@ -9668,6 +10208,7 @@ def render_home_dashboard_sidebar():
     primary_items = [
         ("Home", "/", "home"),
         ("Action Plan", "/action-plan-view", "plan"),
+        ("AI Analysis", "/ai-analysis-view", "spark"),
         ("Customer Enrichment", "/enrichment-view", "spark"),
         ("Customers", "/customers-view", "users"),
         ("Contacts", "/contacts-view", "contact"),
@@ -10077,6 +10618,151 @@ async def upload_sample_data(file: UploadFile = File(...)):
         validation["saved"] = False
 
     return render_sample_data_page(upload_result=validation)
+
+
+@app.get("/ai-analysis-view", response_class=HTMLResponse)
+def get_ai_analysis_view():
+    return render_ai_analysis_page()
+
+
+@app.post("/ai-analysis/compare", response_class=HTMLResponse)
+async def run_ai_company_comparison(
+    file: UploadFile = File(...),
+    company_column: str = Form(""),
+    analysis_request: str = Form(DEFAULT_COMPANY_ANALYSIS_REQUEST),
+    analysis_type: str = Form("auto"),
+    value_column: str = Form(""),
+    quantity_column: str = Form(""),
+    price_list_column: str = Form(""),
+    mat_size_column: str = Form(""),
+    value_mode: str = Form("auto"),
+):
+    content = await file.read()
+    interpreted_request = interpret_analysis_request(analysis_request)
+    selected_analysis_type = str(analysis_type or "auto").strip().casefold()
+    if selected_analysis_type == "auto":
+        selected_analysis_type = interpreted_request["analysis_type"]
+    if selected_analysis_type not in {"company_match", "pricing"}:
+        selected_analysis_type = "company_match"
+
+    form_values = {
+        "company_column": company_column,
+        "analysis_request": analysis_request,
+        "analysis_type": analysis_type,
+        "value_column": value_column,
+        "quantity_column": quantity_column,
+        "price_list_column": price_list_column,
+        "mat_size_column": mat_size_column,
+        "value_mode": value_mode,
+    }
+
+    if selected_analysis_type == "pricing":
+        try:
+            dataset = parse_uploaded_dataset(file.filename or "", content)
+            payload = build_pricing_scenario(
+                dataset,
+                analysis_request,
+                value_column=value_column,
+                quantity_column=quantity_column,
+                price_list_column=price_list_column,
+                mat_size_column=mat_size_column,
+                value_mode=value_mode,
+            )
+        except ComparisonUploadError as error:
+            return render_ai_analysis_page(error=str(error), **form_values)
+        current_user = get_current_session_user() or {}
+        payload.update({
+            "filename": dataset["filename"],
+            "interpreted_request": interpreted_request,
+            "owner": str(current_user.get("username") or "").strip(),
+        })
+        token = save_analysis_run(payload)
+        record_audit_event(
+            "ai-pricing-scenario",
+            target=dataset["filename"],
+            details=(
+                f"Modelled a {payload['change_percent']:.2f}% price change across "
+                f"{payload['summary']['included_rows']} uploaded rows."
+            ),
+            area="ai-analysis",
+            status="success",
+        )
+        return render_ai_analysis_page(payload=payload, download_token=token, **form_values)
+
+    try:
+        upload = parse_uploaded_table(
+            file.filename or "",
+            content,
+            company_column=company_column,
+        )
+    except ComparisonUploadError as error:
+        return render_ai_analysis_page(error=str(error), **form_values)
+
+    master_data = fetch_filemaker_master_data()
+    if master_data.get("status") != "ok":
+        return render_ai_analysis_page(
+            error=(
+                "The FileMaker company list is not available, so the comparison could not run. "
+                f"Current status: {master_data.get('status', 'unknown error')}."
+            ),
+            **form_values,
+        )
+
+    order_result = get_orders_for_analysis()
+    price_list_by_key = build_latest_price_list_by_customer_key(order_result.get("orders") or [])
+    customer_metrics_by_key = build_customer_order_metrics_by_key(order_result.get("orders") or [])
+    results = compare_company_rows(
+        upload["rows"],
+        master_data.get("companies") or [],
+        price_list_by_key=price_list_by_key,
+        customer_metrics_by_key=customer_metrics_by_key,
+    )
+    summary = summarize_results(results)
+    current_user = get_current_session_user() or {}
+    owner = str(current_user.get("username") or "").strip()
+    payload = {
+        "analysis_type": "company_match",
+        "filename": upload["filename"],
+        "company_column": upload["company_column"],
+        "analysis_request": analysis_request,
+        "interpreted_request": interpreted_request,
+        "coverage_note": build_order_history_coverage_note(order_result),
+        "summary": summary,
+        "results": results,
+        "owner": owner,
+    }
+    token = save_analysis_run(payload)
+    record_audit_event(
+        "ai-company-comparison",
+        target=upload["filename"],
+        details=(
+            f"Compared {summary['uploaded']} uploaded companies; "
+            f"{summary['matched']} matched and {summary['price_list_d']} were Price List D."
+        ),
+        area="ai-analysis",
+        status="success",
+    )
+    return render_ai_analysis_page(payload=payload, download_token=token, **form_values)
+
+
+@app.get("/ai-analysis/download/{token}")
+def download_ai_company_comparison(token: str):
+    payload = load_analysis_run(token)
+    if payload is None:
+        return PlainTextResponse("This analysis export has expired or does not exist.", status_code=404)
+    current_user = get_current_session_user() or {}
+    current_username = str(current_user.get("username") or "").strip()
+    if payload.get("owner") and payload.get("owner") != current_username:
+        return PlainTextResponse("This analysis belongs to another user.", status_code=403)
+    content = build_results_workbook(payload)
+    source_stem = re.sub(r"[^A-Za-z0-9_-]+", "-", Path(payload.get("filename") or "companies").stem).strip("-")
+    suffix = "pricing-scenario" if payload.get("analysis_type") == "pricing" else "comparison"
+    filename = f"{source_stem or 'analysis'}-{suffix}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/orders-view", response_class=HTMLResponse)
@@ -16355,6 +17041,53 @@ def get_order_price_list(order):
     return extra.get("Companies 4::Price List") or extra.get("ai_PriceList") or ""
 
 
+def build_latest_price_list_by_customer_key(orders):
+    latest = {}
+    for order in orders:
+        customer_key = str(get_order_primary_key(order) or "").strip()
+        price_list = str(get_order_price_list(order) or "").strip().upper()
+        order_date = str(order.get("order_date") or "").strip()
+        if not customer_key or not price_list:
+            continue
+        existing = latest.get(customer_key)
+        if existing is None or order_date >= existing[0]:
+            latest[customer_key] = (order_date, price_list)
+    return {customer_key: item[1] for customer_key, item in latest.items()}
+
+
+def build_customer_order_metrics_by_key(orders):
+    metrics = {}
+    for order in orders:
+        customer_key = str(get_order_primary_key(order) or "").strip()
+        if not customer_key:
+            continue
+        customer_metrics = metrics.setdefault(customer_key, {"order_count": 0, "total_spend": 0.0})
+        customer_metrics["order_count"] += 1
+        try:
+            customer_metrics["total_spend"] += float(order.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+    for customer_metrics in metrics.values():
+        customer_metrics["total_spend"] = round(customer_metrics["total_spend"], 2)
+    return metrics
+
+
+def build_order_history_coverage_note(order_result):
+    source = str((order_result or {}).get("source") or "unknown").strip()
+    orders = list((order_result or {}).get("orders") or [])
+    if source == "filemaker":
+        limit = get_filemaker_order_limit()
+        if len(orders) >= limit:
+            return (
+                f"Spend totals use the {len(orders):,} FileMaker orders currently loaded. "
+                f"The configured fetch limit is {limit:,}, so these totals may not cover complete all-time history."
+            )
+        return f"Spend totals cover all {len(orders):,} orders returned by the FileMaker order layout."
+    if source == "sample_csv":
+        return f"Spend totals cover the {len(orders):,} orders in the active sample CSV, not necessarily complete history."
+    return f"Spend totals cover the {len(orders):,} orders in the active {source} data source."
+
+
 def get_order_primary_key(order):
     extra = order.get("extra", {})
     return extra.get("Companies 4::PrimaryKey") or extra.get("Customer Ref") or ""
@@ -18415,6 +19148,181 @@ def render_sample_data_page(upload_result=None):
     """
 
     return render_page(title="Sample Data", body=body)
+
+
+def render_ai_analysis_page(
+    payload=None,
+    download_token="",
+    error="",
+    company_column="",
+    analysis_request=DEFAULT_COMPANY_ANALYSIS_REQUEST,
+    analysis_type="auto",
+    value_column="",
+    quantity_column="",
+    price_list_column="",
+    mat_size_column="",
+    value_mode="auto",
+):
+    if payload and payload.get("analysis_request"):
+        analysis_request = str(payload.get("analysis_request"))
+    error_markup = f"<p class='status error'>{escape(error)}</p>" if error else ""
+    results_markup = ""
+    if payload and payload.get("analysis_type") == "pricing":
+        summary = payload.get("summary") or {}
+        rows = payload.get("results") or []
+        row_markup = "".join(
+            f"""
+                <tr>
+                    <td>{escape(str(row.get('price_list') or ''))}</td>
+                    <td>{escape(str(row.get('mat_size') or ''))}</td>
+                    <td>{int(row.get('row_count') or 0):,}</td>
+                    <td>{float(row.get('quantity') or 0):,.2f}</td>
+                    <td>{escape(format_currency(row.get('current_sales') or 0))}</td>
+                    <td>{escape(format_currency(row.get('projected_sales') or 0))}</td>
+                    <td>{escape(format_currency(row.get('change') or 0))}</td>
+                </tr>
+            """
+            for row in rows
+        )
+        quantity_assumption = (
+            f"'{payload.get('value_column')}' is a unit value multiplied by '{payload.get('quantity_column')}'."
+            if payload.get("value_mode") == "unit"
+            else f"'{payload.get('value_column')}' is the complete sales value for each row."
+        )
+        grouping_labels = [
+            label for label in (payload.get("price_list_column"), payload.get("mat_size_column")) if label
+        ]
+        grouping_text = ", ".join(grouping_labels) if grouping_labels else "one overall total"
+        excluded_count = int(summary.get("excluded_rows") or 0)
+        results_markup = f"""
+            <p class="status success"><strong>Analysis plan used:</strong> Apply a {float(summary.get('change_percent') or 0):g}% price change and group the result by {escape(grouping_text)}.</p>
+            <p class="status"><strong>Value assumption:</strong> {escape(quantity_assumption)}</p>
+            {f'<p class="status warning">{excluded_count:,} rows were excluded because their value or quantity was blank or non-numeric.</p>' if excluded_count else ''}
+            <div class="summary">
+                <div><span class="label">Current sales</span><strong>{escape(format_currency(summary.get('current_sales') or 0))}</strong></div>
+                <div><span class="label">Projected sales</span><strong>{escape(format_currency(summary.get('projected_sales') or 0))}</strong></div>
+                <div><span class="label">Change</span><strong>{escape(format_currency(summary.get('change') or 0))}</strong></div>
+                <div><span class="label">Price change</span><strong>{float(summary.get('change_percent') or 0):g}%</strong></div>
+                <div><span class="label">Rows included</span><strong>{int(summary.get('included_rows') or 0):,}</strong></div>
+            </div>
+            <section class="panel">
+                <div class="panel-heading-row">
+                    <div>
+                        <h2>Pricing scenario</h2>
+                        <p class="muted">The projected result assumes the uploaded quantities and product mix stay unchanged.</p>
+                    </div>
+                    <a class="button" href="/ai-analysis/download/{escape(download_token)}">Export results to Excel</a>
+                </div>
+                <div class="table-wrap tall-table">
+                    <table>
+                        <thead><tr><th>Price list</th><th>Mat size</th><th>Rows</th><th>Quantity</th><th>Current sales</th><th>Projected sales</th><th>Change</th></tr></thead>
+                        <tbody>{row_markup}</tbody>
+                    </table>
+                </div>
+            </section>
+        """
+    elif payload:
+        summary = payload.get("summary") or {}
+        rows = payload.get("results") or []
+        row_markup = "".join(
+            f"""
+                <tr>
+                    <td>{escape(str(row.get('source_company') or ''))}</td>
+                    <td>{escape(str(row.get('match_status') or ''))}</td>
+                    <td>{escape(str(row.get('matched_company') or ''))}</td>
+                    <td>{escape(str(row.get('matched_city') or ''))}</td>
+                    <td>{escape(str(row.get('matched_state') or ''))}</td>
+                    <td>{escape(str(row.get('price_list') or ''))}</td>
+                    <td>{'Yes' if row.get('is_price_list_d') else 'No'}</td>
+                    <td>{int(row.get('order_count') or 0):,}</td>
+                    <td>{escape(format_currency(row.get('total_spend') or 0))}</td>
+                    <td>{escape(str(row.get('confidence') or ''))}%</td>
+                    <td>{escape(str(row.get('reason') or ''))}</td>
+                </tr>
+            """
+            for row in rows[:500]
+        )
+        interpreted = payload.get("interpreted_request") or {}
+        understood_items = ["match uploaded companies to FileMaker customers"]
+        if interpreted.get("include_price_list"):
+            understood_items.append("include the associated price list")
+        if interpreted.get("include_spend"):
+            understood_items.append("include total spend from loaded order history")
+        results_markup = f"""
+            <p class="status success"><strong>Request understood:</strong> {escape('; '.join(understood_items))}.</p>
+            <p class="status">{escape(str(payload.get('coverage_note') or ''))}</p>
+            <div class="summary">
+                <div><span class="label">Uploaded</span><strong>{summary.get('uploaded', 0):,}</strong></div>
+                <div><span class="label">Matched</span><strong>{summary.get('matched', 0):,}</strong></div>
+                <div><span class="label">Possible matches</span><strong>{summary.get('possible', 0):,}</strong></div>
+                <div><span class="label">No match</span><strong>{summary.get('unmatched', 0):,}</strong></div>
+                <div><span class="label">Confirmed Price List D</span><strong>{summary.get('price_list_d', 0):,}</strong></div>
+            </div>
+            <section class="panel">
+                <div class="panel-heading-row">
+                    <div>
+                        <h2>Comparison results</h2>
+                        <p class="muted">Certain matches are separated from possible matches that need review.</p>
+                    </div>
+                    <a class="button" href="/ai-analysis/download/{escape(download_token)}">Export results to Excel</a>
+                </div>
+                <div class="table-wrap tall-table">
+                    <table>
+                        <thead><tr>
+                            <th>Uploaded company</th><th>Status</th><th>Matched company</th><th>City</th>
+                            <th>State</th><th>Price list</th><th>Price List D</th><th>Orders</th><th>Total spend</th>
+                            <th>Confidence</th><th>Reason</th>
+                        </tr></thead>
+                        <tbody>{row_markup}</tbody>
+                    </table>
+                </div>
+                {f'<p class="muted">The page shows the first 500 rows. The Excel download contains all {len(rows):,} rows.</p>' if len(rows) > 500 else ''}
+            </section>
+        """
+
+    body = f"""
+        {error_markup}
+        <section class="panel ai-analysis-panel">
+            <h2>Analyse uploaded data</h2>
+            <p class="muted">
+                Describe the result in normal language, then upload an Excel or CSV file. The current analysis types cover
+                company matching against FileMaker and percentage-based pricing scenarios.
+            </p>
+            <form class="upload-form ai-analysis-form" method="post" action="/ai-analysis/compare" enctype="multipart/form-data">
+                <label class="ai-analysis-request-field">
+                    <span>What would you like to find?</span>
+                    <textarea name="analysis_request" rows="3" required>{escape(analysis_request)}</textarea>
+                </label>
+                <label class="ai-analysis-type-field">
+                    <span>Analysis type</span>
+                    <select name="analysis_type">
+                        {render_select_options({'auto': 'Detect from request', 'company_match': 'Company matching', 'pricing': 'Pricing scenario'}, analysis_type)}
+                    </select>
+                </label>
+                <label class="ai-analysis-company-field">
+                    <span>Company-name column (company matching)</span>
+                    <input name="company_column" value="{escape(company_column)}" placeholder="Leave blank to detect automatically">
+                </label>
+                <details class="ai-analysis-pricing-fields">
+                    <summary>Pricing column mapping</summary>
+                    <div class="controls compact">
+                        <label><span>Sales value or unit price column</span><input name="value_column" value="{escape(value_column)}" placeholder="Detect automatically"></label>
+                        <label><span>Quantity column</span><input name="quantity_column" value="{escape(quantity_column)}" placeholder="Optional or detected"></label>
+                        <label><span>Price-list column</span><input name="price_list_column" value="{escape(price_list_column)}" placeholder="Optional or detected"></label>
+                        <label><span>Mat-size column</span><input name="mat_size_column" value="{escape(mat_size_column)}" placeholder="Optional or detected"></label>
+                        <label><span>Value interpretation</span><select name="value_mode">{render_select_options({'auto': 'Detect automatically', 'extended': 'Each row is a complete sales value', 'unit': 'Unit value multiplied by quantity'}, value_mode)}</select></label>
+                    </div>
+                </details>
+                <input class="ai-analysis-file" type="file" name="file" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" required>
+                <button type="submit">Run analysis</button>
+            </form>
+            <p class="muted ai-analysis-help">
+                Example: “Increase prices by 5% and break sales down by price list and mat size.” Uploads are limited to 5,000 rows and 10 MB.
+            </p>
+        </section>
+        {results_markup}
+    """
+    return render_page(title="AI Analysis", body=body, main_class="ai-analysis-main")
 
 
 def render_crm_data_page(upload_result=None, sync_result=None):
@@ -22034,6 +22942,7 @@ def render_global_nav(title):
         ("Action Plan", "/action-plan-view"),
         ("Weekly KPI Dashboard", "/weekly-kpi-dashboard"),
         ("Calendar", "/calendar-view"),
+        ("AI Analysis", "/ai-analysis-view"),
         ("Insights", "/insights-view"),
         ("Customer Map", "/customer-map-view"),
         ("Strategic Contacts", "/strategic-contacts-view"),
@@ -23009,10 +23918,33 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .kpi-dashboard-grid {{
                         display: grid;
-                        grid-template-columns: repeat(3, minmax(0, 1fr));
-                        gap: 20px;
-                        align-items: start;
+                        grid-template-columns: repeat(4, minmax(220px, 1fr));
+                        grid-template-areas:
+                            "production production production production"
+                            "accounts accounts accounts accounts"
+                            "promises movement strategic priority"
+                            "visits visits todos todos";
+                        grid-template-rows: auto auto minmax(190px, auto) minmax(300px, auto);
+                        gap: 16px 18px;
+                        align-items: stretch;
                     }}
+
+                    .kpi-page-toolbar {{ display:flex; justify-content:flex-end; align-items:center; gap:12px; margin:-58px 0 18px; }}
+                    .kpi-sales-stack {{ display:contents; }}
+                    .kpi-sales-stack .kpi-strategic-panel {{ grid-area:strategic; }}
+                    .kpi-sales-stack .kpi-priority-panel {{ grid-area:priority; }}
+                    .kpi-sales-stack .kpi-strategic-panel,
+                    .kpi-sales-stack .kpi-priority-panel {{ min-height:0; box-sizing:border-box; overflow:hidden; padding:12px 14px; }}
+                    .kpi-sales-stack .kpi-section-title h2 {{ font-size:19px; }}
+                    .kpi-sales-stack .kpi-section-mark {{ height:23px; width:5px; }}
+                    .kpi-sales-stack .kpi-strategic-stats {{ margin-top:8px; }}
+                    .kpi-sales-stack .kpi-strategic-stats div {{ padding:7px; }}
+                    .kpi-sales-stack .kpi-strategic-stats strong {{ font-size:25px; }}
+                    .kpi-sales-stack .kpi-strategic-panel .button {{ margin-top:7px; padding:6px 9px; min-height:30px; font-size:11px; }}
+                    .kpi-sales-stack .kpi-promises-head {{ margin-bottom:5px; }}
+                    .kpi-sales-stack .kpi-priority-count-tile {{ min-height:76px; padding:8px 11px; }}
+                    .kpi-sales-stack .kpi-priority-count-tile strong {{ margin:2px 0; font-size:31px; }}
+                    .kpi-sales-stack .kpi-priority-count-tile small {{ font-size:11px; }}
 
                     .kpi-section-title {{
                         display: flex;
@@ -23034,8 +23966,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-section-mark.visits {{
-                        background: linear-gradient(180deg, #00a884, #49c9ad);
-                        box-shadow: 0 5px 14px rgba(0, 168, 132, 0.25);
+                        background: linear-gradient(180deg, #0b4a91, #2f6fb8);
+                        box-shadow: 0 5px 14px rgba(11, 74, 145, 0.20);
                     }}
 
                     .kpi-section-mark.production {{
@@ -23049,14 +23981,17 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-section-mark.priority {{
-                        background: linear-gradient(180deg, #f59e0b, #f7c65b);
-                        box-shadow: 0 5px 14px rgba(245, 158, 11, 0.25);
+                        background: linear-gradient(180deg, #245cff, #6b8cff);
+                        box-shadow: 0 5px 14px rgba(36, 92, 255, 0.22);
                     }}
 
                     .kpi-section-mark.customer-movement {{
-                        background: linear-gradient(180deg, #e14f63, #f28a98);
-                        box-shadow: 0 5px 14px rgba(225, 79, 99, 0.22);
+                        background: linear-gradient(180deg, #174f8f, #5f8fc7);
+                        box-shadow: 0 5px 14px rgba(23, 79, 143, 0.20);
                     }}
+
+                    .kpi-section-mark.strategic {{ background:linear-gradient(180deg, #003f7d, #3278bd); }}
+                    .kpi-section-mark.todo {{ background:linear-gradient(180deg, #0b4a91, #6b8fba); }}
 
                     .kpi-dashboard-actions {{
                         display: flex;
@@ -23067,30 +24002,44 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-promises-panel {{
-                        min-height: 360px;
-                        padding: 24px;
+                        grid-area: promises;
+                        min-height: 0;
+                        box-sizing: border-box;
+                        padding: 11px 14px;
                         border-top: 4px solid #245cff;
                     }}
 
+                    .kpi-promises-panel .kpi-promises-head {{ margin-bottom:6px; }}
+                    .kpi-promises-panel .kpi-section-title h2 {{ font-size:18px; }}
+                    .kpi-promises-panel .kpi-section-mark {{ width:5px; height:23px; }}
+                    .kpi-promises-panel .kpi-summary-grid {{ gap:5px; margin:0 0 6px; }}
+                    .kpi-promises-panel .kpi-summary-grid div {{ min-height:0; padding:5px 8px; border-radius:9px; }}
+                    .kpi-promises-panel .kpi-summary-grid span {{ font-size:10px; line-height:1.1; }}
+                    .kpi-promises-panel .kpi-summary-grid strong {{ margin-top:1px; font-size:19px; }}
+                    .kpi-promises-panel .kpi-detail-button {{ min-height:28px; margin:0; padding:5px 8px; font-size:11px; }}
+
                     .kpi-priority-panel {{
-                        min-height: 360px;
-                        padding: 24px;
-                        border-top: 4px solid #f59e0b;
+                        min-height: 280px;
+                        padding: 18px;
+                        border-top: 4px solid #4b76ad;
                     }}
 
                     .kpi-customer-movement-panel {{
-                        grid-column: 1 / -1;
-                        padding: 20px 24px;
-                        border-top: 4px solid #e14f63;
+                        grid-area: movement;
+                        min-width: 0;
+                        min-height: 0;
+                        box-sizing: border-box;
+                        padding: 10px 14px;
+                        border-top: 4px solid #4b76ad;
                     }}
 
                     .kpi-customer-movement-panel .kpi-section-title {{
                         align-items: flex-start;
-                        margin-bottom: 14px;
+                        margin-bottom: 8px;
                     }}
 
                     .kpi-customer-movement-panel .kpi-section-title h2 {{
-                        font-size: 21px;
+                        font-size: 18px;
                     }}
 
                     .kpi-customer-movement-panel .kpi-section-title p {{
@@ -23099,8 +24048,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .kpi-customer-movement-list {{
                         display: grid;
-                        grid-template-columns: repeat(3, minmax(0, 1fr));
-                        gap: 7px;
+                        grid-template-columns: 1fr;
+                        gap: 9px;
+                        max-height: 132px;
+                        overflow: auto;
                     }}
 
                     .kpi-customer-movement-row {{
@@ -23108,7 +24059,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         grid-template-columns: auto minmax(0, 1fr);
                         align-items: center;
                         gap: 10px;
-                        padding: 9px 10px;
+                        min-height: 54px;
+                        box-sizing: border-box;
+                        padding: 8px 10px;
                         border-radius: 11px;
                         background: #f7f9fc;
                         color: var(--text);
@@ -23165,11 +24118,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .kpi-priority-count-tile {{
                         display: flex;
-                        min-height: 178px;
-                        padding: 22px;
-                        border: 1px solid #f1d8a5;
+                        min-height: 125px;
+                        padding: 14px;
+                        border: 1px solid #c9d9eb;
                         border-radius: 16px;
-                        background: linear-gradient(145deg, #fff9eb, #ffffff);
+                        background: linear-gradient(145deg, #f4f8fd, #ffffff);
                         color: var(--text);
                         text-decoration: none;
                         flex-direction: column;
@@ -23188,8 +24141,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-priority-count-tile strong {{
-                        margin: 10px 0;
-                        font-size: 58px;
+                        margin: 5px 0;
+                        font-size: 44px;
                         line-height: 1;
                     }}
 
@@ -23203,22 +24156,158 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .priority-customers-table th:nth-child(1) {{ width: 25%; }}
                     .priority-customers-table th:nth-child(2) {{ width: 15%; }}
                     .priority-customers-table th:nth-child(3) {{ width: 60%; }}
+                    .priority-recent-outreach {{ color: #08765f; font-weight: 800; }}
+
+                    .kpi-strategic-panel {{ min-height:280px; padding:18px; border-top:4px solid #245582; }}
+                    .kpi-strategic-panel .button {{ width: 100%; margin-top: 12px; text-align: center; }}
+                    .kpi-strategic-stats {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 22px; }}
+                    .kpi-strategic-stats div {{ padding: 12px; border-radius: 12px; background: #f1f8fb; text-align: center; }}
+                    .kpi-strategic-stats strong, .kpi-strategic-stats span {{ display: block; }}
+                    .kpi-strategic-stats strong {{ font-size: 34px; }}
+                    .kpi-strategic-stats span {{ color: var(--muted); font-size: 12px; }}
+
+                    /* One compact, consistent type scale for the four-card meeting column. */
+                    .kpi-promises-panel .kpi-section-title h2,
+                    .kpi-customer-movement-panel .kpi-section-title h2,
+                    .kpi-sales-stack .kpi-section-title h2 {{
+                        font-size: 18px;
+                        line-height: 1.2;
+                        letter-spacing: -0.01em;
+                    }}
+
+                    .kpi-promises-panel,
+                    .kpi-customer-movement-panel,
+                    .kpi-sales-stack .kpi-strategic-panel,
+                    .kpi-sales-stack .kpi-priority-panel {{
+                        padding:14px;
+                    }}
+
+                    .kpi-sales-stack .kpi-strategic-panel,
+                    .kpi-sales-stack .kpi-priority-panel {{
+                        padding-top:18px;
+                    }}
+
+                    .kpi-promises-panel .kpi-section-title,
+                    .kpi-customer-movement-panel .kpi-section-title,
+                    .kpi-sales-stack .kpi-section-title {{
+                        min-height:24px;
+                        align-items:flex-start;
+                    }}
+
+                    .kpi-promises-panel .kpi-promises-head,
+                    .kpi-sales-stack .kpi-promises-head {{
+                        margin:0 0 8px;
+                    }}
+
+                    .kpi-customer-movement-panel .kpi-section-title {{ margin-bottom:8px; }}
+
+                    .kpi-promises-panel .kpi-section-mark,
+                    .kpi-customer-movement-panel .kpi-section-mark,
+                    .kpi-sales-stack .kpi-section-mark {{ width:4px; height:20px; }}
+
+                    .kpi-promises-panel .kpi-summary-grid > div {{
+                        display:flex;
+                        flex-direction:column;
+                        align-items:center;
+                        justify-content:center;
+                        text-align:center;
+                    }}
+
+                    .kpi-promises-panel .kpi-summary-grid span,
+                    .kpi-customer-movement-panel .small,
+                    .kpi-sales-stack span,
+                    .kpi-sales-stack small {{ font-size:11px; line-height:1.25; }}
+
+                    .kpi-promises-panel .kpi-summary-grid strong,
+                    .kpi-sales-stack .kpi-strategic-stats strong,
+                    .kpi-sales-stack .kpi-priority-count-tile strong {{ font-size:24px; line-height:1; }}
+
+                    .kpi-customer-movement-copy strong {{ font-size:14px; line-height:1.2; }}
+                    .kpi-customer-movement-copy small {{ font-size:12px; line-height:1.2; }}
+                    .kpi-customer-movement-badge {{ font-size:10px; }}
+                    .kpi-promises-panel .button,
+                    .kpi-sales-stack .button {{ font-size:12px; line-height:1.2; }}
+
+                    .kpi-sales-stack .kpi-strategic-panel,
+                    .kpi-sales-stack .kpi-priority-panel {{
+                        display:flex;
+                        flex-direction:column;
+                    }}
+
+                    .kpi-sales-stack .kpi-strategic-stats {{ margin-top:auto; }}
+                    .kpi-sales-stack .kpi-strategic-panel .button {{ margin-bottom:auto; }}
+                    .kpi-sales-stack .kpi-priority-count-tile {{ margin-top:auto; margin-bottom:auto; width:100%; box-sizing:border-box; }}
+
+                    .kpi-todo-panel {{ grid-area:todos; min-width:0; min-height:0; box-sizing:border-box; padding:18px 20px; border-top:4px solid #4b76ad; }}
+                    .kpi-todo-head {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }}
+                    .kpi-todo-head h2, .kpi-todo-head p {{ margin:0; }}
+                    .kpi-todo-create {{ display:grid; grid-template-columns:minmax(0, 1fr) 120px auto; gap:8px; margin:10px 0; }}
+                    .kpi-todo-create input {{ min-height:38px; padding:8px 10px; }}
+                    .kpi-todo-list {{ display:grid; grid-template-columns:1fr; gap:7px; max-height:510px; overflow:auto; }}
+                    .kpi-todo-row {{ display:grid; grid-template-columns:auto minmax(0, 1fr) auto; align-items:center; gap:8px; padding:7px 9px; border-radius:10px; background:#f7f9fc; }}
+                    .kpi-todo-row strong, .kpi-todo-row small {{ display:block; }}
+                    .kpi-todo-row small {{ color:var(--muted); }}
+                    .kpi-todo-row.completed strong {{ color:var(--muted); text-decoration:line-through; }}
+                    .kpi-todo-check {{ width:24px; height:24px; padding:0; border:2px solid #7b8da5; border-radius:7px; background:white; color:#08765f; }}
+                    .kpi-todo-row.completed .kpi-todo-check {{ border-color:#49c9ad; background:#e7f8f1; }}
+                    .kpi-todo-delete {{ padding:3px 7px; border:0; background:transparent; color:#8a98aa; font-size:20px; }}
+                    .kpi-meeting-history-links {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:8px 0 2px; font-size:12px; font-weight:700; }}
+                    .kpi-meeting-history-links a {{ color:var(--blue); }}
+                    .kpi-meeting-ai {{ min-width:180px; }}
+                    .kpi-meeting-ai summary {{ cursor:pointer; color:var(--blue); font-weight:800; }}
+                    .kpi-meeting-ai-body {{ position:absolute; right:24px; z-index:20; width:min(520px, calc(100vw - 48px)); padding:14px; border:1px solid var(--border); border-radius:14px; background:white; box-shadow:0 18px 45px rgba(34,55,82,.18); }}
+                    .kpi-meeting-ai-panel-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }}
+                    .kpi-meeting-ai-panel-head p {{ margin:0; }}
+                    .kpi-meeting-ai-close {{ flex:0 0 30px; width:30px; height:30px; padding:0; border:0; border-radius:8px; background:#eef3fb; color:#52667e; font-size:22px; line-height:1; }}
+                    .kpi-meeting-ai-close:hover {{ background:#dfe8f5; }}
+                    .kpi-record-actions {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+                    .kpi-proposal {{ display:flex; gap:8px; margin:8px 0; }}
+                    .kpi-proposal span, .kpi-proposal small {{ display:block; }}
+                    .kpi-meeting-result {{ padding:10px 12px; border-radius:12px; background:#f7f9fc; }}
+                    .kpi-meeting-result h3 {{ margin:8px 0 4px; font-size:14px; }}
+                    .kpi-meeting-result p, .kpi-meeting-result ul {{ margin:4px 0 8px; }}
+
+                    .meeting-history-panel, .meeting-record-panel {{ padding:24px; }}
+                    .meeting-history-grid {{ display:grid; gap:12px; }}
+                    .meeting-history-card {{ display:grid; gap:8px; padding:16px 18px; border:1px solid var(--border); border-radius:14px; color:var(--text); text-decoration:none; background:#fff; box-shadow:var(--shadow-card); }}
+                    .meeting-history-card:hover {{ border-color:#a9c1e5; transform:translateY(-1px); }}
+                    .meeting-history-card div {{ display:flex; align-items:baseline; justify-content:space-between; gap:14px; }}
+                    .meeting-history-card span, .meeting-history-card small {{ color:var(--muted); }}
+                    .meeting-history-card p {{ margin:0; line-height:1.45; }}
+                    .meeting-record-actions {{ display:flex; gap:8px; flex-wrap:wrap; }}
+                    .meeting-record-section {{ margin-top:16px; padding:16px 18px; border:1px solid var(--border); border-radius:14px; background:#fbfdff; }}
+                    .meeting-record-section h3 {{ margin:0 0 8px; }}
+                    .meeting-record-section p {{ margin:0; line-height:1.55; }}
+                    .meeting-record-columns {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }}
+                    .meeting-record-list {{ margin:0; padding-left:20px; display:grid; gap:7px; }}
+                    .meeting-transcript {{ margin-top:16px; padding:14px 16px; border:1px solid var(--border); border-radius:14px; background:white; }}
+                    .meeting-transcript summary {{ cursor:pointer; color:var(--blue); font-weight:800; }}
+                    .meeting-transcript div {{ margin-top:12px; white-space:pre-wrap; line-height:1.55; color:#34465b; }}
 
                     .kpi-production-panel {{
-                        grid-column: 1 / -1;
+                        grid-area: production;
                         padding: 24px;
                         border-top: 4px solid #8b5cf6;
                     }}
 
                     .kpi-accounts-panel {{
-                        grid-column: 1 / -1;
+                        grid-area: accounts;
                         padding: 24px;
                         border-top: 4px solid #0f7896;
                     }}
 
                     .kpi-accounts-grid {{
-                        grid-template-columns: repeat(5, minmax(0, 1fr));
                         margin-bottom: 0;
+                    }}
+
+                    .production-kpi-grid.kpi-accounts-sales-grid {{
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        margin-bottom: 12px;
+                    }}
+
+                    .production-kpi-grid.kpi-accounts-aged-grid {{
+                        grid-template-columns: repeat(7, minmax(0, 1fr));
+                        gap: 8px;
                     }}
 
                     .kpi-production-head {{
@@ -23259,23 +24348,23 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-summary-grid div:nth-child(1) {{
-                        border-color: #b9cbff;
-                        background: linear-gradient(145deg, #f2f6ff, #ffffff);
+                        border-color: #c9d9eb;
+                        background: linear-gradient(145deg, #f4f8fd, #ffffff);
                     }}
 
                     .kpi-summary-grid div:nth-child(2) {{
                         border-color: #c9d9eb;
-                        background: linear-gradient(145deg, #f6f9fc, #ffffff);
+                        background: linear-gradient(145deg, #f4f8fd, #ffffff);
                     }}
 
                     .kpi-summary-grid div:nth-child(3) {{
-                        border-color: #bce8dc;
-                        background: linear-gradient(145deg, #effbf7, #ffffff);
+                        border-color: #c9d9eb;
+                        background: linear-gradient(145deg, #f4f8fd, #ffffff);
                     }}
 
                     .kpi-summary-grid div:nth-child(4) {{
-                        border-color: #f1d8a5;
-                        background: linear-gradient(145deg, #fff9eb, #ffffff);
+                        border-color: #c9d9eb;
+                        background: linear-gradient(145deg, #f4f8fd, #ffffff);
                     }}
 
                     .kpi-promises-table-wrap {{
@@ -23332,9 +24421,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-planned-visits-panel {{
-                        min-height: 360px;
+                        grid-area: visits;
+                        min-height: 0;
+                        box-sizing: border-box;
                         padding: 24px;
-                        border-top: 4px solid #00a884;
+                        border-top: 4px solid #245582;
                     }}
 
                     html:fullscreen body {{
@@ -23347,7 +24438,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         max-width: none;
                         height: 100vh;
                         padding: 10px 14px;
-                        overflow: hidden;
+                        overflow-y: auto;
                     }}
 
                     html:fullscreen .kpi-dashboard-main > .top-row {{
@@ -23359,16 +24450,31 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 22px;
                     }}
 
+                    html:fullscreen .kpi-page-toolbar {{ display:none; }}
+                    html:fullscreen .kpi-sales-stack {{ gap:7px; }}
+                    html:fullscreen .kpi-sales-stack > .panel {{ height:auto; min-height:0; padding:8px 11px; }}
+                    html:fullscreen .kpi-sales-stack .kpi-strategic-stats {{ margin-top:auto; }}
+                    html:fullscreen .kpi-sales-stack .kpi-strategic-stats div {{ padding:4px; }}
+                    html:fullscreen .kpi-sales-stack .kpi-strategic-panel .button {{ margin-top:4px; margin-bottom:auto; }}
+                    html:fullscreen .kpi-sales-stack .kpi-priority-count-tile {{ min-height:55px; padding:5px 8px; }}
+
                     html:fullscreen .kpi-dashboard-grid {{
                         gap: 10px;
+                        grid-template-rows: auto auto 165px minmax(210px, 1fr);
                     }}
 
                     html:fullscreen .kpi-promises-panel,
                     html:fullscreen .kpi-priority-panel,
+                    html:fullscreen .kpi-strategic-panel,
                     html:fullscreen .kpi-planned-visits-panel {{
                         min-height: 0;
-                        height: 210px;
+                        height: auto;
                         padding: 12px 14px;
+                    }}
+
+                    html:fullscreen .kpi-sales-stack .kpi-strategic-panel,
+                    html:fullscreen .kpi-sales-stack .kpi-priority-panel {{
+                        padding-top:16px;
                     }}
 
                     html:fullscreen .kpi-promises-head {{
@@ -23464,13 +24570,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     html.kpi-presentation-mode .kpi-promises-panel .kpi-summary-grid span {{
-                        font-size: 10px;
+                        font-size: 11px;
                         line-height: 1.15;
                     }}
 
                     html.kpi-presentation-mode .kpi-promises-panel .kpi-summary-grid strong {{
                         margin-top: 2px;
-                        font-size: 21px;
+                        font-size: 24px;
                         line-height: 1;
                     }}
 
@@ -23478,7 +24584,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-height: 29px;
                         margin: 0;
                         padding: 5px 9px;
-                        font-size: 11px;
+                        font-size: 12px;
                     }}
 
                     html:fullscreen .kpi-priority-count-tile {{
@@ -23507,8 +24613,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     html:fullscreen .kpi-customer-movement-panel {{
-                        padding: 10px 14px;
+                        padding: 12px 14px;
                     }}
+
+                    html:fullscreen .kpi-todo-panel {{ padding:8px 12px; }}
+                    html:fullscreen .kpi-todo-create {{ margin:5px 0; }}
+                    html:fullscreen .kpi-todo-row {{ padding:4px 7px; font-size:11px; }}
+                    html:fullscreen .kpi-todo-row small {{ display:none; }}
 
                     html:fullscreen .kpi-customer-movement-panel .kpi-section-title {{
                         margin-bottom: 7px;
@@ -27172,6 +28283,117 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         align-items: center;
                     }}
 
+                    main.ai-analysis-main {{
+                        max-width: 1180px;
+                    }}
+
+                    .ai-analysis-main > h1 {{
+                        margin-bottom: 14px;
+                        font-size: 30px;
+                    }}
+
+                    .ai-analysis-panel {{
+                        padding: 20px 22px;
+                        border-radius: 16px;
+                    }}
+
+                    .ai-analysis-panel > h2 {{
+                        margin-bottom: 4px;
+                        font-size: 22px;
+                    }}
+
+                    .ai-analysis-panel > .muted {{
+                        margin-top: 0;
+                        font-size: 14px;
+                        line-height: 1.45;
+                    }}
+
+                    .ai-analysis-form {{
+                        grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
+                        gap: 14px 16px;
+                        align-items: end;
+                        margin-top: 16px;
+                    }}
+
+                    .ai-analysis-form label {{
+                        display: grid;
+                        gap: 5px;
+                        min-width: 0;
+                    }}
+
+                    .ai-analysis-form label > span,
+                    .ai-analysis-pricing-fields summary {{
+                        font-size: 13px;
+                        font-weight: 700;
+                        line-height: 1.25;
+                        color: var(--text);
+                    }}
+
+                    .ai-analysis-form input,
+                    .ai-analysis-form select,
+                    .ai-analysis-form textarea {{
+                        min-height: 42px;
+                        padding: 9px 11px;
+                        font-size: 14px;
+                        line-height: 1.35;
+                    }}
+
+                    .ai-analysis-form textarea {{
+                        min-height: 88px;
+                        resize: vertical;
+                    }}
+
+                    .ai-analysis-request-field {{
+                        grid-column: 1 / -1;
+                    }}
+
+                    .ai-analysis-company-field {{
+                        grid-column: 1;
+                    }}
+
+                    .ai-analysis-type-field {{
+                        grid-column: 2;
+                        grid-row: 2;
+                    }}
+
+                    .ai-analysis-pricing-fields {{
+                        grid-column: 1 / -1;
+                        padding: 11px 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: var(--surface-inset);
+                    }}
+
+                    .ai-analysis-pricing-fields summary {{
+                        cursor: pointer;
+                    }}
+
+                    .ai-analysis-pricing-fields .controls {{
+                        margin: 12px 0 0;
+                        padding: 0;
+                        border: 0;
+                        background: transparent;
+                        box-shadow: none;
+                    }}
+
+                    .ai-analysis-file {{
+                        width: 100%;
+                        border: 1px dashed var(--border-strong);
+                        border-radius: 10px;
+                        background: var(--surface-inset);
+                    }}
+
+                    .ai-analysis-form > button {{
+                        min-height: 44px;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }}
+
+                    .ai-analysis-help {{
+                        margin: 10px 0 0;
+                        font-size: 12px !important;
+                    }}
+
                     .validation-grid {{
                         display: grid;
                         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -28501,15 +29723,41 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .kpi-dashboard-grid {{
                             grid-template-columns: 1fr;
+                            grid-template-areas:
+                                "production"
+                                "accounts"
+                                "promises"
+                                "movement"
+                                "strategic"
+                                "priority"
+                                "visits"
+                                "todos";
+                            grid-template-rows:auto;
                         }}
+
+                        .kpi-sales-stack {{ display:contents; }}
+
+                        .kpi-page-toolbar {{ margin:0 0 12px; }}
+
+                        .meeting-record-columns {{ grid-template-columns:1fr; }}
+                        .meeting-history-card div {{ display:grid; gap:4px; }}
+
+                        .kpi-customer-movement-panel,
+                        .kpi-todo-panel {{ grid-column:auto; }}
 
                         .kpi-promises-panel,
                         .kpi-priority-panel,
+                        .kpi-strategic-panel,
                         .kpi-planned-visits-panel {{
                             min-height: 0;
                         }}
 
                         .kpi-accounts-grid {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .production-kpi-grid.kpi-accounts-sales-grid,
+                        .production-kpi-grid.kpi-accounts-aged-grid {{
                             grid-template-columns: repeat(2, minmax(0, 1fr));
                         }}
 
@@ -28519,6 +29767,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 720px) {{
+                        .kpi-todo-create,
+                        .kpi-todo-list {{ grid-template-columns: 1fr; }}
+
                         .kpi-customer-movement-list {{
                             grid-template-columns: 1fr;
                         }}
@@ -29015,6 +30266,19 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .upload-form {{
                             grid-template-columns: 1fr;
+                        }}
+
+                        .ai-analysis-form > * {{
+                            grid-column: 1 !important;
+                            grid-row: auto !important;
+                        }}
+
+                        .ai-analysis-panel {{
+                            padding: 16px;
+                        }}
+
+                        .ai-analysis-main > h1 {{
+                            font-size: 25px;
                         }}
 
                         .sales-cards {{

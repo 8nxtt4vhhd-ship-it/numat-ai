@@ -270,7 +270,9 @@ def build_production_kpi_payload(result=None, days=90):
     production_revenue_values = [
         item["production_revenue_today"]
         for item in rows
-        if item.get("production_revenue_today") is not None
+        # Blank and zero-value days are not production days and must not
+        # dilute the average daily production value.
+        if (item.get("production_revenue_today") or 0) > 0
     ]
     return {
         "status": result.get("status", "error"),

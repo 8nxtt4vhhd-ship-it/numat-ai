@@ -67,6 +67,23 @@ class ProductionKpiTests(unittest.TestCase):
 
         self.assertIsNone(payload["summary"]["plant_productivity"])
 
+    def test_average_daily_production_value_excludes_blank_and_zero_days(self):
+        result = {
+            "status": "ok",
+            "production_rows": [
+                {"date": "2026-08-17", "production_revenue_today": 6000},
+                {"date": "2026-08-18", "production_revenue_today": None},
+                {"date": "2026-08-19", "production_revenue_today": 0},
+                {"date": "2026-08-20", "production_revenue_today": 8000},
+            ],
+            "operator_rows": [],
+            "plant_operator_rows": [],
+        }
+
+        payload = build_production_kpi_payload(result, days=0)
+
+        self.assertEqual(payload["summary"]["average_production_revenue"], 7000)
+
 
 if __name__ == "__main__":
     unittest.main()

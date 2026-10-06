@@ -28,6 +28,37 @@ class InactiveCustomerFilteringTests(unittest.TestCase):
         self.assertFalse(filemaker.is_supported_filemaker_customer_type({"type": "Prospect"}))
         self.assertFalse(filemaker.is_supported_filemaker_customer_type({"type": ""}))
 
+    def test_other_company_keeps_direct_price_list_for_analysis(self):
+        config = filemaker.get_filemaker_config()
+        record = {
+            "fieldData": {
+                config["customers_key_field"]: "O1",
+                config["customers_name_field"]: "Former Customer",
+                config["customers_type_field"]: "Other",
+                "ai_PriceList": "D",
+            }
+        }
+
+        customer = filemaker.map_filemaker_customer_master_record(record)
+
+        self.assertEqual(customer["type"], "Other")
+        self.assertEqual(customer["price_list"], "D")
+        self.assertFalse(filemaker.is_supported_filemaker_customer_type(customer))
+
+    def test_customer_price_list_mapping_supports_legacy_field_name(self):
+        config = filemaker.get_filemaker_config()
+        record = {
+            "fieldData": {
+                config["customers_key_field"]: "L1",
+                config["customers_name_field"]: "Legacy Customer",
+                "Price List": "B",
+            }
+        }
+
+        customer = filemaker.map_filemaker_customer_master_record(record)
+
+        self.assertEqual(customer["price_list"], "B")
+
     def test_filemaker_orders_exclude_inactive_customer_key(self):
         orders = [
             {"customer": "Active Co", "extra": {"Customer Ref": "A1"}},

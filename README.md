@@ -56,6 +56,7 @@ FILEMAKER_AMOUNT_FIELD=Orders::Repair Value
 FILEMAKER_DATE_ORDER=mdy
 FILEMAKER_LAST_ACTIVITY_CONTENT_FIELD=Companies 4::Last Activity Act Content
 FILEMAKER_EXTRA_FIELDS=Companies 4::Price List,Orders::First Order,Orders::Order No,Orders::Invoice Number,Orders::No of Mats,Orders::Status,Companies 4::State,Companies 4::Territory,Companies 4::ZIP Code,Companies 4::First Order Date,Companies 4::Last Order Date,Companies 4::Last Activity Act,Companies 4::Last Activity Act Content,Companies 4::PrimaryKey
+FILEMAKER_CUSTOMERS_PRICE_LIST_FIELD=ai_PriceList
 ```
 
 Run the API locally:

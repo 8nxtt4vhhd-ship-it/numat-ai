@@ -47,6 +47,7 @@ def get_filemaker_config():
         ).strip(),
         "customers_type_field": os.getenv("FILEMAKER_CUSTOMERS_TYPE_FIELD", "Type").strip(),
         "customers_priority_field": os.getenv("FILEMAKER_CUSTOMERS_PRIORITY_FIELD", "a_Priority Rating").strip(),
+        "customers_price_list_field": os.getenv("FILEMAKER_CUSTOMERS_PRICE_LIST_FIELD", "ai_PriceList").strip(),
         "contacts_layout": os.getenv("FILEMAKER_CONTACTS_LAYOUT", "").strip(),
         "contacts_key_field": os.getenv("FILEMAKER_CONTACTS_KEY_FIELD", "PrimaryKey").strip(),
         "contacts_customer_ref_field": os.getenv(
@@ -741,6 +742,16 @@ def get_field_value(field_data, field_name):
     return None
 
 
+def get_first_nonempty_field_value(field_data, *field_names):
+    for field_name in field_names:
+        if not field_name:
+            continue
+        value = get_field_value(field_data, field_name)
+        if value not in {None, ""}:
+            return value
+    return None
+
+
 def normalize_filemaker_date(value):
     if not value:
         return None
@@ -790,6 +801,7 @@ def build_filemaker_master_data_cache_key():
         config["customers_activity_status_field"],
         config["customers_type_field"],
         config["customers_priority_field"],
+        config["customers_price_list_field"],
         config["contacts_layout"],
         config["contacts_key_field"],
         config["contacts_customer_ref_field"],
@@ -851,6 +863,13 @@ def map_filemaker_customer_master_record(record):
         "priority": normalize_text_value(
             get_field_value(field_data, config["customers_priority_field"])
         ),
+        "price_list": normalize_text_value(get_first_nonempty_field_value(
+            field_data,
+            config["customers_price_list_field"],
+            "ai_PriceList",
+            "Price List",
+            "Companies 4::Price List",
+        )),
     }
 
 

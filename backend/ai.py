@@ -607,6 +607,7 @@ def generate_customer_explanation(customer):
     if not api_key:
         return fallback_explanation(customer)
 
+
     try:
         from openai import OpenAI
 
@@ -646,6 +647,68 @@ def generate_customer_explanation(customer):
     except Exception as error:
         print(f"AI explanation failed: {error}")
         return fallback_explanation(customer)
+
+
+def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
+    """Transcribe a meeting and return a summary, decisions, updates and reviewable actions."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return {"status": "missing_api_key", "transcript": "", "actions": [], "error_message": "OpenAI is not configured."}
+    if not audio_bytes:
+        return {"status": "empty_audio", "transcript": "", "actions": [], "error_message": "No meeting audio was received."}
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        transcription = client.audio.transcriptions.create(
+            model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
+            file=(str(filename or "meeting.webm"), audio_bytes),
+        )
+        transcript = str(getattr(transcription, "text", "") or "").strip()
+        if not transcript:
+            return {"status": "no_transcript", "transcript": "", "actions": [], "error_message": "No speech could be transcribed."}
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=[
+                {"role": "system", "content": (
+                    "Create a factual record of a NuMat weekly management meeting. Summarize the meeting clearly, "
+                    "separate confirmed decisions from notable status updates, and extract explicit follow-up actions. "
+                    "Do not turn discussion, ideas, status updates, or speculation into tasks. Keep each action short, "
+                    "specific and independently understandable. Include an owner only when clearly assigned. "
+                    "Do not invent facts or decisions. Return strict JSON only."
+                )},
+                {"role": "user", "content": transcript},
+            ],
+            text={"format": {"type": "json_schema", "name": "weekly_meeting_record", "strict": True, "schema": {
+                "type": "object", "properties": {
+                    "summary": {"type": "string"},
+                    "decisions": {"type": "array", "items": {"type": "string"}},
+                    "updates": {"type": "array", "items": {"type": "string"}},
+                    "actions": {"type": "array", "items": {
+                        "type": "object", "properties": {"text": {"type": "string"}, "owner": {"type": "string"}},
+                        "required": ["text", "owner"], "additionalProperties": False}},
+                },
+                "required": ["summary", "decisions", "updates", "actions"], "additionalProperties": False,
+            }}},
+            max_output_tokens=1600,
+        )
+        parsed = json.loads(response.output_text or "{}")
+        actions = [
+            {"text": str(item.get("text") or "").strip(), "owner": str(item.get("owner") or "").strip()}
+            for item in parsed.get("actions", []) if str(item.get("text") or "").strip()
+        ]
+        return {
+            "status": "ok",
+            "transcript": transcript,
+            "summary": str(parsed.get("summary") or "").strip(),
+            "decisions": [str(item).strip() for item in parsed.get("decisions", []) if str(item).strip()],
+            "updates": [str(item).strip() for item in parsed.get("updates", []) if str(item).strip()],
+            "actions": actions,
+            "error_message": "",
+        }
+    except Exception as error:
+        print(f"Meeting action extraction failed: {error}")
+        return {"status": "error", "transcript": "", "actions": [], "error_message": str(error)}
 
 
 def add_ai_explanations(customers):
