@@ -24460,7 +24460,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     html:fullscreen .kpi-dashboard-grid {{
                         gap: 10px;
-                        grid-template-rows: auto auto 165px minmax(210px, 1fr);
+                        grid-template-rows: auto auto minmax(230px, auto) minmax(360px, auto);
                     }}
 
                     html:fullscreen .kpi-promises-panel,
@@ -24616,10 +24616,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         padding: 12px 14px;
                     }}
 
-                    html:fullscreen .kpi-todo-panel {{ padding:8px 12px; }}
-                    html:fullscreen .kpi-todo-create {{ margin:5px 0; }}
-                    html:fullscreen .kpi-todo-row {{ padding:4px 7px; font-size:11px; }}
-                    html:fullscreen .kpi-todo-row small {{ display:none; }}
+                    html:fullscreen .kpi-todo-panel {{ padding:14px 16px; }}
+                    html:fullscreen .kpi-todo-create {{ margin:10px 0; }}
+                    html:fullscreen .kpi-todo-row {{ padding:7px 9px; font-size:13px; }}
+                    html:fullscreen .kpi-todo-row small {{ display:block; }}
 
                     html:fullscreen .kpi-customer-movement-panel .kpi-section-title {{
                         margin-bottom: 7px;
