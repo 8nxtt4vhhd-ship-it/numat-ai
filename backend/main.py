@@ -24239,6 +24239,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .kpi-sales-stack .kpi-priority-count-tile {{ margin-top:auto; margin-bottom:auto; width:100%; box-sizing:border-box; }}
 
                     .kpi-todo-panel {{ grid-area:todos; min-width:0; min-height:0; box-sizing:border-box; padding:18px 20px; border-top:4px solid #4b76ad; }}
+                    .kpi-planned-visits-panel,
+                    .kpi-todo-panel {{ align-self:stretch; height:100%; }}
                     .kpi-todo-head {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }}
                     .kpi-todo-head h2, .kpi-todo-head p {{ margin:0; }}
                     .kpi-todo-create {{ display:grid; grid-template-columns:minmax(0, 1fr) 120px auto; gap:8px; margin:10px 0; }}
@@ -24618,6 +24620,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     html:fullscreen .kpi-todo-panel {{ padding:14px 16px; }}
                     html:fullscreen .kpi-todo-create {{ margin:10px 0; }}
+                    html:fullscreen .kpi-planned-visits-panel,
+                    html:fullscreen .kpi-todo-panel {{ height:100%; }}
+                    html:fullscreen .kpi-todo-list {{ max-height:none; overflow:visible; }}
                     html:fullscreen .kpi-todo-row {{ padding:7px 9px; font-size:13px; }}
                     html:fullscreen .kpi-todo-row small {{ display:block; }}
 
