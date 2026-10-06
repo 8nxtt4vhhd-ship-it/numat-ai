@@ -24424,6 +24424,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .kpi-planned-visits-panel {{
                         grid-area: visits;
+                        display: flex;
+                        flex-direction: column;
                         min-height: 0;
                         box-sizing: border-box;
                         padding: 24px;
@@ -24604,7 +24606,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     html:fullscreen .kpi-visits-list {{
-                        max-height: 132px;
+                        max-height: none;
                         margin-top: 7px;
                         gap: 5px;
                     }}
@@ -24685,8 +24687,12 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .kpi-visits-list {{
                         display: grid;
+                        flex: 1 1 auto;
+                        min-height: 0;
+                        align-content: start;
+                        grid-auto-rows: max-content;
                         gap: 8px;
-                        max-height: 250px;
+                        max-height: none;
                         margin-top: 16px;
                         overflow-y: auto;
                     }}
