@@ -224,6 +224,7 @@ DEFAULT_LOGIN_MFA_CHALLENGES_PATH = BASE_DIR / "data" / "login_mfa_challenges.js
 DEFAULT_AUDIT_LOG_PATH = BASE_DIR / "data" / "audit_log.json"
 DEFAULT_WEEKLY_KPI_TODOS_PATH = BASE_DIR / "data" / "weekly_kpi_todos.json"
 DEFAULT_WEEKLY_KPI_MEETINGS_PATH = BASE_DIR / "data" / "weekly_kpi_meetings.json"
+DEFAULT_WEEKLY_KPI_CACHE_PATH = BASE_DIR / "data" / "weekly_kpi_dashboard_cache.json"
 APP_USERS_LOCK = Lock()
 RECENT_SENT_EMAILS_LOCK = Lock()
 STRATEGIC_CONTACTS_LOCK = Lock()
@@ -7496,28 +7497,63 @@ _WEEKLY_KPI_PAYLOAD_CACHE = {
     "date_key": "",
     "expires_at": 0.0,
     "payload": None,
-    "refreshing": False,
+    "saved_at": "",
 }
 _WEEKLY_KPI_PAYLOAD_CACHE_LOCK = Lock()
 
 
-def get_weekly_kpi_payload_cache_seconds():
+def get_weekly_kpi_payload_cache_path():
+    configured = os.getenv("WEEKLY_KPI_PAYLOAD_CACHE_PATH", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_WEEKLY_KPI_CACHE_PATH
+
+
+def load_weekly_kpi_payload_from_disk():
+    path = get_weekly_kpi_payload_cache_path()
     try:
-        return max(0, int(os.getenv("WEEKLY_KPI_PAYLOAD_CACHE_SECONDS", "120")))
-    except ValueError:
-        return 120
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    payload = cached.get("payload") if isinstance(cached, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
+        _WEEKLY_KPI_PAYLOAD_CACHE.update({
+            "date_key": str(cached.get("date_key") or ""),
+            "expires_at": 0.0,
+            "payload": payload,
+            "saved_at": str(cached.get("saved_at") or ""),
+        })
+    return payload
+
+
+def save_weekly_kpi_payload_to_disk(payload, date_key, saved_at):
+    path = get_weekly_kpi_payload_cache_path()
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps({
+            "version": 1,
+            "date_key": date_key,
+            "saved_at": saved_at,
+            "payload": payload,
+        }, separators=(",", ":"), default=str), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except (OSError, TypeError, ValueError) as error:
+        print(f"Weekly KPI dashboard cache write failed: {error}")
 
 
 def store_weekly_kpi_payload(payload, date_key=None):
-    cache_seconds = get_weekly_kpi_payload_cache_seconds()
     date_key = date_key or datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d")
+    saved_at = datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
     with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
         _WEEKLY_KPI_PAYLOAD_CACHE.update({
             "date_key": date_key,
-            "expires_at": time.time() + cache_seconds,
+            "expires_at": 0.0,
             "payload": payload,
-            "refreshing": False,
+            "saved_at": saved_at,
         })
+    save_weekly_kpi_payload_to_disk(payload, date_key, saved_at)
     return payload
 
 
@@ -7527,23 +7563,12 @@ def clear_weekly_kpi_payload_cache():
             "date_key": "",
             "expires_at": 0.0,
             "payload": None,
-            "refreshing": False,
+            "saved_at": "",
         })
-
-
-def refresh_weekly_kpi_payload_in_background(date_key):
-    try:
-        payload = build_weekly_kpi_dashboard_payload()
-        store_weekly_kpi_payload(payload, date_key=date_key)
-    except Exception:
-        traceback.print_exc()
-        with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
-            _WEEKLY_KPI_PAYLOAD_CACHE["refreshing"] = False
 
 
 def get_cached_weekly_kpi_dashboard_payload(force_refresh=False):
     date_key = datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d")
-    now = time.time()
 
     if force_refresh:
         return store_weekly_kpi_payload(
@@ -7553,22 +7578,15 @@ def get_cached_weekly_kpi_dashboard_payload(force_refresh=False):
 
     with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
         cached_payload = _WEEKLY_KPI_PAYLOAD_CACHE.get("payload")
-        same_day = _WEEKLY_KPI_PAYLOAD_CACHE.get("date_key") == date_key
-        cache_is_fresh = _WEEKLY_KPI_PAYLOAD_CACHE.get("expires_at", 0) > now
-        if cached_payload is not None and same_day and cache_is_fresh:
-            return cached_payload
-        if cached_payload is not None and same_day:
-            if not _WEEKLY_KPI_PAYLOAD_CACHE.get("refreshing"):
-                _WEEKLY_KPI_PAYLOAD_CACHE["refreshing"] = True
-                Thread(
-                    target=refresh_weekly_kpi_payload_in_background,
-                    args=(date_key,),
-                    daemon=True,
-                ).start()
+        if cached_payload is not None:
             return cached_payload
 
+    cached_payload = load_weekly_kpi_payload_from_disk()
+    if cached_payload is not None:
+        return cached_payload
+
     return store_weekly_kpi_payload(
-        build_weekly_kpi_dashboard_payload(),
+        build_weekly_kpi_dashboard_payload(force_refresh=True),
         date_key=date_key,
     )
 
@@ -7990,7 +8008,13 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
         f"{oldest_days} day{'s' if oldest_days != 1 else ''}"
         if oldest_days is not None else "—"
     )
-    refresh_label = format_optional_datetime(payload.get("synced_at")) if payload.get("synced_at") else "Current CRM cache"
+    with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
+        cache_saved_at = str(_WEEKLY_KPI_PAYLOAD_CACHE.get("saved_at") or "").strip()
+    refresh_label = cache_saved_at or (format_optional_datetime(payload.get("synced_at")) if payload.get("synced_at") else "saved cache")
+    refresh_button = (
+        '<form method="post" action="/admin-settings/refresh-weekly-kpi"><button class="button secondary small-button" type="submit">Refresh data</button></form>'
+        if can_manage_user_accounts(current_user) else ""
+    )
 
     refresh_status = (
         f'<p class="status ok">{escape(message or "Weekly KPI data refreshed from the connected sources.")}</p>'
@@ -8003,7 +8027,8 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
     body = f"""
         {refresh_status}
         <div class="kpi-page-toolbar">
-            <span class="small muted">Dashboard updated {escape(refresh_label)}</span>
+            <span class="small muted">Cached dashboard updated {escape(refresh_label)} · refreshed nightly</span>
+            {refresh_button}
             <button class="button secondary small-button" type="button" onclick="document.documentElement.classList.add('kpi-presentation-mode'); document.documentElement.onfullscreenchange=()=>document.fullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); document.documentElement.onwebkitfullscreenchange=()=>document.webkitFullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement)">Presentation mode</button>
         </div>
         <div class="kpi-dashboard-grid">

@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the NuMat Weekly KPI dashboard cache
+After=network-online.target numat-ai.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=numatadmin
+WorkingDirectory=/srv/numat-ai/backend
+EnvironmentFile=/srv/numat-ai/backend/.env
+ExecStart=/srv/numat-ai/backend/venv/bin/python /srv/numat-ai/backend/weekly_kpi_refresh.py

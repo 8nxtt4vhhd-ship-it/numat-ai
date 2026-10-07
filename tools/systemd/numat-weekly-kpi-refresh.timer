@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the NuMat Weekly KPI dashboard cache overnight
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 America/Chicago
+Persistent=true
+Unit=numat-weekly-kpi-refresh.service
+
+[Install]
+WantedBy=timers.target

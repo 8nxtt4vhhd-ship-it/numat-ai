@@ -10,12 +10,21 @@ from crm import normalize_crm_row
 
 class WeeklyKpiPeriodTests(unittest.TestCase):
     def setUp(self):
+        self.weekly_cache_directory = TemporaryDirectory()
+        self.addCleanup(self.weekly_cache_directory.cleanup)
+        self.weekly_cache_path_patch = patch.object(
+            main,
+            "get_weekly_kpi_payload_cache_path",
+            return_value=Path(self.weekly_cache_directory.name) / "weekly-kpi-cache.json",
+        )
+        self.weekly_cache_path_patch.start()
+        self.addCleanup(self.weekly_cache_path_patch.stop)
         with main._WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
             main._WEEKLY_KPI_PAYLOAD_CACHE.update({
                 "date_key": "",
                 "expires_at": 0.0,
                 "payload": None,
-                "refreshing": False,
+                "saved_at": "",
             })
 
     def test_complete_dashboard_payload_is_reused_while_fresh(self):
@@ -28,6 +37,24 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
 
         self.assertIs(result, payload)
         builder.assert_not_called()
+
+    def test_dashboard_reuses_disk_cache_after_restart_even_on_a_later_day(self):
+        payload = {"status": "ok", "summary": {"open_count": 7}}
+        main.store_weekly_kpi_payload(payload, date_key="2026-10-06")
+        with main._WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
+            main._WEEKLY_KPI_PAYLOAD_CACHE.update({
+                "date_key": "",
+                "expires_at": 0.0,
+                "payload": None,
+                "saved_at": "",
+            })
+
+        with patch.object(main, "build_weekly_kpi_dashboard_payload") as builder:
+            result = main.get_cached_weekly_kpi_dashboard_payload()
+
+        self.assertEqual(result["summary"]["open_count"], 7)
+        builder.assert_not_called()
+        self.assertTrue(main._WEEKLY_KPI_PAYLOAD_CACHE["saved_at"])
 
     def test_strategic_summary_counts_recent_additions_and_outbound_reach(self):
         summary = main.build_strategic_contact_kpi_summary(
