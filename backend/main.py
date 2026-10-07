@@ -126,8 +126,21 @@ from m365 import (
     send_m365_reporting_mail,
     set_m365_token_record,
 )
-from production import build_production_kpi_payload, fetch_production_analysis_data
-from production_reports import build_ai_analysis_docx, build_ai_report_facts, build_anomaly_workbook, clean_filename
+from production import (
+    build_production_kpi_payload,
+    clear_productivity_detail_cache,
+    fetch_production_analysis_data,
+    fetch_productivity_detail,
+    get_time_bookings_layout,
+    operator_key,
+)
+from production_reports import (
+    build_ai_analysis_docx,
+    build_ai_report_facts,
+    build_ai_report_facts_for_calendar_period,
+    build_anomaly_workbook,
+    clean_filename,
+)
 from strategic_contacts_report import build_strategic_contacts_pdf
 from pdl import (
     check_pdl_connection,
@@ -6144,16 +6157,50 @@ def post_organisation_chart_report_send(group: str = Form("vestis-aramark")):
     )
 
 
+def resolve_production_date_range(start="", end="", fallback_days=90):
+    latest_allowed = datetime.now().date() - timedelta(days=1)
+    def parse_date(value):
+        for pattern in ("%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(str(value or "").strip(), pattern).date()
+            except ValueError:
+                continue
+        return None
+
+    end_date = parse_date(end) or latest_allowed
+    end_date = min(end_date, latest_allowed)
+    start_date = parse_date(start) or end_date - timedelta(days=max(1, int(fallback_days)) - 1)
+    if start_date > end_date:
+        start_date = end_date
+    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+
+
 @app.get("/production-analysis-view", response_class=HTMLResponse)
-def production_analysis_view(days: int = 90, refresh: str = ""):
-    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
+def production_analysis_view(days: int = 90, start: str = "", end: str = "", refresh: str = ""):
+    period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
     force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on"}
     production_result = fetch_production_analysis_data(force_refresh=force_refresh)
-    payload = build_production_kpi_payload(production_result, days=selected_days)
+    payload = build_production_kpi_payload(
+        production_result,
+        days=selected_days,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    productivity_detail = fetch_productivity_detail(
+        days=selected_days,
+        force_refresh=force_refresh,
+        period_start=period_start,
+        period_end=period_end,
+    )
     current_month_payload = build_current_month_production_payload(production_result=production_result)
     current_month_summary = current_month_payload.get("summary", {})
     latest = payload.get("latest", {})
     summary = payload.get("summary", {})
+    detail_summary = productivity_detail.get("summary", {})
+    detail_available = productivity_detail.get("status") == "ok" and bool(productivity_detail.get("clocking_count"))
+    plant_productivity = detail_summary.get("plant_productivity") if detail_available else summary.get("plant_productivity")
+    labour_percentage = detail_summary.get("labour_percentage") if detail_available else None
     latest_date = format_optional_datetime(latest.get("date")) if latest else "No data"
     body = f"""
         <section class="production-analysis-toolbar">
@@ -6163,11 +6210,13 @@ def production_analysis_view(days: int = 90, refresh: str = ""):
                 <p class="small muted">Data through: <strong>{escape(latest_date)}</strong> · today is excluded · refreshed {escape(format_optional_datetime(payload.get('synced_at')))}</p>
             </div>
             <div class="production-toolbar-actions">
-                <div class="production-period-control">{render_production_period_control(selected_days)}</div>
-                <a class="button secondary small-button" href="/production-analysis-view?days={selected_days}&refresh=1">Refresh</a>
-                <a class="button secondary small-button" href="/production-analysis/export-anomalies?days={selected_days}">Export anomalies</a>
+                {render_production_date_control(period_start, period_end)}
+                <a class="button secondary small-button" href="/production-analysis-view?{urlencode({'start': period_start, 'end': period_end, 'refresh': '1'})}">Refresh</a>
+                <a class="button secondary small-button" href="/production-analysis/export-anomalies?{urlencode({'start': period_start, 'end': period_end})}">Export anomalies</a>
                 <form method="post" action="/production-analysis/export-ai-report" class="production-report-form">
                     <input type="hidden" name="days" value="{selected_days}">
+                    <input type="hidden" name="start" value="{period_start}">
+                    <input type="hidden" name="end" value="{period_end}">
                     <button class="button small-button" type="submit">AI analysis report</button>
                 </form>
             </div>
@@ -6175,13 +6224,15 @@ def production_analysis_view(days: int = 90, refresh: str = ""):
         {render_data_availability_banner(payload)}
         <div class="production-kpi-grid">
             <div><span>Average press throughput</span><strong>{format_production_number(summary.get('average_press_throughput'))}</strong><small>FF1 + FF2 + FF3 LF per completed day</small></div>
-            <div><span>Plant productivity</span><strong>{format_production_number(summary.get('plant_productivity'), '%', decimals=1)}</strong><small>selected period · total booked ÷ clocked</small></div>
+            <a class="production-kpi-card-link" href="/production-analysis/productivity-detail?{urlencode({'start': period_start, 'end': period_end})}" aria-label="Open the plant productivity calculation detail"><span>Plant productivity</span><strong>{format_production_number(plant_productivity, '%', decimals=1)}</strong><small>paid time · productive booked ÷ clocked · view calculation</small></a>
             <div><span>Current backlog</span><strong>{format_production_number(latest.get('backlog_weeks'), decimals=1)}</strong><small>weeks · latest completed day</small></div>
             <div><span>Average daily production value</span><strong>{format_production_number(summary.get('average_production_revenue'), currency=True)}</strong><small>per completed recorded day</small></div>
             <div class="quality"><span>Re-cook activity</span><strong>{format_production_number(summary.get('recook_lf'))}</strong><small>LF in selected period</small></div>
-            <div><span>Labour %</span><strong>{format_production_number(current_month_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong><small>MTD labour cost ÷ invoiced revenue</small></div>
+            <a class="production-kpi-card-link" href="/production-analysis/productivity-detail?{urlencode({'start': period_start, 'end': period_end})}#labour-calculation" aria-label="Open the labour percentage calculation detail"><span>Labour %</span><strong>{format_production_number(labour_percentage, '%', decimals=1)}</strong><small>clocked labour + insurance ÷ Press repair value · view calculation</small></a>
         </div>
         <div class="production-analysis-grid">
+            {render_productivity_attention(productivity_detail) if detail_available else ''}
+            {render_department_productivity(productivity_detail.get('department_rows', []), detail_summary) if detail_available else ''}
             <section class="panel production-span-2">
                 <div class="panel-head"><div><span class="home-focus-inline-kicker">Weekly flow trend</span><h2>Department throughput</h2></div></div>
                 {render_production_trend_chart(payload.get('rows', []))}
@@ -6200,8 +6251,8 @@ def production_analysis_view(days: int = 90, refresh: str = ""):
                 {render_recook_trend(payload.get('rows', []))}
             </section>
             <section class="panel production-span-full">
-                <div class="panel-head"><div><span class="home-focus-inline-kicker">Production staff only</span><h2>Operator performance</h2></div><span class="small muted">Excluded: Trudy Dunlap, Kelly Bainbridge, Lois Horace, Temp 1 and Temp 2</span></div>
-                {render_operator_analysis(payload.get('operator_summary', []))}
+                <div class="panel-head"><div><span class="home-focus-inline-kicker">Production operators</span><h2>Operator performance</h2></div><span class="small muted">Lois is reported as manager support · office and work-trial records excluded</span></div>
+                {render_operator_analysis(productivity_detail.get('operator_rows', []) if detail_available else payload.get('operator_summary', []), period_start=period_start, period_end=period_end)}
             </section>
         </div>
     """
@@ -6209,15 +6260,328 @@ def production_analysis_view(days: int = 90, refresh: str = ""):
 
 
 @app.get("/api/production-analysis")
-def get_production_analysis_api(days: int = 90, refresh: bool = False):
-    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
-    return build_production_kpi_payload(fetch_production_analysis_data(force_refresh=refresh), days=selected_days)
+def get_production_analysis_api(days: int = 90, start: str = "", end: str = "", refresh: bool = False):
+    period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    payload = build_production_kpi_payload(fetch_production_analysis_data(force_refresh=refresh), days=selected_days, period_start=period_start, period_end=period_end)
+    payload["productivity_detail"] = fetch_productivity_detail(days=selected_days, force_refresh=refresh, period_start=period_start, period_end=period_end)
+    return payload
+
+
+@app.get("/production-analysis/productivity-detail", response_class=HTMLResponse)
+def production_productivity_detail_view(start: str = "", end: str = "", refresh: str = ""):
+    period_start, period_end = resolve_production_date_range(start, end)
+    force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on"}
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    detail = fetch_productivity_detail(
+        days=selected_days,
+        force_refresh=force_refresh,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    summary = detail.get("summary", {})
+    back_href = "/production-analysis-view?" + urlencode({"start": period_start, "end": period_end})
+    refresh_href = "/production-analysis/productivity-detail?" + urlencode({"start": period_start, "end": period_end, "refresh": "1"})
+    if detail.get("status") != "ok":
+        content = '<p class="status error">The detailed Time Bookings or Clockings data is currently unavailable.</p>'
+    else:
+        content = f'''
+            <div class="production-productivity-equation" aria-label="Plant productivity calculation">
+                <div><span>Productive booked hours</span><strong>{format_production_number(summary.get('booked_hours'), ' hrs', decimals=1)}</strong></div>
+                <b>÷</b>
+                <div><span>Production operator clocked hours</span><strong>{format_production_number(summary.get('clocked_hours'), ' hrs', decimals=1)}</strong><small>manager clockings excluded from productivity</small></div>
+                <b>=</b>
+                <div class="result"><span>Plant productivity</span><strong>{format_production_number(summary.get('plant_productivity'), '%', decimals=1)}</strong></div>
+            </div>
+            <div class="production-productivity-audit-grid">
+                <div><span>Unbooked paid time</span><strong>{format_production_number(summary.get('unbooked_hours'), ' hrs', decimals=1)}</strong></div>
+                <div><span>Manager direct support</span><strong>{format_production_number(summary.get('manager_support_hours'), ' hrs', decimals=1)}</strong></div>
+                <div><span>Bookings without clockings</span><strong>{format_production_number(summary.get('unmatched_booked_hours'), ' hrs', decimals=1)}</strong></div>
+                <div><span>Source records</span><strong>{int(detail.get('booking_count') or 0):,} / {int(detail.get('clocking_count') or 0):,}</strong><small>bookings / clockings</small></div>
+            </div>
+            <section class="panel production-productivity-rules" id="labour-calculation">
+                <div class="panel-head"><div><span class="home-focus-inline-kicker">Selected period</span><h2>Labour percentage calculation</h2></div></div>
+                <div class="production-labour-equation">
+                    <div><span>Total paid plant hours</span><strong>{format_production_number(summary.get('labour_clocked_hours'), ' hrs', decimals=1)}</strong><small>includes {format_production_number(summary.get('manager_clocked_hours'), ' manager hrs', decimals=1)}</small></div>
+                    <b>×</b>
+                    <div><span>Average labour rate</span><strong>{format_production_number(summary.get('average_labour_rate'), currency=True, decimals=2)}</strong></div>
+                    <b>+</b>
+                    <div><span>Prorated insurance</span><strong>{format_production_number(summary.get('insurance_cost'), currency=True, decimals=0)}</strong></div>
+                    <b>÷</b>
+                    <div><span>Press repair value</span><strong>{format_production_number(summary.get('press_repair_value'), currency=True, decimals=0)}</strong></div>
+                    <b>=</b>
+                    <div class="result"><span>Labour percentage</span><strong>{format_production_number(summary.get('labour_percentage'), '%', decimals=1)}</strong></div>
+                </div>
+                <p class="small muted">Total labour cost: {format_production_number(summary.get('total_labour_cost'), currency=True, decimals=0)}. Insurance is prorated by calendar day; a complete month receives the full monthly cost.</p>
+            </section>
+            <section class="panel production-productivity-rules">
+                <h2>Calculation rules</h2>
+                <p>Productive bookings include Sort, Grind, Press, Trim, Extruder, Bag Building, Housekeeping, Engineering, Re-Runs and Press Room Help. Press Room Help rolls into Press. Paid breaks and lunch remain in clocked hours. Lois is shown as manager support; Trudy, Kelly, Temp 1 and Temp 2 are excluded. Bookings without a matching clocking are shown for review and excluded from the headline percentage.</p>
+            </section>
+            <div class="production-analysis-grid">
+                {render_department_productivity(detail.get('department_rows', []), summary)}
+                <section class="panel production-span-full">
+                    <div class="panel-head"><div><span class="home-focus-inline-kicker">Calculation detail</span><h2>Operator contribution</h2></div><a class="button secondary small-button" href="/production-analysis/overbooked-report?{urlencode({'start': period_start, 'end': period_end})}">Overbooked days</a></div>
+                    {render_operator_analysis(detail.get('operator_rows', []), period_start=period_start, period_end=period_end)}
+                </section>
+            </div>
+        '''
+    body = f'''
+        <section class="production-analysis-toolbar">
+            <div><span class="home-focus-inline-kicker">Productivity audit</span><h2>Plant productivity calculation</h2><p class="small muted">{escape(datetime.strptime(period_start, '%Y-%m-%d').strftime('%m/%d/%Y'))} to {escape(datetime.strptime(period_end, '%Y-%m-%d').strftime('%m/%d/%Y'))} · completed days only</p></div>
+            <div class="production-toolbar-actions"><a class="button secondary small-button" href="{escape(back_href)}">Back to Production Analysis</a><a class="button secondary small-button" href="{escape(refresh_href)}">Refresh</a></div>
+        </section>
+        {content}
+    '''
+    return render_page(title="Plant Productivity Calculation", body=body, main_class="production-analysis-main")
+
+
+@app.get("/production-analysis/overbooked-report", response_class=HTMLResponse)
+def production_overbooked_report(start: str = "", end: str = "", refresh: str = ""):
+    period_start, period_end = resolve_production_date_range(start, end)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    detail = fetch_productivity_detail(
+        days=selected_days,
+        force_refresh=str(refresh or "").strip().lower() in {"1", "true", "yes", "on"},
+        period_start=period_start,
+        period_end=period_end,
+    )
+    daily = defaultdict(lambda: {
+        "operator": "",
+        "date": "",
+        "booked_hours": 0.0,
+        "clocked_hours": 0.0,
+        "booking_count": 0,
+    })
+    for item in detail.get("time_bookings", []):
+        if item.get("excluded") or item.get("manager_support"):
+            continue
+        key = (item.get("operator_key") or "", item.get("date") or "")
+        if not all(key):
+            continue
+        row = daily[key]
+        row["operator"] = item.get("operator") or row["operator"]
+        row["date"] = item.get("date") or row["date"]
+        row["booked_hours"] += item.get("hours") or 0
+        row["booking_count"] += 1
+    for item in detail.get("clockings", []):
+        if item.get("excluded") or item.get("manager"):
+            continue
+        key = (item.get("operator_key") or "", item.get("date") or "")
+        if not all(key):
+            continue
+        row = daily[key]
+        row["operator"] = item.get("operator") or row["operator"]
+        row["date"] = item.get("date") or row["date"]
+        row["clocked_hours"] += item.get("clocked_hours") or 0
+
+    exceptions = []
+    for item in daily.values():
+        booked = item["booked_hours"]
+        clocked = item["clocked_hours"]
+        if booked <= clocked + 0.0001:
+            continue
+        exceptions.append({
+            **item,
+            "excess_hours": booked - clocked,
+            "productivity": (booked / clocked * 100) if clocked else None,
+        })
+    exceptions.sort(key=lambda item: (item["date"], item["excess_hours"], item["operator"]), reverse=True)
+
+    rows = []
+    for item in exceptions:
+        operator_href = "/production-analysis/operator-detail?" + urlencode({
+            "operator": item["operator"],
+            "start": period_start,
+            "end": period_end,
+        })
+        rows.append(f'''<tr>
+            <td>{escape(datetime.strptime(item['date'], '%Y-%m-%d').strftime('%m/%d/%Y'))}</td>
+            <td><a class="production-operator-link" href="{escape(operator_href)}"><strong>{escape(item['operator'])}</strong><small>Review bookings</small></a></td>
+            <td>{item['clocked_hours']:,.2f} hrs</td>
+            <td>{item['booked_hours']:,.2f} hrs</td>
+            <td class="production-time-warning">+{item['excess_hours']:,.2f} hrs</td>
+            <td>{format_production_number(item.get('productivity'), '%', decimals=1)}</td>
+            <td>{int(item['booking_count'])}</td>
+        </tr>''')
+    table_body = "".join(rows) or '<tr><td colspan="7"><strong>No overbooked days found.</strong> Every operator’s booked time is within their clocked time for this period.</td></tr>'
+    back_href = "/production-analysis/productivity-detail?" + urlencode({"start": period_start, "end": period_end})
+    refresh_href = "/production-analysis/overbooked-report?" + urlencode({"start": period_start, "end": period_end, "refresh": "1"})
+    body = f'''
+        <section class="production-analysis-toolbar">
+            <div><span class="home-focus-inline-kicker">Data-quality report</span><h2>Overbooked operator days</h2><p class="small muted">{datetime.strptime(period_start, '%Y-%m-%d').strftime('%m/%d/%Y')} to {datetime.strptime(period_end, '%Y-%m-%d').strftime('%m/%d/%Y')} · {len(exceptions)} exception{'s' if len(exceptions) != 1 else ''}</p></div>
+            <div class="production-toolbar-actions"><a class="button secondary small-button" href="{escape(back_href)}">Back to calculation</a><a class="button secondary small-button" href="{escape(refresh_href)}">Refresh</a></div>
+        </section>
+        <section class="panel">
+            <p class="small muted">This report lists every production operator/day where productive booked time exceeds eligible paid clocked time. Select an operator to inspect and correct the underlying Time Booking records.</p>
+            <div class="table-wrap"><table class="production-department-table"><thead><tr><th>Date</th><th>Operator</th><th>Clocked</th><th>Booked</th><th>Excess</th><th>Productivity</th><th>Bookings</th></tr></thead><tbody>{table_body}</tbody></table></div>
+        </section>
+    '''
+    return render_page(title="Overbooked Operator Days", body=body, main_class="production-analysis-main")
+
+
+def parse_production_timestamp(value):
+    text = str(value or "").strip()
+    for pattern in ("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M"):
+        try:
+            return datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def production_timestamp_input(value):
+    parsed = parse_production_timestamp(value)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S") if parsed else ""
+
+
+def production_timestamp_label(value):
+    parsed = parse_production_timestamp(value)
+    return parsed.strftime("%m/%d/%Y %I:%M %p") if parsed else str(value or "—")
+
+
+@app.get("/production-analysis/operator-detail", response_class=HTMLResponse)
+def production_operator_detail_view(operator: str = "", start: str = "", end: str = "", message: str = "", error: str = "", refresh: str = ""):
+    period_start, period_end = resolve_production_date_range(start, end)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    detail = fetch_productivity_detail(
+        days=selected_days,
+        force_refresh=str(refresh or "").strip().lower() in {"1", "true", "yes", "on"},
+        period_start=period_start,
+        period_end=period_end,
+    )
+    selected_key = operator_key(operator)
+    bookings = [item for item in detail.get("time_bookings", []) if item.get("operator_key") == selected_key]
+    clockings = [item for item in detail.get("clockings", []) if item.get("operator_key") == selected_key]
+    operator_summary = next((item for item in detail.get("operator_rows", []) if operator_key(item.get("name")) == selected_key), {})
+    can_edit = can_manage_user_accounts(get_current_session_user())
+
+    days = defaultdict(lambda: {"booked": 0.0, "clocked": 0.0})
+    for item in bookings:
+        days[item.get("date") or "Unknown"]["booked"] += item.get("hours") or 0
+    for item in clockings:
+        days[item.get("date") or "Unknown"]["clocked"] += item.get("clocked_hours") or 0
+    daily_rows = "".join(
+        f'''<tr><td>{escape(datetime.strptime(day, '%Y-%m-%d').strftime('%m/%d/%Y') if day != 'Unknown' else day)}</td><td>{values['clocked']:,.2f} hrs</td><td>{values['booked']:,.2f} hrs</td><td class="{'production-time-warning' if values['booked'] > values['clocked'] else ''}">{values['booked'] - values['clocked']:+,.2f} hrs</td><td>{(values['booked'] / values['clocked'] * 100):,.1f}%</td></tr>'''
+        if values["clocked"] else
+        f'''<tr><td>{escape(datetime.strptime(day, '%Y-%m-%d').strftime('%m/%d/%Y') if day != 'Unknown' else day)}</td><td>—</td><td>{values['booked']:,.2f} hrs</td><td class="production-time-warning">No clocking</td><td>—</td></tr>'''
+        for day, values in sorted(days.items())
+    ) or '<tr><td colspan="5">No records found for this operator and period.</td></tr>'
+
+    clocking_rows = "".join(
+        f'''<tr><td>{escape(production_timestamp_label(item.get('clock_in')))}</td><td>{escape(production_timestamp_label(item.get('clock_out')))}</td><td>{format_production_number(item.get('clocked_hours'), ' hrs', decimals=2)}</td><td>{escape(item.get('notes') or '')}</td></tr>'''
+        for item in sorted(clockings, key=lambda row: (row.get("date") or "", row.get("clock_in") or ""))
+    ) or '<tr><td colspan="4">No clockings found.</td></tr>'
+
+    booking_cards = []
+    for item in sorted(bookings, key=lambda row: (row.get("date") or "", row.get("start_time") or "")):
+        record_id = str(item.get("record_id") or "")
+        form_id = f"booking-edit-{re.sub(r'[^A-Za-z0-9_-]+', '-', record_id)}"
+        if can_edit and record_id:
+            fields = f'''
+                <label><span>Department</span><input form="{form_id}" name="department" value="{escape(item.get('department') or '')}" required></label>
+                <label><span>Start</span><input form="{form_id}" type="datetime-local" step="1" name="booking_start" value="{escape(production_timestamp_input(item.get('start_time')))}" required></label>
+                <label><span>Finish</span><input form="{form_id}" type="datetime-local" step="1" name="booking_finish" value="{escape(production_timestamp_input(item.get('finish_time')))}" required></label>
+                <label class="production-booking-notes"><span>Notes</span><input form="{form_id}" name="notes" value="{escape(item.get('notes') or '')}"></label>
+                <button form="{form_id}" class="button small-button" type="submit">Save to FileMaker</button>
+                <form id="{form_id}" method="post" action="/production-analysis/time-booking/update"><input type="hidden" name="record_id" value="{escape(record_id)}"><input type="hidden" name="operator" value="{escape(operator)}"><input type="hidden" name="start" value="{period_start}"><input type="hidden" name="end" value="{period_end}"></form>
+            '''
+        else:
+            fields = f'''<div><span>Department</span><strong>{escape(item.get('department') or '')}</strong></div><div><span>Start</span><strong>{escape(production_timestamp_label(item.get('start_time')))}</strong></div><div><span>Finish</span><strong>{escape(production_timestamp_label(item.get('finish_time')))}</strong></div><div><span>Notes</span><strong>{escape(item.get('notes') or '—')}</strong></div>'''
+        booking_cards.append(f'''
+            <article class="production-booking-card">
+                <header><div><strong>{escape(item.get('department') or 'Unassigned')}</strong><span>{escape(item.get('sales_order') or 'No sales order')}</span></div><b>{format_production_number(item.get('hours'), ' hrs', decimals=2)}</b></header>
+                <div class="production-booking-edit-grid">{fields}</div>
+            </article>
+        ''')
+
+    status_markup = f'<p class="status">{escape(message)}</p>' if message else ""
+    if error:
+        status_markup += f'<p class="status error">{escape(error)}</p>'
+    back_href = "/production-analysis/productivity-detail?" + urlencode({"start": period_start, "end": period_end})
+    body = f'''
+        {status_markup}
+        <section class="production-analysis-toolbar">
+            <div><span class="home-focus-inline-kicker">Operator audit</span><h2>{escape(operator or 'Operator')}</h2><p class="small muted">{datetime.strptime(period_start, '%Y-%m-%d').strftime('%m/%d/%Y')} to {datetime.strptime(period_end, '%Y-%m-%d').strftime('%m/%d/%Y')}</p></div>
+            <div class="production-toolbar-actions"><a class="button secondary small-button" href="{escape(back_href)}">Back to calculation</a></div>
+        </section>
+        <div class="production-productivity-audit-grid">
+            <div><span>Productivity</span><strong>{format_production_number(operator_summary.get('productivity'), '%', decimals=1)}</strong></div>
+            <div><span>Clocked</span><strong>{format_production_number(operator_summary.get('clocked_hours'), ' hrs', decimals=1)}</strong></div>
+            <div><span>Booked</span><strong>{format_production_number(operator_summary.get('booked_hours'), ' hrs', decimals=1)}</strong></div>
+            <div><span>Difference</span><strong>{format_production_number((operator_summary.get('booked_hours') or 0) - (operator_summary.get('clocked_hours') or 0), ' hrs', decimals=1)}</strong></div>
+        </div>
+        <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Daily reconciliation</span><h2>Clocked versus booked</h2></div></div><div class="table-wrap"><table class="production-department-table"><thead><tr><th>Date</th><th>Clocked</th><th>Booked</th><th>Difference</th><th>Productivity</th></tr></thead><tbody>{daily_rows}</tbody></table></div></section>
+        <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Read only</span><h2>Clockings</h2></div></div><div class="table-wrap"><table class="production-department-table"><thead><tr><th>Clock in</th><th>Clock out</th><th>Paid time</th><th>Notes</th></tr></thead><tbody>{clocking_rows}</tbody></table></div></section>
+        <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Time Booking records</span><h2>Bookings</h2></div><span class="small muted">{'Changes save directly to FileMaker and are audited.' if can_edit else 'Administrator permission is required to edit.'}</span></div><div class="production-booking-list">{''.join(booking_cards) or '<p class="empty-action">No time bookings found.</p>'}</div></section>
+    '''
+    return render_page(title=f"{operator or 'Operator'} Production Detail", body=body, main_class="production-analysis-main")
+
+
+@app.post("/production-analysis/time-booking/update")
+def update_production_time_booking(record_id: str = Form(""), operator: str = Form(""), start: str = Form(""), end: str = Form(""), department: str = Form(""), booking_start: str = Form(""), booking_finish: str = Form(""), notes: str = Form("")):
+    period_start, period_end = resolve_production_date_range(start, end)
+    redirect_base = "/production-analysis/operator-detail?" + urlencode({"operator": operator, "start": period_start, "end": period_end})
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url=redirect_base + "&error=" + quote("Administrator permission is required to amend Time Bookings."), status_code=303)
+    try:
+        start_value = datetime.fromisoformat(str(booking_start or ""))
+        finish_value = datetime.fromisoformat(str(booking_finish or ""))
+    except ValueError:
+        return RedirectResponse(url=redirect_base + "&error=" + quote("Enter valid booking start and finish times."), status_code=303)
+    if finish_value < start_value:
+        return RedirectResponse(url=redirect_base + "&error=" + quote("Finish time cannot be before start time."), status_code=303)
+    if not str(department or "").strip():
+        return RedirectResponse(url=redirect_base + "&error=" + quote("Department is required."), status_code=303)
+
+    detail = fetch_productivity_detail(period_start=period_start, period_end=period_end)
+    existing = next(
+        (
+            item for item in detail.get("time_bookings", [])
+            if str(item.get("record_id") or "") == str(record_id or "")
+            and item.get("operator_key") == operator_key(operator)
+        ),
+        None,
+    )
+    if not existing:
+        return RedirectResponse(url=redirect_base + "&error=" + quote("The selected Time Booking could not be verified."), status_code=303)
+
+    field_data = {
+        "Department": str(department).strip(),
+        "Start Time": start_value.strftime("%m/%d/%Y %H:%M:%S"),
+        "Finish Time": finish_value.strftime("%m/%d/%Y %H:%M:%S"),
+        "Notes": str(notes or "").strip(),
+    }
+    result = update_layout_record(get_time_bookings_layout(), record_id, field_data)
+    changed = (
+        f"Department {existing.get('department')} → {field_data['Department']}; "
+        f"Start {existing.get('start_time')} → {field_data['Start Time']}; "
+        f"Finish {existing.get('finish_time')} → {field_data['Finish Time']}"
+    )
+    record_audit_event(
+        "production-time-booking-update",
+        target=f"{operator} · FileMaker record {record_id}",
+        details=changed if result.get("status") == "ok" else f"Update failed: {result.get('error_message') or result.get('status')}",
+        user=current_user,
+        area="production",
+        status="success" if result.get("status") == "ok" else "failed",
+    )
+    if result.get("status") != "ok":
+        return RedirectResponse(url=redirect_base + "&error=" + quote(result.get("error_message") or "FileMaker could not update the Time Booking."), status_code=303)
+    clear_productivity_detail_cache()
+    clear_weekly_kpi_payload_cache()
+    return RedirectResponse(url=redirect_base + "&message=" + quote("Time Booking updated in FileMaker."), status_code=303)
 
 
 @app.get("/production-analysis/export-anomalies")
-def export_production_anomalies(days: int = 90):
-    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
-    payload = build_production_kpi_payload(fetch_production_analysis_data(), days=selected_days)
+def export_production_anomalies(days: int = 90, start: str = "", end: str = ""):
+    period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    payload = build_production_kpi_payload(fetch_production_analysis_data(), days=selected_days, period_start=period_start, period_end=period_end)
     content, _ = build_anomaly_workbook(payload)
     filename = f"numat-production-anomalies-{selected_days}-days.xlsx"
     return Response(
@@ -6228,10 +6592,23 @@ def export_production_anomalies(days: int = 90):
 
 
 @app.post("/production-analysis/export-ai-report")
-def export_production_ai_report(days: int = Form(90)):
-    selected_days = days if days in {30, 60, 90, 120, 150, 180} else 90
+def export_production_ai_report(days: int = Form(90), start: str = Form(""), end: str = Form("")):
+    period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
     result = fetch_production_analysis_data()
-    facts = build_ai_report_facts(result, selected_days)
+    if start or end:
+        current_start = datetime.strptime(period_start, "%Y-%m-%d")
+        previous_end = current_start - timedelta(days=1)
+        previous_start = previous_end - timedelta(days=selected_days - 1)
+        facts = build_ai_report_facts_for_calendar_period(
+            result,
+            period_start,
+            period_end,
+            previous_start.strftime("%Y-%m-%d"),
+            previous_end.strftime("%Y-%m-%d"),
+        )
+    else:
+        facts = build_ai_report_facts(result, selected_days)
     analysis = generate_production_analysis_report(facts)
     content = build_ai_analysis_docx(facts, analysis)
     period_end = clean_filename(facts.get("period", {}).get("end") or "report")
@@ -6250,12 +6627,17 @@ def format_production_number(value, suffix="", currency=False, decimals=0):
     return f"${value:,.{decimals}f}" if currency else f"{value:,.{decimals}f}{suffix}"
 
 
-def render_production_period_control(days):
-    options = [(30, "1 month"), (60, "2 months"), (90, "3 months"), (120, "4 months"), (150, "5 months"), (180, "6 months")]
-    return "".join(
-        f'<a class="production-period-chip{" active" if days == value else ""}" href="/production-analysis-view?days={value}">{escape(label)}</a>'
-        for value, label in options
-    )
+def render_production_date_control(period_start, period_end):
+    start_display = datetime.strptime(period_start, "%Y-%m-%d").strftime("%m/%d/%Y")
+    end_display = datetime.strptime(period_end, "%Y-%m-%d").strftime("%m/%d/%Y")
+    return f'''
+        <form method="get" action="/production-analysis-view" class="production-date-control">
+            <input type="hidden" name="refresh" value="1">
+            <label>From<input type="text" name="start" value="{escape(start_display)}" placeholder="MM/DD/YYYY" inputmode="numeric" pattern="[0-9]{{2}}/[0-9]{{2}}/[0-9]{{4}}" aria-label="From date in month day year format"></label>
+            <label>To<input type="text" name="end" value="{escape(end_display)}" placeholder="MM/DD/YYYY" inputmode="numeric" pattern="[0-9]{{2}}/[0-9]{{2}}/[0-9]{{4}}" aria-label="To date in month day year format"></label>
+            <button class="button secondary small-button" type="submit">Apply</button>
+        </form>
+    '''
 
 
 def render_production_trend_chart(rows):
@@ -6384,17 +6766,110 @@ def render_recook_trend(rows):
     return f'<div class="production-recook-chart">{bars}</div><div class="production-recook-axis"><span>{escape(format_optional_datetime(recent[0].get("date")))}</span><span>{escape(format_optional_datetime(recent[-1].get("date")))}</span></div>'
 
 
-def render_operator_analysis(rows):
+def render_productivity_attention(detail):
+    operators = detail.get("operator_rows", [])
+    departments = detail.get("department_rows", [])
+    attention = []
+    for item in operators:
+        unbooked = float(item.get("unbooked_hours") or 0)
+        booked = float(item.get("booked_hours") or 0)
+        clocked = float(item.get("clocked_hours") or 0)
+        if booked > 0 and clocked <= 0:
+            attention.append(
+                (
+                    booked,
+                    item.get("name") or "Unknown operator",
+                    f"{booked:,.1f} booked hours have no matching clocking and are excluded from plant productivity.",
+                )
+            )
+            continue
+        if unbooked >= 1:
+            attention.append(
+                (
+                    unbooked,
+                    item.get("name") or "Unknown operator",
+                    f"{unbooked:,.1f} paid hours are not covered by productive bookings in this period.",
+                )
+            )
+    housekeeping = next((item for item in departments if item.get("department") == "Housekeeping"), None)
+    if housekeeping and (housekeeping.get("booked_hours") or 0) > 0:
+        hours = float(housekeeping["booked_hours"])
+        attention.append(
+            (
+                hours,
+                "Housekeeping capacity",
+                f"{hours:,.1f} hours were assigned because other productive work was unavailable.",
+            )
+        )
+    attention.sort(key=lambda item: -item[0])
+    if not attention:
+        content = '<p class="empty-action">No material booking gaps are visible for this period.</p>'
+    else:
+        content = "".join(
+            f'<li><strong>{escape(label)}</strong><span>{escape(message)}</span></li>'
+            for _, label, message in attention[:6]
+        )
+        content = f'<ul class="production-attention-list">{content}</ul>'
+    return f'''
+        <section class="panel production-span-full production-attention-panel">
+            <div class="panel-head"><div><span class="home-focus-inline-kicker">Start here</span><h2>Attention required</h2></div><span class="small muted">Booking gaps and available-capacity signals</span></div>
+            {content}
+        </section>
+    '''
+
+
+def render_department_productivity(rows, summary):
+    if not rows:
+        return ""
+    body = "".join(f'''<tr>
+        <td><strong>{escape(str(item.get('department') or ''))}</strong>{'<small>Includes Press Room Help</small>' if item.get('department') == 'Press' and item.get('helper_hours') else ''}</td>
+        <td>{format_production_number(item.get('booked_hours'), ' hrs', decimals=1)}</td>
+        <td>{format_production_number(item.get('helper_hours'), ' hrs', decimals=1) if item.get('department') == 'Press' else '—'}</td>
+        <td>{format_production_number(item.get('manager_support_hours'), ' hrs', decimals=1)}</td>
+        <td>{int(item.get('operators') or 0)}</td>
+        <td>{format_production_number(item.get('share_of_booked'), '%', decimals=1)}</td>
+    </tr>''' for item in rows)
+    return f'''
+        <section class="panel production-span-full">
+            <div class="panel-head"><div><span class="home-focus-inline-kicker">Paid-time allocation</span><h2>Department productivity breakdown</h2></div><span class="small muted">{format_production_number(summary.get('booked_hours'), ' productive hrs', decimals=1)} · {format_production_number(summary.get('manager_support_hours'), ' manager support hrs', decimals=1)}</span></div>
+            <div class="table-wrap"><table class="production-department-table"><thead><tr><th>Department</th><th>Booked</th><th>Press help</th><th>Manager support</th><th>Operators</th><th>Share</th></tr></thead><tbody>{body}</tbody></table></div>
+        </section>
+    '''
+
+
+def render_operator_analysis(rows, period_start="", period_end=""):
     if not rows:
         return '<p class="empty-action">No operator history is available for this period.</p>'
-    body = "".join(f'''<tr>
-        <td data-sort-value="{escape(str(item.get('name') or '').casefold())}"><strong>{escape(item.get('name') or '')}</strong></td>
-        <td data-sort-value="{int(item.get('days') or 0)}">{int(item.get('days') or 0)}</td>
-        <td data-sort-value="{'' if item.get('productivity') is None else float(item['productivity'])}">{format_production_number(item.get('productivity'), '%', decimals=1)}</td>
-        <td data-sort-value="{'' if item.get('target_achieved') is None else float(item['target_achieved'])}">{format_production_number(item.get('target_achieved'), '%', decimals=1)}</td>
-        <td data-sort-value="{'' if item.get('booked_hours') is None else float(item['booked_hours'])}">{format_production_number(item.get('booked_hours'), ' hrs', decimals=1)}</td>
-    </tr>''' for item in rows)
-    headings = [("Operator", "text", "ascending"), ("Active days", "number", "descending"), ("Productivity", "number", "descending"), ("LF target", "number", "descending"), ("Booked", "number", "descending")]
+    detailed = any("unbooked_hours" in item for item in rows)
+    def operator_name_cell(item):
+        name = str(item.get("name") or "")
+        if not name or not period_start or not period_end:
+            return f"<strong>{escape(name)}</strong>"
+        href = "/production-analysis/operator-detail?" + urlencode({
+            "operator": name,
+            "start": period_start,
+            "end": period_end,
+        })
+        return f'<a class="production-operator-link" href="{escape(href)}"><strong>{escape(name)}</strong><small>View bookings</small></a>'
+    if detailed:
+        body = "".join(f'''<tr>
+            <td data-sort-value="{escape(str(item.get('name') or '').casefold())}">{operator_name_cell(item)}</td>
+            <td data-sort-value="{int(item.get('days') or 0)}">{int(item.get('days') or 0)}</td>
+            <td data-sort-value="{'' if item.get('productivity') is None else float(item['productivity'])}">{format_production_number(item.get('productivity'), '%', decimals=1)}</td>
+            <td data-sort-value="{float(item.get('clocked_hours') or 0)}">{format_production_number(item.get('clocked_hours'), ' hrs', decimals=1)}</td>
+            <td data-sort-value="{float(item.get('booked_hours') or 0)}">{format_production_number(item.get('booked_hours'), ' hrs', decimals=1)}</td>
+            <td data-sort-value="{float(item.get('unbooked_hours') or 0)}">{format_production_number(item.get('unbooked_hours'), ' hrs', decimals=1)}</td>
+        </tr>''' for item in rows)
+        headings = [("Operator", "text", "ascending"), ("Days", "number", "descending"), ("Productivity", "number", "descending"), ("Clocked", "number", "descending"), ("Booked", "number", "descending"), ("Unbooked", "number", "descending")]
+    else:
+        body = "".join(f'''<tr>
+            <td data-sort-value="{escape(str(item.get('name') or '').casefold())}">{operator_name_cell(item)}</td>
+            <td data-sort-value="{int(item.get('days') or 0)}">{int(item.get('days') or 0)}</td>
+            <td data-sort-value="{'' if item.get('productivity') is None else float(item['productivity'])}">{format_production_number(item.get('productivity'), '%', decimals=1)}</td>
+            <td data-sort-value="{'' if item.get('target_achieved') is None else float(item['target_achieved'])}">{format_production_number(item.get('target_achieved'), '%', decimals=1)}</td>
+            <td data-sort-value="{'' if item.get('booked_hours') is None else float(item['booked_hours'])}">{format_production_number(item.get('booked_hours'), ' hrs', decimals=1)}</td>
+        </tr>''' for item in rows)
+        headings = [("Operator", "text", "ascending"), ("Active days", "number", "descending"), ("Productivity", "number", "descending"), ("LF target", "number", "descending"), ("Booked", "number", "descending")]
     header = "".join(f'<th aria-sort="none"><button type="button" class="production-table-sort" data-column="{index}" data-type="{data_type}" data-default-direction="{direction}">{escape(label)}</button></th>' for index, (label, data_type, direction) in enumerate(headings))
     return f'''
         <div class="table-wrap production-operator-table-wrap">
@@ -7046,6 +7521,16 @@ def store_weekly_kpi_payload(payload, date_key=None):
     return payload
 
 
+def clear_weekly_kpi_payload_cache():
+    with _WEEKLY_KPI_PAYLOAD_CACHE_LOCK:
+        _WEEKLY_KPI_PAYLOAD_CACHE.update({
+            "date_key": "",
+            "expires_at": 0.0,
+            "payload": None,
+            "refreshing": False,
+        })
+
+
 def refresh_weekly_kpi_payload_in_background(date_key):
     try:
         payload = build_weekly_kpi_dashboard_payload()
@@ -7088,7 +7573,7 @@ def get_cached_weekly_kpi_dashboard_payload(force_refresh=False):
     )
 
 
-def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, strategic_crm_result=None, today=None, force_refresh=False):
+def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, productivity_detail=None, calendar_result=None, finance_result=None, master_data_result=None, order_result=None, strategic_crm_result=None, today=None, force_refresh=False):
     started_at = time.perf_counter()
     today = today or datetime.now()
     if strategic_crm_result is None and crm_result is not None:
@@ -7096,11 +7581,18 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     review_period = get_weekly_kpi_review_period(today)
     calendar_start = datetime.now(UK_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
     loaders = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=7) as executor:
         if crm_result is None:
             loaders["crm_result"] = executor.submit(fetch_weekly_kpi_crm_result, force_refresh=force_refresh)
         if production_result is None:
             loaders["production_result"] = executor.submit(fetch_production_analysis_data, force_refresh=force_refresh)
+            if productivity_detail is None:
+                loaders["productivity_detail"] = executor.submit(
+                    fetch_productivity_detail,
+                    force_refresh=force_refresh,
+                    period_start=review_period["period_start"].strftime("%Y-%m-%d"),
+                    period_end=review_period["period_end"].strftime("%Y-%m-%d"),
+                )
         if calendar_result is None:
             loaders["calendar_result"] = executor.submit(
                 fetch_calendar_events,
@@ -7118,6 +7610,7 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
 
     crm_result = crm_result if crm_result is not None else loaded["crm_result"]
     production_result = production_result if production_result is not None else loaded["production_result"]
+    productivity_detail = productivity_detail if productivity_detail is not None else loaded.get("productivity_detail", {"status": "unavailable"})
     calendar_result = calendar_result if calendar_result is not None else loaded["calendar_result"]
     finance_result = finance_result if finance_result is not None else loaded["finance_result"]
     master_data_result = master_data_result if master_data_result is not None else loaded["master_data_result"]
@@ -7132,6 +7625,9 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         period_start=review_period["period_start"],
         period_end_exclusive=review_period["period_end_exclusive"],
     )
+    if productivity_detail.get("status") == "ok" and productivity_detail.get("clocking_count"):
+        production_mtd["summary"]["plant_productivity"] = productivity_detail.get("summary", {}).get("plant_productivity")
+        production_mtd["summary"]["plant_productivity_source"] = "time_bookings_and_clockings"
     planned_visits = calendar_result.get("events", []) if calendar_result.get("status") == "ok" else []
     daily_invoice_target = get_daily_invoice_target()
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
@@ -7168,25 +7664,36 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         account_payload["average_debtor_days"] = period_debtor_days
         account_payload["debtor_days_is_historical"] = True
 
+    comparisons = build_kpi_historical_comparisons(
+        production_result,
+        production_mtd,
+        account_payload,
+        today=today,
+        comparison_month=review_period["period_start"].strftime("%Y-%m"),
+        history_end=review_period["period_end_exclusive"],
+    )
+    if production_mtd.get("summary", {}).get("plant_productivity_source") == "time_bookings_and_clockings":
+        comparisons["plant_productivity"] = build_kpi_comparison(
+            production_mtd.get("summary", {}).get("plant_productivity"),
+            None,
+            "New paid-time calculation",
+            higher_is_better=True,
+            comparison_available=False,
+        )
+
     payload = {
         "status": crm_result.get("status", "error"),
         "source": crm_result.get("source", ""),
         "synced_at": crm_result.get("synced_at") or crm_result.get("cache_updated_at") or "",
         "open_promises": promises,
         "production_mtd": production_mtd,
+        "productivity_detail": productivity_detail,
         "planned_visits": planned_visits,
         "calendar_status": calendar_result.get("status", "error"),
         "calendar_error": calendar_result.get("error_message", ""),
         "calendar_synced_at": calendar_result.get("synced_at", ""),
         "accounts": account_payload,
-        "comparisons": build_kpi_historical_comparisons(
-            production_result,
-            production_mtd,
-            account_payload,
-            today=today,
-            comparison_month=review_period["period_start"].strftime("%Y-%m"),
-            history_end=review_period["period_end_exclusive"],
-        ),
+        "comparisons": comparisons,
         "review_period": {
             "period_start": review_period["period_start"].strftime("%Y-%m-%d"),
             "period_end": review_period["period_end"].strftime("%Y-%m-%d"),
@@ -7587,7 +8094,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                 </div>
                 <div class="production-kpi-grid kpi-production-mtd-grid">
                     <div><span>Average press throughput</span><strong>{format_production_number(production_summary.get('average_press_throughput'))}</strong><small>FF1 + FF2 + FF3 LF per completed day</small></div>
-                    <div><span>Plant productivity</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('plant_productivity'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('plant_productivity'))}</div><small>{escape(review_month + ' · total booked ÷ clocked' if reviewing_previous_month else 'MTD · total booked ÷ clocked')}</small></div>
+                    <div><span>Plant productivity</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('plant_productivity'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('plant_productivity'))}</div><small>{escape(review_month + ' · paid productive bookings ÷ eligible clockings' if reviewing_previous_month else 'MTD · paid productive bookings ÷ eligible clockings')}</small></div>
                     <div><span>Current backlog</span><strong>{format_production_number(production_latest.get('backlog_weeks'), decimals=1)}</strong><small>weeks · latest completed day</small></div>
                     <div><span>Average daily production value</span><strong>{format_production_number(production_summary.get('average_production_revenue'), currency=True)}</strong><small>per completed recorded day</small></div>
                     <div><span>Re-cook activity</span><strong>{format_production_number(production_summary.get('recook_lf'))}</strong><small>{escape('LF in ' + review_month if reviewing_previous_month else 'LF month to date')}</small></div>
@@ -25337,7 +25844,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .production-toolbar-actions,
-                    .production-period-control {{
+                    .production-date-control {{
                         display: flex;
                         align-items: center;
                         gap: 8px;
@@ -25346,10 +25853,6 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .production-toolbar-actions {{
                         flex-wrap: nowrap;
                         white-space: nowrap;
-                    }}
-
-                    .production-period-control {{
-                        flex-wrap: nowrap;
                     }}
 
                     .production-report-form {{
@@ -25362,25 +25865,30 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         flex: 0 0 auto;
                     }}
 
-                    .production-period-control {{
+                    .production-date-control {{
                         padding: 5px;
                         border: 1px solid var(--border);
                         border-radius: 12px;
                         background: #ffffff;
                     }}
 
-                    .production-period-chip {{
-                        padding: 6px 10px;
-                        border-radius: 8px;
-                        color: #52677d;
-                        font-size: 12px;
+                    .production-date-control label {{
+                        display: flex;
+                        align-items: center;
+                        gap: 5px;
+                        color: var(--muted);
+                        font-size: 11px;
                         font-weight: 700;
-                        text-decoration: none;
                     }}
 
-                    .production-period-chip.active {{
-                        color: #ffffff;
-                        background: var(--blue);
+                    .production-date-control input {{
+                        width: 132px;
+                        padding: 6px 7px;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
+                        color: var(--text);
+                        background: #ffffff;
+                        font: inherit;
                     }}
 
                     .production-kpi-grid {{
@@ -25390,7 +25898,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         margin-bottom: 18px;
                     }}
 
-                    .production-kpi-grid > div {{
+                    .production-kpi-grid > div,
+                    .production-kpi-grid > a {{
                         padding: 16px;
                         border: 1px solid var(--border);
                         border-top: 4px solid #245cff;
@@ -25399,11 +25908,26 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: var(--shadow-card);
                     }}
 
-                    .production-kpi-grid > div:nth-child(2) {{ border-top-color: #00a884; }}
-                    .production-kpi-grid > div:nth-child(3) {{ border-top-color: #f59e0b; }}
-                    .production-kpi-grid > div:nth-child(4) {{ border-top-color: #8b5cf6; }}
-                    .production-kpi-grid > div:nth-child(5) {{ border-top-color: #e05757; background: linear-gradient(145deg, #fff6f6, #ffffff); }}
-                    .production-kpi-grid > div:nth-child(6) {{ border-top-color: #2e829f; }}
+                    .production-kpi-grid > :nth-child(2) {{ border-top-color: #00a884; }}
+                    .production-kpi-grid > :nth-child(3) {{ border-top-color: #f59e0b; }}
+                    .production-kpi-grid > :nth-child(4) {{ border-top-color: #8b5cf6; }}
+                    .production-kpi-grid > :nth-child(5) {{ border-top-color: #e05757; background: linear-gradient(145deg, #fff6f6, #ffffff); }}
+                    .production-kpi-grid > :nth-child(6) {{ border-top-color: #2e829f; }}
+
+                    .production-kpi-card-link {{
+                        display: block;
+                        color: inherit;
+                        text-decoration: none;
+                        transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+                    }}
+
+                    .production-kpi-card-link:hover,
+                    .production-kpi-card-link:focus-visible {{
+                        transform: translateY(-2px);
+                        border-color: #7fcbb7;
+                        box-shadow: 0 12px 28px rgba(27, 79, 66, .14);
+                        outline: none;
+                    }}
 
                     .production-kpi-grid span,
                     .production-kpi-grid small {{
@@ -25583,11 +26107,63 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .production-recook-bar {{ flex: 1 1 0; min-width: 3px; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #ef7777, #d94b4b); }}
                     .production-recook-axis {{ display: flex; justify-content: space-between; margin-top: 6px; color: var(--muted); font-size: 10px; }}
 
+                    .production-attention-panel {{ border-left: 4px solid #f59e0b; }}
+                    .production-attention-list {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }}
+                    .production-attention-list li {{ padding: 12px 14px; border: 1px solid #f4dfb7; border-radius: 11px; background: #fffaf0; }}
+                    .production-attention-list strong,
+                    .production-attention-list span {{ display: block; }}
+                    .production-attention-list span {{ margin-top: 3px; color: var(--muted); font-size: 12px; }}
+
+                    .production-department-table {{ width: 100%; border-collapse: collapse; }}
+                    .production-department-table th,
+                    .production-department-table td {{ padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; }}
+                    .production-department-table th {{ color: #3f5870; background: #edf4fa; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }}
+                    .production-department-table td small {{ display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }}
+
+                    .production-productivity-equation {{ display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 14px; margin-bottom: 16px; }}
+                    .production-productivity-equation > div {{ padding: 18px; border: 1px solid var(--border); border-radius: 14px; background: #ffffff; box-shadow: var(--shadow-card); }}
+                    .production-productivity-equation > b {{ align-self: center; color: var(--muted); font-size: 25px; }}
+                    .production-productivity-equation span,
+                    .production-productivity-equation small,
+                    .production-productivity-audit-grid span {{ display: block; color: var(--muted); font-size: 12px; }}
+                    .production-productivity-equation strong {{ display: block; margin-top: 5px; font-size: 27px; }}
+                    .production-productivity-equation .result {{ border-top: 4px solid #00a884; background: #f1fbf7; }}
+                    .production-productivity-audit-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }}
+                    .production-productivity-audit-grid > div {{ padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: #ffffff; }}
+                    .production-productivity-audit-grid strong {{ display: block; margin-top: 4px; font-size: 21px; }}
+                    .production-productivity-audit-grid small {{ color: var(--muted); }}
+                    .production-labour-equation {{ display: grid; grid-template-columns: 1.2fr auto 1fr auto 1fr auto 1fr auto 1fr; align-items: stretch; gap: 10px; }}
+                    .production-labour-equation > div {{ padding: 13px; border: 1px solid var(--border); border-radius: 11px; background: #fbfdff; }}
+                    .production-labour-equation > b {{ align-self: center; color: var(--muted); font-size: 20px; }}
+                    .production-labour-equation span,
+                    .production-labour-equation small {{ display: block; color: var(--muted); font-size: 10px; }}
+                    .production-labour-equation strong {{ display: block; margin: 4px 0 2px; font-size: 18px; }}
+                    .production-labour-equation .result {{ border-top: 3px solid #2e829f; background: #f1f9fc; }}
+                    .production-productivity-rules {{ margin-bottom: 16px; }}
+                    .production-productivity-rules h2 {{ margin-top: 0; }}
+                    .production-productivity-rules p {{ margin-bottom: 0; color: var(--muted); line-height: 1.55; }}
+
                     .production-operator-table {{ width: 100%; border-collapse: collapse; }}
                     .production-operator-table th,
                     .production-operator-table td {{ padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; }}
                     .production-operator-table th {{ color: #3f5870; background: #edf4fa; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }}
                     .production-operator-table tbody tr:nth-child(even) {{ background: #f9fbfd; }}
+                    .production-operator-link {{ display: inline-flex; align-items: baseline; gap: 7px; color: var(--blue); text-decoration: none; }}
+                    .production-operator-link:hover strong,
+                    .production-operator-link:focus-visible strong {{ text-decoration: underline; text-underline-offset: 3px; }}
+                    .production-operator-link small {{ color: var(--muted); font-size: 10px; }}
+                    .production-time-warning {{ color: #b33a3a; font-weight: 800; background: #fff0f0; }}
+
+                    .production-booking-list {{ display: grid; gap: 12px; }}
+                    .production-booking-card {{ padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: #fbfdff; }}
+                    .production-booking-card header {{ display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; }}
+                    .production-booking-card header span {{ display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }}
+                    .production-booking-card header > b {{ font-size: 18px; }}
+                    .production-booking-edit-grid {{ display: grid; grid-template-columns: 1fr 1.35fr 1.35fr 1.5fr auto; align-items: end; gap: 10px; }}
+                    .production-booking-edit-grid label span,
+                    .production-booking-edit-grid > div span {{ display: block; margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }}
+                    .production-booking-edit-grid input {{ width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: #ffffff; color: var(--text); }}
+                    .production-booking-edit-grid > div strong {{ font-size: 12px; }}
 
                     .production-table-sort {{
                         display: inline-flex;
@@ -29795,8 +30371,36 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             white-space: normal;
                         }}
 
-                        .production-period-control {{
+                        .production-date-control {{
                             flex-wrap: wrap;
+                        }}
+
+                        .production-attention-list {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .production-productivity-equation {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .production-productivity-equation > b {{
+                            display: none;
+                        }}
+
+                        .production-productivity-audit-grid {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .production-booking-edit-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .production-labour-equation {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .production-labour-equation > b {{
+                            display: none;
                         }}
 
                         .production-kpi-grid {{

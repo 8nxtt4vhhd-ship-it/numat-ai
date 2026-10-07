@@ -97,6 +97,7 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         with (
             patch.object(main, "fetch_weekly_kpi_crm_result", return_value=crm) as crm_loader,
             patch.object(main, "fetch_production_analysis_data", return_value=production) as production_loader,
+            patch.object(main, "fetch_productivity_detail", return_value={"status": "ok", "clocking_count": 1, "summary": {"plant_productivity": 91.2}}) as productivity_loader,
             patch.object(main, "fetch_calendar_events", return_value=calendar) as calendar_loader,
             patch.object(main, "fetch_aged_debt_summary", return_value=finance) as finance_loader,
             patch.object(main, "fetch_filemaker_master_data", return_value=master) as master_loader,
@@ -106,7 +107,7 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             payload = main.build_weekly_kpi_dashboard_payload(today=datetime(2026, 9, 17, 9, 0))
 
         self.assertEqual(payload["status"], "ok")
-        for loader in (crm_loader, production_loader, calendar_loader, finance_loader, master_loader, order_loader):
+        for loader in (crm_loader, production_loader, productivity_loader, calendar_loader, finance_loader, master_loader, order_loader):
             loader.assert_called_once()
 
     def test_forced_dashboard_refresh_bypasses_source_caches(self):
@@ -120,6 +121,7 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         with (
             patch.object(main, "fetch_weekly_kpi_crm_result", return_value=crm) as crm_loader,
             patch.object(main, "fetch_production_analysis_data", return_value=production) as production_loader,
+            patch.object(main, "fetch_productivity_detail", return_value={"status": "ok", "clocking_count": 1, "summary": {"plant_productivity": 91.2}}) as productivity_loader,
             patch.object(main, "fetch_calendar_events", return_value=calendar) as calendar_loader,
             patch.object(main, "fetch_aged_debt_summary", return_value=finance) as finance_loader,
             patch.object(main, "fetch_filemaker_master_data", return_value=master) as master_loader,
@@ -134,6 +136,9 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
 
         crm_loader.assert_called_once_with(force_refresh=True)
         production_loader.assert_called_once_with(force_refresh=True)
+        self.assertTrue(productivity_loader.call_args.kwargs["force_refresh"])
+        self.assertEqual(productivity_loader.call_args.kwargs["period_start"], "2026-09-01")
+        self.assertEqual(productivity_loader.call_args.kwargs["period_end"], "2026-09-30")
         finance_loader.assert_called_once_with(force_refresh=True)
         master_loader.assert_called_once_with(force_refresh=True)
         self.assertTrue(calendar_loader.call_args.kwargs["force_refresh"])
@@ -250,6 +255,34 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         self.assertEqual(payload["accounts"]["invoiced_revenue_mtd"], 100000)
         self.assertEqual(payload["accounts"]["average_debtor_days"], 22.0)
         self.assertTrue(payload["accounts"]["debtor_days_is_historical"])
+
+    def test_dashboard_uses_detailed_paid_time_productivity(self):
+        production_result = {
+            "status": "ok",
+            "production_rows": [{"date": "2026-09-30"}],
+            "operator_rows": [],
+            "plant_operator_rows": [],
+        }
+        payload = main.build_weekly_kpi_dashboard_payload(
+            crm_result={"status": "ok", "activities": []},
+            production_result=production_result,
+            productivity_detail={
+                "status": "ok",
+                "clocking_count": 10,
+                "summary": {"plant_productivity": 91.2},
+            },
+            calendar_result={"status": "ok", "events": []},
+            finance_result={"status": "ok", "average_debtor_days": 24.0},
+            master_data_result={"status": "ok", "companies": []},
+            order_result={"status": "ok", "orders": []},
+            today=datetime(2026, 10, 1, 9, 0),
+        )
+
+        self.assertEqual(payload["production_mtd"]["summary"]["plant_productivity"], 91.2)
+        self.assertEqual(
+            payload["production_mtd"]["summary"]["plant_productivity_source"],
+            "time_bookings_and_clockings",
+        )
 
     def test_identifies_first_ever_and_return_after_two_year_gap(self):
         order_result = {
