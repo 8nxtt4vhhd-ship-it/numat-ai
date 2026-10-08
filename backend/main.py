@@ -131,6 +131,7 @@ from production import (
     clear_productivity_detail_cache,
     fetch_production_analysis_data,
     fetch_productivity_detail,
+    get_last_productivity_detail_range,
     get_time_bookings_layout,
     operator_key,
 )
@@ -6178,9 +6179,10 @@ def resolve_production_date_range(start="", end="", fallback_days=90):
 
 @app.get("/production-analysis-view", response_class=HTMLResponse)
 def production_analysis_view(days: int = 90, start: str = "", end: str = "", refresh: str = ""):
-    period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
-    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
     force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on"}
+    cached_range = get_last_productivity_detail_range() if not start and not end and not force_refresh else None
+    period_start, period_end = cached_range or resolve_production_date_range(start, end, fallback_days=days)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
     production_result = fetch_production_analysis_data(force_refresh=force_refresh)
     payload = build_production_kpi_payload(
         production_result,

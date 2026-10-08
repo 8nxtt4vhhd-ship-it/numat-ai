@@ -20,6 +20,31 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertIn('placeholder="MM/DD/YYYY"', html)
         self.assertIn('name="refresh" value="1"', html)
 
+    def test_default_dashboard_open_uses_last_cached_date_range(self):
+        payload = {
+            "status": "ok",
+            "synced_at": "2026-10-07 04:00:00",
+            "rows": [],
+            "operator_summary": [],
+            "latest": {},
+            "summary": {},
+        }
+        detail = {"status": "ok", "clocking_count": 1, "summary": {}, "department_rows": [], "operator_rows": []}
+        with (
+            patch.object(main, "get_last_productivity_detail_range", return_value=("2026-10-01", "2026-10-07")),
+            patch.object(main, "fetch_production_analysis_data", return_value={"status": "ok"}),
+            patch.object(main, "build_production_kpi_payload", return_value=payload),
+            patch.object(main, "fetch_productivity_detail", return_value=detail) as detail_fetch,
+            patch.object(main, "build_current_month_production_payload", return_value={"summary": {}}),
+        ):
+            response = main.production_analysis_view()
+
+        html = response.body.decode() if hasattr(response, "body") else str(response)
+        self.assertIn('value="10/01/2026"', html)
+        self.assertIn('value="10/07/2026"', html)
+        self.assertEqual(detail_fetch.call_args.kwargs["period_start"], "2026-10-01")
+        self.assertEqual(detail_fetch.call_args.kwargs["period_end"], "2026-10-07")
+
     def test_productivity_detail_page_shows_exact_calculation(self):
         detail = {
             "status": "ok",

@@ -20,6 +20,7 @@ class ProductionKpiTests(unittest.TestCase):
         previous_production = dict(production._PRODUCTION_CACHE)
         previous_details = dict(production._PRODUCTIVITY_DETAIL_CACHE)
         previous_loaded = production._PRODUCTION_DISK_CACHE_LOADED
+        previous_last_range = production._LAST_PRODUCTIVITY_DETAIL_RANGE
         try:
             with tempfile.TemporaryDirectory() as temporary_directory:
                 cache_path = os.path.join(temporary_directory, "production-cache.json")
@@ -30,17 +31,20 @@ class ProductionKpiTests(unittest.TestCase):
                         "expires_at": 0,
                         "result": {"status": "ok", "booked_hours": 237.1},
                     }
+                    production._LAST_PRODUCTIVITY_DETAIL_RANGE = ("2026-10-01", "2026-10-06")
                     production._PRODUCTION_DISK_CACHE_LOADED = True
                     production._save_production_disk_cache()
 
                     production._PRODUCTION_CACHE.update({"expires_at": 0, "result": None})
                     production._PRODUCTIVITY_DETAIL_CACHE.clear()
+                    production._LAST_PRODUCTIVITY_DETAIL_RANGE = None
                     production._PRODUCTION_DISK_CACHE_LOADED = False
                     production._load_production_disk_cache()
 
                     self.assertEqual(production._PRODUCTION_CACHE["result"]["snapshot"], "saved")
                     restored = production._PRODUCTIVITY_DETAIL_CACHE[("2026-10-01", "2026-10-06")]["result"]
                     self.assertEqual(restored["booked_hours"], 237.1)
+                    self.assertEqual(production.get_last_productivity_detail_range(), ("2026-10-01", "2026-10-06"))
                     self.assertEqual(oct(os.stat(cache_path).st_mode & 0o777), "0o600")
         finally:
             production._PRODUCTION_CACHE.clear()
@@ -48,6 +52,7 @@ class ProductionKpiTests(unittest.TestCase):
             production._PRODUCTIVITY_DETAIL_CACHE.clear()
             production._PRODUCTIVITY_DETAIL_CACHE.update(previous_details)
             production._PRODUCTION_DISK_CACHE_LOADED = previous_loaded
+            production._LAST_PRODUCTIVITY_DETAIL_RANGE = previous_last_range
 
     def test_productivity_cache_does_not_expire_without_manual_refresh(self):
         cache_key = ("2026-10-01", "2026-10-06")

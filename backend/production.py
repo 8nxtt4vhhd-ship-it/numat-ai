@@ -18,6 +18,7 @@ from filemaker import (
 
 _PRODUCTION_CACHE = {"expires_at": 0, "result": None}
 _PRODUCTIVITY_DETAIL_CACHE = {}
+_LAST_PRODUCTIVITY_DETAIL_RANGE = None
 _PRODUCTION_CACHE_LOCK = Lock()
 _PRODUCTION_DISK_CACHE_LOADED = False
 _PRODUCTION_CACHE_VERSION = 1
@@ -97,7 +98,7 @@ def get_production_cache_path():
 
 
 def _load_production_disk_cache():
-    global _PRODUCTION_DISK_CACHE_LOADED
+    global _PRODUCTION_DISK_CACHE_LOADED, _LAST_PRODUCTIVITY_DETAIL_RANGE
     with _PRODUCTION_CACHE_LOCK:
         if _PRODUCTION_DISK_CACHE_LOADED:
             return
@@ -118,6 +119,13 @@ def _load_production_disk_cache():
                     continue
                 start, end = key.split("|", 1)
                 _PRODUCTIVITY_DETAIL_CACHE[(start, end)] = {"expires_at": 0, "result": result}
+        last_range = payload.get("last_productivity_detail_range")
+        if isinstance(last_range, list) and len(last_range) == 2:
+            candidate = (str(last_range[0]), str(last_range[1]))
+            if candidate in _PRODUCTIVITY_DETAIL_CACHE:
+                _LAST_PRODUCTIVITY_DETAIL_RANGE = candidate
+        if _LAST_PRODUCTIVITY_DETAIL_RANGE is None and _PRODUCTIVITY_DETAIL_CACHE:
+            _LAST_PRODUCTIVITY_DETAIL_RANGE = next(reversed(_PRODUCTIVITY_DETAIL_CACHE))
 
 
 def _save_production_disk_cache():
@@ -127,6 +135,7 @@ def _save_production_disk_cache():
             "version": _PRODUCTION_CACHE_VERSION,
             "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "production_result": _PRODUCTION_CACHE.get("result"),
+            "last_productivity_detail_range": list(_LAST_PRODUCTIVITY_DETAIL_RANGE) if _LAST_PRODUCTIVITY_DETAIL_RANGE else None,
             "productivity_details": {
                 f"{start}|{end}": cached.get("result")
                 for (start, end), cached in _PRODUCTIVITY_DETAIL_CACHE.items()
@@ -141,6 +150,13 @@ def _save_production_disk_cache():
             os.replace(temporary, path)
         except (OSError, TypeError, ValueError) as error:
             print(f"Production dashboard cache write failed: {error}")
+
+
+def get_last_productivity_detail_range():
+    _load_production_disk_cache()
+    if _LAST_PRODUCTIVITY_DETAIL_RANGE in _PRODUCTIVITY_DETAIL_CACHE:
+        return _LAST_PRODUCTIVITY_DETAIL_RANGE
+    return None
 
 
 def number(value):
@@ -415,6 +431,7 @@ def build_productivity_detail(time_bookings, clockings):
 
 
 def fetch_productivity_detail(days=90, force_refresh=False, today=None, period_start=None, period_end=None):
+    global _LAST_PRODUCTIVITY_DETAIL_RANGE
     today = today or datetime.now()
     end = (
         datetime.strptime(str(period_end), "%Y-%m-%d")
@@ -488,13 +505,16 @@ def fetch_productivity_detail(days=90, force_refresh=False, today=None, period_s
     if result.get("status") == "ok":
         cache_seconds = get_production_cache_seconds()
         _PRODUCTIVITY_DETAIL_CACHE[cache_key] = {"expires_at": now + cache_seconds, "result": result}
+        _LAST_PRODUCTIVITY_DETAIL_RANGE = cache_key
         _save_production_disk_cache()
     return result
 
 
 def clear_productivity_detail_cache():
+    global _LAST_PRODUCTIVITY_DETAIL_RANGE
     _load_production_disk_cache()
     _PRODUCTIVITY_DETAIL_CACHE.clear()
+    _LAST_PRODUCTIVITY_DETAIL_RANGE = None
     _save_production_disk_cache()
 
 
