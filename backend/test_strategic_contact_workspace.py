@@ -10,6 +10,104 @@ from strategic_contacts_report import _activity_contacts, _activity_text, build_
 
 
 class StrategicContactWorkspaceTests(unittest.TestCase):
+    def test_hierarchy_renders_business_sections_and_parent_drop_zones(self):
+        manager = main.normalize_strategic_contact_record(
+            {
+                "id": "regional-1",
+                "organization": "Vestis Corporate",
+                "name": "Regional Manager",
+                "position": "Regional Director",
+                "email": "regional@vestis.com",
+                "org_chart_tier": "regional",
+                "org_chart_section": "production",
+            }
+        )
+        subordinate = main.normalize_strategic_contact_record(
+            {
+                "id": "branch-1",
+                "organization": "Vestis Corporate",
+                "name": "Branch Manager",
+                "position": "Branch Manager",
+                "email": "branch@vestis.com",
+                "org_chart_tier": "branch",
+                "org_chart_section": "production",
+                "org_chart_parent_id": "regional-1",
+            }
+        )
+
+        with patch.object(main, "can_manage_strategic_contacts", return_value=True):
+            html = main.render_organisation_chart([manager, subordinate], "vestis-aramark")
+
+        self.assertIn("Supply Chain", html)
+        self.assertIn("Production", html)
+        self.assertIn("Operations", html)
+        self.assertIn('data-tier="section-lead"', html)
+        self.assertIn("Regional managers report to the division lead", html)
+        self.assertIn('data-parent-id="regional-1"', html)
+        self.assertIn('<details class="hierarchy-branch-area drop-zone"', html)
+        self.assertIn("Branch Manager", html)
+        self.assertIn("Drop a subordinate here", html)
+        manager_card_end = html.index("</article>", html.index('data-contact-id="regional-1"'))
+        branch_drop_zone = html.index('data-parent-id="regional-1"')
+        self.assertLess(manager_card_end, branch_drop_zone)
+
+    def test_section_lead_tier_is_specific_to_vestis_structure(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "id": "alsco-1",
+                "organization": "Alsco",
+                "name": "Alsco Regional Manager",
+                "position": "Regional Manager",
+                "email": "regional@alsco.com",
+            }
+        )
+        with patch.object(main, "can_manage_strategic_contacts", return_value=True):
+            html = main.render_organisation_chart([contact], "alsco")
+
+        self.assertNotIn('data-tier="section-lead"', html)
+        self.assertNotIn("Regional managers report to the division lead", html)
+
+    def test_chart_move_persists_branch_parent_assignment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contacts_path = Path(temp_dir) / "strategic_contacts.json"
+            manager = main.normalize_strategic_contact_record(
+                {
+                    "id": "regional-2",
+                    "organization": "Vestis Corporate",
+                    "name": "Regional Manager",
+                    "position": "Regional Director",
+                    "email": "regional2@vestis.com",
+                    "org_chart_tier": "regional",
+                    "org_chart_section": "operations",
+                }
+            )
+            branch = main.normalize_strategic_contact_record(
+                {
+                    "id": "branch-2",
+                    "organization": "Vestis Corporate",
+                    "name": "Branch Manager",
+                    "position": "Branch Manager",
+                    "email": "branch2@vestis.com",
+                }
+            )
+            with patch.dict(os.environ, {"STRATEGIC_CONTACTS_PATH": str(contacts_path)}), patch.object(
+                main, "can_manage_strategic_contacts", return_value=True
+            ), patch.object(main, "record_audit_event"):
+                main.save_strategic_contacts([manager, branch])
+                response = main.post_organisation_chart_move(
+                    contact_id="branch-2",
+                    group="vestis-aramark",
+                    tier="branch",
+                    section="operations",
+                    parent_id="regional-2",
+                )
+                saved = {item["id"]: item for item in main.load_strategic_contacts()}
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(saved["branch-2"]["org_chart_tier"], "branch")
+            self.assertEqual(saved["branch-2"]["org_chart_parent_id"], "regional-2")
+            self.assertEqual(saved["branch-2"]["org_chart_section"], "operations")
+
     def test_placeholder_contact_email_detection(self):
         self.assertTrue(main.is_placeholder_contact_email("tbc@vestis.com"))
         self.assertTrue(main.is_placeholder_contact_email("TBD@example.com"))
@@ -113,12 +211,14 @@ This older quoted message should not appear.
             )
 
         self.assertIn('action="/strategic-contacts/enrich"', html)
+        self.assertIn('action="/strategic-contacts/delete"', html)
         self.assertNotIn('action="/strategic-contacts/sync-filemaker"', html)
-        self.assertIn("Most recent contact", html)
-        self.assertIn("Plant review", html)
-        self.assertIn("We confirmed the next review meeting.", html)
+        self.assertIn("Last contact", html)
+        self.assertIn("01/10/2026 14:30", html)
+        self.assertNotIn("Plant review", html)
+        self.assertNotIn("We confirmed the next review meeting.", html)
         self.assertIn("org-chart-contact-card contact-recent", html)
-        self.assertLess(html.index('class="org-chart-levels"'), html.index('class="panel org-map-panel"'))
+        self.assertNotIn('class="panel org-map-panel"', html)
 
     def test_recent_contact_map_uses_latest_matching_email_activity(self):
         contacts = [
@@ -157,6 +257,46 @@ This older quoted message should not appear.
         self.assertEqual(result["contact-activity"]["subject"], "Latest note")
         self.assertEqual(result["contact-activity"]["preview"], "This is the newest contact preview.")
         self.assertEqual(result["contact-activity"]["direction"], "outbound")
+
+    def test_workspace_maps_reuse_derived_cache_for_chart_only_moves(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "id": "cached-contact",
+                "organization": "Vestis Corporate",
+                "name": "Cached Contact",
+                "email": "cached@vestis.com",
+                "org_chart_tier": "regional",
+                "org_chart_section": "operations",
+            }
+        )
+        moved_contact = {**contact, "org_chart_section": "production", "org_chart_order": 4}
+        master_result = {"status": "ok", "all_contacts": [], "companies": []}
+        crm_result = {"status": "ok", "source": "test", "activities": []}
+        main._STRATEGIC_CONTACT_WORKSPACE_CACHE.update(
+            {
+                "key": None,
+                "contact_signature": None,
+                "expires_at": 0,
+                "presence_map": {},
+                "activity_map": {},
+            }
+        )
+
+        with patch.object(
+            main, "build_strategic_contact_filemaker_presence_map", return_value={"cached-contact": {"exists": True}}
+        ) as presence_builder, patch.object(
+            main, "build_strategic_contact_activity_map", return_value={"cached-contact": {"date_raw": "2026-10-01"}}
+        ) as activity_builder:
+            first = main.build_strategic_contact_workspace_maps(
+                [contact], master_data_result=master_result, crm_result=crm_result
+            )
+            second = main.build_strategic_contact_workspace_maps(
+                [moved_contact], master_data_result=master_result, crm_result=crm_result
+            )
+
+        self.assertEqual(first, second)
+        presence_builder.assert_called_once()
+        activity_builder.assert_called_once()
 
     def test_non_filemaker_contact_keeps_sync_action(self):
         contact = main.normalize_strategic_contact_record(
