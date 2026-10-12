@@ -981,6 +981,12 @@ ORG_CHART_GROUPS = {
         "organizations": ("vestis", "ameripride"),
         "section_lead_enabled": True,
         "section_lead_label": "Division lead",
+        "business_sections": (
+            ("supply-chain", "Supply Chain"),
+            ("production", "Production"),
+            ("operations", "Operations"),
+            ("canada-operations", "Canada Operations"),
+        ),
     },
     "alsco": {
         "label": "Alsco",
@@ -2815,7 +2821,7 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                 </section>
                 <section class="hierarchy-level hierarchy-regional-level">
                     <div class="hierarchy-level-label"><strong>Regional</strong><span>Business leadership</span></div>
-                    <div class="hierarchy-business-grid">{''.join(business_columns)}</div>
+                    <div class="hierarchy-business-grid" style="grid-template-columns: repeat({len(business_sections)}, minmax(300px, 1fr));">{''.join(business_columns)}</div>
                 </section>
                 <section class="panel hierarchy-unassigned">
                     <div class="hierarchy-level-label"><strong>Unassigned</strong><span>{len(unassigned)} contact{'s' if len(unassigned) != 1 else ''}</span></div>
@@ -3561,6 +3567,10 @@ def build_strategic_contacts_report_payload(items, selected_group, contact_activ
                 "region": str(item.get("region") or "").strip() or "Shared / Unassigned",
                 "email": str(item.get("email") or "").strip(),
                 "phone": str(item.get("phone") or "").strip() or str(item.get("cell") or "").strip(),
+                "org_chart_tier": str(item.get("org_chart_tier") or "").strip().lower(),
+                "org_chart_section": str(item.get("org_chart_section") or "").strip().lower(),
+                "org_chart_parent_id": str(item.get("org_chart_parent_id") or "").strip(),
+                "org_chart_order": int(item.get("org_chart_order") or 0),
                 "activity_state": "recent" if recency_class == " contact-recent" else "older" if recency_class == " contact-older" else "none",
                 "last_contact_date": str(activity.get("date_label") or "").strip(),
                 "direction": str(activity.get("direction") or "").strip(),
@@ -3582,6 +3592,12 @@ def build_strategic_contacts_report_payload(items, selected_group, contact_activ
     return {
         "group": selected_group,
         "group_label": selected_config["label"],
+        "business_sections": [
+            {"key": key, "label": label}
+            for key, label in get_org_chart_business_sections(selected_group)
+        ],
+        "section_lead_enabled": bool(selected_config.get("section_lead_enabled")),
+        "section_lead_label": str(selected_config.get("section_lead_label") or "Division lead"),
         "generated_at": generated_at.strftime("%d %B %Y %H:%M"),
         "contacts": rows,
     }

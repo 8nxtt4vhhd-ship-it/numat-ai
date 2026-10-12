@@ -41,6 +41,8 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
         self.assertIn("Supply Chain", html)
         self.assertIn("Production", html)
         self.assertIn("Operations", html)
+        self.assertIn("Canada Operations", html)
+        self.assertIn("repeat(4, minmax(300px, 1fr))", html)
         self.assertIn('data-tier="section-lead"', html)
         self.assertIn("Regional managers report to the division lead", html)
         self.assertIn('data-parent-id="regional-1"', html)
@@ -66,6 +68,8 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
 
         self.assertNotIn('data-tier="section-lead"', html)
         self.assertNotIn("Regional managers report to the division lead", html)
+        self.assertNotIn("Canada Operations", html)
+        self.assertIn("repeat(3, minmax(300px, 1fr))", html)
 
     def test_chart_move_persists_branch_parent_assignment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -351,6 +355,8 @@ This older quoted message should not appear.
                     "phone": "+1 555 0101",
                     "scope_type": "Corporate",
                     "region": "GA",
+                    "org_chart_tier": "section-lead",
+                    "org_chart_section": "operations",
                 }
             )
         ]
@@ -374,6 +380,10 @@ This older quoted message should not appear.
 
         self.assertEqual(payload["contacts"][0]["activity_state"], "recent")
         self.assertEqual(payload["contacts"][0]["full_body"], "This is the complete most recent outreach message.")
+        self.assertEqual(payload["contacts"][0]["org_chart_tier"], "section-lead")
+        self.assertTrue(payload["section_lead_enabled"])
+        self.assertEqual(payload["business_sections"][0]["key"], "supply-chain")
+        self.assertEqual(payload["business_sections"][-1]["key"], "canada-operations")
         self.assertTrue(pdf_content.startswith(b"%PDF"))
         self.assertGreater(len(pdf_content), 3000)
 
