@@ -30893,6 +30893,28 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .hierarchy-manager-group {{
                         display: grid;
                         gap: 0;
+                        min-width: 0;
+                    }}
+
+                    .hierarchy-manager-group .org-chart-contact-title-row {{
+                        min-width: 0;
+                        gap: 4px;
+                    }}
+
+                    .hierarchy-manager-group .org-chart-contact-title-row h4 {{
+                        min-width: 0;
+                        overflow-wrap: anywhere;
+                        font-size: 13px;
+                    }}
+
+                    .hierarchy-manager-group .org-chart-contact-title-row .status-pill {{
+                        flex: 0 1 auto;
+                        min-width: 0;
+                        padding: 5px 7px;
+                        overflow: hidden;
+                        font-size: 9px;
+                        text-overflow: ellipsis;
+                        white-space: nowrap;
                     }}
 
                     .hierarchy-contact-card {{
@@ -30965,6 +30987,19 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         padding: 8px 10px;
                     }}
 
+                    .hierarchy-manager-group .org-chart-recent-contact-head {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+                        gap: 4px;
+                    }}
+
+                    .hierarchy-manager-group .org-chart-recent-contact-head strong {{
+                        min-width: 0;
+                        max-width: 76px;
+                        overflow-wrap: anywhere;
+                        font-size: 9.5px;
+                    }}
+
                     .hierarchy-branch-area {{
                         display: grid;
                         gap: 8px;
@@ -31008,6 +31043,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .hierarchy-subordinate-head span {{
                         flex: 1 1 auto;
+                        min-width: 0;
+                        overflow-wrap: anywhere;
                     }}
 
                     .hierarchy-child-stack {{
