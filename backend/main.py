@@ -7645,9 +7645,14 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         period_start=review_period["period_start"],
         period_end_exclusive=review_period["period_end_exclusive"],
     )
+    production_mtd["summary"]["labour_percentage_mtd"] = None
     if productivity_detail.get("status") == "ok" and productivity_detail.get("clocking_count"):
-        production_mtd["summary"]["plant_productivity"] = productivity_detail.get("summary", {}).get("plant_productivity")
+        detail_summary = productivity_detail.get("summary", {})
+        production_mtd["summary"]["plant_productivity"] = detail_summary.get("plant_productivity")
         production_mtd["summary"]["plant_productivity_source"] = "time_bookings_and_clockings"
+        production_mtd["summary"]["labour_percentage_mtd"] = detail_summary.get("labour_percentage")
+        production_mtd["summary"]["total_labour_cost"] = detail_summary.get("total_labour_cost")
+        production_mtd["summary"]["labour_percentage_source"] = "clockings_insurance_and_press_value"
     planned_visits = calendar_result.get("events", []) if calendar_result.get("status") == "ok" else []
     daily_invoice_target = get_daily_invoice_target()
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
@@ -7698,6 +7703,14 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
             None,
             "New paid-time calculation",
             higher_is_better=True,
+            comparison_available=False,
+        )
+    if production_mtd.get("summary", {}).get("labour_percentage_source") == "clockings_insurance_and_press_value":
+        comparisons["labour_percentage"] = build_kpi_comparison(
+            production_mtd.get("summary", {}).get("labour_percentage_mtd"),
+            None,
+            "New clocked-labour calculation",
+            higher_is_better=False,
             comparison_available=False,
         )
 
@@ -8125,7 +8138,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                     <div><span>Current backlog</span><strong>{format_production_number(production_latest.get('backlog_weeks'), decimals=1)}</strong><small>weeks · latest completed day</small></div>
                     <div><span>Average daily production value</span><strong>{format_production_number(production_summary.get('average_production_revenue'), currency=True)}</strong><small>per completed recorded day</small></div>
                     <div><span>Re-cook activity</span><strong>{format_production_number(production_summary.get('recook_lf'))}</strong><small>{escape('LF in ' + review_month if reviewing_previous_month else 'LF month to date')}</small></div>
-                    <div><span>Labour %</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('labour_percentage'))}</div><small>{escape(review_month + ' labour cost ÷ invoiced revenue' if reviewing_previous_month else 'MTD labour cost ÷ invoiced revenue')}</small></div>
+                    <div><span>Labour %</span><div class="kpi-value-trend"><strong>{format_production_number(production_summary.get('labour_percentage_mtd'), '%', decimals=1)}</strong>{render_kpi_trend(comparisons.get('labour_percentage'))}</div><small>{escape(review_month + ' · clocked labour + insurance ÷ Press repair value' if reviewing_previous_month else 'MTD · clocked labour + insurance ÷ Press repair value')}</small></div>
                 </div>
             </section>
 

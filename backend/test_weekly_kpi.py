@@ -296,7 +296,11 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             productivity_detail={
                 "status": "ok",
                 "clocking_count": 10,
-                "summary": {"plant_productivity": 91.2},
+                "summary": {
+                    "plant_productivity": 91.2,
+                    "labour_percentage": 33.7,
+                    "total_labour_cost": 13356.53,
+                },
             },
             calendar_result={"status": "ok", "events": []},
             finance_result={"status": "ok", "average_debtor_days": 24.0},
@@ -310,6 +314,12 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             payload["production_mtd"]["summary"]["plant_productivity_source"],
             "time_bookings_and_clockings",
         )
+        self.assertEqual(payload["production_mtd"]["summary"]["labour_percentage_mtd"], 33.7)
+        self.assertEqual(
+            payload["production_mtd"]["summary"]["labour_percentage_source"],
+            "clockings_insurance_and_press_value",
+        )
+        self.assertFalse(payload["comparisons"]["labour_percentage"]["comparison_available"])
 
     def test_identifies_first_ever_and_return_after_two_year_gap(self):
         order_result = {
