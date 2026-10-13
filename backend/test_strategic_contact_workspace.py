@@ -49,6 +49,8 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
         self.assertIn('<details class="hierarchy-branch-area drop-zone"', html)
         self.assertIn("Branch Manager", html)
         self.assertIn("Drop a subordinate here", html)
+        self.assertIn("card.classList.add('is-saving')", html)
+        self.assertIn("const rollback = () =>", html)
         manager_card_end = html.index("</article>", html.index('data-contact-id="regional-1"'))
         branch_drop_zone = html.index('data-parent-id="regional-1"')
         self.assertLess(manager_card_end, branch_drop_zone)

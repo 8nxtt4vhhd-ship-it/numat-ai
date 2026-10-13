@@ -2786,17 +2786,68 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                             event.preventDefault(); event.stopPropagation(); zone.classList.remove('is-drag-over');
                             const contactId = event.dataTransfer.getData('text/plain') || draggedId;
                             if (!contactId) return;
+                            const card = Array.from(document.querySelectorAll('.hierarchy-contact-card')).find((item) => item.dataset.contactId === contactId);
+                            if (!card || card.classList.contains('is-saving')) return;
+                            const originalGroup = card.closest('.hierarchy-manager-group');
+                            const originalNode = originalGroup || card;
+                            const marker = document.createComment(`original-position-${{contactId}}`);
+                            originalNode.before(marker);
+                            const originalGroupDisplay = originalGroup ? originalGroup.style.display : '';
+                            let temporaryGroup = null;
+                            const tier = zone.dataset.tier || 'unassigned';
+                            const insertBeforeHint = (container, node) => {{
+                                const hint = Array.from(container.children).find((child) => child.classList && child.classList.contains('hierarchy-drop-hint'));
+                                container.insertBefore(node, hint || null);
+                            }};
+                            if (tier === 'regional') {{
+                                if (originalGroup) {{
+                                    insertBeforeHint(zone, originalGroup);
+                                }} else {{
+                                    temporaryGroup = document.createElement('div');
+                                    temporaryGroup.className = 'hierarchy-manager-group';
+                                    temporaryGroup.appendChild(card);
+                                    insertBeforeHint(zone, temporaryGroup);
+                                }}
+                            }} else if (tier === 'branch') {{
+                                if (originalGroup) originalGroup.style.display = 'none';
+                                const childStack = zone.querySelector('.hierarchy-child-stack');
+                                (childStack || zone).appendChild(card);
+                                if (zone.matches('details')) zone.open = true;
+                            }} else {{
+                                if (originalGroup) originalGroup.style.display = 'none';
+                                insertBeforeHint(zone, card);
+                            }}
+                            card.classList.remove('is-dragging');
+                            card.classList.add('is-saving');
+                            card.setAttribute('aria-busy', 'true');
+                            const rollback = () => {{
+                                card.classList.remove('is-saving');
+                                card.removeAttribute('aria-busy');
+                                if (temporaryGroup) temporaryGroup.remove();
+                                if (originalGroup) {{
+                                    originalGroup.style.display = originalGroupDisplay;
+                                    if (!originalGroup.contains(card)) originalGroup.prepend(card);
+                                    marker.replaceWith(originalGroup);
+                                }} else {{
+                                    marker.replaceWith(card);
+                                }}
+                            }};
                             const body = new URLSearchParams({{
                                 contact_id: contactId,
                                 group: '{escape(selected_group)}',
-                                tier: zone.dataset.tier || 'unassigned',
+                                tier,
                                 section: zone.dataset.section || '',
                                 parent_id: zone.dataset.parentId || ''
                             }});
-                            const response = await fetch('/organisation-chart/move', {{ method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}, body }});
-                            const result = await response.json();
-                            if (!response.ok) {{ alert(result.error || 'Could not move that contact.'); return; }}
-                            window.location.reload();
+                            try {{
+                                const response = await fetch('/organisation-chart/move', {{ method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}, body }});
+                                const result = await response.json();
+                                if (!response.ok) {{ rollback(); alert(result.error || 'Could not move that contact.'); return; }}
+                                window.location.reload();
+                            }} catch (error) {{
+                                rollback();
+                                alert('Could not save that move. Please check your connection and try again.');
+                            }}
                         }});
                     }});
                 }})();
@@ -30939,6 +30990,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .hierarchy-contact-card.is-dragging {{
                         opacity: 0.38;
+                    }}
+
+                    .hierarchy-contact-card.is-saving {{
+                        cursor: progress;
+                        box-shadow: 0 0 0 3px rgba(36, 92, 255, 0.16);
                     }}
 
                     .hierarchy-contact-card.contact-recent,
