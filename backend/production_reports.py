@@ -328,6 +328,202 @@ def build_operator_productivity_workbook(operator, period_start, period_end, boo
     return output.getvalue()
 
 
+def build_press_analysis_workbook(period_start, period_end, production_rows, cycles):
+    from openpyxl import Workbook
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    navy = "17324D"
+    blue = "245CFF"
+    pale_blue = "EAF2FF"
+    pale_amber = "FFF4D6"
+    amber = "9A6700"
+    muted = "5E7184"
+    border = Border(bottom=Side(style="thin", color="D9E2EC"))
+
+    def parse_date(value):
+        try:
+            return datetime.strptime(str(value or ""), "%Y-%m-%d").date()
+        except ValueError:
+            return value or ""
+
+    def parse_timestamp(value):
+        text = str(value or "").strip()
+        for pattern in ("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(text, pattern)
+            except ValueError:
+                continue
+        return text
+
+    def title(sheet, heading, subtitle):
+        sheet.sheet_view.showGridLines = False
+        sheet["A2"] = heading
+        sheet["A2"].font = Font(name="Arial", size=16, bold=True, color=blue)
+        sheet["A3"] = subtitle
+        sheet["A3"].font = Font(name="Arial", size=10, italic=True, color=muted)
+        sheet["A4"] = ""
+        sheet.row_dimensions[2].height = 24
+
+    def headers(sheet, row, count):
+        for cell in sheet[row][:count]:
+            cell.fill = PatternFill("solid", fgColor=navy)
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        sheet.row_dimensions[row].height = 30
+
+    def body(sheet, first, last, count):
+        if last < first:
+            return
+        for row in sheet.iter_rows(min_row=first, max_row=last, min_col=1, max_col=count):
+            for cell in row:
+                cell.font = Font(name="Arial", size=10, color="1E293B")
+                cell.alignment = Alignment(vertical="center")
+                cell.border = border
+
+    period_text = f"{datetime.strptime(period_start, '%Y-%m-%d').strftime('%m/%d/%Y')} to {datetime.strptime(period_end, '%Y-%m-%d').strftime('%m/%d/%Y')}"
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Summary"
+    title(summary, "Press analysis", period_text)
+    summary["A5"] = "Selected-period totals"
+    summary["A5"].font = Font(name="Arial", size=11, bold=True, color=navy)
+    metrics = [
+        ("Completed production days", f"=COUNTA('Daily Press'!A6:A{max(6, len(production_rows) + 5)})", "0"),
+        ("Total dashboard linear feet", f"=SUM('Daily Press'!E6:E{max(6, len(production_rows) + 5)})", "#,##0"),
+        ("Average daily linear feet", f'=IF(A6=0,"n.a.",B6/A6)', "#,##0"),
+        ("Cycle records", f"=COUNTA('Cycle Detail'!A6:A{max(6, len(cycles) + 5)})", "0"),
+        ("Cycle-detail linear feet", f"=SUM('Cycle Detail'!K6:K{max(6, len(cycles) + 5)})", "#,##0"),
+        ("Orders shared by operators", f"=COUNTA('Shared Orders'!A6:A{max(6, len(cycles) + 5)})", "0"),
+    ]
+    for column, (label, formula, number_format) in enumerate(metrics, start=1):
+        summary.cell(5, column, label)
+        summary.cell(6, column, formula)
+        summary.cell(5, column).font = Font(name="Arial", size=9, bold=True, color=muted)
+        summary.cell(5, column).alignment = Alignment(horizontal="center", wrap_text=True)
+        summary.cell(6, column).font = Font(name="Arial", size=14, bold=True, color=navy)
+        summary.cell(6, column).alignment = Alignment(horizontal="center")
+        summary.cell(6, column).fill = PatternFill("solid", fgColor=pale_blue)
+        summary.cell(6, column).number_format = number_format
+        summary.column_dimensions[summary.cell(1, column).column_letter].width = 22
+    summary["A8"] = "How to investigate a changing figure"
+    summary["A8"].font = Font(name="Arial", size=11, bold=True, color=navy)
+    summary["A9"] = "Daily Press reproduces the dashboard's completed-day FF1, FF2 and FF3 totals. Cycle Detail shows the current FileMaker cycle attribution by order, operator and press. Shared Orders lists order/day combinations worked by more than one operator; this is a review list, not proof of an error."
+    summary.merge_cells("A9:F9")
+    summary["A9"].font = Font(name="Arial", size=10, color=muted)
+    summary["A9"].alignment = Alignment(wrap_text=True, vertical="top")
+    summary.row_dimensions[9].height = 48
+
+    daily = workbook.create_sheet("Daily Press")
+    title(daily, "Daily press performance", "These figures match the completed-day data used by the dashboard")
+    daily.append(["Date", "FF1 linear feet", "FF2 linear feet", "FF3 linear feet", "Total linear feet", "FF1 mats", "FF2 mats", "FF3 mats", "Total mats", "FF1 cycles", "FF2 cycles", "FF3 cycles", "Total cycles", "Press repair value"])
+    for index, item in enumerate(sorted(production_rows, key=lambda row: row.get("date") or ""), start=6):
+        daily.append([
+            parse_date(item.get("date")), item.get("ff1_lf"), item.get("ff2_lf"), item.get("ff3_lf"),
+            f"=SUM(B{index}:D{index})", item.get("ff1_mats"), item.get("ff2_mats"), item.get("ff3_mats"),
+            f"=SUM(F{index}:H{index})", item.get("ff1_cycles"), item.get("ff2_cycles"), item.get("ff3_cycles"),
+            f"=SUM(J{index}:L{index})", sum(item.get(f"ff{press}_revenue") or 0 for press in (1, 2, 3)),
+        ])
+    headers(daily, 5, 14)
+    body(daily, 6, len(production_rows) + 5, 14)
+    if production_rows:
+        table = Table(displayName="DailyPressPerformance", ref=f"A5:N{len(production_rows) + 5}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        daily.add_table(table)
+        for row in range(6, len(production_rows) + 6):
+            daily.cell(row, 1).number_format = "mm/dd/yyyy"
+            for column in range(2, 14):
+                daily.cell(row, column).number_format = "#,##0"
+            daily.cell(row, 14).number_format = '"$"#,##0.00'
+    daily.freeze_panes = "B6"
+    for column, width in {"A": 14, "B": 16, "C": 16, "D": 16, "E": 18, "F": 12, "G": 12, "H": 12, "I": 12, "J": 12, "K": 12, "L": 12, "M": 13, "N": 18}.items():
+        daily.column_dimensions[column].width = width
+
+    cycle_sheet = workbook.create_sheet("Cycle Detail")
+    title(cycle_sheet, "Cycle detail", "Current FileMaker cycle records for the selected period")
+    cycle_headers = ["Date", "Start", "Finish", "Order reference", "Cycle number", "Press", "Operator", "Extra operator", "Mats", "Edges", "Cycle linear feet", "FF1 linear feet", "FF2 linear feet", "FF3 linear feet", "Order LF summary", "Repair value", "Cycle time (hours)", "Record ID", "Modified"]
+    cycle_sheet.append(cycle_headers)
+    for item in sorted(cycles, key=lambda row: (row.get("date") or "", row.get("start_time") or "", row.get("cycle_number") or "")):
+        cycle_sheet.append([
+            parse_date(item.get("date")), parse_timestamp(item.get("start_time")), parse_timestamp(item.get("finish_time")),
+            item.get("order_reference") or "", item.get("cycle_number") or "", item.get("machine") or "", item.get("operator") or "",
+            item.get("extra_operator") or "", item.get("mat_count"), item.get("edges"), item.get("linear_feet"), item.get("ff1_lf"),
+            item.get("ff2_lf"), item.get("ff3_lf"), item.get("order_linear_feet_summary"), item.get("repair_value"),
+            item.get("cycle_hours"), item.get("record_id") or "", item.get("modified_at") or "",
+        ])
+    headers(cycle_sheet, 5, len(cycle_headers))
+    body(cycle_sheet, 6, len(cycles) + 5, len(cycle_headers))
+    if cycles:
+        table = Table(displayName="PressCycleDetail", ref=f"A5:S{len(cycles) + 5}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        cycle_sheet.add_table(table)
+        for row in range(6, len(cycles) + 6):
+            cycle_sheet.cell(row, 1).number_format = "mm/dd/yyyy"
+            cycle_sheet.cell(row, 2).number_format = "mm/dd/yyyy h:mm AM/PM"
+            cycle_sheet.cell(row, 3).number_format = "mm/dd/yyyy h:mm AM/PM"
+            for column in (4, 5, 6, 7, 8, 18, 19):
+                cycle_sheet.cell(row, column).alignment = Alignment(horizontal="left", vertical="center")
+            for column in range(9, 16):
+                cycle_sheet.cell(row, column).number_format = "#,##0"
+            cycle_sheet.cell(row, 16).number_format = '"$"#,##0.00'
+            cycle_sheet.cell(row, 17).number_format = "0.00"
+    cycle_sheet.freeze_panes = "G6"
+    for column, width in {"A": 13, "B": 22, "C": 22, "D": 18, "E": 16, "F": 10, "G": 22, "H": 22, "I": 10, "J": 10, "K": 17, "L": 15, "M": 15, "N": 15, "O": 17, "P": 15, "Q": 18, "R": 12, "S": 20}.items():
+        cycle_sheet.column_dimensions[column].width = width
+
+    shared = defaultdict(lambda: {"operators": set(), "presses": set(), "cycles": 0, "linear_feet": 0.0})
+    for item in cycles:
+        order = str(item.get("order_reference") or "").strip()
+        date_key = str(item.get("date") or "").strip()
+        operator = str(item.get("operator") or "").strip()
+        if not order or not date_key or not operator:
+            continue
+        entry = shared[(date_key, order)]
+        entry["operators"].add(operator)
+        if item.get("machine"):
+            entry["presses"].add(str(item.get("machine")))
+        entry["cycles"] += 1
+        entry["linear_feet"] += float(item.get("linear_feet") or 0)
+    shared_rows = [
+        (date_key, order, values)
+        for (date_key, order), values in shared.items()
+        if len(values["operators"]) > 1
+    ]
+    shared_rows.sort(key=lambda item: (item[0], item[1]))
+    review = workbook.create_sheet("Shared Orders")
+    title(review, "Orders shared by operators", "Order/day combinations with cycle records assigned to more than one operator")
+    review.append(["Date", "Order reference", "Operators", "Presses", "Cycle records", "Cycle-detail linear feet", "Review note"])
+    for date_key, order, values in shared_rows:
+        review.append([parse_date(date_key), order, ", ".join(sorted(values["operators"])), ", ".join(sorted(values["presses"])), values["cycles"], values["linear_feet"], "Confirm the work was intentionally shared between operators."])
+    headers(review, 5, 7)
+    body(review, 6, len(shared_rows) + 5, 7)
+    if shared_rows:
+        table = Table(displayName="SharedOrderReview", ref=f"A5:G{len(shared_rows) + 5}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        review.add_table(table)
+        review.conditional_formatting.add(f"E6:E{len(shared_rows) + 5}", CellIsRule(operator="greaterThan", formula=["0"], fill=PatternFill("solid", fgColor=pale_amber), font=Font(color=amber, bold=True)))
+        for row in range(6, len(shared_rows) + 6):
+            review.cell(row, 1).number_format = "mm/dd/yyyy"
+            for column in (2, 3, 4, 7):
+                review.cell(row, column).alignment = Alignment(horizontal="left", vertical="top" if column == 7 else "center", wrap_text=column == 7)
+            review.cell(row, 5).number_format = "0"
+            review.cell(row, 6).number_format = "#,##0"
+    review.freeze_panes = "A6"
+    for column, width in {"A": 14, "B": 18, "C": 38, "D": 18, "E": 15, "F": 24, "G": 54}.items():
+        review.column_dimensions[column].width = width
+
+    for sheet in workbook.worksheets:
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 0
+        sheet.sheet_properties.tabColor = blue if sheet.title == "Summary" else pale_blue
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def summarize_rows(rows, operator_rows):
     revenue = [item.get("production_revenue_today") for item in rows if item.get("production_revenue_today") is not None]
     press_lf = [item.get("press_throughput") for item in rows if item.get("press_throughput") is not None]

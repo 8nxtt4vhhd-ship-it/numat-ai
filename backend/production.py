@@ -21,7 +21,7 @@ _PRODUCTIVITY_DETAIL_CACHE = {}
 _LAST_PRODUCTIVITY_DETAIL_RANGE = None
 _PRODUCTION_CACHE_LOCK = Lock()
 _PRODUCTION_DISK_CACHE_LOADED = False
-_PRODUCTION_CACHE_VERSION = 1
+_PRODUCTION_CACHE_VERSION = 2
 DEFAULT_PRODUCTION_CACHE_PATH = Path(__file__).resolve().parent / "data" / "production_dashboard_cache.json"
 
 PRODUCTION_LAYOUT_DEFAULT = "ai_Numat Production Data"
@@ -279,16 +279,32 @@ def normalize_clocking_record(record):
 def normalize_cycle_record(record):
     row = record.get("fieldData", {})
     value = lambda field: get_field_value(row, field)
+    press_linear_feet = {
+        f"ff{press}_lf": number(value(f"FF{press} LF"))
+        for press in (1, 2, 3)
+    }
+    cycle_linear_feet = sum(item or 0 for item in press_linear_feet.values())
+    if not any(item is not None for item in press_linear_feet.values()):
+        cycle_linear_feet = number(value("Linear Feet in Cycle"))
     return {
         "record_id": str(record.get("recordId") or ""),
         "primary_key": str(value("PrimaryKey") or "").strip(),
         "modified_at": str(value("ModificationTimestamp") or "").strip(),
         "date": normalize_filemaker_date(value("Start Time") or value("CreationTimestamp")),
+        "start_time": str(value("Start Time") or "").strip(),
+        "finish_time": str(value("Finish Time") or "").strip(),
         "machine": str(value("Machine No") or "").strip(),
         "operator": str(value("Operator") or "").strip(),
+        "extra_operator": str(value("Extra Operator") or "").strip(),
+        "order_reference": str(value("Order Ref") or "").strip(),
+        "cycle_number": str(value("Cycle No") or "").strip(),
+        "mat_count": number(value("Count Mats in Cycle")),
+        "edges": number(value("Edges in Cycle")),
         "repair_value": number(value("Revenue in Cycle")),
-        "linear_feet": number(value("Linear Feet in Cycle")),
+        "linear_feet": cycle_linear_feet,
+        "order_linear_feet_summary": number(value("Linear Feet in Cycle Summary")),
         "cycle_hours": duration_hours(value("Time")),
+        **press_linear_feet,
     }
 
 

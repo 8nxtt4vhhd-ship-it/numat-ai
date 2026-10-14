@@ -82,6 +82,35 @@ class ProductionKpiTests(unittest.TestCase):
         self.assertEqual(duration_hours("10:30:00"), 10.5)
         self.assertEqual(duration_hours(timedelta(hours=2, minutes=15)), 2.25)
 
+    def test_cycle_normalization_keeps_press_trace_fields(self):
+        cycle = production.normalize_cycle_record({
+            "recordId": "42",
+            "fieldData": {
+                "Start Time": "10/08/2026 08:00:00",
+                "Finish Time": "10/08/2026 08:30:00",
+                "Order Ref": "3736",
+                "Cycle No": "3736-1",
+                "Machine No": "FF1",
+                "Operator": "Kenley Pike",
+                "Extra Operator": "Cedrick Brown",
+                "Count Mats in Cycle": 3,
+                "Edges in Cycle": 9,
+                "FF1 LF": 125,
+                "FF2 LF": "",
+                "FF3 LF": "",
+                "Linear Feet in Cycle Summary": 4500,
+                "Revenue in Cycle": 300,
+                "Time": "00:30:00",
+            },
+        })
+
+        self.assertEqual(cycle["date"], "2026-10-08")
+        self.assertEqual(cycle["order_reference"], "3736")
+        self.assertEqual(cycle["cycle_number"], "3736-1")
+        self.assertEqual(cycle["linear_feet"], 125)
+        self.assertEqual(cycle["order_linear_feet_summary"], 4500)
+        self.assertEqual(cycle["extra_operator"], "Cedrick Brown")
+
     def test_department_names_are_normalized(self):
         self.assertEqual(canonical_department("ReRuns"), "Re-Runs")
         self.assertEqual(canonical_department("Re-Runs"), "Re-Runs")

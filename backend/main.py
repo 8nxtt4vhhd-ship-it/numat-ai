@@ -141,6 +141,7 @@ from production_reports import (
     build_ai_report_facts_for_calendar_period,
     build_anomaly_workbook,
     build_operator_productivity_workbook,
+    build_press_analysis_workbook,
     clean_filename,
 )
 from strategic_contacts_report import build_strategic_contacts_pdf
@@ -7550,7 +7551,7 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
                 <div class="production-flow-list">{render_production_flow(latest, payload.get('rows', []))}</div>
             </section>
             <section class="panel production-span-2">
-                <span class="home-focus-inline-kicker">Latest available completed day</span><h2>Most recent press performance</h2>
+                <div class="panel-head"><div><span class="home-focus-inline-kicker">Latest available completed day</span><h2>Most recent press performance</h2></div><a class="button secondary small-button" href="/production-analysis/export-press-analysis?{urlencode({'start': period_start, 'end': period_end})}">Export press analysis</a></div>
                 <div class="production-press-grid">{render_press_cards(payload.get('rows', []))}</div>
             </section>
             <section class="panel production-quality-panel">
@@ -7933,6 +7934,36 @@ def export_production_anomalies(days: int = 90, start: str = "", end: str = ""):
     payload = build_production_kpi_payload(fetch_production_analysis_data(), days=selected_days, period_start=period_start, period_end=period_end)
     content, _ = build_anomaly_workbook(payload)
     filename = f"numat-production-anomalies-{selected_days}-days.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/production-analysis/export-press-analysis")
+def export_production_press_analysis(days: int = 90, start: str = "", end: str = ""):
+    period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    production_result = fetch_production_analysis_data()
+    payload = build_production_kpi_payload(
+        production_result,
+        days=selected_days,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    detail = fetch_productivity_detail(
+        days=selected_days,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    content = build_press_analysis_workbook(
+        period_start,
+        period_end,
+        payload.get("rows", []),
+        detail.get("cycles", []),
+    )
+    filename = f"press-analysis-{period_start}-to-{period_end}.xlsx"
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

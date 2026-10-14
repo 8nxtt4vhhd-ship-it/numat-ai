@@ -47,6 +47,8 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertIn('value="10/07/2026"', html)
         self.assertEqual(detail_fetch.call_args.kwargs["period_start"], "2026-10-01")
         self.assertEqual(detail_fetch.call_args.kwargs["period_end"], "2026-10-07")
+        self.assertIn("Export press analysis", html)
+        self.assertIn("/production-analysis/export-press-analysis?start=2026-10-01&end=2026-10-07", html)
 
     def test_productivity_detail_page_shows_exact_calculation(self):
         detail = {
@@ -169,6 +171,50 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertEqual(daily_rows[1][3], 0)
         self.assertEqual(workbook["Departments"]["A6"].value, "Engineering")
         self.assertIn("James-Frieson-productivity-2026-10-05-to-2026-10-06.xlsx", response.headers["content-disposition"])
+
+    def test_press_analysis_export_includes_dashboard_and_cycle_trace(self):
+        production_result = {"status": "ok"}
+        payload = {
+            "rows": [
+                {
+                    "date": "2026-10-08",
+                    "ff1_lf": 1000,
+                    "ff2_lf": 1200,
+                    "ff3_lf": 800,
+                    "ff1_mats": 10,
+                    "ff2_mats": 12,
+                    "ff3_mats": 8,
+                    "ff1_cycles": 3,
+                    "ff2_cycles": 4,
+                    "ff3_cycles": 2,
+                    "ff1_revenue": 1000,
+                    "ff2_revenue": 1200,
+                    "ff3_revenue": 800,
+                }
+            ]
+        }
+        detail = {
+            "cycles": [
+                {"date": "2026-10-08", "start_time": "10/08/2026 08:00:00", "finish_time": "10/08/2026 08:30:00", "order_reference": "3736", "cycle_number": "3736-1", "machine": "FF1", "operator": "Kenley Pike", "mat_count": 2, "linear_feet": 100, "ff1_lf": 100, "repair_value": 250, "record_id": "1"},
+                {"date": "2026-10-08", "start_time": "10/08/2026 09:00:00", "finish_time": "10/08/2026 09:30:00", "order_reference": "3736", "cycle_number": "3736-2", "machine": "FF2", "operator": "Cedrick Brown", "mat_count": 2, "linear_feet": 120, "ff2_lf": 120, "repair_value": 300, "record_id": "2"},
+            ]
+        }
+        with (
+            patch.object(main, "fetch_production_analysis_data", return_value=production_result),
+            patch.object(main, "build_production_kpi_payload", return_value=payload),
+            patch.object(main, "fetch_productivity_detail", return_value=detail),
+        ):
+            response = main.export_production_press_analysis(start="10/08/2026", end="10/08/2026")
+
+        workbook = load_workbook(BytesIO(response.body), data_only=False)
+        self.assertEqual(workbook.sheetnames, ["Summary", "Daily Press", "Cycle Detail", "Shared Orders"])
+        self.assertEqual(workbook["Daily Press"]["E6"].value, "=SUM(B6:D6)")
+        self.assertEqual(workbook["Cycle Detail"]["D6"].value, "3736")
+        self.assertEqual(workbook["Cycle Detail"]["G7"].value, "Cedrick Brown")
+        self.assertEqual(workbook["Shared Orders"]["B6"].value, "3736")
+        self.assertIn("Cedrick Brown", workbook["Shared Orders"]["C6"].value)
+        self.assertIn("Kenley Pike", workbook["Shared Orders"]["C6"].value)
+        self.assertIn("press-analysis-2026-10-08-to-2026-10-08.xlsx", response.headers["content-disposition"])
 
     def test_time_booking_update_writes_verified_record_and_clears_cache(self):
         detail = {
