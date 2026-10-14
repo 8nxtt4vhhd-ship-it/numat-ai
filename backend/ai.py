@@ -660,10 +660,33 @@ def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
-        transcription = client.audio.transcriptions.create(
-            model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
-            file=(str(filename or "meeting.webm"), audio_bytes),
-        )
+        configured_transcription_model = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
+        transcription_models = [configured_transcription_model or "gpt-4o-mini-transcribe"]
+        if "whisper-1" not in transcription_models:
+            transcription_models.append("whisper-1")
+        transcription = None
+        for transcription_model in transcription_models:
+            try:
+                transcription = client.audio.transcriptions.create(
+                    model=transcription_model,
+                    file=(str(filename or "meeting.webm"), audio_bytes),
+                )
+                break
+            except Exception as transcription_error:
+                error_text = str(transcription_error).casefold()
+                status_code = getattr(transcription_error, "status_code", None)
+                unavailable = (
+                    status_code in {403, 404}
+                    or "model_not_found" in error_text
+                    or "does not have access to model" in error_text
+                )
+                if transcription_model != transcription_models[-1] and unavailable:
+                    print(
+                        f"Transcription model {transcription_model} is unavailable; "
+                        f"retrying with {transcription_models[-1]}."
+                    )
+                    continue
+                raise
         transcript = str(getattr(transcription, "text", "") or "").strip()
         if not transcript:
             return {"status": "no_transcript", "transcript": "", "actions": [], "error_message": "No speech could be transcribed."}
