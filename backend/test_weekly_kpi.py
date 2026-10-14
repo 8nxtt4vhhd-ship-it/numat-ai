@@ -79,6 +79,29 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             main.save_weekly_kpi_todos(expected)
             self.assertEqual(main.load_weekly_kpi_todos(), expected)
 
+    def test_archived_weekly_todo_is_hidden_from_live_checklist(self):
+        html = main.render_weekly_kpi_todos([
+            {"id": "live", "text": "Visible action", "completed_at": ""},
+            {"id": "archived", "text": "Archived action", "completed_at": "2026-10-01 10:00:00", "archived_at": "2026-10-08 10:00:00"},
+        ])
+        self.assertIn("Visible action", html)
+        self.assertNotIn("Archived action", html)
+        self.assertIn("Archive", html)
+        self.assertIn("Delete", html)
+
+    def test_archive_weekly_todo_preserves_item_with_archive_metadata(self):
+        with TemporaryDirectory() as temp_dir, patch.object(
+            main, "get_weekly_kpi_todos_path", return_value=Path(temp_dir) / "todos.json"
+        ), patch.object(main, "get_current_session_user", return_value={"display_name": "Kelly"}), patch.object(
+            main, "record_audit_event"
+        ):
+            main.save_weekly_kpi_todos([{"id": "todo-1", "text": "Call customer", "completed_at": "2026-10-07 10:00:00"}])
+            response = main.post_weekly_kpi_todo_archive(todo_id="todo-1", ajax="1")
+            archived = main.load_weekly_kpi_todos()[0]
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(archived["archived_by"], "Kelly")
+            self.assertTrue(archived["archived_at"])
+
     def test_weekly_meeting_records_round_trip_and_finalize_actions(self):
         with TemporaryDirectory() as temp_dir, patch.object(
             main, "get_weekly_kpi_meetings_path", return_value=Path(temp_dir) / "meetings.json"

@@ -660,12 +660,13 @@ def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
-        configured_transcription_model = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
-        transcription_models = [configured_transcription_model or "gpt-4o-mini-transcribe"]
-        if "whisper-1" not in transcription_models:
-            transcription_models.append("whisper-1")
+        configured_transcription_model = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-transcribe").strip()
+        transcription_models = []
+        for model_name in (configured_transcription_model or "gpt-transcribe", "gpt-transcribe", "gpt-4o-mini-transcribe", "whisper-1"):
+            if model_name not in transcription_models:
+                transcription_models.append(model_name)
         transcription = None
-        for transcription_model in transcription_models:
+        for model_index, transcription_model in enumerate(transcription_models):
             try:
                 transcription = client.audio.transcriptions.create(
                     model=transcription_model,
@@ -680,12 +681,22 @@ def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
                     or "model_not_found" in error_text
                     or "does not have access to model" in error_text
                 )
-                if transcription_model != transcription_models[-1] and unavailable:
+                if model_index < len(transcription_models) - 1 and unavailable:
                     print(
                         f"Transcription model {transcription_model} is unavailable; "
-                        f"retrying with {transcription_models[-1]}."
+                        f"retrying with {transcription_models[model_index + 1]}."
                     )
                     continue
+                if unavailable:
+                    return {
+                        "status": "transcription_model_unavailable",
+                        "transcript": "",
+                        "actions": [],
+                        "error_message": (
+                            "Meeting transcription is not enabled for this app's OpenAI project. "
+                            "Please ask an administrator to enable an audio transcription model."
+                        ),
+                    }
                 raise
         transcript = str(getattr(transcription, "text", "") or "").strip()
         if not transcript:

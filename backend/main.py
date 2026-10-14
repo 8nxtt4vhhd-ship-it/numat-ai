@@ -8364,12 +8364,13 @@ def render_new_and_returning_customers(customers):
 
 
 def render_weekly_kpi_todos(items):
+    visible = [item for item in items if not item.get("archived_at")]
     active = sorted(
-        [item for item in items if not item.get("completed_at")],
+        [item for item in visible if not item.get("completed_at")],
         key=lambda item: str(item.get("created_at") or ""),
     )
     completed = sorted(
-        [item for item in items if item.get("completed_at")],
+        [item for item in visible if item.get("completed_at")],
         key=lambda item: str(item.get("completed_at") or ""),
         reverse=True,
     )[:4]
@@ -8385,9 +8386,14 @@ def render_weekly_kpi_todos(items):
                     <button class="kpi-todo-check" type="submit" aria-label="{'Reopen' if is_done else 'Complete'} action">{'✓' if is_done else ''}</button>
                 </form>
                 <div><strong>{escape(str(item.get('text') or ''))}</strong>{f'<small>{escape(owner)}</small>' if owner else ''}</div>
-                <form method="post" action="/weekly-kpi/todos/delete" onsubmit="return confirm('Remove this action?');">
-                    <input type="hidden" name="todo_id" value="{item_id}"><button class="kpi-todo-delete" type="submit">×</button>
-                </form>
+                <div class="kpi-todo-row-actions">
+                    <form class="kpi-todo-archive-form" method="post" action="/weekly-kpi/todos/archive">
+                        <input type="hidden" name="todo_id" value="{item_id}"><button class="kpi-todo-archive" type="submit">Archive</button>
+                    </form>
+                    <form class="kpi-todo-delete-form" method="post" action="/weekly-kpi/todos/delete">
+                        <input type="hidden" name="todo_id" value="{item_id}"><button class="kpi-todo-delete" type="submit">Delete</button>
+                    </form>
+                </div>
             </div>
         """)
     return "".join(rows) or "<p class='small muted kpi-todo-empty'>No meeting actions yet.</p>"
@@ -8450,12 +8456,33 @@ def post_weekly_kpi_todo_toggle(todo_id: str = Form(""), ajax: str = ""):
 
 
 @app.post("/weekly-kpi/todos/delete")
-def post_weekly_kpi_todo_delete(todo_id: str = Form("")):
+def post_weekly_kpi_todo_delete(todo_id: str = Form(""), ajax: str = ""):
     items = load_weekly_kpi_todos()
     removed = next((item for item in items if str(item.get("id") or "") == str(todo_id or "")), None)
     save_weekly_kpi_todos([item for item in items if str(item.get("id") or "") != str(todo_id or "")])
     if removed:
         record_audit_event("meeting-action-delete", target=str(removed.get("text") or "")[:120], area="weekly-kpi")
+    if str(ajax or "").strip().casefold() in {"1", "true", "yes"}:
+        return JSONResponse({"status": "ok" if removed else "not_found", "todo_id": str(todo_id or "")}, status_code=200 if removed else 404)
+    return RedirectResponse(url="/weekly-kpi-dashboard#weekly-actions", status_code=303)
+
+
+@app.post("/weekly-kpi/todos/archive")
+def post_weekly_kpi_todo_archive(todo_id: str = Form(""), ajax: str = ""):
+    current_user = get_current_session_user() or {}
+    items = load_weekly_kpi_todos()
+    changed = None
+    for item in items:
+        if str(item.get("id") or "") == str(todo_id or ""):
+            item["archived_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            item["archived_by"] = str(current_user.get("display_name") or current_user.get("username") or "").strip()
+            changed = item
+            break
+    if changed:
+        save_weekly_kpi_todos(items)
+        record_audit_event("meeting-action-archive", target=str(changed.get("text") or "")[:120], area="weekly-kpi")
+    if str(ajax or "").strip().casefold() in {"1", "true", "yes"}:
+        return JSONResponse({"status": "ok" if changed else "not_found", "todo_id": str(todo_id or "")}, status_code=200 if changed else 404)
     return RedirectResponse(url="/weekly-kpi-dashboard#weekly-actions", status_code=303)
 
 
@@ -8649,6 +8676,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                 </div>
                 <div class="kpi-meeting-history-links">
                     <a href="/weekly-kpi-meetings">Meeting history</a>
+                    <a href="/weekly-kpi-actions-history">Action history</a>
                     {f'<a href="/weekly-kpi-meetings/{quote(str(latest_meeting.get("id") or ""))}">Latest summary · {escape(str(latest_meeting.get("meeting_date") or ""))}</a>' if latest_meeting else '<span class="small muted">No saved meetings yet</span>'}
                 </div>
                 <form class="kpi-todo-create" method="post" action="/weekly-kpi/todos/create"><input name="text" required maxlength="500" placeholder="Add an action…"><input name="owner" maxlength="120" placeholder="Owner (optional)"><button class="button small-button" type="submit">Add</button></form>
@@ -8738,6 +8766,32 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                     }
                 });
             });
+            const submitTodoRemoval = async (form, permanent = false) => {
+                if (permanent && !window.confirm('Permanently delete this action? This cannot be undone.')) return;
+                const button = form.querySelector('button');
+                const row = form.closest('.kpi-todo-row');
+                if (!button || !row || button.disabled) return;
+                button.disabled = true;
+                try {
+                    const response = await fetch(`${form.action}?ajax=1`, {
+                        method: 'POST', body: new FormData(form), headers: {'Accept': 'application/json'},
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.error_message || 'The action could not be updated.');
+                    row.remove();
+                    const list = document.querySelector('.kpi-todo-list');
+                    if (list && !list.querySelector('.kpi-todo-row')) list.innerHTML = '<p class="small muted kpi-todo-empty">No meeting actions yet.</p>';
+                } catch (error) {
+                    window.alert(error.message || 'The action could not be updated.');
+                    button.disabled = false;
+                }
+            };
+            document.querySelectorAll('.kpi-todo-archive-form').forEach(form => form.addEventListener('submit', event => {
+                event.preventDefault(); submitTodoRemoval(form, false);
+            }));
+            document.querySelectorAll('.kpi-todo-delete-form').forEach(form => form.addEventListener('submit', event => {
+                event.preventDefault(); submitTodoRemoval(form, true);
+            }));
             if (!start || !navigator.mediaDevices || !window.MediaRecorder) return;
             let recorder, chunks = [], stream;
             start.addEventListener('click', async () => {
@@ -8801,6 +8855,35 @@ def get_weekly_kpi_meetings_page():
         </section>
     """
     return render_page(title="Meeting History", body=body)
+
+
+@app.get("/weekly-kpi-actions-history", response_class=HTMLResponse)
+def get_weekly_kpi_actions_history_page():
+    items = [item for item in load_weekly_kpi_todos() if item.get("archived_at") or item.get("completed_at")]
+    items.sort(key=lambda item: str(item.get("archived_at") or item.get("completed_at") or item.get("created_at") or ""), reverse=True)
+    rows = []
+    for item in items:
+        archived = bool(item.get("archived_at"))
+        status = "Archived" if archived else "Completed"
+        changed_at = item.get("archived_at") if archived else item.get("completed_at")
+        changed_by = item.get("archived_by") if archived else ""
+        rows.append(f"""
+            <tr>
+                <td data-label="Action"><strong>{escape(str(item.get('text') or ''))}</strong></td>
+                <td data-label="Owner">{escape(str(item.get('owner') or '—'))}</td>
+                <td data-label="Status"><span class="action-history-status {'archived' if archived else 'completed'}">{status}</span></td>
+                <td data-label="Created">{escape(str(item.get('created_at') or '—'))}</td>
+                <td data-label="Completed">{escape(str(item.get('completed_at') or '—'))}</td>
+                <td data-label="Archived">{escape(str(changed_at or '—')) if archived else '—'}{f'<small> by {escape(str(changed_by))}</small>' if changed_by else ''}</td>
+            </tr>
+        """)
+    body = f"""
+        <section class="panel meeting-history-panel">
+            <div class="kpi-production-head"><div><h2>Weekly action history</h2><p class="muted">Completed and archived meeting actions retained for future reference.</p></div><a class="button secondary small-button" href="/weekly-kpi-dashboard#weekly-actions">Back to KPI dashboard</a></div>
+            <div class="table-wrap"><table class="contacts-table action-history-table"><thead><tr><th>Action</th><th>Owner</th><th>Status</th><th>Created</th><th>Completed</th><th>Archived</th></tr></thead><tbody>{''.join(rows) if rows else '<tr><td colspan="6">No completed or archived actions yet.</td></tr>'}</tbody></table></div>
+        </section>
+    """
+    return render_page(title="Action History", body=body)
 
 
 @app.get("/weekly-kpi-meetings/{meeting_id}", response_class=HTMLResponse)
@@ -25336,7 +25419,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .kpi-todo-row.completed strong {{ color:var(--muted); text-decoration:line-through; }}
                     .kpi-todo-check {{ width:24px; height:24px; padding:0; border:2px solid #7b8da5; border-radius:7px; background:white; color:#08765f; }}
                     .kpi-todo-row.completed .kpi-todo-check {{ border-color:#49c9ad; background:#e7f8f1; }}
-                    .kpi-todo-delete {{ padding:3px 7px; border:0; background:transparent; color:#8a98aa; font-size:20px; }}
+                    .kpi-todo-row-actions {{ display:flex; align-items:center; gap:5px; }}
+                    .kpi-todo-row-actions form {{ margin:0; }}
+                    .kpi-todo-archive, .kpi-todo-delete {{ padding:5px 8px; border:1px solid #cad7e8; border-radius:7px; background:#fff; font-size:11px; font-weight:750; line-height:1.1; }}
+                    .kpi-todo-archive {{ color:#315f96; }}
+                    .kpi-todo-delete {{ color:#a83b3b; border-color:#efd1d1; }}
+                    .kpi-todo-archive:hover {{ background:#edf4fd; }}
+                    .kpi-todo-delete:hover {{ background:#fff0f0; }}
                     .kpi-meeting-history-links {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:8px 0 2px; font-size:12px; font-weight:700; }}
                     .kpi-meeting-history-links a {{ color:var(--blue); }}
                     .kpi-meeting-ai {{ min-width:180px; }}
@@ -25358,6 +25447,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .meeting-history-card {{ display:grid; gap:8px; padding:16px 18px; border:1px solid var(--border); border-radius:14px; color:var(--text); text-decoration:none; background:#fff; box-shadow:var(--shadow-card); }}
                     .meeting-history-card:hover {{ border-color:#a9c1e5; transform:translateY(-1px); }}
                     .meeting-history-card div {{ display:flex; align-items:baseline; justify-content:space-between; gap:14px; }}
+                    .action-history-status {{ display:inline-block; padding:4px 8px; border-radius:999px; font-size:11px; font-weight:800; }}
+                    .action-history-status.archived {{ color:#315f96; background:#edf4fd; }}
+                    .action-history-status.completed {{ color:#08765f; background:#e7f8f1; }}
+                    .action-history-table td small {{ display:block; color:var(--muted); }}
                     .meeting-history-card span, .meeting-history-card small {{ color:var(--muted); }}
                     .meeting-history-card p {{ margin:0; line-height:1.45; }}
                     .meeting-record-actions {{ display:flex; gap:8px; flex-wrap:wrap; }}
