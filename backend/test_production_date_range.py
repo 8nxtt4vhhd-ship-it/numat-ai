@@ -1,5 +1,8 @@
 import unittest
+from io import BytesIO
 from unittest.mock import patch
+
+from openpyxl import load_workbook
 
 import main
 from main import render_production_date_control, resolve_production_date_range
@@ -136,6 +139,36 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertIn("5.00 hrs", html)
         self.assertIn("50.0%", html)
         self.assertIn("10.00 hrs", html)
+        self.assertIn("Export Excel report", html)
+        self.assertIn("/production-analysis/operator-detail/export?", html)
+
+    def test_operator_excel_report_highlights_daily_lost_time(self):
+        detail = {
+            "status": "ok",
+            "time_bookings": [
+                {"record_id": "1", "operator": "James Frieson", "operator_key": "jamesfrieson", "date": "2026-10-05", "department": "Press", "hours": 5.4, "start_time": "10/05/2026 08:00:00", "finish_time": "10/05/2026 13:24:00"},
+                {"record_id": "2", "operator": "James Frieson", "operator_key": "jamesfrieson", "date": "2026-10-06", "department": "Engineering", "hours": 8.0, "start_time": "10/06/2026 08:00:00", "finish_time": "10/06/2026 16:00:00"},
+            ],
+            "clockings": [
+                {"record_id": "10", "operator": "James Frieson", "operator_key": "jamesfrieson", "date": "2026-10-05", "clocked_hours": 8.0, "clock_in": "10/05/2026 08:00:00", "clock_out": "10/05/2026 16:00:00"},
+                {"record_id": "11", "operator": "James Frieson", "operator_key": "jamesfrieson", "date": "2026-10-06", "clocked_hours": 8.0, "clock_in": "10/06/2026 08:00:00", "clock_out": "10/06/2026 16:00:00"},
+            ],
+            "operator_rows": [{"name": "James Frieson", "booked_hours": 13.4, "clocked_hours": 16.0, "productivity": 83.75}],
+        }
+        with patch.object(main, "fetch_productivity_detail", return_value=detail):
+            response = main.export_production_operator_detail("James Frieson", "10/05/2026", "10/06/2026")
+
+        workbook = load_workbook(BytesIO(response.body), data_only=False)
+        self.assertEqual(workbook.sheetnames, ["Summary", "Departments", "Time Bookings", "Clockings"])
+        summary = workbook["Summary"]
+        self.assertEqual(summary["C5"].value, "Lost / unbooked time")
+        self.assertAlmostEqual(summary["C6"].value, 2.6)
+        daily_rows = list(summary.iter_rows(min_row=12, values_only=True))
+        self.assertEqual(daily_rows[0][3], 2.6)
+        self.assertEqual(daily_rows[0][6], "Lost time")
+        self.assertEqual(daily_rows[1][3], 0)
+        self.assertEqual(workbook["Departments"]["A6"].value, "Engineering")
+        self.assertIn("James-Frieson-productivity-2026-10-05-to-2026-10-06.xlsx", response.headers["content-disposition"])
 
     def test_time_booking_update_writes_verified_record_and_clears_cache(self):
         detail = {

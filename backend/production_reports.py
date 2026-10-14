@@ -1,3 +1,4 @@
+from collections import defaultdict
 from datetime import datetime, timedelta
 from io import BytesIO
 import re
@@ -106,6 +107,225 @@ def build_anomaly_workbook(payload):
     output = BytesIO()
     workbook.save(output)
     return output.getvalue(), len(anomalies)
+
+
+def build_operator_productivity_workbook(operator, period_start, period_end, bookings, clockings, operator_summary=None):
+    from openpyxl import Workbook
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    operator_summary = operator_summary or {}
+    navy = "17324D"
+    blue = "245CFF"
+    pale_blue = "EAF2FF"
+    pale_red = "FDECEC"
+    red = "B42318"
+    pale_amber = "FFF4D6"
+    amber = "9A6700"
+    pale_green = "E7F6EF"
+    green = "177245"
+    muted = "5E7184"
+    border = Border(bottom=Side(style="thin", color="D9E2EC"))
+
+    def parse_timestamp(value):
+        text = str(value or "").strip()
+        for pattern in ("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(text, pattern)
+            except ValueError:
+                continue
+        return None
+
+    def parse_date(value):
+        try:
+            return datetime.strptime(str(value or ""), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    def style_title(sheet, title, subtitle):
+        sheet.sheet_view.showGridLines = False
+        sheet["A2"] = title
+        sheet["A2"].font = Font(name="Arial", size=16, bold=True, color=blue)
+        sheet["A3"] = subtitle
+        sheet["A3"].font = Font(name="Arial", size=10, italic=True, color=muted)
+        sheet["A4"] = ""
+        sheet.row_dimensions[2].height = 24
+
+    def style_headers(sheet, row, columns):
+        for cell in sheet[row][:columns]:
+            cell.fill = PatternFill("solid", fgColor=navy)
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        sheet.row_dimensions[row].height = 28
+
+    def style_body(sheet, min_row, max_row, columns):
+        for row in sheet.iter_rows(min_row=min_row, max_row=max_row, min_col=1, max_col=columns):
+            for cell in row:
+                cell.font = Font(name="Arial", size=10, color="1E293B")
+                cell.alignment = Alignment(vertical="center")
+                cell.border = border
+
+    daily = defaultdict(lambda: {"clocked": 0.0, "booked": 0.0})
+    departments = defaultdict(lambda: {"hours": 0.0, "bookings": 0})
+    for item in bookings:
+        date_key = str(item.get("date") or "")
+        daily[date_key]["booked"] += float(item.get("hours") or 0)
+        department = str(item.get("department") or "Unassigned").strip() or "Unassigned"
+        departments[department]["hours"] += float(item.get("hours") or 0)
+        departments[department]["bookings"] += 1
+    for item in clockings:
+        daily[str(item.get("date") or "")]["clocked"] += float(item.get("clocked_hours") or 0)
+
+    daily_rows = []
+    for date_key, values in sorted(daily.items()):
+        clocked = values["clocked"]
+        booked = values["booked"]
+        lost = max(clocked - booked, 0)
+        overbooked = max(booked - clocked, 0)
+        daily_rows.append({
+            "date": parse_date(date_key) or date_key,
+            "clocked": clocked,
+            "booked": booked,
+            "lost": lost,
+            "overbooked": overbooked,
+            "productivity": booked / clocked if clocked else None,
+            "status": "Lost time" if lost > 0.005 else "Overbooked" if overbooked > 0.005 else "Reconciled",
+        })
+
+    total_clocked = sum(item["clocked"] for item in daily_rows)
+    total_booked = sum(item["booked"] for item in daily_rows)
+    total_lost = sum(item["lost"] for item in daily_rows)
+    total_overbooked = sum(item["overbooked"] for item in daily_rows)
+    days_with_lost_time = sum(item["lost"] > 0.005 for item in daily_rows)
+
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Summary"
+    style_title(summary, f"{operator} productivity report", f"{datetime.strptime(period_start, '%Y-%m-%d').strftime('%m/%d/%Y')} to {datetime.strptime(period_end, '%Y-%m-%d').strftime('%m/%d/%Y')}")
+    kpis = [
+        ("Clocked time", total_clocked),
+        ("Booked time", total_booked),
+        ("Lost / unbooked time", total_lost),
+        ("Overbooked time", total_overbooked),
+        ("Productivity", total_booked / total_clocked if total_clocked else None),
+        ("Days with lost time", days_with_lost_time),
+    ]
+    for column, (label, value) in enumerate(kpis, start=1):
+        summary.cell(5, column, label)
+        summary.cell(6, column, value)
+        summary.cell(5, column).font = Font(name="Arial", size=9, bold=True, color=muted)
+        summary.cell(5, column).alignment = Alignment(horizontal="center")
+        summary.cell(6, column).font = Font(name="Arial", size=14, bold=True, color=red if label == "Lost / unbooked time" and total_lost else navy)
+        summary.cell(6, column).alignment = Alignment(horizontal="center")
+        summary.cell(6, column).fill = PatternFill("solid", fgColor=pale_red if label == "Lost / unbooked time" and total_lost else pale_blue)
+        summary.cell(6, column).number_format = "0.0%" if label == "Productivity" else "0" if label == "Days with lost time" else "0.00"
+    summary["A8"] = "How lost time is calculated"
+    summary["A8"].font = Font(name="Arial", size=11, bold=True, color=navy)
+    summary["A9"] = "Lost / unbooked time is the positive difference between paid clocked time and productive booked time for each day. Use the daily rows below, then review the matching Time Bookings and Clockings tabs."
+    summary["A9"].alignment = Alignment(wrap_text=True, vertical="top")
+    summary["A9"].font = Font(name="Arial", size=10, color=muted)
+    summary.merge_cells("A9:F9")
+    summary.row_dimensions[9].height = 42
+    summary.append([])
+    header_row = 11
+    summary.append(["Date", "Clocked time", "Booked time", "Lost / unbooked time", "Overbooked time", "Productivity", "Status"])
+    for item in daily_rows:
+        summary.append([item["date"], item["clocked"], item["booked"], item["lost"], item["overbooked"], item["productivity"], item["status"]])
+    style_headers(summary, header_row, 7)
+    if daily_rows:
+        style_body(summary, header_row + 1, header_row + len(daily_rows), 7)
+        table = Table(displayName="OperatorDailyReconciliation", ref=f"A{header_row}:G{header_row + len(daily_rows)}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        summary.add_table(table)
+        summary.conditional_formatting.add(f"D{header_row + 1}:D{header_row + len(daily_rows)}", CellIsRule(operator="greaterThan", formula=["0.005"], fill=PatternFill("solid", fgColor=pale_red), font=Font(color=red, bold=True)))
+        summary.conditional_formatting.add(f"E{header_row + 1}:E{header_row + len(daily_rows)}", CellIsRule(operator="greaterThan", formula=["0.005"], fill=PatternFill("solid", fgColor=pale_amber), font=Font(color=amber, bold=True)))
+        for row in range(header_row + 1, header_row + len(daily_rows) + 1):
+            summary.cell(row, 1).number_format = "mm/dd/yyyy"
+            for column in (2, 3, 4, 5):
+                summary.cell(row, column).number_format = "0.00"
+            summary.cell(row, 6).number_format = "0.0%"
+            status_cell = summary.cell(row, 7)
+            if status_cell.value == "Lost time":
+                status_cell.fill = PatternFill("solid", fgColor=pale_red); status_cell.font = Font(name="Arial", size=10, bold=True, color=red)
+            elif status_cell.value == "Overbooked":
+                status_cell.fill = PatternFill("solid", fgColor=pale_amber); status_cell.font = Font(name="Arial", size=10, bold=True, color=amber)
+            else:
+                status_cell.fill = PatternFill("solid", fgColor=pale_green); status_cell.font = Font(name="Arial", size=10, bold=True, color=green)
+    summary.freeze_panes = f"A{header_row + 1}"
+    for column, width in {"A": 14, "B": 16, "C": 16, "D": 22, "E": 18, "F": 14, "G": 16}.items():
+        summary.column_dimensions[column].width = width
+
+    department_sheet = workbook.create_sheet("Departments")
+    style_title(department_sheet, "Time by department", f"{operator} booked time")
+    department_sheet.append(["Department", "Booked time", "Share of booked time", "Bookings"])
+    department_header = 5
+    for department, values in sorted(departments.items(), key=lambda item: (-item[1]["hours"], item[0].casefold())):
+        department_sheet.append([department, values["hours"], values["hours"] / total_booked if total_booked else None, values["bookings"]])
+    style_headers(department_sheet, department_header, 4)
+    if departments:
+        style_body(department_sheet, 6, 5 + len(departments), 4)
+        table = Table(displayName="OperatorDepartmentSummary", ref=f"A5:D{5 + len(departments)}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        department_sheet.add_table(table)
+        for row in range(6, 6 + len(departments)):
+            department_sheet.cell(row, 2).number_format = "0.00"
+            department_sheet.cell(row, 3).number_format = "0.0%"
+    department_sheet.freeze_panes = "A6"
+    for column, width in {"A": 28, "B": 18, "C": 22, "D": 14}.items():
+        department_sheet.column_dimensions[column].width = width
+
+    booking_sheet = workbook.create_sheet("Time Bookings")
+    style_title(booking_sheet, "Time booking records", f"{operator} source records")
+    booking_sheet.append(["Date", "Department", "Start", "Finish", "Booked time", "Sales order", "Notes", "Record ID"])
+    booking_header = 5
+    for item in sorted(bookings, key=lambda row: (row.get("date") or "", row.get("start_time") or "")):
+        booking_sheet.append([parse_date(item.get("date")) or item.get("date"), item.get("department") or "Unassigned", parse_timestamp(item.get("start_time")) or item.get("start_time"), parse_timestamp(item.get("finish_time")) or item.get("finish_time"), float(item.get("hours") or 0), item.get("sales_order") or "", item.get("notes") or "", item.get("record_id") or ""])
+    style_headers(booking_sheet, booking_header, 8)
+    if bookings:
+        style_body(booking_sheet, 6, 5 + len(bookings), 8)
+        table = Table(displayName="OperatorTimeBookings", ref=f"A5:H{5 + len(bookings)}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        booking_sheet.add_table(table)
+        for row in range(6, 6 + len(bookings)):
+            booking_sheet.cell(row, 1).number_format = "mm/dd/yyyy"
+            booking_sheet.cell(row, 3).number_format = "mm/dd/yyyy h:mm AM/PM"
+            booking_sheet.cell(row, 4).number_format = "mm/dd/yyyy h:mm AM/PM"
+            booking_sheet.cell(row, 5).number_format = "0.00"
+    booking_sheet.freeze_panes = "A6"
+    for column, width in {"A": 14, "B": 24, "C": 22, "D": 22, "E": 16, "F": 18, "G": 42, "H": 14}.items():
+        booking_sheet.column_dimensions[column].width = width
+
+    clocking_sheet = workbook.create_sheet("Clockings")
+    style_title(clocking_sheet, "Clocking records", f"{operator} paid-time source records")
+    clocking_sheet.append(["Date", "Clock in", "Clock out", "Paid time", "Notes", "Record ID"])
+    clocking_header = 5
+    for item in sorted(clockings, key=lambda row: (row.get("date") or "", row.get("clock_in") or "")):
+        clocking_sheet.append([parse_date(item.get("date")) or item.get("date"), parse_timestamp(item.get("clock_in")) or item.get("clock_in"), parse_timestamp(item.get("clock_out")) or item.get("clock_out"), float(item.get("clocked_hours") or 0), item.get("notes") or "", item.get("record_id") or ""])
+    style_headers(clocking_sheet, clocking_header, 6)
+    if clockings:
+        style_body(clocking_sheet, 6, 5 + len(clockings), 6)
+        table = Table(displayName="OperatorClockings", ref=f"A5:F{5 + len(clockings)}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        clocking_sheet.add_table(table)
+        for row in range(6, 6 + len(clockings)):
+            clocking_sheet.cell(row, 1).number_format = "mm/dd/yyyy"
+            clocking_sheet.cell(row, 2).number_format = "mm/dd/yyyy h:mm AM/PM"
+            clocking_sheet.cell(row, 3).number_format = "mm/dd/yyyy h:mm AM/PM"
+            clocking_sheet.cell(row, 4).number_format = "0.00"
+    clocking_sheet.freeze_panes = "A6"
+    for column, width in {"A": 14, "B": 22, "C": 22, "D": 16, "E": 42, "F": 14}.items():
+        clocking_sheet.column_dimensions[column].width = width
+
+    for sheet in workbook.worksheets:
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 0
+        sheet.sheet_properties.tabColor = blue if sheet.title == "Summary" else pale_blue
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
 
 
 def summarize_rows(rows, operator_rows):

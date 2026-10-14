@@ -140,6 +140,7 @@ from production_reports import (
     build_ai_report_facts,
     build_ai_report_facts_for_calendar_period,
     build_anomaly_workbook,
+    build_operator_productivity_workbook,
     clean_filename,
 )
 from strategic_contacts_report import build_strategic_contacts_pdf
@@ -7823,11 +7824,12 @@ def production_operator_detail_view(operator: str = "", start: str = "", end: st
     if error:
         status_markup += f'<p class="status error">{escape(error)}</p>'
     back_href = "/production-analysis/productivity-detail?" + urlencode({"start": period_start, "end": period_end})
+    export_href = "/production-analysis/operator-detail/export?" + urlencode({"operator": operator, "start": period_start, "end": period_end})
     body = f'''
         {status_markup}
         <section class="production-analysis-toolbar">
             <div><span class="home-focus-inline-kicker">Operator audit</span><h2>{escape(operator or 'Operator')}</h2><p class="small muted">{datetime.strptime(period_start, '%Y-%m-%d').strftime('%m/%d/%Y')} to {datetime.strptime(period_end, '%Y-%m-%d').strftime('%m/%d/%Y')}</p></div>
-            <div class="production-toolbar-actions"><a class="button secondary small-button" href="{escape(back_href)}">Back to calculation</a></div>
+            <div class="production-toolbar-actions"><a class="button secondary small-button" href="{escape(back_href)}">Back to calculation</a><a class="button small-button" href="{escape(export_href)}">Export Excel report</a></div>
         </section>
         <div class="production-productivity-audit-grid">
             <div><span>Productivity</span><strong>{format_production_number(operator_summary.get('productivity'), '%', decimals=1)}</strong></div>
@@ -7840,6 +7842,32 @@ def production_operator_detail_view(operator: str = "", start: str = "", end: st
         <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Time Booking records</span><h2>Bookings</h2></div><span class="small muted">{'Changes save directly to FileMaker and are audited.' if can_edit else 'Administrator permission is required to edit.'}</span></div><div class="production-booking-department-summary"><h3>Time by department</h3><div class="table-wrap"><table class="production-department-table"><thead><tr><th>Department</th><th>Booked time</th><th>Share</th><th>Bookings</th></tr></thead><tbody>{department_rows}</tbody><tfoot><tr><td><strong>Total</strong></td><td><strong>{total_department_hours:,.2f} hrs</strong></td><td><strong>{'100.0%' if total_department_hours else '—'}</strong></td><td><strong>{len(bookings):,}</strong></td></tr></tfoot></table></div></div><div class="production-booking-list">{''.join(booking_cards) or '<p class="empty-action">No time bookings found.</p>'}</div></section>
     '''
     return render_page(title=f"{operator or 'Operator'} Production Detail", body=body, main_class="production-analysis-main")
+
+
+@app.get("/production-analysis/operator-detail/export")
+def export_production_operator_detail(operator: str = "", start: str = "", end: str = ""):
+    period_start, period_end = resolve_production_date_range(start, end)
+    selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    detail = fetch_productivity_detail(days=selected_days, period_start=period_start, period_end=period_end)
+    selected_key = operator_key(operator)
+    bookings = [item for item in detail.get("time_bookings", []) if item.get("operator_key") == selected_key]
+    clockings = [item for item in detail.get("clockings", []) if item.get("operator_key") == selected_key]
+    operator_summary = next((item for item in detail.get("operator_rows", []) if operator_key(item.get("name")) == selected_key), {})
+    display_name = str(operator_summary.get("name") or operator or "Operator").strip()
+    content = build_operator_productivity_workbook(
+        display_name,
+        period_start,
+        period_end,
+        bookings,
+        clockings,
+        operator_summary=operator_summary,
+    )
+    filename = f"{clean_filename(display_name) or 'operator'}-productivity-{period_start}-to-{period_end}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/production-analysis/time-booking/update")
