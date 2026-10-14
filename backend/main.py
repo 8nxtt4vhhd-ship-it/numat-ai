@@ -230,6 +230,7 @@ DEFAULT_ACTION_PLAN_DISMISSALS_PATH = BASE_DIR / "data" / "action_plan_dismissal
 DEFAULT_APP_USERS_PATH = BASE_DIR / "data" / "app_users.json"
 DEFAULT_RECENT_SENT_EMAILS_PATH = BASE_DIR / "data" / "recent_sent_emails.json"
 DEFAULT_STRATEGIC_CONTACTS_PATH = BASE_DIR / "data" / "strategic_contacts.json"
+DEFAULT_ORG_CHART_STRUCTURES_PATH = BASE_DIR / "data" / "org_chart_structures.json"
 DEFAULT_LOGIN_MFA_CHALLENGES_PATH = BASE_DIR / "data" / "login_mfa_challenges.json"
 DEFAULT_AUDIT_LOG_PATH = BASE_DIR / "data" / "audit_log.json"
 DEFAULT_WEEKLY_KPI_TODOS_PATH = BASE_DIR / "data" / "weekly_kpi_todos.json"
@@ -238,6 +239,7 @@ DEFAULT_WEEKLY_KPI_CACHE_PATH = BASE_DIR / "data" / "weekly_kpi_dashboard_cache.
 APP_USERS_LOCK = Lock()
 RECENT_SENT_EMAILS_LOCK = Lock()
 STRATEGIC_CONTACTS_LOCK = Lock()
+ORG_CHART_STRUCTURES_LOCK = Lock()
 LOGIN_MFA_CHALLENGES_LOCK = Lock()
 AUDIT_LOG_LOCK = Lock()
 WEEKLY_KPI_TODOS_LOCK = Lock()
@@ -886,6 +888,7 @@ def normalize_strategic_contact_record(item):
         "company_record_label": str(item.get("company_record_label") or "").strip(),
         "filemaker_company_label": str(item.get("filemaker_company_label") or "").strip(),
         "filemaker_company_primary_key": str(item.get("filemaker_company_primary_key") or "").strip(),
+        "filemaker_contact_primary_key": str(item.get("filemaker_contact_primary_key") or "").strip(),
         "filemaker_contact_record_id": str(item.get("filemaker_contact_record_id") or "").strip(),
         "filemaker_sync_status": str(item.get("filemaker_sync_status") or "").strip(),
         "filemaker_sync_error": str(item.get("filemaker_sync_error") or "").strip(),
@@ -987,6 +990,12 @@ ORG_CHART_GROUPS = {
             ("operations", "Operations"),
             ("canada-operations", "Canada Operations"),
         ),
+        "layers": (
+            ("section-lead", "Division lead"),
+            ("branch-contacts", "Regional VP"),
+            ("regional", "Group VP"),
+            ("branch", "Branch contacts"),
+        ),
     },
     "alsco": {
         "label": "Alsco",
@@ -998,12 +1007,18 @@ ORG_CHART_GROUPS = {
         "organizations": ("cintas", "unifirst", "uni first"),
         "section_lead_enabled": False,
     },
+    "prudential": {
+        "label": "Prudential",
+        "organizations": ("prudential",),
+        "section_lead_enabled": False,
+    },
 }
 
 ORG_CHART_FILEMAKER_COMPANY_LABELS = {
     "vestis-aramark": "Vestis Corporate",
     "alsco": "Alsco Corporate",
     "cintas-unifirst": "Cintas Corporate",
+    "prudential": "Prudential",
 }
 
 ORG_CHART_BUSINESS_SECTIONS = (
@@ -1013,9 +1028,73 @@ ORG_CHART_BUSINESS_SECTIONS = (
 )
 
 
+def get_org_chart_structures_path():
+    raw_path = os.getenv("ORG_CHART_STRUCTURES_PATH", "").strip()
+    return Path(raw_path).expanduser() if raw_path else DEFAULT_ORG_CHART_STRUCTURES_PATH
+
+
+def get_default_org_chart_structure(group_key):
+    config = ORG_CHART_GROUPS.get(group_key) or next(iter(ORG_CHART_GROUPS.values()))
+    sections = config.get("business_sections") or ORG_CHART_BUSINESS_SECTIONS
+    configured_layers = config.get("layers") or ()
+    if configured_layers:
+        layers = [{"key": key, "label": label} for key, label in configured_layers]
+    else:
+        layers = []
+        if config.get("section_lead_enabled"):
+            layers.append({"key": "section-lead", "label": str(config.get("section_lead_label") or "Division lead")})
+        layers.extend([
+            {"key": "regional", "label": "Regional manager"},
+            {"key": "branch", "label": "Branch contacts"},
+        ])
+    return {
+        "business_sections": [{"key": key, "label": label} for key, label in sections],
+        "layers": layers,
+    }
+
+
+def load_org_chart_structures():
+    path = get_org_chart_structures_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ORG_CHART_STRUCTURES_LOCK:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError):
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_org_chart_structures(structures):
+    path = get_org_chart_structures_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ORG_CHART_STRUCTURES_LOCK:
+        path.write_text(json.dumps(structures, indent=2), encoding="utf-8")
+
+
+def get_org_chart_structure(group_key):
+    default = get_default_org_chart_structure(group_key)
+    saved = load_org_chart_structures().get(group_key)
+    if not isinstance(saved, dict):
+        return default
+    sections = [
+        {"key": str(item.get("key") or "").strip().lower(), "label": str(item.get("label") or "").strip()}
+        for item in saved.get("business_sections") or [] if isinstance(item, dict)
+    ]
+    layers = [
+        {"key": str(item.get("key") or "").strip().lower(), "label": str(item.get("label") or "").strip()}
+        for item in saved.get("layers") or [] if isinstance(item, dict)
+    ]
+    sections = [item for item in sections if item["key"] and item["label"]] or default["business_sections"]
+    layers = [item for item in layers if item["key"] and item["label"]]
+    required = {item["key"] for item in layers}
+    for item in default["layers"]:
+        if item["key"] in {"section-lead", "regional", "branch"} and item["key"] not in required:
+            layers.append(item)
+    return {"business_sections": sections, "layers": layers}
+
+
 def get_org_chart_business_sections(group_key):
-    config = ORG_CHART_GROUPS.get(group_key) or {}
-    return tuple(config.get("business_sections") or ORG_CHART_BUSINESS_SECTIONS)
+    return tuple((item["key"], item["label"]) for item in get_org_chart_structure(group_key)["business_sections"])
 
 
 def can_manage_strategic_contacts(user):
@@ -1104,6 +1183,19 @@ def resolve_strategic_contact_filemaker_company(contact, master_data_result=None
         }
 
     companies = directory_result.get("companies", [])
+    expected_primary_key = str(contact.get("filemaker_company_primary_key") or "").strip()
+    if expected_primary_key:
+        exact_company = next(
+            (company for company in companies if str(company.get("primary_key") or "").strip() == expected_primary_key),
+            None,
+        )
+        if exact_company:
+            return {
+                "ok": True,
+                "status": "ok",
+                "message": "",
+                "company": exact_company,
+            }
     corporate_companies = [
         company
         for company in companies
@@ -1249,17 +1341,47 @@ def find_existing_filemaker_contact_for_strategic_contact(contact, company, mast
     if not company_key:
         return None
 
+    filemaker_primary_key = str(contact.get("filemaker_contact_primary_key") or "").strip()
+    if filemaker_primary_key:
+        linked_contact = next(
+            (
+                existing_contact
+                for existing_contact in master_data_result.get("all_contacts", [])
+                if str(existing_contact.get("primary_key") or "").strip() == filemaker_primary_key
+            ),
+            None,
+        )
+        if linked_contact:
+            return linked_contact
+
+    # Backwards-compatible recovery for contacts saved before the durable PrimaryKey was stored.
+    filemaker_record_id = str(contact.get("filemaker_contact_record_id") or "").strip()
+    if filemaker_record_id:
+        linked_contact = next(
+            (
+                existing_contact
+                for existing_contact in master_data_result.get("all_contacts", [])
+                if str(existing_contact.get("filemaker_record_id") or "").strip() == filemaker_record_id
+            ),
+            None,
+        )
+        if linked_contact:
+            return linked_contact
+
+    email = str(contact.get("email") or "").strip().lower()
+    if email:
+        email_matches = [
+            existing_contact
+            for existing_contact in master_data_result.get("all_contacts", [])
+            if str(existing_contact.get("email") or "").strip().lower() == email
+        ]
+        if len(email_matches) == 1:
+            return email_matches[0]
+
     contacts_for_company = master_data_result.get("contacts_by_customer_key", {}).get(company_key, [])
     if not contacts_for_company:
         return None
 
-    filemaker_record_id = str(contact.get("filemaker_contact_record_id") or "").strip()
-    if filemaker_record_id:
-        for existing_contact in contacts_for_company:
-            if str(existing_contact.get("filemaker_record_id") or "").strip() == filemaker_record_id:
-                return existing_contact
-
-    email = str(contact.get("email") or "").strip().lower()
     if email:
         for existing_contact in contacts_for_company:
             if str(existing_contact.get("email") or "").strip().lower() == email:
@@ -1632,7 +1754,7 @@ def sync_enrichment_branch_contact_to_filemaker(
     }
 
 
-def sync_strategic_contact_to_filemaker(contact_id):
+def sync_strategic_contact_to_filemaker(contact_id, allow_create=True):
     contact = find_strategic_contact(contact_id)
     if not contact:
         return {
@@ -1695,10 +1817,32 @@ def sync_strategic_contact_to_filemaker(contact_id):
         )
         write_mode = "updated"
         filemaker_record_id = str(existing_contact.get("filemaker_record_id") or "").strip()
+        filemaker_primary_key = str(existing_contact.get("primary_key") or "").strip()
     else:
+        duplicate_email_matches = [
+            existing
+            for existing in master_data_result.get("all_contacts", [])
+            if str(existing.get("email") or "").strip().casefold()
+            == str(contact.get("email") or "").strip().casefold()
+            and str(contact.get("email") or "").strip()
+        ]
+        if len(duplicate_email_matches) > 1:
+            error_message = (
+                "FileMaker contains multiple contacts with this email address. "
+                "Choose the correct existing FileMaker contact before saving again."
+            )
+            save_sync_error(error_message)
+            return {"ok": False, "message": error_message, "error": error_message}
+        if not allow_create:
+            error_message = (
+                "The existing FileMaker contact could not be identified, so no new contact was created."
+            )
+            save_sync_error(error_message)
+            return {"ok": False, "message": error_message, "error": error_message}
         write_result = create_layout_record(config["contacts_layout"], field_data)
         write_mode = "created"
         filemaker_record_id = str(write_result.get("record_id") or "").strip()
+        filemaker_primary_key = ""
 
     if write_result.get("status") != "ok":
         filemaker_detail = str(write_result.get("error_message") or "").strip()
@@ -1713,6 +1857,17 @@ def sync_strategic_contact_to_filemaker(contact_id):
         }
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not filemaker_primary_key:
+        clear_filemaker_master_data_cache()
+        refreshed_master_data = fetch_filemaker_master_data(force_refresh=True)
+        refreshed_contact = find_existing_filemaker_contact_for_strategic_contact(
+            {**contact, "filemaker_contact_record_id": filemaker_record_id},
+            company,
+            refreshed_master_data,
+        )
+        if refreshed_contact:
+            filemaker_record_id = str(refreshed_contact.get("filemaker_record_id") or filemaker_record_id).strip()
+            filemaker_primary_key = str(refreshed_contact.get("primary_key") or "").strip()
     updated_items = []
     for item in load_strategic_contacts():
         if str(item.get("id") or "").strip() != str(contact_id or "").strip():
@@ -1724,6 +1879,7 @@ def sync_strategic_contact_to_filemaker(contact_id):
                     **item,
                     "filemaker_company_label": str(company.get("company") or "").strip(),
                     "filemaker_company_primary_key": str(company.get("primary_key") or "").strip(),
+                    "filemaker_contact_primary_key": filemaker_primary_key,
                     "filemaker_contact_record_id": filemaker_record_id,
                     "filemaker_sync_status": "synced",
                     "filemaker_sync_error": "",
@@ -1879,6 +2035,55 @@ def render_org_chart_group_selector(selected_group):
             f"<a class=\"{class_name} small-button\" href=\"/organisation-chart-view?group={quote(key)}\">{escape(config['label'])}</a>"
         )
     return "".join(buttons)
+
+
+def render_org_chart_structure_editor(selected_group):
+    structure = get_org_chart_structure(selected_group)
+    layer_rows = []
+    for layer in structure["layers"]:
+        layer_rows.append(f"""
+            <form method="post" action="/organisation-chart/structure" class="org-structure-row">
+                <input type="hidden" name="group" value="{escape(selected_group)}">
+                <input type="hidden" name="action" value="rename-layer">
+                <input type="hidden" name="key" value="{escape(layer['key'])}">
+                <span class="small muted">Layer</span>
+                <input name="label" value="{escape(layer['label'])}" maxlength="50" required>
+                <button class="button secondary small-button" type="submit">Save title</button>
+            </form>
+        """)
+    section_rows = []
+    for section in structure["business_sections"]:
+        section_rows.append(f"""
+            <form method="post" action="/organisation-chart/structure" class="org-structure-row">
+                <input type="hidden" name="group" value="{escape(selected_group)}">
+                <input type="hidden" name="action" value="rename-section">
+                <input type="hidden" name="key" value="{escape(section['key'])}">
+                <span class="small muted">Section</span>
+                <input name="label" value="{escape(section['label'])}" maxlength="50" required>
+                <button class="button secondary small-button" type="submit">Save title</button>
+            </form>
+        """)
+    has_intermediate = any(item["key"] not in {"section-lead", "regional", "branch"} for item in structure["layers"])
+    add_layer = ""
+    if not has_intermediate:
+        add_layer = f"""
+            <form method="post" action="/organisation-chart/structure" class="org-structure-add-row">
+                <input type="hidden" name="group" value="{escape(selected_group)}">
+                <input type="hidden" name="action" value="add-layer">
+                <input name="label" placeholder="e.g. Regional VP" maxlength="50" required>
+                <button class="button small-button" type="submit">Add management layer</button>
+            </form>
+        """
+    return f"""
+        <details class="panel org-structure-editor">
+            <summary>Edit structure and titles</summary>
+            <p class="small muted">Changes apply only to this customer group. Renaming a title does not move its contacts.</p>
+            <div class="org-structure-editor-grid">
+                <div><h4>Layer titles</h4>{''.join(layer_rows)}{add_layer}</div>
+                <div><h4>Business section titles</h4>{''.join(section_rows)}</div>
+            </div>
+        </details>
+    """
 
 
 def build_organisation_map_rows(items, filemaker_presence_map=None):
@@ -2428,18 +2633,8 @@ def render_organisation_chart_legacy(items, selected_group, filemaker_presence_m
                     sync_status_markup = f"<p class='small muted' style='color:#b42318;'>{escape(filemaker_sync_error)}</p>"
                 actions = ""
                 if can_manage_strategic_contacts(current_user):
-                    sync_action = ""
-                    if not filemaker_presence.get("exists"):
-                        sync_action = f"""
-                            <form method="post" action="/strategic-contacts/sync-filemaker">
-                                <input type="hidden" name="contact_id" value="{escape(str(item.get('id') or ''))}">
-                                <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
-                                <button class="button secondary small-button" type="submit">Sync to FileMaker</button>
-                            </form>
-                        """
                     actions = f"""
                         <div class="strategic-card-actions">
-                            {sync_action}
                             <form method="post" action="/strategic-contacts/enrich">
                                 <input type="hidden" name="contact_id" value="{escape(str(item.get('id') or ''))}">
                                 <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
@@ -2596,24 +2791,19 @@ def render_hierarchy_contact_card(
     )
     actions = ""
     if can_manage_strategic_contacts(get_current_session_user()):
-        sync_action = ""
-        if not filemaker_presence.get("exists"):
-            sync_action = f"""
-                <form method="post" action="/strategic-contacts/sync-filemaker">
-                    <input type="hidden" name="contact_id" value="{escape(item_id)}">
-                    <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
-                    <button class="button secondary small-button" type="submit">Sync to FileMaker</button>
-                </form>
-            """
         actions = f"""
             <div class="strategic-card-actions">
-                {sync_action}
                 <form method="post" action="/strategic-contacts/enrich">
                     <input type="hidden" name="contact_id" value="{escape(item_id)}">
                     <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
                     <button class="button secondary small-button" type="submit">Enrich</button>
                 </form>
-                <a class="button secondary small-button" href="/strategic-contacts-view?edit={quote(item_id)}">Edit</a>
+                <button class="button secondary small-button hierarchy-edit-contact" type="button" data-contact-id="{escape(item_id)}">Edit</button>
+                <form method="post" action="/strategic-contacts/make-inactive" onsubmit="return confirm('Make this contact inactive in FileMaker and remove it from Strategic Contacts?');">
+                    <input type="hidden" name="contact_id" value="{escape(item_id)}">
+                    <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
+                    <button class="button secondary small-button" type="submit">Make inactive</button>
+                </form>
                 <form method="post" action="/strategic-contacts/delete" onsubmit="return confirm('Remove this contact from the organisation view?');">
                     <input type="hidden" name="contact_id" value="{escape(item_id)}">
                     <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
@@ -2627,10 +2817,10 @@ def render_hierarchy_contact_card(
             data-contact-id="{escape(item_id)}">
             <div class="org-chart-contact-node">
                 <div class="org-chart-contact-title-row">
-                    <h4>{escape(name)}</h4>{presence_badge}
+                    <h4 data-contact-field="name">{escape(name)}</h4>{presence_badge}
                 </div>
-                <p class="org-chart-contact-preview-role">{escape(position)}</p>
-                <p class="small muted hierarchy-card-meta">{escape(region or 'Region not set')}</p>
+                <p class="org-chart-contact-preview-role" data-contact-field="position">{escape(position)}</p>
+                <p class="small muted hierarchy-card-meta" data-contact-field="region">{escape(region or 'Region not set')}</p>
                 <div class="org-chart-recent-contact hierarchy-recent-contact">
                     <div class="org-chart-recent-contact-head">
                         <span>Last contact</span>
@@ -2641,13 +2831,247 @@ def render_hierarchy_contact_card(
             <details class="org-chart-contact-details">
                 <summary>Details</summary>
                 <div class="org-chart-contact-detail-body">
-                    <p><strong>Email:</strong> {escape(str(item.get('email') or 'Not set'))}</p>
-                    <p><strong>Function:</strong> {escape(str(item.get('function') or 'Not set'))}</p>
+                    <p><strong>Email:</strong> <span data-contact-field="email">{escape(str(item.get('email') or 'Not set'))}</span></p>
+                    <p><strong>Function:</strong> <span data-contact-field="function">{escape(str(item.get('function') or 'Not set'))}</span></p>
                     {actions}
                 </div>
             </details>
             {child_markup}
         </article>
+    """
+
+
+def render_organisation_contact_editor(items, selected_group="vestis-aramark", filemaker_companies=None):
+    """Render the in-place editor used by organisation chart contact cards."""
+    editable_fields = (
+        "id", "organization", "company_record_label", "name", "position", "email",
+        "phone", "cell", "scope_type", "region", "function", "influence_level",
+        "seniority", "preferred_contact_method", "outreach_angle", "coverage_notes",
+        "relationship_notes", "active", "filemaker_sync_status", "filemaker_synced_at",
+        "enrichment_source", "enriched_at",
+    )
+    contacts = {
+        str(item.get("id") or "").strip(): {field: item.get(field, "") for field in editable_fields}
+        for item in items
+        if str(item.get("id") or "").strip()
+    }
+    filemaker_companies = list(filemaker_companies or [])
+    group_config = ORG_CHART_GROUPS.get(selected_group) or {}
+    group_terms = {
+        normalize_apollo_location_value(value)
+        for value in (*group_config.get("organizations", ()), group_config.get("label", ""))
+        if normalize_apollo_location_value(value)
+    }
+    current_company_keys = {
+        str(item.get("filemaker_company_primary_key") or "").strip() for item in items
+        if str(item.get("filemaker_company_primary_key") or "").strip()
+    }
+    relevant_companies = []
+    for company in filemaker_companies:
+        company_key = str(company.get("primary_key") or "").strip()
+        searchable = normalize_apollo_location_value(
+            f"{company.get('company') or ''} {company.get('parent_org') or ''}"
+        )
+        if company_key and (company_key in current_company_keys or any(term in searchable for term in group_terms)):
+            relevant_companies.append(company)
+    if not relevant_companies and filemaker_companies:
+        relevant_companies = filemaker_companies
+    locations = sorted(
+        {
+            str(value or "").strip()
+            for value in (
+                *[item.get("region") for item in items],
+                *[company.get("state") for company in relevant_companies],
+            )
+            if str(value or "").strip()
+        },
+        key=str.casefold,
+    )
+    organizations = sorted(
+        {str(item.get("organization") or "").strip() for item in items if str(item.get("organization") or "").strip()},
+        key=str.casefold,
+    )
+
+    def choice_values(field, defaults):
+        saved = {str(item.get(field) or "").strip() for item in items if str(item.get(field) or "").strip()}
+        return sorted(saved | set(defaults), key=str.casefold)
+
+    def options(values):
+        return "".join(f'<option value="{escape(value)}">{escape(value)}</option>' for value in values)
+
+    company_options = []
+    for company in sorted(relevant_companies, key=lambda item: str(item.get("company") or "").casefold()):
+        company_key = str(company.get("primary_key") or "").strip()
+        company_name = str(company.get("company") or "").strip()
+        place = ", ".join(value for value in (str(company.get("city") or "").strip(), str(company.get("state") or "").strip()) if value)
+        label = " — ".join(value for value in (company_name, place) if value)
+        company_options.append(
+            f'<option value="{escape(company_key)}" data-company-label="{escape(company_name)}" '
+            f'data-region="{escape(str(company.get("state") or "").strip())}">{escape(label)}</option>'
+        )
+
+    payload = json.dumps(contacts, ensure_ascii=False).replace("</", "<\\/")
+    return f"""
+        <div class="org-contact-modal" id="org-contact-editor" hidden>
+            <button class="org-contact-modal-backdrop" type="button" aria-label="Close contact editor" data-close-contact-editor></button>
+            <section class="panel org-contact-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="org-contact-editor-title">
+                <div class="org-contact-modal-head">
+                    <div>
+                        <p class="org-chart-root-eyebrow">Edit contact</p>
+                        <h2 id="org-contact-editor-title">Contact details</h2>
+                        <p class="small muted" id="org-contact-editor-description">Changes are saved here and sent to the matching FileMaker contact.</p>
+                    </div>
+                    <button class="org-contact-modal-close" type="button" aria-label="Close" data-close-contact-editor>×</button>
+                </div>
+                <form id="org-contact-editor-form" class="org-contact-editor-form">
+                    <input type="hidden" name="contact_id">
+                    <div class="org-contact-editor-grid">
+                        <label><span class="label">Organisation</span><select name="organization" required>{options(organizations)}</select></label>
+                        <label class="org-contact-editor-wide"><span class="label">Location / FileMaker customer branch</span><select name="filemaker_company_primary_key" required><option value="">Choose a FileMaker customer branch</option>{''.join(company_options)}</select><input name="company_record_label" type="hidden"></label>
+                        <label><span class="label">Name</span><input name="name" type="text" required></label>
+                        <label><span class="label">Job title</span><input name="position" type="text" required></label>
+                        <label><span class="label">Email</span><input name="email" type="email" required></label>
+                        <label><span class="label">Location</span><select name="region"><option value="">Not set</option>{options(locations)}</select></label>
+                        <label><span class="label">Phone</span><input name="phone" type="text"></label>
+                        <label><span class="label">Mobile</span><input name="cell" type="text"></label>
+                        <label><span class="label">Scope</span><select name="scope_type"><option value=""></option>{options(choice_values('scope_type', STRATEGIC_CONTACT_SCOPE_OPTIONS))}</select></label>
+                        <label><span class="label">Function</span><select name="function"><option value=""></option>{options(choice_values('function', STRATEGIC_CONTACT_FUNCTION_OPTIONS))}</select></label>
+                        <label><span class="label">Influence</span><select name="influence_level"><option value=""></option>{options(choice_values('influence_level', STRATEGIC_CONTACT_INFLUENCE_OPTIONS))}</select></label>
+                        <label><span class="label">Seniority</span><select name="seniority"><option value=""></option>{options(choice_values('seniority', STRATEGIC_CONTACT_SENIORITY_OPTIONS))}</select></label>
+                        <label><span class="label">Preferred contact method</span><select name="preferred_contact_method"><option value=""></option>{options(choice_values('preferred_contact_method', STRATEGIC_CONTACT_METHOD_OPTIONS))}</select></label>
+                        <label class="org-contact-editor-active"><input name="active" type="checkbox" value="active"><span>Active contact</span></label>
+                    </div>
+                    <div class="org-contact-editor-notes">
+                        <label><span class="label">Outreach angle</span><textarea name="outreach_angle" rows="3"></textarea></label>
+                        <label><span class="label">Coverage notes</span><textarea name="coverage_notes" rows="3"></textarea></label>
+                        <label><span class="label">Relationship notes</span><textarea name="relationship_notes" rows="3"></textarea></label>
+                    </div>
+                    <p class="small muted org-contact-editor-meta" id="org-contact-editor-meta"></p>
+                    <p class="status" id="org-contact-editor-status" hidden></p>
+                    <div class="org-contact-modal-actions">
+                        <button class="button secondary" type="button" data-close-contact-editor>Cancel</button>
+                        <button class="button" type="submit">Save contact</button>
+                    </div>
+                </form>
+            </section>
+        </div>
+        <script type="application/json" id="org-contact-editor-data">{payload}</script>
+        <script>
+            (() => {{
+                const modal = document.getElementById('org-contact-editor');
+                const form = document.getElementById('org-contact-editor-form');
+                const dataNode = document.getElementById('org-contact-editor-data');
+                if (!modal || !form || !dataNode) return;
+                const contacts = JSON.parse(dataNode.textContent || '{{}}');
+                const status = document.getElementById('org-contact-editor-status');
+                const meta = document.getElementById('org-contact-editor-meta');
+                const title = document.getElementById('org-contact-editor-title');
+                const description = document.getElementById('org-contact-editor-description');
+                const submit = form.querySelector('[type="submit"]');
+                const companySelect = form.elements.namedItem('filemaker_company_primary_key');
+                let editorMode = 'edit';
+                const setStatus = (message, kind) => {{
+                    status.textContent = message || '';
+                    status.className = `status ${{kind || ''}}`;
+                    status.hidden = !message;
+                }};
+                const close = () => {{ modal.hidden = true; document.body.classList.remove('has-org-contact-modal'); setStatus('', ''); }};
+                const setControl = (name, value) => {{
+                    const control = form.elements.namedItem(name);
+                    if (!control) return;
+                    if (control.type === 'checkbox') control.checked = Boolean(value);
+                    else control.value = value == null ? '' : String(value);
+                }};
+                const open = (contactId) => {{
+                    const contact = contacts[contactId];
+                    if (!contact) return;
+                    editorMode = 'edit';
+                    form.reset();
+                    Object.entries(contact).forEach(([name, value]) => setControl(name === 'id' ? 'contact_id' : name, value));
+                    title.textContent = 'Edit contact';
+                    description.textContent = 'Changes are saved here and sent to the matching FileMaker contact.';
+                    submit.textContent = 'Save contact';
+                    meta.textContent = [
+                        contact.filemaker_sync_status ? `FileMaker: ${{contact.filemaker_sync_status}}` : '',
+                        contact.filemaker_synced_at ? `last synced ${{contact.filemaker_synced_at}}` : '',
+                        contact.enrichment_source ? `Enriched via ${{contact.enrichment_source}}` : ''
+                    ].filter(Boolean).join(' • ');
+                    modal.hidden = false;
+                    document.body.classList.add('has-org-contact-modal');
+                    form.elements.namedItem('name').focus();
+                }};
+                const openNew = () => {{
+                    editorMode = 'add';
+                    form.reset();
+                    setControl('contact_id', '');
+                    setControl('active', true);
+                    title.textContent = 'Add contact';
+                    description.textContent = 'The contact will be added to Strategic Contacts and created in FileMaker.';
+                    meta.textContent = 'The new contact will initially appear in Unassigned so it can be dragged into the correct position.';
+                    submit.textContent = 'Add contact';
+                    modal.hidden = false;
+                    document.body.classList.add('has-org-contact-modal');
+                    form.elements.namedItem('name').focus();
+                }};
+                document.addEventListener('click', (event) => {{
+                    const edit = event.target.closest('.hierarchy-edit-contact');
+                    if (edit) {{ event.preventDefault(); open(edit.dataset.contactId); return; }}
+                    if (event.target.closest('[data-add-contact]')) {{ event.preventDefault(); openNew(); return; }}
+                    if (event.target.closest('[data-close-contact-editor]')) close();
+                }});
+                document.addEventListener('keydown', (event) => {{ if (event.key === 'Escape' && !modal.hidden) close(); }});
+                companySelect.addEventListener('change', () => {{
+                    const option = companySelect.selectedOptions[0];
+                    setControl('company_record_label', option ? option.dataset.companyLabel || '' : '');
+                    if (option && option.dataset.region) setControl('region', option.dataset.region);
+                }});
+                form.addEventListener('submit', async (event) => {{
+                    event.preventDefault();
+                    const submittingMode = editorMode;
+                    submit.disabled = true;
+                    setStatus('Saving contact and updating FileMaker…', '');
+                    if (submittingMode === 'add') {{
+                        modal.hidden = true;
+                        document.body.classList.remove('has-org-contact-modal');
+                    }}
+                    try {{
+                        const endpoint = submittingMode === 'add' ? '/organisation-chart/contact/create' : '/organisation-chart/contact/update';
+                        const response = await fetch(endpoint, {{method: 'POST', body: new FormData(form)}});
+                        const result = await response.json();
+                        if (!response.ok || !result.ok) throw new Error(result.error || 'Could not save this contact.');
+                        contacts[result.contact.id] = result.contact;
+                        if (submittingMode === 'add') {{
+                            if (result.warning) {{
+                                modal.hidden = false;
+                                document.body.classList.add('has-org-contact-modal');
+                                setStatus(result.warning, 'warning');
+                            }} else {{
+                                window.location.reload();
+                            }}
+                            return;
+                        }}
+                        const card = document.querySelector(`.hierarchy-contact-card[data-contact-id="${{CSS.escape(result.contact.id)}}"]`);
+                        if (card) {{
+                            ['name', 'position', 'email', 'function'].forEach((field) => {{
+                                const node = card.querySelector(`[data-contact-field="${{field}}"]`);
+                                if (node) node.textContent = result.contact[field] || (field === 'name' ? 'Unnamed contact' : field === 'position' ? 'Unknown role' : 'Not set');
+                            }});
+                            const regionNode = card.querySelector('[data-contact-field="region"]');
+                            if (regionNode) regionNode.textContent = result.contact.region || 'Region not set';
+                        }}
+                        setStatus(result.warning || 'Contact saved and updated in FileMaker.', result.warning ? 'warning' : 'ok');
+                        if (!result.warning) window.setTimeout(close, 900);
+                    }} catch (error) {{
+                        if (submittingMode === 'add') {{
+                            modal.hidden = false;
+                            document.body.classList.add('has-org-contact-modal');
+                        }}
+                        setStatus(error.message || 'Could not save this contact.', 'error');
+                    }}
+                    finally {{ submit.disabled = false; }}
+                }});
+            }})();
+        </script>
     """
 
 
@@ -2661,13 +3085,19 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
     if not filtered:
         return "<p class='subtle'>No strategic contacts are saved for this group yet.</p>"
 
-    business_sections = get_org_chart_business_sections(selected_group)
+    structure = get_org_chart_structure(selected_group)
+    business_sections = tuple((item["key"], item["label"]) for item in structure["business_sections"])
     section_labels = dict(business_sections)
-    section_lead_enabled = bool(selected_config.get("section_lead_enabled"))
-    section_lead_label = str(selected_config.get("section_lead_label") or "Division lead")
+    layer_labels = {item["key"]: item["label"] for item in structure["layers"]}
+    section_lead_enabled = "section-lead" in layer_labels
+    section_lead_label = layer_labels.get("section-lead", "Division lead")
+    regional_label = layer_labels.get("regional", "Regional manager")
+    branch_label = layer_labels.get("branch", "Branch contacts")
+    intermediate_layers = [item for item in structure["layers"] if item["key"] not in {"section-lead", "regional", "branch"}]
     contacts_by_id = {str(item.get("id") or "").strip(): item for item in filtered}
     c_suite = []
     section_leads = defaultdict(list)
+    intermediate = defaultdict(lambda: defaultdict(list))
     regional = defaultdict(list)
     branch = defaultdict(list)
     unassigned = []
@@ -2679,6 +3109,8 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
             c_suite.append(item)
         elif tier == "section-lead" and section_lead_enabled and section in section_labels:
             section_leads[section].append(item)
+        elif tier in layer_labels and tier not in {"regional", "branch", "section-lead"} and section in section_labels:
+            intermediate[tier][section].append(item)
         elif tier == "regional" and section in section_labels:
             regional[section].append(item)
         elif (
@@ -2707,23 +3139,60 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
     c_suite_cards = "".join(card(item) for item in c_suite)
     business_columns = []
     for section_key, section_label in business_sections:
-        manager_cards = []
-        for manager in sorted(regional[section_key], key=sort_key):
-            manager_id = str(manager.get("id") or "").strip()
-            child_cards = "".join(card(child) for child in sorted(branch[manager_id], key=sort_key))
-            manager_cards.append(f"""
-                <div class="hierarchy-manager-group">
-                    {card(manager)}
-                    <details class="hierarchy-branch-area drop-zone" data-tier="branch" data-section="{escape(section_key)}" data-parent-id="{escape(manager_id)}">
-                        <summary class="hierarchy-subordinate-head">
-                            <span>Branch contacts reporting to {escape(str(manager.get('name') or 'this regional contact'))}</span>
-                            <small>{len(branch[manager_id])}</small>
-                        </summary>
-                        <div class="hierarchy-child-stack">{child_cards}</div>
-                        <p class="hierarchy-drop-hint">Drop a subordinate here</p>
-                    </details>
+        def render_manager_cards(managers):
+            manager_cards = []
+            for manager in sorted(managers, key=sort_key):
+                manager_id = str(manager.get("id") or "").strip()
+                child_cards = "".join(card(child) for child in sorted(branch[manager_id], key=sort_key))
+                manager_cards.append(f"""
+                    <div class="hierarchy-manager-group">
+                        {card(manager)}
+                        <details class="hierarchy-branch-area drop-zone" data-tier="branch" data-section="{escape(section_key)}" data-parent-id="{escape(manager_id)}">
+                            <summary class="hierarchy-subordinate-head">
+                                <span>{escape(branch_label)} reporting to {escape(str(manager.get('name') or regional_label))}</span>
+                                <small>{len(branch[manager_id])}</small>
+                            </summary>
+                            <div class="hierarchy-child-stack">{child_cards}</div>
+                            <p class="hierarchy-drop-hint">Drop a {escape(branch_label.lower().rstrip('s'))} here</p>
+                        </details>
+                    </div>
+                """)
+            return "".join(manager_cards)
+
+        parented_regional_ids = set()
+        intermediate_markup = ""
+        if intermediate_layers:
+            active_layer = intermediate_layers[-1]
+            active_key = active_layer["key"]
+            active_label = active_layer["label"]
+            layer_groups = []
+            for leader in sorted(intermediate[active_key][section_key], key=sort_key):
+                leader_id = str(leader.get("id") or "").strip()
+                reports = [item for item in regional[section_key] if str(item.get("org_chart_parent_id") or "").strip() == leader_id]
+                parented_regional_ids.update(str(item.get("id") or "").strip() for item in reports)
+                layer_groups.append(f"""
+                    <div class="hierarchy-intermediate-group">
+                        {card(leader)}
+                        <details class="hierarchy-nested-management-zone drop-zone" data-tier="regional" data-section="{escape(section_key)}" data-parent-id="{escape(leader_id)}">
+                            <summary class="hierarchy-subordinate-head">
+                                <span>{escape(regional_label)}s reporting to {escape(str(leader.get('name') or active_label))}</span>
+                                <small>{len(reports)}</small>
+                            </summary>
+                            <div class="hierarchy-regional-zone">{render_manager_cards(reports)}</div>
+                            <p class="hierarchy-drop-hint">Drop {escape(regional_label.lower())}s here</p>
+                        </details>
+                    </div>
+                """)
+            intermediate_markup = f"""
+                <div class="hierarchy-layer-heading">{escape(active_label)}</div>
+                <div class="hierarchy-intermediate-zone drop-zone" data-tier="{escape(active_key)}" data-section="{escape(section_key)}" data-parent-id="">
+                    {''.join(layer_groups)}
+                    <p class="hierarchy-drop-hint">Drop {escape(active_label.lower())} contacts here</p>
                 </div>
-            """)
+                <div class="hierarchy-reporting-connector"><span>{escape(regional_label)}s report to {escape(active_label.lower())}</span></div>
+            """
+
+        unparented_managers = [item for item in regional[section_key] if str(item.get("id") or "").strip() not in parented_regional_ids]
         lead_cards = "".join(card(item) for item in sorted(section_leads[section_key], key=sort_key))
         section_lead_markup = ""
         if section_lead_enabled:
@@ -2734,7 +3203,7 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     {f'<p class="hierarchy-drop-hint">Drop the {escape(section_lead_label.lower())} here</p>' if not lead_cards else ''}
                 </div>
                 <div class="hierarchy-reporting-connector">
-                    <span>Regional managers report to the {escape(section_lead_label.lower())}</span>
+                    <span>{escape((intermediate_layers[-1]['label'] if intermediate_layers else regional_label))}s report to the {escape(section_lead_label.lower())}</span>
                 </div>
             """
         business_columns.append(f"""
@@ -2742,13 +3211,15 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                 <div class="org-chart-lane-head">
                     <div class="org-chart-lane-title-group">
                         <h3>{escape(section_label)}</h3>
-                        <span class="org-chart-lane-count">{len(regional[section_key])} regional</span>
+                        <span class="org-chart-lane-count">{len(regional[section_key])} {escape(regional_label.lower())}</span>
                     </div>
                 </div>
                 {section_lead_markup}
+                {intermediate_markup}
+                <div class="hierarchy-layer-heading">{escape(regional_label)}</div>
                 <div class="hierarchy-regional-zone drop-zone" data-tier="regional" data-section="{escape(section_key)}" data-parent-id="">
-                    {''.join(manager_cards)}
-                    <p class="hierarchy-drop-hint">Drop regional contacts here</p>
+                    {render_manager_cards(unparented_managers)}
+                    <p class="hierarchy-drop-hint">Drop unassigned {escape(regional_label.lower())} contacts here</p>
                 </div>
             </section>
         """)
@@ -2778,7 +3249,7 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     document.querySelectorAll('.drop-zone').forEach((zone) => {{
                         zone.addEventListener('dragover', (event) => {{
                             event.preventDefault();
-                            if (zone.matches('details.hierarchy-branch-area')) zone.open = true;
+                            if (zone.matches('details')) zone.open = true;
                             zone.classList.add('is-drag-over');
                         }});
                         zone.addEventListener('dragleave', (event) => {{ if (!zone.contains(event.relatedTarget)) zone.classList.remove('is-drag-over'); }});
@@ -3408,9 +3879,53 @@ def build_strategic_contact_filemaker_presence_map(items, master_data_result=Non
         return presence_map
 
     contact_rows = build_contact_master_rows(master_data_result)
+    all_filemaker_contacts = master_data_result.get("all_contacts", [])
+    filemaker_record_ids = {
+        str(contact.get("filemaker_record_id") or "").strip()
+        for contact in all_filemaker_contacts
+        if str(contact.get("filemaker_record_id") or "").strip()
+    }
+    filemaker_primary_keys = {
+        str(contact.get("primary_key") or "").strip()
+        for contact in all_filemaker_contacts
+        if str(contact.get("primary_key") or "").strip()
+    }
+    global_emails = {
+        str(contact.get("email") or "").strip().casefold()
+        for contact in all_filemaker_contacts
+        if str(contact.get("email") or "").strip()
+    }
     cache_by_org_region = {}
 
     for item in items or []:
+        item_id = str(item.get("id") or "").strip()
+        linked_primary_key = str(item.get("filemaker_contact_primary_key") or "").strip()
+        linked_record_id = str(item.get("filemaker_contact_record_id") or "").strip()
+        item_email = str(item.get("email") or "").strip().casefold()
+        if linked_primary_key and linked_primary_key in filemaker_primary_keys:
+            presence_map[item_id] = {
+                "exists": True,
+                "kind": "linked_primary_key",
+                "label": "In FileMaker",
+                "details": "This card is linked to an existing FileMaker contact PrimaryKey.",
+            }
+            continue
+        if linked_record_id and linked_record_id in filemaker_record_ids:
+            presence_map[item_id] = {
+                "exists": True,
+                "kind": "linked_record_id",
+                "label": "In FileMaker",
+                "details": "This card is linked to an existing FileMaker contact record.",
+            }
+            continue
+        if item_email and item_email in global_emails:
+            presence_map[item_id] = {
+                "exists": True,
+                "kind": "email_global",
+                "label": "In FileMaker",
+                "details": "This email exists on a FileMaker contact record.",
+            }
+            continue
         organization_name = str(item.get("organization") or "").strip()
         region_value = str(item.get("region") or "").strip()
         cache_key = (
@@ -3426,7 +3941,7 @@ def build_strategic_contact_filemaker_presence_map(items, master_data_result=Non
             )
 
         existing_emails, existing_names, existing_initial_last = cache_by_org_region[cache_key]
-        presence_map[str(item.get("id") or "").strip()] = assess_filemaker_contact_presence(
+        presence_map[item_id] = assess_filemaker_contact_presence(
             email=str(item.get("email") or "").strip().lower(),
             name=str(item.get("name") or "").strip(),
             existing_emails=existing_emails,
@@ -3598,6 +4113,7 @@ def get_strategic_contact_recency_class(recent_contact, today=None):
 
 def build_strategic_contacts_report_payload(items, selected_group, contact_activity_map=None, now=None):
     selected_config = ORG_CHART_GROUPS.get(selected_group) or next(iter(ORG_CHART_GROUPS.values()))
+    structure = get_org_chart_structure(selected_group)
     generated_at = now or datetime.now()
     rows = []
     for item in items or []:
@@ -3643,12 +4159,10 @@ def build_strategic_contacts_report_payload(items, selected_group, contact_activ
     return {
         "group": selected_group,
         "group_label": selected_config["label"],
-        "business_sections": [
-            {"key": key, "label": label}
-            for key, label in get_org_chart_business_sections(selected_group)
-        ],
-        "section_lead_enabled": bool(selected_config.get("section_lead_enabled")),
-        "section_lead_label": str(selected_config.get("section_lead_label") or "Division lead"),
+        "business_sections": structure["business_sections"],
+        "layers": structure["layers"],
+        "section_lead_enabled": any(item["key"] == "section-lead" for item in structure["layers"]),
+        "section_lead_label": next((item["label"] for item in structure["layers"] if item["key"] == "section-lead"), "Division lead"),
         "generated_at": generated_at.strftime("%d %B %Y %H:%M"),
         "contacts": rows,
     }
@@ -6474,7 +6988,11 @@ def post_strategic_contacts_search(
 def get_organisation_chart_view(group: str = "vestis-aramark", message: str = "", error: str = ""):
     selected_group = group if group in ORG_CHART_GROUPS else "vestis-aramark"
     items = [item for item in load_strategic_contacts() if bool(item.get("active", True))]
-    filemaker_presence_map, contact_activity_map = build_strategic_contact_workspace_maps(items)
+    master_data_result = fetch_filemaker_master_data()
+    filemaker_presence_map, contact_activity_map = build_strategic_contact_workspace_maps(
+        items,
+        master_data_result=master_data_result,
+    )
     status_markup = ""
     if message:
         status_markup = f"<p class='status ok'>{escape(message)}</p>"
@@ -6489,6 +7007,7 @@ def get_organisation_chart_view(group: str = "vestis-aramark", message: str = ""
                     {render_org_chart_group_selector(selected_group)}
                 </div>
                 <div class="org-chart-report-actions">
+                    {('<button class="button small-button" type="button" data-add-contact>Add contact</button>' if can_manage_strategic_contacts(get_current_session_user()) else '')}
                     <form method="post" action="/organisation-chart/report/send">
                         <input type="hidden" name="group" value="{escape(selected_group)}">
                         <button class="button small-button" type="submit">Send report</button>
@@ -6503,8 +7022,63 @@ def get_organisation_chart_view(group: str = "vestis-aramark", message: str = ""
             filemaker_presence_map=filemaker_presence_map,
             contact_activity_map=contact_activity_map,
         )}
+        {render_org_chart_structure_editor(selected_group) if can_manage_strategic_contacts(get_current_session_user()) else ''}
+        {render_organisation_contact_editor(
+            items,
+            selected_group=selected_group,
+            filemaker_companies=master_data_result.get('companies') or [],
+        ) if can_manage_strategic_contacts(get_current_session_user()) else ''}
     """
     return render_page(title="Organisation View", body=body, main_class="organisation-chart-main")
+
+
+@app.post("/organisation-chart/structure", response_class=HTMLResponse)
+def post_organisation_chart_structure(
+    group: str = Form("vestis-aramark"),
+    action: str = Form(""),
+    key: str = Form(""),
+    label: str = Form(""),
+):
+    if not can_manage_strategic_contacts(get_current_session_user()):
+        return RedirectResponse(url="/organisation-chart-view?error=You+do+not+have+permission+to+edit+the+structure.", status_code=303)
+    selected_group = group if group in ORG_CHART_GROUPS else ""
+    label = " ".join(str(label or "").strip().split())[:50]
+    key = str(key or "").strip().lower()
+    if not selected_group or not label:
+        return RedirectResponse(url=f"/organisation-chart-view?group={quote(group)}&error=Enter+a+valid+title.", status_code=303)
+    structures = load_org_chart_structures()
+    structure = get_org_chart_structure(selected_group)
+    if action == "rename-layer":
+        matched = next((item for item in structure["layers"] if item["key"] == key), None)
+        if not matched:
+            return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=Layer+not+found.", status_code=303)
+        matched["label"] = label
+    elif action == "rename-section":
+        matched = next((item for item in structure["business_sections"] if item["key"] == key), None)
+        if not matched:
+            return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=Section+not+found.", status_code=303)
+        matched["label"] = label
+    elif action == "add-layer":
+        if any(item["key"] not in {"section-lead", "regional", "branch"} for item in structure["layers"]):
+            return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=This+version+supports+one+additional+management+layer.", status_code=303)
+        slug = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-") or "management"
+        existing_keys = {item["key"] for item in structure["layers"]}
+        base_slug = slug
+        suffix = 2
+        while slug in existing_keys or slug in {"c-suite", "unassigned"}:
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        regional_index = next((index for index, item in enumerate(structure["layers"]) if item["key"] == "regional"), len(structure["layers"]))
+        structure["layers"].insert(regional_index, {"key": slug, "label": label})
+    else:
+        return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=Unknown+structure+change.", status_code=303)
+    structures[selected_group] = structure
+    save_org_chart_structures(structures)
+    record_audit_event("strategic-chart-structure", target=selected_group, details=f"{action} • {key or label}", area="strategic-contacts")
+    return RedirectResponse(
+        url=f"/organisation-chart-view?group={quote(selected_group)}&message={quote('Organisation structure updated.')}",
+        status_code=303,
+    )
 
 
 @app.post("/organisation-chart/move", response_class=JSONResponse)
@@ -6524,14 +7098,13 @@ def post_organisation_chart_move(
     tier = str(tier or "unassigned").strip().lower()
     section = str(section or "").strip().lower()
     parent_id = str(parent_id or "").strip()
-    selected_config = ORG_CHART_GROUPS.get(selected_group) or {}
+    structure = get_org_chart_structure(selected_group) if selected_group else {"layers": []}
+    layer_keys = [item["key"] for item in structure["layers"]]
     valid_sections = {key for key, _label in get_org_chart_business_sections(selected_group)}
-    valid_tiers = {"c-suite", "regional", "branch", "unassigned"}
-    if selected_config.get("section_lead_enabled"):
-        valid_tiers.add("section-lead")
+    valid_tiers = {"c-suite", "unassigned", *layer_keys}
     if not selected_group or tier not in valid_tiers:
         return JSONResponse({"ok": False, "error": "That chart position is not valid."}, status_code=400)
-    if tier in {"regional", "section-lead"} and section not in valid_sections:
+    if tier in layer_keys and tier != "branch" and section not in valid_sections:
         return JSONResponse({"ok": False, "error": "Choose a valid business section."}, status_code=400)
 
     items = load_strategic_contacts()
@@ -6550,9 +7123,21 @@ def post_organisation_chart_move(
         ):
             return JSONResponse({"ok": False, "error": "Branch contacts must be placed beneath a regional contact."}, status_code=400)
         section = str(parent.get("org_chart_section") or "").strip().lower()
+    elif tier == "regional" and parent_id:
+        parent = contacts_by_id.get(parent_id)
+        regional_index = layer_keys.index("regional") if "regional" in layer_keys else -1
+        expected_parent_tier = layer_keys[regional_index - 1] if regional_index > 0 else ""
+        if (
+            not parent
+            or parent_id == contact_id
+            or get_org_chart_group_key(parent.get("organization")) != selected_group
+            or str(parent.get("org_chart_tier") or "").strip().lower() != expected_parent_tier
+        ):
+            return JSONResponse({"ok": False, "error": "Choose a valid manager for this contact."}, status_code=400)
+        section = str(parent.get("org_chart_section") or "").strip().lower()
     else:
         parent_id = ""
-        if tier not in {"regional", "section-lead"}:
+        if tier not in layer_keys:
             section = ""
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -6580,8 +7165,8 @@ def post_organisation_chart_move(
             # Vestis has one division lead per business section; replacing it returns the former lead to Unassigned.
             updated.update({"org_chart_tier": "", "org_chart_section": "", "org_chart_parent_id": "", "org_chart_order": 0})
         elif str(item.get("org_chart_parent_id") or "").strip() == contact_id:
-            if tier == "regional":
-                # A regional manager carries their branch team when moved between business sections.
+            if tier in layer_keys and tier != "branch":
+                # A manager carries their direct reports when moved between business sections.
                 updated.update({"org_chart_section": section})
             else:
                 # A card that is no longer regional cannot retain direct reports.
@@ -6595,6 +7180,194 @@ def post_organisation_chart_move(
         area="strategic-contacts",
     )
     return JSONResponse({"ok": True})
+
+
+@app.post("/organisation-chart/contact/update", response_class=JSONResponse)
+async def post_organisation_chart_contact_update(request: Request):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return JSONResponse({"ok": False, "error": "You do not have permission to edit contacts."}, status_code=403)
+
+    form = await request.form()
+    contact_id = str(form.get("contact_id") or "").strip()
+    items = load_strategic_contacts()
+    original = next((item for item in items if str(item.get("id") or "").strip() == contact_id), None)
+    if not original:
+        return JSONResponse({"ok": False, "error": "Strategic contact not found."}, status_code=404)
+
+    organization = str(form.get("organization") or "").strip()
+    name = str(form.get("name") or "").strip()
+    position = str(form.get("position") or "").strip()
+    email = str(form.get("email") or "").strip().lower()
+    region = str(form.get("region") or "").strip()
+    company_primary_key = str(form.get("filemaker_company_primary_key") or "").strip()
+    if not organization or not name or not position or not email:
+        return JSONResponse(
+            {"ok": False, "error": "Please complete organisation, contact name, job title and email."},
+            status_code=400,
+        )
+
+    existing_organizations = {str(item.get("organization") or "").strip() for item in items}
+    if organization not in existing_organizations:
+        return JSONResponse({"ok": False, "error": "Choose an existing organisation."}, status_code=400)
+    master_data_result = fetch_filemaker_master_data()
+    selected_company = next(
+        (
+            company for company in master_data_result.get("companies", [])
+            if str(company.get("primary_key") or "").strip() == company_primary_key
+        ),
+        None,
+    )
+    if not selected_company:
+        return JSONResponse({"ok": False, "error": "Choose an existing FileMaker customer branch."}, status_code=400)
+    existing_locations = {
+        str(value or "").strip()
+        for value in (
+            *[item.get("region") for item in items],
+            *[company.get("state") for company in master_data_result.get("companies", [])],
+        )
+        if str(value or "").strip()
+    }
+    if region and region not in existing_locations:
+        return JSONResponse({"ok": False, "error": "Choose an existing location."}, status_code=400)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    editable_fields = (
+        "company_record_label", "phone", "cell", "scope_type", "function",
+        "influence_level", "seniority", "preferred_contact_method", "outreach_angle",
+        "coverage_notes", "relationship_notes",
+    )
+    changes = {field: str(form.get(field) or "").strip() for field in editable_fields}
+    updated_contact = normalize_strategic_contact_record(
+        {
+            **original,
+            **changes,
+            "organization": organization,
+            "company_record_label": str(selected_company.get("company") or "").strip(),
+            "filemaker_company_label": str(selected_company.get("company") or "").strip(),
+            "filemaker_company_primary_key": company_primary_key,
+            "name": name,
+            "position": position,
+            "email": email,
+            "region": region,
+            "active": str(form.get("active") or "").strip().lower() == "active",
+            "updated_at": timestamp,
+        }
+    )
+    save_strategic_contacts([
+        updated_contact if str(item.get("id") or "").strip() == contact_id else item
+        for item in items
+    ])
+    clear_strategic_contact_workspace_cache()
+
+    filemaker_result = sync_strategic_contact_to_filemaker(contact_id, allow_create=False)
+    saved_contact = find_strategic_contact(contact_id) or updated_contact
+    warning = "" if filemaker_result.get("ok") else (
+        "Contact saved here, but FileMaker could not be updated. "
+        + str(filemaker_result.get("error") or "Please try the FileMaker sync again.")
+    )
+    record_audit_event(
+        "strategic-edit",
+        target=name,
+        details=(filemaker_result.get("message") if filemaker_result.get("ok") else warning),
+        area="strategic-contacts",
+        status="success" if filemaker_result.get("ok") else "warning",
+    )
+    return JSONResponse({"ok": True, "contact": saved_contact, "warning": warning})
+
+
+@app.post("/organisation-chart/contact/create", response_class=JSONResponse)
+async def post_organisation_chart_contact_create(request: Request):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return JSONResponse({"ok": False, "error": "You do not have permission to add contacts."}, status_code=403)
+
+    form = await request.form()
+    items = load_strategic_contacts()
+    organization = str(form.get("organization") or "").strip()
+    name = str(form.get("name") or "").strip()
+    position = str(form.get("position") or "").strip()
+    email = str(form.get("email") or "").strip().lower()
+    region = str(form.get("region") or "").strip()
+    company_primary_key = str(form.get("filemaker_company_primary_key") or "").strip()
+    if not organization or not name or not position or not email:
+        return JSONResponse(
+            {"ok": False, "error": "Please complete organisation, contact name, job title and email."},
+            status_code=400,
+        )
+
+    existing_organizations = {str(item.get("organization") or "").strip() for item in items}
+    if organization not in existing_organizations:
+        return JSONResponse({"ok": False, "error": "Choose an existing organisation."}, status_code=400)
+    if any(str(item.get("email") or "").strip().casefold() == email.casefold() for item in items):
+        return JSONResponse({"ok": False, "error": "A Strategic Contact with that email already exists."}, status_code=400)
+
+    master_data_result = fetch_filemaker_master_data()
+    selected_company = next(
+        (
+            company for company in master_data_result.get("companies", [])
+            if str(company.get("primary_key") or "").strip() == company_primary_key
+        ),
+        None,
+    )
+    if not selected_company:
+        return JSONResponse({"ok": False, "error": "Choose an existing FileMaker customer branch."}, status_code=400)
+    existing_locations = {
+        str(value or "").strip()
+        for value in (
+            *[item.get("region") for item in items],
+            *[company.get("state") for company in master_data_result.get("companies", [])],
+        )
+        if str(value or "").strip()
+    }
+    if region and region not in existing_locations:
+        return JSONResponse({"ok": False, "error": "Choose an existing state or region."}, status_code=400)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    contact_id = secrets.token_hex(8)
+    new_contact = normalize_strategic_contact_record(
+        {
+            "id": contact_id,
+            "organization": organization,
+            "company_record_label": str(selected_company.get("company") or "").strip(),
+            "filemaker_company_label": str(selected_company.get("company") or "").strip(),
+            "filemaker_company_primary_key": company_primary_key,
+            "name": name,
+            "position": position,
+            "email": email,
+            "phone": str(form.get("phone") or "").strip(),
+            "cell": str(form.get("cell") or "").strip(),
+            "scope_type": str(form.get("scope_type") or "").strip(),
+            "region": region,
+            "function": str(form.get("function") or "").strip(),
+            "influence_level": str(form.get("influence_level") or "").strip(),
+            "seniority": str(form.get("seniority") or "").strip(),
+            "preferred_contact_method": str(form.get("preferred_contact_method") or "").strip(),
+            "outreach_angle": str(form.get("outreach_angle") or "").strip(),
+            "coverage_notes": str(form.get("coverage_notes") or "").strip(),
+            "relationship_notes": str(form.get("relationship_notes") or "").strip(),
+            "active": str(form.get("active") or "").strip().lower() == "active",
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+    )
+    save_strategic_contacts([*items, new_contact])
+    clear_strategic_contact_workspace_cache()
+
+    filemaker_result = sync_strategic_contact_to_filemaker(contact_id)
+    saved_contact = find_strategic_contact(contact_id) or new_contact
+    warning = "" if filemaker_result.get("ok") else (
+        "Contact created in Strategic Contacts, but FileMaker could not be updated. "
+        + str(filemaker_result.get("error") or "Please try the FileMaker sync again.")
+    )
+    record_audit_event(
+        "strategic-add",
+        target=name,
+        details=(filemaker_result.get("message") if filemaker_result.get("ok") else warning),
+        area="strategic-contacts",
+        status="success" if filemaker_result.get("ok") else "warning",
+    )
+    return JSONResponse({"ok": True, "contact": saved_contact, "warning": warning})
 
 
 @app.post("/organisation-chart/report/send", response_class=HTMLResponse)
@@ -9123,6 +9896,78 @@ def post_strategic_contact_delete(
         url=append_message_to_url(
             return_to or "/organisation-chart-view",
             message="Strategic contact removed.",
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/strategic-contacts/make-inactive", response_class=HTMLResponse)
+def post_strategic_contact_make_inactive(
+    contact_id: str = Form(""),
+    return_to: str = Form("/organisation-chart-view"),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        return RedirectResponse(
+            url=append_message_to_url(return_to or "/organisation-chart-view", error="You do not have permission to manage strategic contacts."),
+            status_code=303,
+        )
+
+    contact_id = str(contact_id or "").strip()
+    items = load_strategic_contacts()
+    original = next((item for item in items if str(item.get("id") or "").strip() == contact_id), None)
+    if not original:
+        return RedirectResponse(
+            url=append_message_to_url(return_to or "/organisation-chart-view", error="Strategic contact not found."),
+            status_code=303,
+        )
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    inactive_contact = normalize_strategic_contact_record(
+        {**original, "active": False, "updated_at": timestamp}
+    )
+    save_strategic_contacts([
+        inactive_contact if str(item.get("id") or "").strip() == contact_id else item
+        for item in items
+    ])
+    sync_result = sync_strategic_contact_to_filemaker(contact_id, allow_create=False)
+    if not sync_result.get("ok"):
+        # FileMaker is authoritative for this action. Restore the app contact if it could not be inactivated there.
+        current_items = load_strategic_contacts()
+        save_strategic_contacts([
+            original if str(item.get("id") or "").strip() == contact_id else item
+            for item in current_items
+        ])
+        clear_strategic_contact_workspace_cache()
+        error_message = str(sync_result.get("error") or "FileMaker could not make this contact inactive.")
+        record_audit_event(
+            "strategic-make-inactive",
+            target=str(original.get("name") or contact_id),
+            details=error_message,
+            area="filemaker",
+            status="failed",
+        )
+        return RedirectResponse(
+            url=append_message_to_url(return_to or "/organisation-chart-view", error=error_message),
+            status_code=303,
+        )
+
+    remaining = [
+        item for item in load_strategic_contacts()
+        if str(item.get("id") or "").strip() != contact_id
+    ]
+    save_strategic_contacts(remaining)
+    clear_strategic_contact_workspace_cache()
+    record_audit_event(
+        "strategic-make-inactive",
+        target=str(original.get("name") or contact_id),
+        details="Contact made inactive in FileMaker and removed from Strategic Contacts.",
+        area="filemaker",
+    )
+    return RedirectResponse(
+        url=append_message_to_url(
+            return_to or "/organisation-chart-view",
+            message="Contact made inactive in FileMaker and removed from Strategic Contacts.",
         ),
         status_code=303,
     )
@@ -28394,10 +29239,24 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-contact-detail-body .strategic-card-actions .button,
                     .org-chart-contact-detail-body .strategic-card-actions button {{
-                        width: auto;
-                        min-width: 0;
-                        padding: 6px 9px;
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        width: 86px;
+                        min-width: 86px;
+                        height: 36px;
+                        padding: 0 7px;
                         font-size: 10.5px;
+                    }}
+
+                    .org-chart-contact-detail-body .strategic-card-actions form {{
+                        flex: 0 0 86px;
+                        width: 86px;
+                    }}
+
+                    .org-chart-contact-detail-body .strategic-card-actions form .button,
+                    .org-chart-contact-detail-body .strategic-card-actions form button {{
+                        width: 100%;
                     }}
 
                     .strategic-contact-summary {{
@@ -28441,6 +29300,42 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .org-chart-report-actions form {{
                         margin: 0;
+                    }}
+
+                    .org-structure-editor {{
+                        padding: 10px 14px;
+                    }}
+
+                    .org-structure-editor > summary {{
+                        cursor: pointer;
+                        color: #245cff;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }}
+
+                    .org-structure-editor-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 18px;
+                        margin-top: 12px;
+                    }}
+
+                    .org-structure-editor-grid h4 {{
+                        margin: 0 0 8px;
+                    }}
+
+                    .org-structure-row,
+                    .org-structure-add-row {{
+                        display: grid;
+                        grid-template-columns: 52px minmax(0, 1fr) auto;
+                        gap: 7px;
+                        align-items: center;
+                        margin: 7px 0;
+                    }}
+
+                    .org-structure-add-row {{
+                        grid-template-columns: minmax(0, 1fr) auto;
+                        margin-top: 12px;
                     }}
 
                     .org-chart-segmented-control {{
@@ -30961,6 +31856,64 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         display: none;
                     }}
 
+                    .hierarchy-layer-heading,
+                    .hierarchy-nested-label {{
+                        margin: 8px 0 6px;
+                        color: #526b86;
+                        font-size: 10px;
+                        font-weight: 800;
+                        letter-spacing: 0.05em;
+                        text-align: center;
+                        text-transform: uppercase;
+                    }}
+
+                    .hierarchy-intermediate-zone {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px;
+                        min-height: 70px;
+                        padding: 8px;
+                        border-radius: 10px;
+                        background: #f8fafc;
+                    }}
+
+                    .hierarchy-intermediate-zone:has(.hierarchy-intermediate-group) > .hierarchy-drop-hint,
+                    .hierarchy-nested-management-zone:has(.hierarchy-manager-group) > .hierarchy-drop-hint {{
+                        display: none;
+                    }}
+
+                    .hierarchy-intermediate-zone > .hierarchy-drop-hint {{
+                        grid-column: 1 / -1;
+                    }}
+
+                    .hierarchy-intermediate-group {{
+                        min-width: 0;
+                    }}
+
+                    .hierarchy-intermediate-group > .hierarchy-contact-card {{
+                        width: min(240px, 100%);
+                        min-width: 0;
+                        height: 210px;
+                        margin: 0 auto;
+                        padding: 10px;
+                        box-sizing: border-box;
+                        border-color: #76a4e8;
+                        background: #e8f2ff;
+                    }}
+
+                    .hierarchy-nested-management-zone {{
+                        margin-top: -2px;
+                        padding: 8px;
+                        border: 1px solid #d5dce5;
+                        border-radius: 10px;
+                        background: #f2f4f7;
+                    }}
+
+                    .hierarchy-nested-management-zone > .hierarchy-regional-zone {{
+                        grid-template-columns: minmax(0, 1fr);
+                        min-height: 0;
+                    }}
+
                     .hierarchy-section-lead-zone {{
                         position: relative;
                         display: grid;
@@ -30988,7 +31941,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-height: 210px;
                         box-sizing: border-box;
                         border-color: #76a4e8;
-                        background: #e4efff;
+                        background: #f1edff;
                     }}
 
                     .hierarchy-section-lead-zone > .hierarchy-contact-card:has(.org-chart-contact-details[open]) {{
@@ -31040,18 +31993,27 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-width: 0;
                     }}
 
-                    .hierarchy-manager-group .org-chart-contact-title-row {{
+                    .hierarchy-manager-group .org-chart-contact-title-row,
+                    .hierarchy-intermediate-group .org-chart-contact-title-row {{
                         min-width: 0;
                         gap: 4px;
                     }}
 
-                    .hierarchy-manager-group .org-chart-contact-title-row h4 {{
+                    .hierarchy-intermediate-group .org-chart-contact-title-row {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr) auto;
+                        align-items: start;
+                    }}
+
+                    .hierarchy-manager-group .org-chart-contact-title-row h4,
+                    .hierarchy-intermediate-group .org-chart-contact-title-row h4 {{
                         min-width: 0;
                         overflow-wrap: anywhere;
                         font-size: 13px;
                     }}
 
-                    .hierarchy-manager-group .org-chart-contact-title-row .status-pill {{
+                    .hierarchy-manager-group .org-chart-contact-title-row .status-pill,
+                    .hierarchy-intermediate-group .org-chart-contact-title-row .status-pill {{
                         flex: 0 1 auto;
                         min-width: 0;
                         padding: 5px 7px;
@@ -31059,6 +32021,31 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 9px;
                         text-overflow: ellipsis;
                         white-space: nowrap;
+                    }}
+
+                    .hierarchy-intermediate-group .org-chart-contact-title-row .status-pill {{
+                        max-width: 82px;
+                        min-height: 22px;
+                        padding: 0 6px;
+                        border-radius: 7px;
+                        font-size: 8.5px;
+                    }}
+
+                    .hierarchy-intermediate-group .org-chart-contact-node,
+                    .hierarchy-intermediate-group .org-chart-contact-preview-role,
+                    .hierarchy-intermediate-group .hierarchy-card-meta {{
+                        min-width: 0;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .hierarchy-intermediate-group .org-chart-contact-preview-role {{
+                        min-height: 28px;
+                        font-size: 11px;
+                        line-height: 1.25;
+                    }}
+
+                    .hierarchy-intermediate-group .hierarchy-card-meta {{
+                        font-size: 11px;
                     }}
 
                     .hierarchy-contact-card {{
@@ -31090,6 +32077,120 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: 0 0 0 3px rgba(36, 92, 255, 0.16);
                     }}
 
+                    body.has-org-contact-modal {{
+                        overflow: hidden;
+                    }}
+
+                    .org-contact-modal[hidden] {{
+                        display: none;
+                    }}
+
+                    .org-contact-modal {{
+                        position: fixed;
+                        z-index: 1000;
+                        inset: 0;
+                        display: grid;
+                        place-items: center;
+                        padding: 24px;
+                    }}
+
+                    .org-contact-modal-backdrop {{
+                        position: absolute;
+                        inset: 0;
+                        width: 100%;
+                        border: 0;
+                        background: rgba(18, 31, 52, 0.52);
+                        cursor: default;
+                    }}
+
+                    .org-contact-modal-dialog {{
+                        position: relative;
+                        width: min(920px, 100%);
+                        max-height: calc(100vh - 48px);
+                        padding: 22px;
+                        overflow: auto;
+                        border: 1px solid #cad8ea;
+                        box-shadow: 0 24px 70px rgba(18, 31, 52, 0.3);
+                    }}
+
+                    .org-contact-modal-head {{
+                        display: flex;
+                        align-items: flex-start;
+                        justify-content: space-between;
+                        gap: 20px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .org-contact-modal-head h2 {{
+                        margin: 2px 0 4px;
+                    }}
+
+                    .org-contact-modal-close {{
+                        flex: 0 0 auto;
+                        width: 36px;
+                        height: 36px;
+                        padding: 0;
+                        border: 1px solid #cad8ea;
+                        border-radius: 50%;
+                        background: #fff;
+                        color: #24364b;
+                        font-size: 24px;
+                        line-height: 1;
+                        cursor: pointer;
+                    }}
+
+                    .org-contact-editor-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 14px;
+                    }}
+
+                    .org-contact-editor-notes {{
+                        display: grid;
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        gap: 14px;
+                        margin-top: 14px;
+                    }}
+
+                    .org-contact-editor-wide {{
+                        grid-column: 1 / -1;
+                    }}
+
+                    .org-contact-editor-form label:not(.org-contact-editor-active) {{
+                        display: grid;
+                        gap: 5px;
+                    }}
+
+                    .org-contact-editor-form input,
+                    .org-contact-editor-form select,
+                    .org-contact-editor-form textarea {{
+                        width: 100%;
+                        box-sizing: border-box;
+                    }}
+
+                    .org-contact-editor-active {{
+                        display: flex;
+                        align-items: center;
+                        gap: 8px;
+                        align-self: end;
+                        min-height: 42px;
+                    }}
+
+                    .org-contact-editor-active input {{
+                        width: auto;
+                    }}
+
+                    .org-contact-editor-meta {{
+                        margin: 14px 0 0;
+                    }}
+
+                    .org-contact-modal-actions {{
+                        display: flex;
+                        justify-content: flex-end;
+                        gap: 10px;
+                        margin-top: 18px;
+                    }}
+
                     .hierarchy-contact-card.contact-recent,
                     .hierarchy-contact-card.contact-older {{
                         border-color: #d8e4f2;
@@ -31100,9 +32201,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .hierarchy-manager-group > .hierarchy-contact-card,
                     .hierarchy-manager-group > .hierarchy-contact-card.contact-recent,
                     .hierarchy-manager-group > .hierarchy-contact-card.contact-older {{
-                        border-color: #9fc0ee;
-                        background: #eef5ff;
-                        box-shadow: 0 8px 20px rgba(36, 92, 255, 0.08);
+                        border-color: #a9d7bd;
+                        background: #edf8f1;
+                        box-shadow: 0 8px 20px rgba(31, 122, 69, 0.07);
                     }}
 
                     .hierarchy-contact-card .hierarchy-recent-contact {{
@@ -31136,17 +32237,37 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         padding: 8px 10px;
                     }}
 
-                    .hierarchy-manager-group .org-chart-recent-contact-head {{
+                    .hierarchy-manager-group .org-chart-recent-contact-head,
+                    .hierarchy-intermediate-group .org-chart-recent-contact-head {{
                         display: grid;
                         grid-template-columns: minmax(0, 1fr) minmax(0, auto);
                         gap: 4px;
                     }}
 
-                    .hierarchy-manager-group .org-chart-recent-contact-head strong {{
+                    .hierarchy-manager-group .org-chart-recent-contact-head strong,
+                    .hierarchy-intermediate-group .org-chart-recent-contact-head strong {{
                         min-width: 0;
                         max-width: 76px;
                         overflow-wrap: anywhere;
                         font-size: 9.5px;
+                    }}
+
+                    .hierarchy-intermediate-group .org-chart-recent-contact-head span {{
+                        align-self: center;
+                        font-size: 7.5px;
+                        letter-spacing: 0;
+                        white-space: nowrap;
+                    }}
+
+                    .hierarchy-intermediate-group .org-chart-recent-contact-head strong {{
+                        max-width: 68px;
+                        font-size: 8.5px;
+                        line-height: 1.15;
+                    }}
+
+                    .hierarchy-intermediate-group .hierarchy-recent-contact {{
+                        width: 100%;
+                        box-sizing: border-box;
                     }}
 
                     .hierarchy-branch-area {{
@@ -31186,7 +32307,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 9px;
                     }}
 
-                    .hierarchy-branch-area[open] .hierarchy-subordinate-head::before {{
+                    .hierarchy-branch-area[open] .hierarchy-subordinate-head::before,
+                    .hierarchy-nested-management-zone[open] .hierarchy-subordinate-head::before {{
                         content: "▼";
                     }}
 
@@ -31203,7 +32325,78 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .hierarchy-child-stack .hierarchy-contact-card {{
                         box-shadow: none;
-                        border-color: #d8e4f2;
+                        border-color: #ead9b8;
+                        background: #fff9ec;
+                    }}
+
+                    .hierarchy-nested-management-zone .hierarchy-manager-group > .hierarchy-contact-card {{
+                        height: auto;
+                        min-height: 188px;
+                        padding: 9px;
+                    }}
+
+                    .hierarchy-nested-management-zone .org-chart-contact-title-row,
+                    .hierarchy-child-stack .org-chart-contact-title-row {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr);
+                        gap: 5px;
+                    }}
+
+                    .hierarchy-nested-management-zone .org-chart-contact-title-row h4,
+                    .hierarchy-child-stack .org-chart-contact-title-row h4 {{
+                        overflow-wrap: normal;
+                        word-break: normal;
+                        font-size: 12px;
+                    }}
+
+                    .hierarchy-nested-management-zone .org-chart-contact-title-row .status-pill,
+                    .hierarchy-child-stack .org-chart-contact-title-row .status-pill {{
+                        justify-self: start;
+                        max-width: 100%;
+                        min-height: 21px;
+                        padding: 0 6px;
+                        border-radius: 7px;
+                        font-size: 8px;
+                    }}
+
+                    .hierarchy-nested-management-zone .org-chart-contact-preview-role,
+                    .hierarchy-child-stack .org-chart-contact-preview-role {{
+                        min-height: 0;
+                        font-size: 10px;
+                        line-height: 1.25;
+                    }}
+
+                    .hierarchy-nested-management-zone .hierarchy-card-meta,
+                    .hierarchy-child-stack .hierarchy-card-meta {{
+                        font-size: 10px;
+                    }}
+
+                    .hierarchy-nested-management-zone .org-chart-recent-contact-head,
+                    .hierarchy-child-stack .org-chart-recent-contact-head {{
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr);
+                        gap: 2px;
+                    }}
+
+                    .hierarchy-nested-management-zone .org-chart-recent-contact-head span,
+                    .hierarchy-child-stack .org-chart-recent-contact-head span {{
+                        font-size: 7px;
+                        letter-spacing: 0;
+                        white-space: nowrap;
+                    }}
+
+                    .hierarchy-nested-management-zone .org-chart-recent-contact-head strong,
+                    .hierarchy-child-stack .org-chart-recent-contact-head strong {{
+                        max-width: none;
+                        font-size: 8.5px;
+                        line-height: 1.15;
+                        text-align: left;
+                    }}
+
+                    .hierarchy-child-stack .hierarchy-contact-card {{
+                        height: auto;
+                        min-height: 166px;
+                        padding: 8px;
                     }}
 
                     .hierarchy-drop-hint {{
@@ -31228,6 +32421,20 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 720px) {{
+                        .org-contact-modal {{
+                            padding: 10px;
+                        }}
+
+                        .org-contact-modal-dialog {{
+                            max-height: calc(100vh - 20px);
+                            padding: 16px;
+                        }}
+
+                        .org-contact-editor-grid,
+                        .org-contact-editor-notes {{
+                            grid-template-columns: 1fr;
+                        }}
+
                         .hierarchy-root {{
                             display: grid;
                         }}
@@ -31251,6 +32458,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .hierarchy-section-lead-zone {{
                             grid-template-columns: minmax(0, 1fr);
+                        }}
+
+                        .hierarchy-intermediate-zone {{
+                            grid-template-columns: minmax(0, 1fr);
+                        }}
+
+                        .org-structure-editor-grid,
+                        .org-structure-row,
+                        .org-structure-add-row {{
+                            grid-template-columns: 1fr;
                         }}
                     }}
 

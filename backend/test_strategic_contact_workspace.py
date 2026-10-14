@@ -1,4 +1,5 @@
 import os
+import asyncio
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,279 @@ from strategic_contacts_report import _activity_contacts, _activity_text, build_
 
 
 class StrategicContactWorkspaceTests(unittest.TestCase):
+    def test_prudential_has_its_own_chart_group_and_default_structure(self):
+        self.assertEqual(main.get_org_chart_group_key("Prudential Financial"), "prudential")
+        self.assertIn("Prudential", main.render_org_chart_group_selector("prudential"))
+        structure = main.get_default_org_chart_structure("prudential")
+        self.assertEqual(
+            [section["label"] for section in structure["business_sections"]],
+            ["Supply Chain", "Production", "Operations"],
+        )
+        self.assertEqual([layer["key"] for layer in structure["layers"]], ["regional", "branch"])
+
+    def test_organisation_contact_editor_is_modal_and_limits_location_choices(self):
+        contacts = [
+            main.normalize_strategic_contact_record(
+                {
+                    "id": "contact-1",
+                    "organization": "Vestis Corporate",
+                    "name": "Taylor Smith",
+                    "position": "Director",
+                    "email": "taylor@example.com",
+                    "region": "GA",
+                }
+            ),
+            main.normalize_strategic_contact_record(
+                {
+                    "id": "contact-2",
+                    "organization": "Vestis Corporate",
+                    "name": "Jordan Lee",
+                    "position": "VP",
+                    "email": "jordan@example.com",
+                    "region": "CA",
+                }
+            ),
+        ]
+
+        html = main.render_organisation_contact_editor(
+            contacts,
+            filemaker_companies=[
+                {"primary_key": "branch-ca", "company": "Vestis Bakersfield", "parent_org": "Vestis", "city": "Bakersfield", "state": "CA"},
+                {"primary_key": "branch-ga", "company": "Vestis Atlanta", "parent_org": "Vestis", "city": "Atlanta", "state": "GA"},
+            ],
+        )
+
+        self.assertIn('role="dialog"', html)
+        self.assertIn('id="org-contact-editor-form"', html)
+        self.assertIn('name="region"', html)
+        self.assertIn('<option value="CA">CA</option>', html)
+        self.assertIn('<option value="GA">GA</option>', html)
+        self.assertIn('Vestis Atlanta — Atlanta, GA', html)
+        self.assertNotIn('Vestis Atlanta — Atlanta, GA — branch-ga', html)
+        self.assertIn("/organisation-chart/contact/update", html)
+        self.assertIn("updating FileMaker", html)
+
+    def test_hierarchy_edit_button_opens_contact_editor_instead_of_navigating(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "id": "contact-edit",
+                "organization": "Vestis Corporate",
+                "name": "Taylor Smith",
+                "position": "Director",
+                "email": "taylor@example.com",
+            }
+        )
+
+        with patch.object(main, "can_manage_strategic_contacts", return_value=True):
+            html = main.render_hierarchy_contact_card(contact, "vestis-aramark")
+
+        self.assertIn('class="button secondary small-button hierarchy-edit-contact"', html)
+        self.assertIn('data-contact-id="contact-edit"', html)
+        self.assertNotIn('/strategic-contacts-view?edit=', html)
+
+    def test_modal_contact_update_preserves_chart_position_and_syncs_filemaker(self):
+        class FormRequest:
+            async def form(self):
+                return {
+                    "contact_id": "contact-edit",
+                    "organization": "Vestis Corporate",
+                    "filemaker_company_primary_key": "branch-ga",
+                    "name": "Taylor Updated",
+                    "position": "Senior Director",
+                    "email": "taylor.updated@example.com",
+                    "phone": "555-0101",
+                    "cell": "555-0102",
+                    "scope_type": "Regional",
+                    "region": "GA",
+                    "function": "Operations",
+                    "influence_level": "Decision Maker",
+                    "seniority": "Director",
+                    "preferred_contact_method": "Email",
+                    "outreach_angle": "Discuss service coverage",
+                    "coverage_notes": "Covers the southeast",
+                    "relationship_notes": "Known to the sales team",
+                    "active": "active",
+                }
+
+        original = main.normalize_strategic_contact_record(
+            {
+                "id": "contact-edit",
+                "organization": "Vestis Corporate",
+                "name": "Taylor Smith",
+                "position": "Director",
+                "email": "taylor@example.com",
+                "region": "GA",
+                "org_chart_tier": "regional",
+                "org_chart_section": "production",
+                "org_chart_parent_id": "division-lead",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contacts_path = Path(temp_dir) / "strategic_contacts.json"
+            with patch.dict(os.environ, {"STRATEGIC_CONTACTS_PATH": str(contacts_path)}):
+                main.save_strategic_contacts([original])
+                with patch.object(main, "can_manage_strategic_contacts", return_value=True), patch.object(
+                    main,
+                    "fetch_filemaker_master_data",
+                    return_value={"status": "ok", "companies": [{"primary_key": "branch-ga", "company": "Vestis Atlanta", "state": "GA"}]},
+                ), patch.object(
+                    main, "sync_strategic_contact_to_filemaker", return_value={"ok": True, "message": "Updated in FileMaker."}
+                ) as sync, patch.object(main, "record_audit_event"):
+                    response = asyncio.run(main.post_organisation_chart_contact_update(FormRequest()))
+                saved = main.load_strategic_contacts()[0]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(saved["name"], "Taylor Updated")
+        self.assertEqual(saved["filemaker_company_primary_key"], "branch-ga")
+        self.assertEqual(saved["company_record_label"], "Vestis Atlanta")
+        self.assertEqual(saved["org_chart_tier"], "regional")
+        self.assertEqual(saved["org_chart_section"], "production")
+        self.assertEqual(saved["org_chart_parent_id"], "division-lead")
+        sync.assert_called_once_with("contact-edit", allow_create=False)
+
+    def test_filemaker_sync_keeps_linked_record_when_organisation_changes(self):
+        contact = main.normalize_strategic_contact_record(
+            {"filemaker_contact_record_id": "fm-17", "email": "new@example.com", "name": "New Name"}
+        )
+        linked = {"filemaker_record_id": "fm-17", "customer_ref": "old-company", "email": "old@example.com"}
+        result = main.find_existing_filemaker_contact_for_strategic_contact(
+            contact,
+            {"primary_key": "new-company"},
+            {"all_contacts": [linked], "contacts_by_customer_key": {"new-company": []}},
+        )
+
+        self.assertIs(result, linked)
+
+    def test_filemaker_contact_primary_key_overrides_stale_record_id(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "filemaker_contact_primary_key": "contact-primary-key",
+                "filemaker_contact_record_id": "stale-record-id",
+                "email": "changed@example.com",
+            }
+        )
+        linked = {
+            "primary_key": "contact-primary-key",
+            "filemaker_record_id": "current-record-id",
+            "customer_ref": "branch-a",
+            "email": "old@example.com",
+        }
+
+        result = main.find_existing_filemaker_contact_for_strategic_contact(
+            contact,
+            {"primary_key": "branch-b"},
+            {"all_contacts": [linked], "contacts_by_customer_key": {"branch-b": []}},
+        )
+
+        self.assertIs(result, linked)
+
+    def test_modal_add_contact_creates_app_record_and_syncs_filemaker(self):
+        class FormRequest:
+            async def form(self):
+                return {
+                    "organization": "Vestis Corporate",
+                    "filemaker_company_primary_key": "branch-il",
+                    "name": "New Contact",
+                    "position": "Branch Manager",
+                    "email": "new.contact@example.com",
+                    "region": "IL",
+                    "function": "Operations",
+                    "active": "active",
+                }
+
+        existing = main.normalize_strategic_contact_record(
+            {
+                "id": "existing",
+                "organization": "Vestis Corporate",
+                "name": "Existing Contact",
+                "position": "Director",
+                "email": "existing@example.com",
+                "region": "IL",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contacts_path = Path(temp_dir) / "strategic_contacts.json"
+            with patch.dict(os.environ, {"STRATEGIC_CONTACTS_PATH": str(contacts_path)}):
+                main.save_strategic_contacts([existing])
+                with patch.object(main, "can_manage_strategic_contacts", return_value=True), patch.object(
+                    main,
+                    "fetch_filemaker_master_data",
+                    return_value={"status": "ok", "companies": [{"primary_key": "branch-il", "company": "Vestis Chicago", "state": "IL"}]},
+                ), patch.object(
+                    main, "sync_strategic_contact_to_filemaker", return_value={"ok": True, "message": "Created in FileMaker."}
+                ) as sync, patch.object(main, "record_audit_event"):
+                    response = asyncio.run(main.post_organisation_chart_contact_create(FormRequest()))
+                contacts = main.load_strategic_contacts()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(contacts), 2)
+        created = contacts[1]
+        self.assertEqual(created["name"], "New Contact")
+        self.assertEqual(created["company_record_label"], "Vestis Chicago")
+        self.assertEqual(created["filemaker_company_primary_key"], "branch-il")
+        self.assertEqual(created["org_chart_tier"], "")
+        sync.assert_called_once_with(created["id"])
+
+    def test_make_inactive_updates_filemaker_before_removing_strategic_contact(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "id": "inactive-contact",
+                "organization": "Vestis Corporate",
+                "name": "Taylor Smith",
+                "position": "Director",
+                "email": "taylor@example.com",
+                "active": True,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contacts_path = Path(temp_dir) / "strategic_contacts.json"
+            with patch.dict(os.environ, {"STRATEGIC_CONTACTS_PATH": str(contacts_path)}):
+                main.save_strategic_contacts([contact])
+
+                def successful_sync(contact_id, allow_create=True):
+                    self.assertFalse(main.find_strategic_contact(contact_id)["active"])
+                    self.assertFalse(allow_create)
+                    return {"ok": True, "message": "Updated in FileMaker."}
+
+                with patch.object(main, "can_manage_strategic_contacts", return_value=True), patch.object(
+                    main, "sync_strategic_contact_to_filemaker", side_effect=successful_sync
+                ), patch.object(main, "record_audit_event"):
+                    response = main.post_strategic_contact_make_inactive(
+                        "inactive-contact", "/organisation-chart-view?group=vestis-aramark"
+                    )
+                remaining = main.load_strategic_contacts()
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(remaining, [])
+
+    def test_make_inactive_keeps_strategic_contact_when_filemaker_fails(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "id": "inactive-contact",
+                "organization": "Vestis Corporate",
+                "name": "Taylor Smith",
+                "position": "Director",
+                "email": "taylor@example.com",
+                "active": True,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contacts_path = Path(temp_dir) / "strategic_contacts.json"
+            with patch.dict(os.environ, {"STRATEGIC_CONTACTS_PATH": str(contacts_path)}):
+                main.save_strategic_contacts([contact])
+                with patch.object(main, "can_manage_strategic_contacts", return_value=True), patch.object(
+                    main,
+                    "sync_strategic_contact_to_filemaker",
+                    return_value={"ok": False, "error": "FileMaker unavailable."},
+                ), patch.object(main, "record_audit_event"):
+                    response = main.post_strategic_contact_make_inactive(
+                        "inactive-contact", "/organisation-chart-view?group=vestis-aramark"
+                    )
+                restored = main.load_strategic_contacts()[0]
+
+        self.assertEqual(response.status_code, 303)
+        self.assertTrue(restored["active"])
+
     def test_hierarchy_renders_business_sections_and_parent_drop_zones(self):
         manager = main.normalize_strategic_contact_record(
             {
@@ -44,11 +318,11 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
         self.assertIn("Canada Operations", html)
         self.assertIn("repeat(4, minmax(300px, 1fr))", html)
         self.assertIn('data-tier="section-lead"', html)
-        self.assertIn("Regional managers report to the division lead", html)
+        self.assertIn("report to the division lead", html)
         self.assertIn('data-parent-id="regional-1"', html)
         self.assertIn('<details class="hierarchy-branch-area drop-zone"', html)
         self.assertIn("Branch Manager", html)
-        self.assertIn("Drop a subordinate here", html)
+        self.assertIn("Drop a branch contact here", html)
         self.assertIn("card.classList.add('is-saving')", html)
         self.assertIn("const rollback = () =>", html)
         manager_card_end = html.index("</article>", html.index('data-contact-id="regional-1"'))
@@ -72,6 +346,87 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
         self.assertNotIn("Regional managers report to the division lead", html)
         self.assertNotIn("Canada Operations", html)
         self.assertIn("repeat(3, minmax(300px, 1fr))", html)
+
+    def test_structure_titles_and_added_management_layer_are_group_specific(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            structures_path = Path(temp_dir) / "org_chart_structures.json"
+            with patch.dict(os.environ, {"ORG_CHART_STRUCTURES_PATH": str(structures_path)}), patch.object(
+                main, "can_manage_strategic_contacts", return_value=True
+            ), patch.object(main, "record_audit_event"):
+                add_response = main.post_organisation_chart_structure(
+                    group="vestis-aramark", action="add-layer", label="Regional VP"
+                )
+                rename_response = main.post_organisation_chart_structure(
+                    group="vestis-aramark", action="rename-layer", key="regional", label="Group VP"
+                )
+                branch_response = main.post_organisation_chart_structure(
+                    group="vestis-aramark", action="rename-layer", key="branch", label="Location leaders"
+                )
+                structure = main.get_org_chart_structure("vestis-aramark")
+                alsco_structure = main.get_org_chart_structure("alsco")
+
+        self.assertEqual(add_response.status_code, 303)
+        self.assertEqual(rename_response.status_code, 303)
+        self.assertEqual(branch_response.status_code, 303)
+        self.assertEqual([item["label"] for item in structure["layers"]], ["Division lead", "Regional VP", "Group VP", "Location leaders"])
+        self.assertEqual([item["label"] for item in alsco_structure["layers"]], ["Regional manager", "Branch contacts"])
+
+    def test_added_layer_renders_parent_drop_zone_for_renamed_regional_layer(self):
+        contacts = [
+            main.normalize_strategic_contact_record({
+                "id": "rvp-1", "organization": "Vestis Corporate", "name": "Regional Leader",
+                "position": "Regional VP", "org_chart_tier": "regional-vp", "org_chart_section": "operations",
+            }),
+            main.normalize_strategic_contact_record({
+                "id": "gvp-1", "organization": "Vestis Corporate", "name": "Group Leader",
+                "position": "Group VP", "org_chart_tier": "regional", "org_chart_section": "operations",
+                "org_chart_parent_id": "rvp-1",
+            }),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            structures_path = Path(temp_dir) / "org_chart_structures.json"
+            structures_path.write_text('{"vestis-aramark":{"business_sections":[{"key":"operations","label":"Operations"}],"layers":[{"key":"section-lead","label":"Division lead"},{"key":"regional-vp","label":"Regional VP"},{"key":"regional","label":"Group VP"},{"key":"branch","label":"Location leaders"}]}}')
+            with patch.dict(os.environ, {"ORG_CHART_STRUCTURES_PATH": str(structures_path)}), patch.object(
+                main, "can_manage_strategic_contacts", return_value=True
+            ):
+                html = main.render_organisation_chart(contacts, "vestis-aramark")
+
+        self.assertIn("Regional VP", html)
+        self.assertIn("Group VPs reporting to Regional Leader", html)
+        self.assertIn('<details class="hierarchy-nested-management-zone drop-zone"', html)
+        self.assertIn("<small>1</small>", html)
+        self.assertIn('data-tier="regional" data-section="operations" data-parent-id="rvp-1"', html)
+        self.assertIn("Location leaders reporting to Group Leader", html)
+
+    def test_renamed_regional_contact_can_report_to_added_layer_contact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contacts_path = Path(temp_dir) / "strategic_contacts.json"
+            structures_path = Path(temp_dir) / "org_chart_structures.json"
+            structures_path.write_text('{"vestis-aramark":{"business_sections":[{"key":"operations","label":"Operations"}],"layers":[{"key":"section-lead","label":"Division lead"},{"key":"regional-vp","label":"Regional VP"},{"key":"regional","label":"Group VP"},{"key":"branch","label":"Branch contacts"}]}}')
+            contacts = [
+                main.normalize_strategic_contact_record({
+                    "id": "rvp-2", "organization": "Vestis Corporate", "name": "Regional VP",
+                    "org_chart_tier": "regional-vp", "org_chart_section": "operations",
+                }),
+                main.normalize_strategic_contact_record({
+                    "id": "gvp-2", "organization": "Vestis Corporate", "name": "Group VP",
+                    "org_chart_tier": "regional", "org_chart_section": "supply-chain",
+                }),
+            ]
+            with patch.dict(os.environ, {
+                "STRATEGIC_CONTACTS_PATH": str(contacts_path),
+                "ORG_CHART_STRUCTURES_PATH": str(structures_path),
+            }), patch.object(main, "can_manage_strategic_contacts", return_value=True), patch.object(main, "record_audit_event"):
+                main.save_strategic_contacts(contacts)
+                response = main.post_organisation_chart_move(
+                    contact_id="gvp-2", group="vestis-aramark", tier="regional",
+                    section="operations", parent_id="rvp-2",
+                )
+                saved = {item["id"]: item for item in main.load_strategic_contacts()}
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(saved["gvp-2"]["org_chart_parent_id"], "rvp-2")
+        self.assertEqual(saved["gvp-2"]["org_chart_section"], "operations")
 
     def test_chart_move_persists_branch_parent_assignment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -304,7 +659,7 @@ This older quoted message should not appear.
         presence_builder.assert_called_once()
         activity_builder.assert_called_once()
 
-    def test_non_filemaker_contact_keeps_sync_action(self):
+    def test_non_filemaker_contact_uses_edit_instead_of_sync_action(self):
         contact = main.normalize_strategic_contact_record(
             {
                 "id": "contact-2",
@@ -324,9 +679,35 @@ This older quoted message should not appear.
             )
 
         self.assertIn('action="/strategic-contacts/enrich"', html)
-        self.assertIn('action="/strategic-contacts/sync-filemaker"', html)
+        self.assertIn('class="button secondary small-button hierarchy-edit-contact"', html)
+        self.assertNotIn('action="/strategic-contacts/sync-filemaker"', html)
         self.assertNotIn("org-chart-contact-card contact-recent", html)
         self.assertNotIn("org-chart-contact-card contact-older", html)
+
+    def test_filemaker_presence_uses_linked_id_before_location_filter(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "id": "aaron",
+                "organization": "Vestis Sacramento",
+                "name": "Aaron Spehling",
+                "email": "aaron.spehling@vestis.com",
+                "region": "ON",
+                "filemaker_contact_record_id": "5929",
+            }
+        )
+        result = main.build_strategic_contact_filemaker_presence_map(
+            [contact],
+            master_data_result={
+                "status": "ok",
+                "all_contacts": [
+                    {"filemaker_record_id": "5929", "email": "aaron.spehling@vestis.com", "customer_ref": "london"}
+                ],
+                "companies": [],
+            },
+        )
+
+        self.assertTrue(result["aaron"]["exists"])
+        self.assertEqual(result["aaron"]["kind"], "linked_record_id")
 
     def test_contact_recency_colours_use_sixty_day_threshold(self):
         today = datetime(2026, 10, 2, 12, 0, 0)
