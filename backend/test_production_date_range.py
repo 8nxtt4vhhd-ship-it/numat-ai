@@ -112,6 +112,31 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertNotIn("Amy Smith", html)
         self.assertNotIn(">Lois<", html)
 
+    def test_operator_detail_summarizes_booked_time_by_department(self):
+        detail = {
+            "status": "ok",
+            "time_bookings": [
+                {"record_id": "1", "operator": "Zach Holmes", "operator_key": "zachholmes", "date": "2026-10-05", "department": "Press", "hours": 3.0},
+                {"record_id": "2", "operator": "Zach Holmes", "operator_key": "zachholmes", "date": "2026-10-05", "department": "Press", "hours": 2.0},
+                {"record_id": "3", "operator": "Zach Holmes", "operator_key": "zachholmes", "date": "2026-10-05", "department": "Engineering", "hours": 5.0},
+            ],
+            "clockings": [],
+            "operator_rows": [{"name": "Zach Holmes", "booked_hours": 10.0, "clocked_hours": 8.0, "productivity": 125.0}],
+        }
+        with (
+            patch.object(main, "fetch_productivity_detail", return_value=detail),
+            patch.object(main, "get_current_session_user", return_value={"role": "user"}),
+        ):
+            response = main.production_operator_detail_view("Zach Holmes", "10/05/2026", "10/05/2026")
+
+        html = response.body.decode() if hasattr(response, "body") else str(response)
+        self.assertIn("Time by department", html)
+        self.assertIn("Engineering", html)
+        self.assertIn("Press", html)
+        self.assertIn("5.00 hrs", html)
+        self.assertIn("50.0%", html)
+        self.assertIn("10.00 hrs", html)
+
     def test_time_booking_update_writes_verified_record_and_clears_cache(self):
         detail = {
             "time_bookings": [

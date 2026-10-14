@@ -7778,6 +7778,20 @@ def production_operator_detail_view(operator: str = "", start: str = "", end: st
         for day, values in sorted(days.items())
     ) or '<tr><td colspan="5">No records found for this operator and period.</td></tr>'
 
+    department_totals = defaultdict(lambda: {"hours": 0.0, "bookings": 0})
+    for item in bookings:
+        department = str(item.get("department") or "Unassigned").strip() or "Unassigned"
+        department_totals[department]["hours"] += item.get("hours") or 0
+        department_totals[department]["bookings"] += 1
+    total_department_hours = sum(item["hours"] for item in department_totals.values())
+    department_rows = "".join(
+        f'''<tr><td><strong>{escape(department)}</strong></td><td>{values['hours']:,.2f} hrs</td><td>{(values['hours'] / total_department_hours * 100):,.1f}%</td><td>{values['bookings']:,}</td></tr>'''
+        for department, values in sorted(
+            department_totals.items(),
+            key=lambda item: (-item[1]["hours"], item[0].casefold()),
+        )
+    ) or '<tr><td colspan="4">No booked department time found.</td></tr>'
+
     clocking_rows = "".join(
         f'''<tr><td>{escape(production_timestamp_label(item.get('clock_in')))}</td><td>{escape(production_timestamp_label(item.get('clock_out')))}</td><td>{format_production_number(item.get('clocked_hours'), ' hrs', decimals=2)}</td><td>{escape(item.get('notes') or '')}</td></tr>'''
         for item in sorted(clockings, key=lambda row: (row.get("date") or "", row.get("clock_in") or ""))
@@ -7823,7 +7837,7 @@ def production_operator_detail_view(operator: str = "", start: str = "", end: st
         </div>
         <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Daily reconciliation</span><h2>Clocked versus booked</h2></div></div><div class="table-wrap"><table class="production-department-table"><thead><tr><th>Date</th><th>Clocked</th><th>Booked</th><th>Difference</th><th>Productivity</th></tr></thead><tbody>{daily_rows}</tbody></table></div></section>
         <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Read only</span><h2>Clockings</h2></div></div><div class="table-wrap"><table class="production-department-table"><thead><tr><th>Clock in</th><th>Clock out</th><th>Paid time</th><th>Notes</th></tr></thead><tbody>{clocking_rows}</tbody></table></div></section>
-        <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Time Booking records</span><h2>Bookings</h2></div><span class="small muted">{'Changes save directly to FileMaker and are audited.' if can_edit else 'Administrator permission is required to edit.'}</span></div><div class="production-booking-list">{''.join(booking_cards) or '<p class="empty-action">No time bookings found.</p>'}</div></section>
+        <section class="panel"><div class="panel-head"><div><span class="home-focus-inline-kicker">Time Booking records</span><h2>Bookings</h2></div><span class="small muted">{'Changes save directly to FileMaker and are audited.' if can_edit else 'Administrator permission is required to edit.'}</span></div><div class="production-booking-department-summary"><h3>Time by department</h3><div class="table-wrap"><table class="production-department-table"><thead><tr><th>Department</th><th>Booked time</th><th>Share</th><th>Bookings</th></tr></thead><tbody>{department_rows}</tbody><tfoot><tr><td><strong>Total</strong></td><td><strong>{total_department_hours:,.2f} hrs</strong></td><td><strong>{'100.0%' if total_department_hours else '—'}</strong></td><td><strong>{len(bookings):,}</strong></td></tr></tfoot></table></div></div><div class="production-booking-list">{''.join(booking_cards) or '<p class="empty-action">No time bookings found.</p>'}</div></section>
     '''
     return render_page(title=f"{operator or 'Operator'} Production Detail", body=body, main_class="production-analysis-main")
 
@@ -27670,6 +27684,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .production-time-warning {{ color: #b33a3a; font-weight: 800; background: #fff0f0; }}
 
                     .production-booking-list {{ display: grid; gap: 12px; }}
+                    .production-booking-department-summary {{ margin-bottom: 18px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: #f7fbfe; }}
+                    .production-booking-department-summary h3 {{ margin: 0 0 10px; }}
+                    .production-booking-department-summary tfoot td {{ border-top: 2px solid var(--border); border-bottom: 0; background: #ffffff; }}
                     .production-booking-card {{ padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: #fbfdff; }}
                     .production-booking-card header {{ display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; }}
                     .production-booking-card header span {{ display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }}
