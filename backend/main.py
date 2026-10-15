@@ -2801,6 +2801,7 @@ def render_hierarchy_contact_card(
                     <button class="button secondary small-button" type="submit">Enrich</button>
                 </form>
                 <button class="button secondary small-button hierarchy-edit-contact" type="button" data-contact-id="{escape(item_id)}">Edit</button>
+                <button class="button secondary small-button hierarchy-cut-contact" type="button" data-contact-id="{escape(item_id)}" data-contact-name="{escape(name)}">Cut</button>
                 <form method="post" action="/strategic-contacts/make-inactive" onsubmit="return confirm('Make this contact inactive in FileMaker and remove it from Strategic Contacts?');">
                     <input type="hidden" name="contact_id" value="{escape(item_id)}">
                     <input type="hidden" name="return_to" value="{escape(f'/organisation-chart-view?group={selected_group}')}">
@@ -3234,6 +3235,97 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
             <script>
                 (() => {{
                     let draggedId = "";
+                    let clipboardId = "";
+                    const findCard = (contactId) => Array.from(document.querySelectorAll('.hierarchy-contact-card')).find((item) => item.dataset.contactId === contactId);
+                    const insertBeforeHint = (container, node) => {{
+                        const hint = Array.from(container.children).find((child) => child.classList && child.classList.contains('hierarchy-drop-hint'));
+                        container.insertBefore(node, hint || null);
+                    }};
+                    const clearClipboard = () => {{
+                        clipboardId = "";
+                        document.querySelectorAll('.hierarchy-contact-card.is-cut').forEach((card) => card.classList.remove('is-cut'));
+                        document.querySelectorAll('.hierarchy-paste-here, .hierarchy-clipboard-bar').forEach((node) => node.remove());
+                    }};
+                    const startClipboard = (contactId, contactName) => {{
+                        clearClipboard();
+                        const card = findCard(contactId);
+                        if (!card) return;
+                        clipboardId = contactId;
+                        card.classList.add('is-cut');
+                        const bar = document.createElement('div');
+                        bar.className = 'hierarchy-clipboard-bar';
+                        bar.innerHTML = `<strong>Cut: ${{contactName || 'contact'}}</strong><span>Scroll to a destination and choose Paste here.</span><button type="button" class="button secondary small-button hierarchy-cancel-cut">Cancel</button>`;
+                        document.body.appendChild(bar);
+                        document.querySelectorAll('.drop-zone').forEach((zone) => {{
+                            if (card.contains(zone)) return;
+                            const paste = document.createElement('button');
+                            paste.type = 'button';
+                            paste.className = 'button small-button hierarchy-paste-here';
+                            paste.textContent = 'Paste here';
+                            zone.appendChild(paste);
+                        }});
+                    }};
+                    const moveContactToZone = async (contactId, zone) => {{
+                        const card = findCard(contactId);
+                        if (!card || card.classList.contains('is-saving')) return;
+                        const originalGroup = card.closest('.hierarchy-manager-group');
+                        const originalNode = originalGroup || card;
+                        const marker = document.createComment(`original-position-${{contactId}}`);
+                        originalNode.before(marker);
+                        const originalGroupDisplay = originalGroup ? originalGroup.style.display : '';
+                        let temporaryGroup = null;
+                        const tier = zone.dataset.tier || 'unassigned';
+                        if (tier === 'regional') {{
+                            if (originalGroup) {{
+                                insertBeforeHint(zone, originalGroup);
+                            }} else {{
+                                temporaryGroup = document.createElement('div');
+                                temporaryGroup.className = 'hierarchy-manager-group';
+                                temporaryGroup.appendChild(card);
+                                insertBeforeHint(zone, temporaryGroup);
+                            }}
+                        }} else if (tier === 'branch') {{
+                            if (originalGroup) originalGroup.style.display = 'none';
+                            const childStack = zone.querySelector('.hierarchy-child-stack');
+                            (childStack || zone).appendChild(card);
+                            if (zone.matches('details')) zone.open = true;
+                        }} else {{
+                            if (originalGroup) originalGroup.style.display = 'none';
+                            insertBeforeHint(zone, card);
+                        }}
+                        card.classList.remove('is-dragging', 'is-cut');
+                        card.classList.add('is-saving');
+                        card.setAttribute('aria-busy', 'true');
+                        const rollback = () => {{
+                            card.classList.remove('is-saving');
+                            card.removeAttribute('aria-busy');
+                            if (temporaryGroup) temporaryGroup.remove();
+                            if (originalGroup) {{
+                                originalGroup.style.display = originalGroupDisplay;
+                                if (!originalGroup.contains(card)) originalGroup.prepend(card);
+                                marker.replaceWith(originalGroup);
+                            }} else {{
+                                marker.replaceWith(card);
+                            }}
+                        }};
+                        const body = new URLSearchParams({{
+                            contact_id: contactId,
+                            group: '{escape(selected_group)}',
+                            tier,
+                            section: zone.dataset.section || '',
+                            parent_id: zone.dataset.parentId || ''
+                        }});
+                        try {{
+                            const response = await fetch('/organisation-chart/move', {{ method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}, body }});
+                            const result = await response.json();
+                            if (!response.ok) {{ rollback(); alert(result.error || 'Could not move that contact.'); return; }}
+                            clearClipboard();
+                            window.location.reload();
+                        }} catch (error) {{
+                            rollback();
+                            alert('Could not save that move. Please check your connection and try again.');
+                        }}
+                    }};
                     document.querySelectorAll('.hierarchy-contact-card[draggable="true"]').forEach((card) => {{
                         card.addEventListener('dragstart', (event) => {{
                             if (event.target.closest('button, a, summary')) {{ event.preventDefault(); return; }}
@@ -3259,69 +3351,28 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                             event.preventDefault(); event.stopPropagation(); zone.classList.remove('is-drag-over');
                             const contactId = event.dataTransfer.getData('text/plain') || draggedId;
                             if (!contactId) return;
-                            const card = Array.from(document.querySelectorAll('.hierarchy-contact-card')).find((item) => item.dataset.contactId === contactId);
-                            if (!card || card.classList.contains('is-saving')) return;
-                            const originalGroup = card.closest('.hierarchy-manager-group');
-                            const originalNode = originalGroup || card;
-                            const marker = document.createComment(`original-position-${{contactId}}`);
-                            originalNode.before(marker);
-                            const originalGroupDisplay = originalGroup ? originalGroup.style.display : '';
-                            let temporaryGroup = null;
-                            const tier = zone.dataset.tier || 'unassigned';
-                            const insertBeforeHint = (container, node) => {{
-                                const hint = Array.from(container.children).find((child) => child.classList && child.classList.contains('hierarchy-drop-hint'));
-                                container.insertBefore(node, hint || null);
-                            }};
-                            if (tier === 'regional') {{
-                                if (originalGroup) {{
-                                    insertBeforeHint(zone, originalGroup);
-                                }} else {{
-                                    temporaryGroup = document.createElement('div');
-                                    temporaryGroup.className = 'hierarchy-manager-group';
-                                    temporaryGroup.appendChild(card);
-                                    insertBeforeHint(zone, temporaryGroup);
-                                }}
-                            }} else if (tier === 'branch') {{
-                                if (originalGroup) originalGroup.style.display = 'none';
-                                const childStack = zone.querySelector('.hierarchy-child-stack');
-                                (childStack || zone).appendChild(card);
-                                if (zone.matches('details')) zone.open = true;
-                            }} else {{
-                                if (originalGroup) originalGroup.style.display = 'none';
-                                insertBeforeHint(zone, card);
-                            }}
-                            card.classList.remove('is-dragging');
-                            card.classList.add('is-saving');
-                            card.setAttribute('aria-busy', 'true');
-                            const rollback = () => {{
-                                card.classList.remove('is-saving');
-                                card.removeAttribute('aria-busy');
-                                if (temporaryGroup) temporaryGroup.remove();
-                                if (originalGroup) {{
-                                    originalGroup.style.display = originalGroupDisplay;
-                                    if (!originalGroup.contains(card)) originalGroup.prepend(card);
-                                    marker.replaceWith(originalGroup);
-                                }} else {{
-                                    marker.replaceWith(card);
-                                }}
-                            }};
-                            const body = new URLSearchParams({{
-                                contact_id: contactId,
-                                group: '{escape(selected_group)}',
-                                tier,
-                                section: zone.dataset.section || '',
-                                parent_id: zone.dataset.parentId || ''
-                            }});
-                            try {{
-                                const response = await fetch('/organisation-chart/move', {{ method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}, body }});
-                                const result = await response.json();
-                                if (!response.ok) {{ rollback(); alert(result.error || 'Could not move that contact.'); return; }}
-                                window.location.reload();
-                            }} catch (error) {{
-                                rollback();
-                                alert('Could not save that move. Please check your connection and try again.');
-                            }}
+                            await moveContactToZone(contactId, zone);
                         }});
+                    }});
+                    document.addEventListener('click', async (event) => {{
+                        const cut = event.target.closest('.hierarchy-cut-contact');
+                        if (cut) {{
+                            event.preventDefault();
+                            startClipboard(cut.dataset.contactId, cut.dataset.contactName);
+                            return;
+                        }}
+                        if (event.target.closest('.hierarchy-cancel-cut')) {{
+                            event.preventDefault();
+                            clearClipboard();
+                            return;
+                        }}
+                        const paste = event.target.closest('.hierarchy-paste-here');
+                        if (paste && clipboardId) {{
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const zone = paste.closest('.drop-zone');
+                            if (zone) await moveContactToZone(clipboardId, zone);
+                        }}
                     }});
                 }})();
             </script>
@@ -3334,7 +3385,7 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     <p class="org-chart-root-eyebrow">Strategic organisation structure</p>
                     <h2>{escape(root_label)}</h2>
                 </div>
-                <p class="small muted">Drag contacts between the C-suite, regional business sections, branch teams and Unassigned.</p>
+                <p class="small muted">Drag contacts, or use Cut and Paste here to move them while scrolling the chart.</p>
             </section>
             <section class="org-chart-levels">
                 <section class="hierarchy-level hierarchy-c-suite-level">
@@ -32153,6 +32204,52 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: 0 0 0 3px rgba(36, 92, 255, 0.16);
                     }}
 
+                    .hierarchy-contact-card.is-cut {{
+                        opacity: 0.62;
+                        outline: 3px solid #245cff;
+                        outline-offset: 2px;
+                    }}
+
+                    .hierarchy-paste-here {{
+                        grid-column: 1 / -1;
+                        justify-self: center;
+                        width: auto;
+                        min-width: 104px;
+                        min-height: 34px;
+                        margin: 6px;
+                        padding: 0 12px;
+                        box-shadow: 0 6px 16px rgba(36, 92, 255, 0.22);
+                    }}
+
+                    .hierarchy-clipboard-bar {{
+                        position: fixed;
+                        z-index: 900;
+                        right: 20px;
+                        bottom: 20px;
+                        left: 20px;
+                        display: flex;
+                        align-items: center;
+                        gap: 12px;
+                        width: fit-content;
+                        max-width: calc(100vw - 40px);
+                        margin: 0 auto;
+                        padding: 10px 12px;
+                        border: 1px solid #a9c3ef;
+                        border-radius: 12px;
+                        background: #ffffff;
+                        box-shadow: 0 16px 40px rgba(18, 31, 52, 0.25);
+                        color: #183b66;
+                    }}
+
+                    .hierarchy-clipboard-bar span {{
+                        color: var(--muted);
+                        font-size: 12px;
+                    }}
+
+                    .hierarchy-clipboard-bar .small-button {{
+                        min-width: 72px;
+                    }}
+
                     body.has-org-contact-modal {{
                         overflow: hidden;
                     }}
@@ -32497,6 +32594,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 720px) {{
+                        .hierarchy-clipboard-bar {{
+                            right: 10px;
+                            bottom: 10px;
+                            left: 10px;
+                            flex-wrap: wrap;
+                            max-width: calc(100vw - 20px);
+                        }}
+
                         .org-contact-modal {{
                             padding: 10px;
                         }}

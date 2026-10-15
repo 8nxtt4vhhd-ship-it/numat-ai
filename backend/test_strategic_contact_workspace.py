@@ -79,7 +79,28 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
 
         self.assertIn('class="button secondary small-button hierarchy-edit-contact"', html)
         self.assertIn('data-contact-id="contact-edit"', html)
+        self.assertIn('class="button secondary small-button hierarchy-cut-contact"', html)
+        self.assertIn('data-contact-name="Taylor Smith"', html)
         self.assertNotIn('/strategic-contacts-view?edit=', html)
+
+    def test_hierarchy_cut_and_paste_controls_share_move_endpoint(self):
+        contact = main.normalize_strategic_contact_record(
+            {
+                "id": "clipboard-contact",
+                "organization": "Vestis Corporate",
+                "name": "Clipboard Contact",
+                "position": "Director",
+                "email": "clipboard@example.com",
+            }
+        )
+        with patch.object(main, "can_manage_strategic_contacts", return_value=True):
+            html = main.render_organisation_chart([contact], "vestis-aramark")
+
+        self.assertIn("startClipboard", html)
+        self.assertIn("Paste here", html)
+        self.assertIn("moveContactToZone", html)
+        self.assertIn("fetch('/organisation-chart/move'", html)
+        self.assertIn("hierarchy-cancel-cut", html)
 
     def test_modal_contact_update_preserves_chart_position_and_syncs_filemaker(self):
         class FormRequest:
