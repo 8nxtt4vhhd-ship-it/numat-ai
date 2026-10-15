@@ -11395,6 +11395,7 @@ def get_crm_activities():
 @app.get("/crm-activities-view", response_class=HTMLResponse)
 def get_crm_activities_view(
     customer: str = "",
+    sender: str = "",
     direction: str = "",
     category: str = "",
     subject: str = "",
@@ -11418,6 +11419,7 @@ def get_crm_activities_view(
     filtered_activities = filter_crm_activities(
         result["activities"],
         customer=customer,
+        sender=sender,
         direction=direction,
         category=category,
         subject=subject,
@@ -11438,6 +11440,7 @@ def get_crm_activities_view(
     )
     has_active_filters = any([
         customer.strip(),
+        sender.strip(),
         direction.strip(),
         category.strip(),
         subject.strip(),
@@ -11462,6 +11465,7 @@ def get_crm_activities_view(
     filter_summary = render_crm_filter_summary(
         total_filtered=total_filtered,
         customer=customer,
+        sender=sender,
         direction=direction,
         category=category,
         subject=subject,
@@ -11495,7 +11499,7 @@ def get_crm_activities_view(
             </div>
         </div>
 
-        {render_crm_filter_form(customer, direction, category, subject, page_size, date_from, date_to, range_key)}
+        {render_crm_filter_form(customer, sender, direction, category, subject, page_size, date_from, date_to, range_key)}
         {filter_summary}
 
         <div class="table-wrap tall-table crm-activities-wrap">
@@ -11510,7 +11514,7 @@ def get_crm_activities_view(
         </table>
         </div>
 
-        {render_crm_pagination(customer, direction, category, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered)}
+        {render_crm_pagination(customer, sender, direction, category, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered)}
     """
 
     return render_page(title="CRM Activities", body=body)
@@ -16120,7 +16124,7 @@ def build_contact_recommendation(
     }
 
 
-def render_crm_filter_form(customer, direction, category, subject, page_size, date_from, date_to, range_key):
+def render_crm_filter_form(customer, sender, direction, category, subject, page_size, date_from, date_to, range_key):
     direction_options = {
         "": "All",
         "inbound": "Inbound",
@@ -16149,12 +16153,12 @@ def render_crm_filter_form(customer, direction, category, subject, page_size, da
         range_key,
     )
     recent_link = (
-        f'/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}'
+        f'/crm-activities-view?customer={quote(customer)}&sender={quote(sender)}&direction={quote(direction)}'
         f'&category={quote(category)}&subject={quote(subject)}'
         f'&range_key=90d&page_size={page_size}'
     )
     all_link = (
-        f'/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}'
+        f'/crm-activities-view?customer={quote(customer)}&sender={quote(sender)}&direction={quote(direction)}'
         f'&category={quote(category)}&subject={quote(subject)}'
         f'&range_key=all&page_size={page_size}'
     )
@@ -16183,6 +16187,16 @@ def render_crm_filter_form(customer, direction, category, subject, page_size, da
                     name="customer"
                     value="{escape(customer)}"
                     placeholder="Search company"
+                >
+            </label>
+
+            <label class="crm-field sender">
+                <span>Sender</span>
+                <input
+                    type="search"
+                    name="sender"
+                    value="{escape(sender)}"
+                    placeholder="Search sender"
                 >
             </label>
 
@@ -16244,7 +16258,7 @@ def render_crm_filter_form(customer, direction, category, subject, page_size, da
     """
 
 
-def render_crm_filter_summary(total_filtered, customer="", direction="", category="", subject="", date_from="", date_to="", range_key="all"):
+def render_crm_filter_summary(total_filtered, customer="", sender="", direction="", category="", subject="", date_from="", date_to="", range_key="all"):
     parts = [f"{total_filtered:,} matches"]
     effective_date_from, effective_date_to = get_crm_effective_date_range(
         date_from,
@@ -16254,6 +16268,9 @@ def render_crm_filter_summary(total_filtered, customer="", direction="", categor
 
     if customer.strip():
         parts.append(f"customer: {customer.strip()}")
+
+    if sender.strip():
+        parts.append(f"sender: {sender.strip()}")
 
     if direction.strip():
         parts.append(f"direction: {direction.strip().title()}")
@@ -16289,7 +16306,7 @@ def render_crm_filter_summary(total_filtered, customer="", direction="", categor
     )
 
 
-def render_crm_pagination(customer, direction, category, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered):
+def render_crm_pagination(customer, sender, direction, category, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered):
     if total_filtered <= page_size:
         return ""
 
@@ -16299,13 +16316,13 @@ def render_crm_pagination(customer, direction, category, subject, date_from, dat
     if page > 1:
         previous_link = (
             f'<a class="button secondary small-button pager-button" '
-            f'href="/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}&category={quote(category)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page - 1}&page_size={page_size}">Previous</a>'
+            f'href="/crm-activities-view?customer={quote(customer)}&sender={quote(sender)}&direction={quote(direction)}&category={quote(category)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page - 1}&page_size={page_size}">Previous</a>'
         )
 
     if page < total_pages:
         next_link = (
             f'<a class="button secondary small-button pager-button" '
-            f'href="/crm-activities-view?customer={quote(customer)}&direction={quote(direction)}&category={quote(category)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page + 1}&page_size={page_size}">Next</a>'
+            f'href="/crm-activities-view?customer={quote(customer)}&sender={quote(sender)}&direction={quote(direction)}&category={quote(category)}&subject={quote(subject)}&date_from={quote(date_from)}&date_to={quote(date_to)}&range_key={quote(range_key)}&page={page + 1}&page_size={page_size}">Next</a>'
         )
 
     return f"""
@@ -16346,8 +16363,9 @@ def render_crm_activity_row(activity):
     """
 
 
-def filter_crm_activities(activities, customer="", direction="", category="", subject="", date_from="", date_to="", range_key="all"):
+def filter_crm_activities(activities, customer="", sender="", direction="", category="", subject="", date_from="", date_to="", range_key="all"):
     customer_filter = customer.strip().lower()
+    sender_filter = sender.strip().lower()
     direction_filter = direction.strip().lower()
     category_filter = category.strip().lower()
     subject_filter = subject.strip().lower()
@@ -16367,10 +16385,14 @@ def filter_crm_activities(activities, customer="", direction="", category="", su
             or ""
         ).lower()
         subject_value = str(activity.get("subject") or "").lower()
+        sender_value = str(activity.get("sender_email") or "").lower()
         direction_value = str(activity.get("direction") or "").lower()
         category_value = get_activity_category(activity)
 
         if customer_filter and customer_filter not in customer_value:
+            continue
+
+        if sender_filter and sender_filter not in sender_value:
             continue
 
         if direction_filter and direction_filter != direction_value:
@@ -30923,11 +30945,12 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
 
                     .crm-filter-grid {{
-                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        grid-template-columns: repeat(6, minmax(0, 1fr));
                         grid-template-areas:
-                            "toggle toggle toggle toggle"
-                            "customer direction subject rows"
-                            "range datefrom dateto actions";
+                            "customer sender subject direction category rows"
+                            "toggle toggle range datefrom dateto actions";
+                        gap: 10px;
+                        padding: 12px;
                     }}
 
                     .crm-filter-toggle {{
@@ -30935,8 +30958,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         display: flex;
                         align-items: center;
                         justify-content: space-between;
-                        gap: 16px;
-                        padding: 2px 0 4px;
+                        gap: 10px;
+                        padding: 0;
                     }}
 
                     .toggle-label {{
@@ -30979,6 +31002,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         grid-area: direction;
                     }}
 
+                    .crm-filter-grid .crm-field.sender {{
+                        grid-area: sender;
+                    }}
+
+                    .crm-filter-grid .crm-field.category {{
+                        grid-area: category;
+                    }}
+
                     .crm-filter-grid .crm-field.subject {{
                         grid-area: subject;
                     }}
@@ -30997,6 +31028,20 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .crm-filter-grid .crm-field.date-to {{
                         grid-area: dateto;
+                    }}
+
+                    .crm-filter-grid .crm-field input,
+                    .crm-filter-grid .crm-field select,
+                    .crm-filter-grid .toggle-chip,
+                    .crm-filter-grid .crm-filter-action {{
+                        height: 40px;
+                        min-height: 40px;
+                    }}
+
+                    .crm-filter-grid .crm-field input,
+                    .crm-filter-grid .crm-field select {{
+                        padding-top: 8px;
+                        padding-bottom: 8px;
                     }}
 
                     .crm-filter-action {{
@@ -32816,6 +32861,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     @media (max-width: 1480px) {{
+                        .crm-filter-grid {{
+                            grid-template-columns: repeat(4, minmax(0, 1fr));
+                            grid-template-areas:
+                                "customer sender subject direction"
+                                "category rows range datefrom"
+                                "toggle toggle dateto actions";
+                        }}
+
                         .insights-grid {{
                             grid-template-columns: repeat(2, minmax(0, 1fr));
                         }}
@@ -33557,7 +33610,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             grid-template-areas:
                                 "toggle"
                                 "customer"
+                                "sender"
                                 "direction"
+                                "category"
                                 "subject"
                                 "rows"
                                 "range"
