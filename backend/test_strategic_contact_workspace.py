@@ -11,6 +11,16 @@ from strategic_contacts_report import _activity_contacts, _activity_text, build_
 
 
 class StrategicContactWorkspaceTests(unittest.TestCase):
+    def test_layer_colours_override_contact_recency_colours(self):
+        html = main.render_page(title="Test", body="")
+
+        self.assertIn(".hierarchy-section-lead-zone > .hierarchy-contact-card.contact-recent", html)
+        self.assertIn(".hierarchy-intermediate-group > .hierarchy-contact-card.contact-recent", html)
+        self.assertIn("background: #f1edff", html)
+        self.assertIn("background: #e8f2ff", html)
+        self.assertIn("background: #edf8f1", html)
+        self.assertIn("background: #fff9ec", html)
+
     def test_prudential_has_its_own_chart_group_and_default_structure(self):
         self.assertEqual(main.get_org_chart_group_key("Prudential Financial"), "prudential")
         self.assertIn("Prudential", main.render_org_chart_group_selector("prudential"))

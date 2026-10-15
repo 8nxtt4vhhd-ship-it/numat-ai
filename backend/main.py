@@ -32587,6 +32587,22 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         box-shadow: 0 8px 20px rgba(31, 122, 69, 0.07);
                     }}
 
+                    .hierarchy-section-lead-zone > .hierarchy-contact-card,
+                    .hierarchy-section-lead-zone > .hierarchy-contact-card.contact-recent,
+                    .hierarchy-section-lead-zone > .hierarchy-contact-card.contact-older {{
+                        border-color: #b8a8e8;
+                        background: #f1edff;
+                        box-shadow: 0 8px 20px rgba(103, 80, 164, 0.07);
+                    }}
+
+                    .hierarchy-intermediate-group > .hierarchy-contact-card,
+                    .hierarchy-intermediate-group > .hierarchy-contact-card.contact-recent,
+                    .hierarchy-intermediate-group > .hierarchy-contact-card.contact-older {{
+                        border-color: #76a4e8;
+                        background: #e8f2ff;
+                        box-shadow: 0 8px 20px rgba(50, 108, 190, 0.07);
+                    }}
+
                     .hierarchy-contact-card .hierarchy-recent-contact {{
                         border-color: #d8e4f2;
                         background: #f8fbff;
