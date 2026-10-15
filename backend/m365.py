@@ -122,7 +122,7 @@ def get_m365_reporting_access_token():
     return {"status": "ok", "access_token": access_token}
 
 
-def send_m365_reporting_mail(recipients, subject, body, attachments=None):
+def send_m365_reporting_mail(recipients, subject, body, attachments=None, body_content_type="Text"):
     recipient_addresses = []
     seen = set()
     for recipient in recipients or []:
@@ -140,7 +140,10 @@ def send_m365_reporting_mail(recipients, subject, body, attachments=None):
     payload = {
         "message": {
             "subject": str(subject or "").strip(),
-            "body": {"contentType": "Text", "content": str(body or "")},
+            "body": {
+                "contentType": "HTML" if str(body_content_type).strip().lower() == "html" else "Text",
+                "content": str(body or ""),
+            },
             "toRecipients": [
                 {"emailAddress": {"address": address}}
                 for address in recipient_addresses
@@ -439,7 +442,7 @@ def ensure_valid_access_token(username):
     }
 
 
-def send_m365_mail(access_token, recipient, subject, body, attachments=None):
+def send_m365_mail(access_token, recipient, subject, body, attachments=None, body_content_type="Text"):
     headers = {
         "Authorization": f"Bearer {str(access_token or '').strip()}",
         "Content-Type": "application/json",
@@ -449,7 +452,7 @@ def send_m365_mail(access_token, recipient, subject, body, attachments=None):
         "message": {
             "subject": str(subject or "").strip(),
             "body": {
-                "contentType": "Text",
+                "contentType": "HTML" if str(body_content_type).strip().lower() == "html" else "Text",
                 "content": str(body or ""),
             },
             "toRecipients": [

@@ -153,6 +153,27 @@ class ReportingMailTests(unittest.TestCase):
         self.assertEqual(payload["message"]["attachments"][0]["contentBytes"], "aGVsbG8=")
         self.assertEqual(payload["message"]["toRecipients"][0]["emailAddress"]["address"], "kelly@example.com")
 
+    def test_app_only_sender_can_send_html_body(self):
+        environment = {
+            "M365_REPORTING_ENABLED": "true",
+            "M365_REPORTING_TENANT_ID": "tenant-id",
+            "M365_REPORTING_CLIENT_ID": "client-id",
+            "M365_REPORTING_CLIENT_SECRET": "secret-value",
+            "M365_REPORTING_SENDER_EMAIL": "apps@numatsystems.com",
+        }
+        responses = [FakeResponse(200, {"access_token": "test-token"}), FakeResponse(202, None)]
+        with patch.dict(os.environ, environment, clear=False):
+            with patch.object(m365.requests, "post", side_effect=responses) as request:
+                result = m365.send_m365_reporting_mail(
+                    ["manager@example.com"],
+                    "Production checks",
+                    "<p>Check this</p>",
+                    body_content_type="HTML",
+                )
+        self.assertEqual(result["status"], "ok")
+        payload = request.call_args_list[1].kwargs["json"]
+        self.assertEqual(payload["message"]["body"]["contentType"], "HTML")
+
 
 if __name__ == "__main__":
     unittest.main()

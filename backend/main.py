@@ -46,7 +46,13 @@ from analysis import (
     group_by_customer,
     find_late_customers,
 )
-from app_settings import calculate_elapsed_invoice_target, get_daily_invoice_target, set_daily_invoice_target
+from app_settings import (
+    calculate_elapsed_invoice_target,
+    get_daily_invoice_target,
+    get_production_daily_issues_settings,
+    set_daily_invoice_target,
+    set_production_daily_issues_settings,
+)
 from data_sources import (
     MAX_SAMPLE_ROWS,
     clear_filemaker_orders_cache,
@@ -122,6 +128,7 @@ from m365 import (
     get_m365_config,
     get_m365_token_record,
     has_m365_config,
+    has_m365_reporting_config,
     send_m365_mail,
     send_m365_reporting_mail,
     set_m365_token_record,
@@ -144,6 +151,8 @@ from production_reports import (
     build_press_analysis_workbook,
     clean_filename,
 )
+from production_daily_issues import deliver as deliver_production_daily_issues
+from production_daily_issues import generate_report as generate_production_daily_issues_report
 from strategic_contacts_report import build_strategic_contacts_pdf
 from pdl import (
     check_pdl_connection,
@@ -6362,6 +6371,10 @@ def get_admin_settings_page(message: str = "", error: str = ""):
             body="<p class='status error'>You do not have permission to manage system settings.</p>",
         )
     daily_target = get_daily_invoice_target()
+    daily_issue_settings = get_production_daily_issues_settings()
+    daily_issue_recipients = "\n".join(daily_issue_settings["recipients"])
+    daily_issue_enabled = " checked" if daily_issue_settings["enabled"] else ""
+    daily_issue_test_date = datetime.now().strftime("%Y-%m-%d")
     through_date = (datetime.now() - timedelta(days=1)).date()
     elapsed_target = calculate_elapsed_invoice_target(through_date, daily_target)
     status_markup = f"<p class='status ok'>{escape(message)}</p>" if message else f"<p class='status error'>{escape(error)}</p>" if error else ""
@@ -6398,6 +6411,41 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                     </form>
                 </div>
             </div>
+            <div class="action-column" id="production-daily-issues" style="margin-top:18px;scroll-margin-top:18px">
+                <h3>Daily management checks email</h3>
+                <p class="subtle">Each evening, AI ranks up to two calculated management exceptions in each represented area—production, sales outreach and aged debt—then sends the plant manager an evidence-backed check list. The scheduled job uses America/Chicago plant time.</p>
+                <form method="post" action="/admin-settings/production-daily-issues" class="login-form">
+                    <label>
+                        <span class="label">Distribution list</span>
+                        <textarea name="recipients" rows="4" placeholder="manager@numatsystems.com">{escape(daily_issue_recipients)}</textarea>
+                        <span class="subtle">Enter one address per line, or separate addresses with commas.</span>
+                    </label>
+                    <label>
+                        <span class="label">Nightly send time</span>
+                        <input type="time" name="send_time" value="{escape(daily_issue_settings['send_time'])}" required />
+                    </label>
+                    <label>
+                        <span class="label">Management AI context</span>
+                        <textarea name="context" rows="12" required>{escape(daily_issue_settings['context'])}</textarea>
+                        <span class="subtle">Describe normal working practices, genuine warning signs and anything the AI must not treat as a problem. This context is included in every nightly analysis.</span>
+                    </label>
+                    <label class="checkbox-row"><input type="checkbox" name="enabled" value="1"{daily_issue_enabled}> Enable nightly management checks</label>
+                    <button class="button" type="submit">Save email settings</button>
+                </form>
+                <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
+                    <h4 style="margin:0 0 8px">Test a report date</h4>
+                    <p class="subtle">This affects only the preview or manual test email. It does not change the nightly schedule.</p>
+                    <form method="get" action="/admin-settings/production-daily-issues-preview" class="login-form">
+                        <label><span class="label">Test report date</span><input type="date" name="report_date" value="{daily_issue_test_date}" required /></label>
+                        <button class="button secondary" type="submit">Preview selected date</button>
+                    </form>
+                    <form method="post" action="/admin-settings/production-daily-issues-test" class="login-form" style="margin-top:12px">
+                        <input type="hidden" name="report_date" value="{daily_issue_test_date}" data-production-test-date-copy />
+                        <button class="button secondary" type="submit">Send selected date now</button>
+                    </form>
+                    <script>document.addEventListener('change',function(event){{if(event.target.matches('input[name="report_date"]')){{document.querySelectorAll('[data-production-test-date-copy]').forEach(function(input){{input.value=event.target.value;}});}}}});</script>
+                </div>
+            </div>
         </section>
     """
     return render_page(title="System Settings", body=body)
@@ -6420,6 +6468,120 @@ def post_admin_invoice_target(daily_invoice_target: str = Form("")):
         area="system-settings",
     )
     return RedirectResponse(url="/admin-settings?message=" + quote("Daily invoiced-sales target updated."), status_code=303)
+
+
+@app.post("/admin-settings/production-daily-issues")
+def post_admin_production_daily_issues(enabled: str = Form(""), recipients: str = Form(""), send_time: str = Form(""), context: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to change system settings."), status_code=303)
+    try:
+        settings = set_production_daily_issues_settings(
+            enabled=str(enabled or "").strip().lower() in {"1", "true", "yes", "on"},
+            recipients=recipients,
+            send_time=send_time,
+            context=context,
+        )
+    except ValueError as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)), status_code=303)
+    record_audit_event(
+        "settings-update",
+        target="Daily management checks email",
+        details=f"{'Enabled' if settings['enabled'] else 'Disabled'} at {settings['send_time']} America/Chicago for {len(settings['recipients'])} recipient(s).",
+        user=current_user,
+        area="system-settings",
+    )
+    return RedirectResponse(url="/admin-settings?message=" + quote("Daily management email settings updated."), status_code=303)
+
+
+def parse_production_daily_issue_test_date(value):
+    try:
+        return datetime.strptime(str(value or "").strip(), "%Y-%m-%d").date()
+    except ValueError as error:
+        raise ValueError("Select a valid report date.") from error
+
+
+@app.get("/admin-settings/production-daily-issues-preview", response_class=HTMLResponse)
+def get_admin_production_daily_issues_preview(report_date: str = ""):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return render_page(title="Management Email Preview", body="<p class='status error'>You do not have permission to preview this email.</p>")
+    try:
+        selected_date = parse_production_daily_issue_test_date(report_date) if report_date else datetime.now().date()
+        report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True)
+        issue_count = len(report.get("issues", []))
+        body = f"""
+            <section class="panel user-accounts-panel">
+                <div class="panel-head"><div><span class="home-focus-inline-kicker">Email preview</span><h2>{escape(report['subject'])}</h2></div><a class="button secondary small-button" href="/admin-settings#production-daily-issues">Back to settings</a></div>
+                <p class="subtle">{issue_count} check(s) selected · AI status: {escape(report.get('selection', {}).get('_analysis_status') or 'unknown')}</p>
+                <div style="margin-top:18px;padding:18px;border:1px solid var(--border);border-radius:12px;background:#fff">{report['body_html']}</div>
+            </section>
+        """
+    except Exception as error:
+        body = f"<section class='panel user-accounts-panel'><p class='status error'>{escape(str(error))}</p><a class='button secondary' href='/admin-settings#production-daily-issues'>Back to settings</a></section>"
+    return render_page(title="Management Email Preview", body=body)
+
+
+@app.post("/admin-settings/production-daily-issues-test")
+def post_admin_production_daily_issues_test(report_date: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to send this email."), status_code=303)
+    try:
+        selected_date = parse_production_daily_issue_test_date(report_date) if report_date else datetime.now().date()
+    except ValueError as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#production-daily-issues", status_code=303)
+    if has_m365_reporting_config():
+        result = deliver_production_daily_issues(requested_day=selected_date, force=True)
+    else:
+        settings = get_production_daily_issues_settings()
+        recipients = settings.get("recipients", [])
+        token_result = ensure_valid_access_token(str((current_user or {}).get("username") or ""))
+        if not recipients:
+            result = {"status": "missing_recipients", "recipients": []}
+        elif token_result.get("status") != "ok":
+            result = {
+                "status": token_result.get("status") or "m365_user_not_connected",
+                "error": "The reporting mailbox is not configured locally and the signed-in Microsoft 365 account is unavailable.",
+                "recipients": [],
+            }
+        else:
+            try:
+                report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True)
+                send_results = [
+                    send_m365_mail(
+                        token_result.get("access_token"),
+                        recipient,
+                        report["subject"],
+                        report["body_html"],
+                        body_content_type="HTML",
+                    )
+                    for recipient in recipients
+                ]
+                failed = next((item for item in send_results if item.get("status") != "ok"), None)
+                result = (
+                    {"status": "ok", "recipients": recipients}
+                    if failed is None else
+                    {
+                        "status": failed.get("status") or "send_failed",
+                        "error": failed.get("error_message") or failed.get("status") or "The email could not be sent.",
+                        "recipients": [],
+                    }
+                )
+            except Exception as error:
+                result = {"status": "generation_error", "error": str(error), "recipients": []}
+    record_audit_event(
+        "production-daily-issues-test",
+        target="Daily management checks email",
+        details=f"Manual send for {selected_date.isoformat()}: {result.get('status')}; recipients: {len(result.get('recipients', []))}.",
+        user=current_user,
+        area="system-settings",
+        status="success" if result.get("status") == "ok" else "failed",
+    )
+    if result.get("status") == "ok":
+        return RedirectResponse(url="/admin-settings?message=" + quote(f"Management checks email for {selected_date.strftime('%m/%d/%Y')} sent to {len(result.get('recipients', []))} recipient(s).") + "#production-daily-issues", status_code=303)
+    error = result.get("error") or result.get("error_message") or result.get("status") or "The email could not be sent."
+    return RedirectResponse(url="/admin-settings?error=" + quote(f"Management checks email was not sent: {error}") + "#production-daily-issues", status_code=303)
 
 
 @app.post("/admin-settings/refresh-weekly-kpi")
@@ -25107,6 +25269,7 @@ def render_global_nav(title):
                 <a href="/pdl-branch-view">PDL Enrichment Test</a>
                 <a href="/user-accounts">User Accounts</a>
                 <a href="/admin-settings">System Settings</a>
+                <a href="/admin-settings#production-daily-issues">Management Email Checks</a>
                 <a href="/admin-audit-log">Audit Log</a>
                 <a href="/dismissed-customers-view">Dismissed Customers</a>
                 <a href="/filemaker-health">FileMaker Health</a>

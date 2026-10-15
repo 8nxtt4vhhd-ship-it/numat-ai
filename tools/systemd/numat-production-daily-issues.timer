@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the configured NuMat daily production email schedule
+
+[Timer]
+OnCalendar=*-*-* *:0/15:00 America/Chicago
+Persistent=true
+Unit=numat-production-daily-issues.service
+
+[Install]
+WantedBy=timers.target

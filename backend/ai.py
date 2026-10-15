@@ -1642,3 +1642,98 @@ def generate_production_analysis_report(facts):
     except Exception as error:
         print(f"AI production analysis failed: {error}")
         return {**fallback, "_analysis_status": "error"}
+
+
+def generate_daily_production_issue_selection(facts):
+    candidates = facts.get("candidates", []) if isinstance(facts, dict) else []
+    def management_area(item):
+        category = str(item.get("category") or "").strip().lower()
+        return "sales" if category == "sales" else "finance" if category == "finance" else "production"
+
+    def select_two_per_area(items):
+        selected = []
+        counts = {"production": 0, "sales": 0, "finance": 0}
+        for item in sorted(items, key=lambda candidate: -float(candidate.get("priority") or 0)):
+            area = management_area(item)
+            if counts[area] >= 2:
+                continue
+            selected.append(item)
+            counts[area] += 1
+        return selected
+
+    fallback_issues = [
+        {"id": item.get("id"), "check": item.get("check"), "reason": item.get("why")}
+        for item in select_two_per_area(candidates)
+    ]
+    fallback = {
+        "summary": (
+            "The checks below are the most material exceptions found in the available management data."
+            if fallback_issues else
+            "No material management exceptions were identified in the available data."
+        ),
+        "issues": fallback_issues,
+    }
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or not candidates:
+        return {**fallback, "_analysis_status": "missing_api_key" if not api_key else "no_candidates"}
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful management analyst preparing a short daily email for the NuMat plant manager. "
+                        "NuMat repairs rubber-backed carpeted mats. The supplied checks may cover production, sales-related CRM outreach, or aged debt. Select up to two checks from each represented area (production, sales and finance), "
+                        "prioritising issues that need verification or action within each area. Do not omit an area merely because another area has higher-priority checks. "
+                        "Follow the supplied production_context as authoritative operating context. Do not select a candidate that the context identifies as normal. "
+                        "CRM records classified as customer service have already been excluded. Select a CRM concern only when its supplied note clearly indicates a material customer or commercial risk; routine outreach is not a concern. "
+                        "Never create a new issue, number, cause, person, target or explanation. Do not imply misconduct. "
+                        "A high or low result can be a data-entry issue, an operational exception or a valid event; say what should be checked. "
+                        "Use concise British English. Return strict JSON with summary and issues. issues must be an array with id, check and reason. "
+                        "Every id must exactly match a supplied candidate id. Keep check and reason to one sentence each. Do not use markdown."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(facts, indent=2)},
+            ],
+            max_output_tokens=900,
+        )
+        parsed = json.loads(response.output_text.strip())
+        allowed = {str(item.get("id")): item for item in candidates}
+        selected = []
+        seen = set()
+        area_counts = {"production": 0, "sales": 0, "finance": 0}
+        for item in parsed.get("issues", []) if isinstance(parsed, dict) else []:
+            item_id = str(item.get("id") or "")
+            if item_id not in allowed or item_id in seen:
+                continue
+            area = management_area(allowed[item_id])
+            if area_counts[area] >= 2:
+                continue
+            selected.append({
+                "id": item_id,
+                "check": str(item.get("check") or allowed[item_id].get("check") or "").strip(),
+                "reason": str(item.get("reason") or allowed[item_id].get("why") or "").strip(),
+            })
+            seen.add(item_id)
+            area_counts[area] += 1
+        for candidate in select_two_per_area(candidates):
+            item_id = str(candidate.get("id") or "")
+            area = management_area(candidate)
+            if item_id in seen or area_counts[area] >= 2:
+                continue
+            selected.append({"id": item_id, "check": candidate.get("check"), "reason": candidate.get("why")})
+            seen.add(item_id)
+            area_counts[area] += 1
+        if not selected:
+            return {**fallback, "_analysis_status": "invalid_response"}
+        return {
+            "summary": str(parsed.get("summary") or fallback["summary"]).strip(),
+            "issues": selected,
+            "_analysis_status": "ok",
+        }
+    except Exception as error:
+        print(f"AI daily production issue selection failed: {error}")
+        return {**fallback, "_analysis_status": "error"}
