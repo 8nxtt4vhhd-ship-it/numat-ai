@@ -200,18 +200,52 @@ def build_daily_issue_facts(production_result, productivity_detail, report_day=N
     press_change = percentage_change(current_press, baseline_press)
     if press_change is not None and len(baseline_press_values) >= 5 and abs(press_change) >= 20:
         direction = "below" if press_change < 0 else "above"
+        current_value = current.get("production_revenue_today")
+        historical_value_pairs = [
+            (float(item.get("press_throughput")), float(item.get("production_revenue_today")))
+            for item in history
+            if item.get("press_throughput") not in (None, 0) and item.get("production_revenue_today") is not None
+        ]
+        baseline_value = safe_mean([value for _, value in historical_value_pairs])
+        current_value_per_lf = (
+            float(current_value) / float(current_press)
+            if current_value is not None and current_press not in (None, 0) else None
+        )
+        baseline_value_per_lf = (
+            sum(value for _, value in historical_value_pairs) / sum(linear_feet for linear_feet, _ in historical_value_pairs)
+            if historical_value_pairs and sum(linear_feet for linear_feet, _ in historical_value_pairs) else None
+        )
+        value_change = percentage_change(current_value, baseline_value)
+        value_mix_explanation = (
+            press_change < 0
+            and value_change is not None
+            and abs(value_change) <= 20
+            and current_value_per_lf is not None
+            and baseline_value_per_lf is not None
+            and current_value_per_lf >= baseline_value_per_lf * 1.2
+        )
+        why = f"Total press output is {abs(press_change):.1f}% {direction} the recent completed-day average."
+        check = "Check that the FF1, FF2 and FF3 completed-day linear-foot totals and cycle assignments are correct."
+        evidence = [
+            f"Today: {float(current_press or 0):,.0f} LF",
+            f"Recent {len(baseline_press_values)}-day average: {baseline_press:,.0f} LF",
+            f"FF1 {float(current.get('ff1_lf') or 0):,.0f} LF; FF2 {float(current.get('ff2_lf') or 0):,.0f} LF; FF3 {float(current.get('ff3_lf') or 0):,.0f} LF",
+        ]
+        if current_value is not None and baseline_value is not None:
+            evidence.append(f"Repair value: ${float(current_value):,.0f}; recent average: ${baseline_value:,.0f}")
+        if current_value_per_lf is not None and baseline_value_per_lf is not None:
+            evidence.append(f"Value per linear foot: ${current_value_per_lf:,.2f}; recent average: ${baseline_value_per_lf:,.2f}")
+        if value_mix_explanation:
+            why += " Repair value remained close to normal because the mats processed were worth more per linear foot than the recent mix."
+            check = "Check the lower physical throughput, while noting that a higher-value mat mix kept repair value close to normal."
         add_candidate(
             candidates,
             "press-total-variance",
             60 + abs(press_change),
             f"Total press linear feet {direction} recent norm",
-            "Check that the FF1, FF2 and FF3 completed-day linear-foot totals and cycle assignments are correct.",
-            f"Total press output is {abs(press_change):.1f}% {direction} the recent completed-day average.",
-            [
-                f"Today: {float(current_press or 0):,.0f} LF",
-                f"Recent {len(baseline_press_values)}-day average: {baseline_press:,.0f} LF",
-                f"FF1 {float(current.get('ff1_lf') or 0):,.0f} LF; FF2 {float(current.get('ff2_lf') or 0):,.0f} LF; FF3 {float(current.get('ff3_lf') or 0):,.0f} LF",
-            ],
+            check,
+            why,
+            evidence,
             "Press",
         )
 

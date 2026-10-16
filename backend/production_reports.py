@@ -328,7 +328,7 @@ def build_operator_productivity_workbook(operator, period_start, period_end, boo
     return output.getvalue()
 
 
-def build_press_analysis_workbook(period_start, period_end, production_rows, cycles):
+def build_press_analysis_workbook(period_start, period_end, production_rows, cycles, mats=None):
     from openpyxl import Workbook
     from openpyxl.formatting.rule import CellIsRule
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -382,6 +382,7 @@ def build_press_analysis_workbook(period_start, period_end, production_rows, cyc
                 cell.alignment = Alignment(vertical="center")
                 cell.border = border
 
+    mats = mats or []
     period_text = f"{datetime.strptime(period_start, '%Y-%m-%d').strftime('%m/%d/%Y')} to {datetime.strptime(period_end, '%Y-%m-%d').strftime('%m/%d/%Y')}"
     workbook = Workbook()
     summary = workbook.active
@@ -409,7 +410,7 @@ def build_press_analysis_workbook(period_start, period_end, production_rows, cyc
         summary.column_dimensions[summary.cell(1, column).column_letter].width = 22
     summary["A8"] = "How to investigate a changing figure"
     summary["A8"].font = Font(name="Arial", size=11, bold=True, color=navy)
-    summary["A9"] = "Daily Press reproduces the dashboard's completed-day FF1, FF2 and FF3 totals. Cycle Detail shows the current FileMaker cycle attribution by order, operator and press. Shared Orders lists order/day combinations worked by more than one operator; this is a review list, not proof of an error."
+    summary["A9"] = "Daily Press reproduces the dashboard's completed-day FF1, FF2 and FF3 totals. Cycle Detail shows cycle attribution. Mat Analysis explains the size and value mix by operator. Shared Orders is a review list, not proof of an error."
     summary.merge_cells("A9:F9")
     summary["A9"].font = Font(name="Arial", size=10, color=muted)
     summary["A9"].alignment = Alignment(wrap_text=True, vertical="top")
@@ -471,6 +472,72 @@ def build_press_analysis_workbook(period_start, period_end, production_rows, cyc
     cycle_sheet.freeze_panes = "G6"
     for column, width in {"A": 13, "B": 22, "C": 22, "D": 18, "E": 16, "F": 10, "G": 22, "H": 22, "I": 10, "J": 10, "K": 17, "L": 15, "M": 15, "N": 15, "O": 17, "P": 15, "Q": 18, "R": 12, "S": 20}.items():
         cycle_sheet.column_dimensions[column].width = width
+
+    cycle_lookup = {
+        str(item.get("cycle_number") or "").strip(): item
+        for item in cycles if str(item.get("cycle_number") or "").strip()
+    }
+    mat_groups = defaultdict(lambda: {"mats": 0, "linear_feet": 0.0, "square_feet": 0.0, "repair_value": 0.0, "sizes": defaultdict(int)})
+    for item in mats:
+        cycle = cycle_lookup.get(str(item.get("cycle_number") or "").strip(), {})
+        operator = str(cycle.get("operator") or "Unassigned").strip() or "Unassigned"
+        group = mat_groups[operator]
+        group["mats"] += 1
+        group["linear_feet"] += float(item.get("linear_feet") or 0)
+        group["square_feet"] += float(item.get("square_feet") or 0)
+        group["repair_value"] += float(item.get("repair_value") or 0)
+        size = str(item.get("mat_size") or "Not recorded").strip() or "Not recorded"
+        group["sizes"][size] += 1
+
+    mat_sheet = workbook.create_sheet("Mat Analysis")
+    title(mat_sheet, "Mat size and value analysis", "Mat-level FileMaker records allocated to operators through their press cycle")
+    mat_sheet.append(["Operator", "Mats", "Linear feet", "Average LF per mat", "Square feet", "Average sq ft per mat", "Repair value", "Value per mat", "Value per LF", "Most common sizes"])
+    for operator, values in sorted(mat_groups.items(), key=lambda pair: (-pair[1]["repair_value"], pair[0])):
+        common_sizes = ", ".join(f"{size} ({count})" for size, count in sorted(values["sizes"].items(), key=lambda pair: (-pair[1], pair[0]))[:5])
+        mat_sheet.append([
+            operator, values["mats"], values["linear_feet"], values["linear_feet"] / values["mats"] if values["mats"] else None,
+            values["square_feet"], values["square_feet"] / values["mats"] if values["mats"] else None,
+            values["repair_value"], values["repair_value"] / values["mats"] if values["mats"] else None,
+            values["repair_value"] / values["linear_feet"] if values["linear_feet"] else None, common_sizes,
+        ])
+    headers(mat_sheet, 5, 10)
+    summary_last_row = len(mat_groups) + 5
+    body(mat_sheet, 6, summary_last_row, 10)
+    if mat_groups:
+        summary_table = Table(displayName="MatMixByOperator", ref=f"A5:J{summary_last_row}")
+        summary_table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        mat_sheet.add_table(summary_table)
+        for row in range(6, summary_last_row + 1):
+            mat_sheet.cell(row, 2).number_format = "0"
+            for column in (3, 4, 5, 6):
+                mat_sheet.cell(row, column).number_format = "#,##0.0"
+            for column in (7, 8, 9):
+                mat_sheet.cell(row, column).number_format = '"$"#,##0.00'
+
+    detail_header_row = summary_last_row + 3
+    detail_headers = ["Press date", "Order", "Cycle", "Press", "Operator", "Mat number", "Mat size", "Mat type", "Outcome", "Height", "Width", "Square feet", "Linear feet", "Repair value", "Repairs", "Re-cooks", "Record ID"]
+    for column, label in enumerate(detail_headers, start=1):
+        mat_sheet.cell(detail_header_row, column, label)
+    for row_number, item in enumerate(sorted(mats, key=lambda row: (row.get("press_date") or "", row.get("cycle_number") or "", row.get("mat_number") or "")), start=detail_header_row + 1):
+        cycle = cycle_lookup.get(str(item.get("cycle_number") or "").strip(), {})
+        values = [parse_date(item.get("press_date")), item.get("order_reference"), item.get("cycle_number"), cycle.get("machine"), cycle.get("operator"), item.get("mat_number"), item.get("mat_size"), item.get("mat_type"), item.get("mat_outcome"), item.get("height"), item.get("width"), item.get("square_feet"), item.get("linear_feet"), item.get("repair_value"), item.get("repair_count"), item.get("recook_count"), item.get("record_id")]
+        for column, value in enumerate(values, start=1):
+            mat_sheet.cell(row_number, column, value)
+    headers(mat_sheet, detail_header_row, len(detail_headers))
+    detail_last_row = detail_header_row + len(mats)
+    body(mat_sheet, detail_header_row + 1, detail_last_row, len(detail_headers))
+    if mats:
+        detail_table = Table(displayName="PressMatDetail", ref=f"A{detail_header_row}:Q{detail_last_row}")
+        detail_table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        mat_sheet.add_table(detail_table)
+        for row in range(detail_header_row + 1, detail_last_row + 1):
+            mat_sheet.cell(row, 1).number_format = "mm/dd/yyyy"
+            for column in (10, 11, 12, 13, 15, 16):
+                mat_sheet.cell(row, column).number_format = "#,##0.0"
+            mat_sheet.cell(row, 14).number_format = '"$"#,##0.00'
+    mat_sheet.freeze_panes = f"A{detail_header_row + 1}"
+    for column, width in {"A": 14, "B": 14, "C": 16, "D": 10, "E": 22, "F": 18, "G": 14, "H": 16, "I": 14, "J": 11, "K": 11, "L": 14, "M": 14, "N": 16, "O": 12, "P": 12, "Q": 14}.items():
+        mat_sheet.column_dimensions[column].width = width
 
     shared = defaultdict(lambda: {"operators": set(), "presses": set(), "cycles": 0, "linear_feet": 0.0})
     for item in cycles:

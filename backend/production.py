@@ -601,6 +601,45 @@ def normalize_production_record(record):
     return normalized
 
 
+def normalize_mat_record(record):
+    row = record.get("fieldData", {})
+    value = lambda field: get_field_value(row, field)
+    return {
+        "record_id": str(record.get("recordId") or ""),
+        "primary_key": str(value("PrimaryKey") or "").strip(),
+        "press_date": normalize_filemaker_date(value("Press_Date")),
+        "press_timestamp": str(value("Press_Date") or "").strip(),
+        "cycle_number": str(value("Press_Cycle No") or "").strip(),
+        "order_reference": str(value("Order Ref") or "").strip(),
+        "mat_number": str(value("Mat No This Order") or "").strip(),
+        "mat_size": str(value("Mat Size") or "").strip(),
+        "mat_type": str(value("Mat Type") or "").strip(),
+        "mat_outcome": str(value("Mat Outcome") or "").strip(),
+        "height": number(value("Height")),
+        "width": number(value("Width")),
+        "square_feet": number(value("Square Foot")),
+        "linear_feet": number(value("Linear Feet")),
+        "repair_value": number(value("Repair Cost")),
+        "repair_count": number(value("Rep_Total No")),
+        "repair_sides": number(value("Rep_Sides Total")),
+        "plugs": number(value("Rep_Plugs")),
+        "labels": number(value("Total Labels")),
+        "recook_count": number(value("Recook Count")),
+    }
+
+
+def fetch_press_mats(period_start, period_end):
+    """Fetch mat-level press records for an explicitly selected report period."""
+    start = datetime.strptime(str(period_start), "%Y-%m-%d")
+    end = datetime.strptime(str(period_end), "%Y-%m-%d")
+    filemaker_range = f'{start.strftime("%m/%d/%Y")}...{end.strftime("%m/%d/%Y")}'
+    result = _find_all_records(get_mats_layout(), {"Press_Date": filemaker_range})
+    return {
+        "status": result.get("status"),
+        "mats": [normalize_mat_record(item) for item in result.get("records", [])],
+    }
+
+
 def normalize_operator_record(record):
     row = record.get("fieldData", {})
     value = lambda field: get_field_value(row, field)

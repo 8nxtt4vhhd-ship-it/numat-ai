@@ -89,6 +89,16 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertNotIn("ff1-low-output", ids)
         self.assertNotIn("press-total-variance", ids)
 
+    def test_low_throughput_explains_when_high_value_mix_offsets_the_shortfall(self):
+        production_result, detail = sample_results()
+        production_result["production_rows"][-1]["production_revenue_today"] = 7000
+        facts = issues.build_daily_issue_facts(production_result, detail, report_day=issues.date(2026, 10, 15))
+        candidate = next(item for item in facts["candidates"] if item["id"] == "press-total-variance")
+
+        self.assertIn("higher-value mat mix", candidate["check"])
+        self.assertIn("worth more per linear foot", candidate["why"])
+        self.assertTrue(any("Value per linear foot" in line for line in candidate["evidence"]))
+
     def test_unbooked_time_is_only_flagged_when_daily_gap_exceeds_one_and_a_half_hours(self):
         production_result, detail = sample_results()
         james = detail["operator_rows"][1]
