@@ -8166,6 +8166,13 @@ def export_production_press_analysis(days: int = 90, start: str = "", end: str =
         period_start=period_start,
         period_end=period_end,
     )
+    if detail.get("cycle_status") != "ok" or not detail.get("cycles"):
+        detail = fetch_productivity_detail(
+            days=selected_days,
+            force_refresh=True,
+            period_start=period_start,
+            period_end=period_end,
+        )
     payload = build_production_kpi_payload(
         production_result,
         days=selected_days,

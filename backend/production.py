@@ -518,7 +518,10 @@ def fetch_productivity_detail(days=90, force_refresh=False, today=None, period_s
         "cycles": cycles,
         **productivity,
     }
-    if result.get("status") == "ok":
+    # A failed cycle pull must never replace a valid disk cache with an empty
+    # Cycle Detail result. Booking and clocking data can still be shown as
+    # partial, but this range is only persisted when all three sources succeed.
+    if result.get("status") == "ok" and result.get("cycle_status") == "ok":
         cache_seconds = get_production_cache_seconds()
         _PRODUCTIVITY_DETAIL_CACHE[cache_key] = {"expires_at": now + cache_seconds, "result": result}
         _LAST_PRODUCTIVITY_DETAIL_RANGE = cache_key
