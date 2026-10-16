@@ -138,7 +138,6 @@ from production import (
     clear_productivity_detail_cache,
     fetch_production_analysis_data,
     fetch_productivity_detail,
-    fetch_press_mats,
     get_last_productivity_detail_range,
     get_time_bookings_layout,
     operator_key,
@@ -8174,13 +8173,11 @@ def export_production_press_analysis(days: int = 90, start: str = "", end: str =
         period_end=period_end,
         cycles=detail.get("cycles", []),
     )
-    mat_result = fetch_press_mats(period_start, period_end)
     content = build_press_analysis_workbook(
         period_start,
         period_end,
         payload.get("rows", []),
         detail.get("cycles", []),
-        mat_result.get("mats", []),
     )
     filename = f"press-analysis-{period_start}-to-{period_end}.xlsx"
     return Response(

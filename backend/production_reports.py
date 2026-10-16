@@ -478,25 +478,38 @@ def build_press_analysis_workbook(period_start, period_end, production_rows, cyc
         for item in cycles if str(item.get("cycle_number") or "").strip()
     }
     mat_groups = defaultdict(lambda: {"mats": 0, "linear_feet": 0.0, "square_feet": 0.0, "repair_value": 0.0, "sizes": defaultdict(int)})
-    for item in mats:
-        cycle = cycle_lookup.get(str(item.get("cycle_number") or "").strip(), {})
-        operator = str(cycle.get("operator") or "Unassigned").strip() or "Unassigned"
-        group = mat_groups[operator]
-        group["mats"] += 1
-        group["linear_feet"] += float(item.get("linear_feet") or 0)
-        group["square_feet"] += float(item.get("square_feet") or 0)
-        group["repair_value"] += float(item.get("repair_value") or 0)
-        size = str(item.get("mat_size") or "Not recorded").strip() or "Not recorded"
-        group["sizes"][size] += 1
+    if mats:
+        for item in mats:
+            cycle = cycle_lookup.get(str(item.get("cycle_number") or "").strip(), {})
+            operator = str(cycle.get("operator") or "Unassigned").strip() or "Unassigned"
+            group = mat_groups[operator]
+            group["mats"] += 1
+            group["linear_feet"] += float(item.get("linear_feet") or 0)
+            group["square_feet"] += float(item.get("square_feet") or 0)
+            group["repair_value"] += float(item.get("repair_value") or 0)
+            size = str(item.get("mat_size") or "Not recorded").strip() or "Not recorded"
+            group["sizes"][size] += 1
+    else:
+        for cycle in cycles:
+            operator = str(cycle.get("operator") or "Unassigned").strip() or "Unassigned"
+            group = mat_groups[operator]
+            group["mats"] += int(float(cycle.get("mat_count") or 0))
+            group["linear_feet"] += float(cycle.get("linear_feet") or 0)
+            group["repair_value"] += float(cycle.get("repair_value") or 0)
 
     mat_sheet = workbook.create_sheet("Mat Analysis")
-    title(mat_sheet, "Mat size and value analysis", "Mat-level FileMaker records allocated to operators through their press cycle")
+    mat_subtitle = (
+        "Mat-level FileMaker records allocated to operators through their press cycle"
+        if mats else
+        "Cycle-derived mat summary; average LF per mat indicates relative mat size when mat-level records are unavailable"
+    )
+    title(mat_sheet, "Mat size and value analysis", mat_subtitle)
     mat_sheet.append(["Operator", "Mats", "Linear feet", "Average LF per mat", "Square feet", "Average sq ft per mat", "Repair value", "Value per mat", "Value per LF", "Most common sizes"])
     for operator, values in sorted(mat_groups.items(), key=lambda pair: (-pair[1]["repair_value"], pair[0])):
-        common_sizes = ", ".join(f"{size} ({count})" for size, count in sorted(values["sizes"].items(), key=lambda pair: (-pair[1], pair[0]))[:5])
+        common_sizes = ", ".join(f"{size} ({count})" for size, count in sorted(values["sizes"].items(), key=lambda pair: (-pair[1], pair[0]))[:5]) or "Cycle summary only"
         mat_sheet.append([
             operator, values["mats"], values["linear_feet"], values["linear_feet"] / values["mats"] if values["mats"] else None,
-            values["square_feet"], values["square_feet"] / values["mats"] if values["mats"] else None,
+            values["square_feet"] if mats else None, values["square_feet"] / values["mats"] if mats and values["mats"] else None,
             values["repair_value"], values["repair_value"] / values["mats"] if values["mats"] else None,
             values["repair_value"] / values["linear_feet"] if values["linear_feet"] else None, common_sizes,
         ])
