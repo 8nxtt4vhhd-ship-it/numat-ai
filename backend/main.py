@@ -134,6 +134,7 @@ from m365 import (
     set_m365_token_record,
 )
 from production import (
+    apply_press_value_fallback,
     build_production_kpi_payload,
     clear_productivity_detail_cache,
     fetch_production_analysis_data,
@@ -7709,6 +7710,10 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
         period_start=period_start,
         period_end=period_end,
     )
+    productivity_detail = apply_press_value_fallback(
+        productivity_detail,
+        production_result.get("production_rows", []),
+    )
     payload = build_production_kpi_payload(
         production_result,
         days=selected_days,
@@ -7786,8 +7791,10 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
 def get_production_analysis_api(days: int = 90, start: str = "", end: str = "", refresh: bool = False):
     period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
     selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
+    production_result = fetch_production_analysis_data(force_refresh=refresh)
     detail = fetch_productivity_detail(days=selected_days, force_refresh=refresh, period_start=period_start, period_end=period_end)
-    payload = build_production_kpi_payload(fetch_production_analysis_data(force_refresh=refresh), days=selected_days, period_start=period_start, period_end=period_end, cycles=detail.get("cycles", []))
+    detail = apply_press_value_fallback(detail, production_result.get("production_rows", []))
+    payload = build_production_kpi_payload(production_result, days=selected_days, period_start=period_start, period_end=period_end, cycles=detail.get("cycles", []))
     payload["productivity_detail"] = detail
     return payload
 
@@ -7802,6 +7809,10 @@ def production_productivity_detail_view(start: str = "", end: str = "", refresh:
         force_refresh=force_refresh,
         period_start=period_start,
         period_end=period_end,
+    )
+    detail = apply_press_value_fallback(
+        detail,
+        fetch_production_analysis_data().get("production_rows", []),
     )
     summary = detail.get("summary", {})
     back_href = "/production-analysis-view?" + urlencode({"start": period_start, "end": period_end})
@@ -7832,7 +7843,7 @@ def production_productivity_detail_view(start: str = "", end: str = "", refresh:
                     <b>+</b>
                     <div><span>Prorated insurance</span><strong>{format_production_number(summary.get('insurance_cost'), currency=True, decimals=0)}</strong></div>
                     <b>÷</b>
-                    <div><span>Press repair value</span><strong>{format_production_number(summary.get('press_repair_value'), currency=True, decimals=0)}</strong></div>
+                    <div><span>Press repair value</span><strong>{format_production_number(summary.get('press_repair_value'), currency=True, decimals=0)}</strong>{'<small>completed-day summary fallback</small>' if summary.get('press_repair_value_source') == 'completed_day_summary' else ''}</div>
                     <b>=</b>
                     <div class="result"><span>Labour percentage</span><strong>{format_production_number(summary.get('labour_percentage'), '%', decimals=1)}</strong></div>
                 </div>

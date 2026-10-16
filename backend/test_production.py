@@ -7,6 +7,7 @@ from unittest.mock import patch
 import production
 
 from production import (
+    apply_press_value_fallback,
     build_productivity_detail,
     build_production_kpi_payload,
     canonical_department,
@@ -16,6 +17,20 @@ from production import (
 
 
 class ProductionKpiTests(unittest.TestCase):
+    def test_labour_percentage_uses_completed_day_value_when_cycles_timeout(self):
+        detail = {
+            "period_start": "2026-10-15", "period_end": "2026-10-15",
+            "cycle_status": "timeout",
+            "summary": {"press_repair_value": 0, "total_labour_cost": 2415.423387096774, "labour_percentage": None},
+        }
+        rows = [{"date": "2026-10-15", "production_revenue_today": 8079}]
+
+        result = apply_press_value_fallback(detail, rows)
+
+        self.assertEqual(result["summary"]["press_repair_value"], 8079)
+        self.assertEqual(result["summary"]["press_repair_value_source"], "completed_day_summary")
+        self.assertAlmostEqual(result["summary"]["labour_percentage"], 29.898, places=3)
+
     def test_production_cache_survives_application_restart(self):
         previous_production = dict(production._PRODUCTION_CACHE)
         previous_details = dict(production._PRODUCTIVITY_DETAIL_CACHE)

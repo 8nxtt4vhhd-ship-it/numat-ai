@@ -821,6 +821,30 @@ def apply_cycle_press_totals(rows, cycles):
     return reconciled
 
 
+def apply_press_value_fallback(productivity_detail, production_rows):
+    """Use completed-day repair value when cycle detail is temporarily unavailable."""
+    summary = productivity_detail.get("summary", {})
+    if (summary.get("press_repair_value") or 0) > 0:
+        return productivity_detail
+    period_start = str(productivity_detail.get("period_start") or "")
+    period_end = str(productivity_detail.get("period_end") or "")
+    fallback_value = sum(
+        float(item.get("production_revenue_today") or 0)
+        for item in production_rows or []
+        if period_start <= str(item.get("date") or "") <= period_end
+    )
+    if fallback_value <= 0:
+        return productivity_detail
+    result = dict(productivity_detail)
+    result_summary = dict(summary)
+    result_summary["press_repair_value"] = fallback_value
+    result_summary["press_repair_value_source"] = "completed_day_summary"
+    total_labour_cost = float(result_summary.get("total_labour_cost") or 0)
+    result_summary["labour_percentage"] = total_labour_cost / fallback_value * 100
+    result["summary"] = result_summary
+    return result
+
+
 def build_production_kpi_payload(result=None, days=90, period_start=None, period_end=None, cycles=None):
     result = result or fetch_production_analysis_data()
     rows, operators = (
