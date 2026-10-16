@@ -231,7 +231,7 @@ class ProductionDateRangeTests(unittest.TestCase):
             response = main.export_production_press_analysis(start="10/08/2026", end="10/08/2026")
 
         workbook = load_workbook(BytesIO(response.body), data_only=False)
-        self.assertEqual(workbook.sheetnames, ["Summary", "Daily Press", "Cycle Detail", "Mat Analysis", "Shared Orders"])
+        self.assertEqual(workbook.sheetnames, ["Summary", "Daily Press", "Cycle Detail", "Shared Orders"])
         self.assertEqual(workbook["Daily Press"]["E6"].value, "=SUM(B6:D6)")
         self.assertEqual(workbook["Cycle Detail"]["D6"].value, "3736")
         self.assertEqual(workbook["Cycle Detail"]["G7"].value, "Cedrick Brown")
