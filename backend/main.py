@@ -7704,17 +7704,18 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
     period_start, period_end = cached_range or resolve_production_date_range(start, end, fallback_days=days)
     selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
     production_result = fetch_production_analysis_data(force_refresh=force_refresh)
-    payload = build_production_kpi_payload(
-        production_result,
-        days=selected_days,
-        period_start=period_start,
-        period_end=period_end,
-    )
     productivity_detail = fetch_productivity_detail(
         days=selected_days,
         force_refresh=force_refresh,
         period_start=period_start,
         period_end=period_end,
+    )
+    payload = build_production_kpi_payload(
+        production_result,
+        days=selected_days,
+        period_start=period_start,
+        period_end=period_end,
+        cycles=productivity_detail.get("cycles", []),
     )
     current_month_payload = build_current_month_production_payload(production_result=production_result)
     current_month_summary = current_month_payload.get("summary", {})
@@ -7786,8 +7787,9 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
 def get_production_analysis_api(days: int = 90, start: str = "", end: str = "", refresh: bool = False):
     period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
     selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
-    payload = build_production_kpi_payload(fetch_production_analysis_data(force_refresh=refresh), days=selected_days, period_start=period_start, period_end=period_end)
-    payload["productivity_detail"] = fetch_productivity_detail(days=selected_days, force_refresh=refresh, period_start=period_start, period_end=period_end)
+    detail = fetch_productivity_detail(days=selected_days, force_refresh=refresh, period_start=period_start, period_end=period_end)
+    payload = build_production_kpi_payload(fetch_production_analysis_data(force_refresh=refresh), days=selected_days, period_start=period_start, period_end=period_end, cycles=detail.get("cycles", []))
+    payload["productivity_detail"] = detail
     return payload
 
 
@@ -8160,16 +8162,17 @@ def export_production_press_analysis(days: int = 90, start: str = "", end: str =
     period_start, period_end = resolve_production_date_range(start, end, fallback_days=days)
     selected_days = (datetime.strptime(period_end, "%Y-%m-%d") - datetime.strptime(period_start, "%Y-%m-%d")).days + 1
     production_result = fetch_production_analysis_data()
+    detail = fetch_productivity_detail(
+        days=selected_days,
+        period_start=period_start,
+        period_end=period_end,
+    )
     payload = build_production_kpi_payload(
         production_result,
         days=selected_days,
         period_start=period_start,
         period_end=period_end,
-    )
-    detail = fetch_productivity_detail(
-        days=selected_days,
-        period_start=period_start,
-        period_end=period_end,
+        cycles=detail.get("cycles", []),
     )
     mat_result = fetch_press_mats(period_start, period_end)
     content = build_press_analysis_workbook(

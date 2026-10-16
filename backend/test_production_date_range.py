@@ -6,9 +6,33 @@ from openpyxl import load_workbook
 
 import main
 from main import render_production_date_control, resolve_production_date_range
+from production import build_production_kpi_payload
 
 
 class ProductionDateRangeTests(unittest.TestCase):
+    def test_cycle_detail_replaces_saved_daily_press_total(self):
+        result = {
+            "status": "ok",
+            "production_rows": [{
+                "date": "2026-10-15", "press_throughput": 2429,
+                "ff1_lf": 300, "ff2_lf": 1230, "ff3_lf": 899,
+            }],
+            "operator_rows": [], "plant_operator_rows": [],
+        }
+        cycles = [
+            {"date": "2026-10-15", "machine": "FF1", "linear_feet": 299, "ff1_lf": 299, "ff2_lf": None, "ff3_lf": None},
+            {"date": "2026-10-15", "machine": "FF2", "linear_feet": 1241, "ff1_lf": None, "ff2_lf": 1241, "ff3_lf": None},
+            {"date": "2026-10-15", "machine": "FF3", "linear_feet": 912, "ff1_lf": None, "ff2_lf": None, "ff3_lf": 912},
+        ]
+
+        payload = build_production_kpi_payload(result, period_start="2026-10-15", period_end="2026-10-15", cycles=cycles)
+        latest = payload["latest"]
+
+        self.assertEqual(latest["press_throughput"], 2452)
+        self.assertEqual(latest["press_throughput_daily_summary"], 2429)
+        self.assertEqual((latest["ff1_lf"], latest["ff2_lf"], latest["ff3_lf"]), (299, 1241, 912))
+        self.assertEqual(payload["summary"]["average_press_throughput"], 2452)
+
     def test_accepts_us_formatted_dates(self):
         start, end = resolve_production_date_range("10/01/2026", "10/06/2026")
 

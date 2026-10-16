@@ -771,13 +771,61 @@ def build_operator_summary(operator_rows):
     return sorted(summaries, key=lambda item: (-(item.get("productivity") or 0), item["name"]))
 
 
-def build_production_kpi_payload(result=None, days=90, period_start=None, period_end=None):
+def apply_cycle_press_totals(rows, cycles):
+    """Use cycle-detail LF as the authoritative press total without mutating the cache."""
+    cycle_days = defaultdict(lambda: {
+        "press_throughput": 0.0,
+        "cycle_count": 0,
+        "press_counts": defaultdict(int),
+        "press_lf": defaultdict(float),
+    })
+    for cycle in cycles or []:
+        date_key = str(cycle.get("date") or "").strip()
+        if not date_key:
+            continue
+        linear_feet = float(cycle.get("linear_feet") or 0)
+        values = cycle_days[date_key]
+        values["press_throughput"] += linear_feet
+        values["cycle_count"] += 1
+        allocated = False
+        for press in (1, 2, 3):
+            press_value = cycle.get(f"ff{press}_lf")
+            if press_value is None:
+                continue
+            values["press_lf"][press] += float(press_value or 0)
+            values["press_counts"][press] += 1
+            allocated = True
+        if not allocated:
+            machine = str(cycle.get("machine") or "").strip().upper()
+            if machine in {"FF1", "FF2", "FF3"}:
+                press = int(machine[-1])
+                values["press_lf"][press] += linear_feet
+                values["press_counts"][press] += 1
+
+    reconciled = []
+    for original in rows:
+        item = dict(original)
+        cycle_day = cycle_days.get(str(item.get("date") or ""))
+        if cycle_day and cycle_day["cycle_count"]:
+            item["press_throughput_daily_summary"] = item.get("press_throughput")
+            item["press_throughput"] = cycle_day["press_throughput"]
+            item["press_total_source"] = "cycles"
+            for press in (1, 2, 3):
+                if cycle_day["press_counts"].get(press):
+                    item[f"ff{press}_lf_daily_summary"] = item.get(f"ff{press}_lf")
+                    item[f"ff{press}_lf"] = cycle_day["press_lf"][press]
+        reconciled.append(item)
+    return reconciled
+
+
+def build_production_kpi_payload(result=None, days=90, period_start=None, period_end=None, cycles=None):
     result = result or fetch_production_analysis_data()
     rows, operators = (
         filter_production_date_range(result, period_start, period_end)
         if period_start and period_end
         else filter_production_period(result, days=days)
     )
+    rows = apply_cycle_press_totals(rows, cycles)
     plant_operators = result.get("plant_operator_rows", operators)
     if rows:
         period_start = rows[0]["date"]
