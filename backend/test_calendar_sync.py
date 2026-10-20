@@ -66,6 +66,7 @@ class CalendarSyncTests(unittest.TestCase):
             "end": {"dateTime": "2026-08-20T10:00:00", "timeZone": "GMT Standard Time"},
             "body": {"contentType": "text", "content": "Full notes"},
             "location": {"displayName": "Customer site"},
+            "categories": ["Customer Visits", "Travel"],
         }]})
         with patch.object(calendar_sync, "discover_shared_calendar", return_value={"status": "ok", "calendar_id": "calendar-id"}):
             with patch.object(calendar_sync, "reporting_token", return_value={"status": "ok", "access_token": "token"}):
@@ -78,6 +79,7 @@ class CalendarSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["events"][0]["subject"], "Planned visit")
         self.assertEqual(result["events"][0]["notes"], "Full notes")
+        self.assertEqual(result["events"][0]["categories"], ["Customer Visits", "Travel"])
 
 
 if __name__ == "__main__":

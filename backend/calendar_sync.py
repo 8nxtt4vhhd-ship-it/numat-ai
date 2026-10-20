@@ -115,6 +115,7 @@ def normalize_event(item):
     return {
         "id": str(item.get("id") or ""),
         "subject": str(item.get("subject") or "Untitled event").strip(),
+        "categories": [str(category).strip() for category in (item.get("categories") or []) if str(category).strip()],
         "start": start.isoformat() if start else "",
         "end": end.isoformat() if end else "",
         "start_date": start.strftime("%Y-%m-%d") if start else "",

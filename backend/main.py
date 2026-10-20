@@ -9264,7 +9264,10 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
         production_mtd["summary"]["labour_percentage_mtd"] = detail_summary.get("labour_percentage")
         production_mtd["summary"]["total_labour_cost"] = detail_summary.get("total_labour_cost")
         production_mtd["summary"]["labour_percentage_source"] = "clockings_insurance_and_press_value"
-    planned_visits = calendar_result.get("events", []) if calendar_result.get("status") == "ok" else []
+    planned_visits = filter_calendar_events_by_category(
+        calendar_result.get("events", []) if calendar_result.get("status") == "ok" else [],
+        "Customer Visits",
+    )
     daily_invoice_target = get_daily_invoice_target()
     elapsed_invoice_target = calculate_elapsed_invoice_target(production_mtd.get("period_end"), daily_invoice_target)
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
@@ -9361,11 +9364,21 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     return payload
 
 
+def filter_calendar_events_by_category(events, category):
+    expected = str(category or "").strip().casefold()
+    if not expected:
+        return list(events or [])
+    return [
+        event for event in (events or [])
+        if any(str(value or "").strip().casefold() == expected for value in (event.get("categories") or []))
+    ]
+
+
 def render_kpi_planned_visits(events, calendar_status="ok", calendar_error=""):
     if calendar_status != "ok":
         return f"<p class='status error'>{escape(calendar_error or 'Shared calendar is currently unavailable.')}</p>"
     if not events:
-        return "<div class='kpi-visits-empty'><strong>No planned visits</strong><span>Nothing is scheduled in the next two weeks.</span></div>"
+        return "<div class='kpi-visits-empty'><strong>No planned customer visits</strong><span>No events categorised as Customer Visits are scheduled in the next two weeks.</span></div>"
     cards = []
     for event in events[:12]:
         start = calendar_event_datetime(event, "start")

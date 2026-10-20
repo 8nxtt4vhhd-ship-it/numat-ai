@@ -79,6 +79,18 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             main.save_weekly_kpi_todos(expected)
             self.assertEqual(main.load_weekly_kpi_todos(), expected)
 
+    def test_kpi_calendar_only_includes_customer_visit_category(self):
+        events = [
+            {"id": "visit", "categories": ["Customer Visits"]},
+            {"id": "internal", "categories": ["Internal Meeting"]},
+            {"id": "uncategorised", "categories": []},
+            {"id": "case-insensitive", "categories": ["customer visits"]},
+        ]
+        self.assertEqual(
+            [item["id"] for item in main.filter_calendar_events_by_category(events, "Customer Visits")],
+            ["visit", "case-insensitive"],
+        )
+
     def test_archived_weekly_todo_is_hidden_from_live_checklist(self):
         html = main.render_weekly_kpi_todos([
             {"id": "live", "text": "Visible action", "completed_at": ""},
