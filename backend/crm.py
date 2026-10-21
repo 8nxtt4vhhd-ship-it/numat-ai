@@ -214,6 +214,10 @@ def get_filemaker_promise_status_field():
     ).strip()
 
 
+def get_filemaker_crm_body_field():
+    return os.getenv("FILEMAKER_CRM_BODY_FIELD", "body").strip()
+
+
 def get_filemaker_crm_type_field():
     return os.getenv("FILEMAKER_CRM_TYPE_FIELD", "CRM Type").strip()
 
@@ -256,10 +260,11 @@ def fetch_promise_of_order_activities(force_refresh=False):
             "activities": [],
         }
 
-    activities = [
-        normalize_crm_row(record.get("fieldData", {}), index=index)
-        for index, record in enumerate(result.get("records", []), start=1)
-    ]
+    activities = []
+    for index, record in enumerate(result.get("records", []), start=1):
+        activity = normalize_crm_row(record.get("fieldData", {}), index=index)
+        activity["filemaker_record_id"] = str(record.get("recordId") or "").strip()
+        activities.append(activity)
     payload = {
         "status": "ok",
         "source": "filemaker_promise_query",
@@ -270,6 +275,11 @@ def fetch_promise_of_order_activities(force_refresh=False):
         _PROMISE_OF_ORDER_CACHE["expires_at"] = now + cache_seconds
         _PROMISE_OF_ORDER_CACHE["result"] = payload
     return payload
+
+
+def clear_promise_of_order_cache():
+    _PROMISE_OF_ORDER_CACHE["expires_at"] = 0
+    _PROMISE_OF_ORDER_CACHE["result"] = None
 
 
 def get_row_value(row, *field_names):

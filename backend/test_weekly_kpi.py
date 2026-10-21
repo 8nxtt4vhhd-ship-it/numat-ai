@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import main
+import crm
 from crm import normalize_crm_row
 
 
@@ -220,6 +221,56 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             "Promise of Order Cancelled": "",
         }, index=1)
         self.assertFalse(activity["crm_is_complete"])
+
+    def test_promise_query_preserves_filemaker_record_id(self):
+        source = {"status": "ok", "records": [{
+            "recordId": "987",
+            "fieldData": {"CRM Type": "Promise of Order", "subject": "Ten pallets"},
+        }]}
+        with patch.object(crm, "find_layout_records", return_value=source):
+            result = crm.fetch_promise_of_order_activities(force_refresh=True)
+        self.assertEqual(result["activities"][0]["filemaker_record_id"], "987")
+
+    def test_promise_update_body_records_user_time_outcome_and_note(self):
+        body = main.build_promise_status_update_body(
+            "Original CRM body",
+            "Received",
+            "Order 12345 received today.",
+            {"display_name": "Kelly Bainbridge"},
+            updated_at=main.datetime(2026, 10, 21, 9, 30, tzinfo=main.UK_TIMEZONE),
+        )
+        self.assertIn("Original CRM body", body)
+        self.assertIn("Updated by: Kelly Bainbridge", body)
+        self.assertIn("Outcome: Received", body)
+        self.assertIn("Note: Order 12345 received today.", body)
+
+    def test_promise_update_writes_filemaker_and_clears_caches(self):
+        promise_result = {"status": "ok", "activities": [{
+            "filemaker_record_id": "987",
+            "crm_type": "Promise of Order",
+            "crm_is_complete": False,
+            "body": "Original body",
+            "customer_company": "Customer A",
+        }]}
+        with (
+            patch.object(main, "fetch_promise_of_order_activities", return_value=promise_result) as fetch,
+            patch.object(main, "update_layout_record", return_value={"status": "ok"}) as update,
+            patch.object(main, "get_current_session_user", return_value={"display_name": "Kelly"}),
+            patch.object(main, "clear_promise_of_order_cache") as clear_promise,
+            patch.object(main, "clear_crm_cache") as clear_crm,
+            patch.object(main, "clear_weekly_kpi_payload_cache") as clear_weekly,
+            patch.object(main, "record_audit_event"),
+        ):
+            response = main.post_weekly_kpi_promise_update("987", "Received", "PO received")
+
+        self.assertEqual(response.status_code, 303)
+        field_data = update.call_args.args[2]
+        self.assertEqual(field_data[main.get_filemaker_promise_status_field()], "Received")
+        self.assertIn("PO received", field_data[main.get_filemaker_crm_body_field()])
+        self.assertEqual(fetch.call_count, 2)
+        clear_promise.assert_called_once_with()
+        clear_crm.assert_called_once_with()
+        clear_weekly.assert_called_once_with()
 
     def test_open_promise_uses_contacts_current_filemaker_location(self):
         crm_result = {

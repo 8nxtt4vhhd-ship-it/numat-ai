@@ -76,13 +76,17 @@ from data_comparison import (
 )
 from crm import (
     MAX_CRM_SAMPLE_ROWS,
+    clear_crm_cache,
+    clear_promise_of_order_cache,
     extract_emails,
     fetch_crm_activities,
     fetch_promise_of_order_activities,
     get_crm_data_source,
     get_filemaker_emails_layout,
+    get_filemaker_crm_body_field,
     get_filemaker_crm_cache_path,
     get_filemaker_crm_use_sync_cache,
+    get_filemaker_promise_status_field,
     is_customer_service_activity,
     get_crm_sample_csv_path,
     get_uploaded_crm_csv_path,
@@ -9028,6 +9032,7 @@ def build_open_promises(crm_result, master_data_result=None):
             master_data_result,
         )
         promises.append({
+            "filemaker_record_id": str(activity.get("filemaker_record_id") or "").strip(),
             "customer": customer,
             "customer_primary_key": customer_primary_key,
             "promise": str(activity.get("subject") or activity.get("body") or "Promise details not recorded").strip(),
@@ -9036,6 +9041,7 @@ def build_open_promises(crm_result, master_data_result=None):
             "age_days": age_days,
             "owner": str(activity.get("sender_email") or "Owner not recorded").strip(),
             "completion": str(activity.get("crm_complete") or "").strip(),
+            "body": str(activity.get("body") or "").strip(),
         })
     promises.sort(key=lambda item: parse_crm_datetime(item.get("created_at")) or datetime.min, reverse=True)
     return promises
@@ -9180,6 +9186,10 @@ def clear_weekly_kpi_payload_cache():
             "payload": None,
             "saved_at": "",
         })
+    try:
+        get_weekly_kpi_payload_cache_path().unlink(missing_ok=True)
+    except OSError as error:
+        print(f"Weekly KPI dashboard cache removal failed: {error}")
 
 
 def get_cached_weekly_kpi_dashboard_payload(force_refresh=False):
@@ -10006,8 +10016,24 @@ def get_weekly_kpi_meeting_page(meeting_id: str):
     return render_page(title="Meeting Record", body=body)
 
 
+def build_promise_status_update_body(existing_body, status, note, user, updated_at=None):
+    timestamp = updated_at or datetime.now(UK_TIMEZONE)
+    user_label = str((user or {}).get("display_name") or (user or {}).get("username") or "Sales Focus user").strip()
+    note_text = str(note or "").strip()
+    update_lines = [
+        "--- Sales Focus promise update ---",
+        f"Updated: {timestamp.strftime('%d %b %Y %H:%M %Z')}",
+        f"Updated by: {user_label}",
+        f"Outcome: {status}",
+    ]
+    if note_text:
+        update_lines.append(f"Note: {note_text}")
+    existing_text = str(existing_body or "").rstrip()
+    return (existing_text + "\n\n" if existing_text else "") + "\n".join(update_lines)
+
+
 @app.get("/weekly-kpi-promises", response_class=HTMLResponse)
-def get_weekly_kpi_promises_page():
+def get_weekly_kpi_promises_page(message: str = "", error: str = ""):
     crm_result = fetch_promise_of_order_activities()
     if crm_result.get("status") != "ok":
         crm_result = fetch_crm_activities()
@@ -10017,6 +10043,13 @@ def get_weekly_kpi_promises_page():
     for item in promises:
         customer = str(item.get("customer") or "Customer not identified")
         customer_key = str(item.get("customer_primary_key") or "").strip()
+        record_id = str(item.get("filemaker_record_id") or "").strip()
+        update_button = (
+            f'<button class="promise-update-button" type="button" aria-label="Update promise for {escape(customer)}" '
+            f'title="Update promise" data-record-id="{escape(record_id)}" data-customer="{escape(customer)}">'
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button>'
+            if record_id else '<span class="small muted">Unavailable</span>'
+        )
         rows.append(f"""
             <tr>
                 <td data-label="Date">{escape(item.get('created_label') or 'Date unavailable')}</td>
@@ -10024,19 +10057,106 @@ def get_weekly_kpi_promises_page():
                 <td data-label="Promise">{escape(str(item.get('promise') or ''))}</td>
                 <td data-label="Age">{escape(str(item.get('age_days')) + ' days' if item.get('age_days') is not None else '—')}</td>
                 <td data-label="Owner">{escape(str(item.get('owner') or ''))}</td>
+                <td class="promise-action-cell" data-label="Action">{update_button}</td>
             </tr>
         """)
     table = (
-        f"<div class='table-wrap'><table class='contacts-table'><thead><tr><th>Date</th><th>Customer</th><th>Promise</th><th>Age</th><th>Owner</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        f"<div class='table-wrap'><table class='contacts-table promised-orders-table'><thead><tr><th>Date</th><th>Customer</th><th>Promise</th><th>Age</th><th>Owner</th><th class='promise-action-cell'>Action</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
         if rows else "<p class='empty-action'>No open promises of order were found.</p>"
     )
     body = f"""
         <section class="panel">
             <div class="kpi-production-head"><div><h2>Open Promises of Order</h2><p class="muted">Detailed list including the date each promise was created.</p></div><a class="button secondary small-button" href="/weekly-kpi-dashboard">Back to KPI dashboard</a></div>
+            {f'<p class="status success">{escape(message)}</p>' if message else ''}
+            {f'<p class="status error">{escape(error)}</p>' if error else ''}
             {table}
         </section>
+        <dialog class="promise-update-dialog" id="promise-update-dialog">
+            <form method="post" action="/weekly-kpi-promises/update">
+                <input type="hidden" name="record_id" id="promise-update-record-id">
+                <div class="promise-update-dialog-head"><div><h2>Update promised order</h2><p class="small muted" id="promise-update-customer"></p></div><button type="button" class="promise-dialog-close" aria-label="Close">×</button></div>
+                <label>Outcome<select name="status" required><option value="">Select an outcome</option><option value="Received">Received — order received</option><option value="Cancelled">Cancelled — no longer expected</option></select></label>
+                <label>Update note <span class="muted">(optional)</span><textarea name="note" maxlength="2000" rows="5" placeholder="Add any useful detail for the FileMaker CRM record…"></textarea></label>
+                <p class="small muted">Sales Focus will add your name and the update time to the existing FileMaker body.</p>
+                <div class="promise-update-actions"><button type="button" class="button secondary promise-dialog-cancel">Cancel</button><button type="submit" class="button">Save to FileMaker</button></div>
+            </form>
+        </dialog>
+        <script>
+        (() => {{
+            const dialog = document.getElementById('promise-update-dialog');
+            const recordInput = document.getElementById('promise-update-record-id');
+            const customerLabel = document.getElementById('promise-update-customer');
+            document.querySelectorAll('.promise-update-button').forEach(button => button.addEventListener('click', () => {{
+                recordInput.value = button.dataset.recordId || '';
+                customerLabel.textContent = button.dataset.customer || '';
+                dialog.querySelector('select').value = '';
+                dialog.querySelector('textarea').value = '';
+                dialog.showModal();
+            }}));
+            const close = () => dialog.close();
+            dialog.querySelector('.promise-dialog-close')?.addEventListener('click', close);
+            dialog.querySelector('.promise-dialog-cancel')?.addEventListener('click', close);
+            dialog.addEventListener('click', event => {{ if (event.target === dialog) close(); }});
+        }})();
+        </script>
     """
     return render_page(title="Promised Orders", body=body)
+
+
+@app.post("/weekly-kpi-promises/update")
+def post_weekly_kpi_promise_update(record_id: str = Form(""), status: str = Form(""), note: str = Form("")):
+    normalized_record_id = str(record_id or "").strip()
+    normalized_status = str(status or "").strip().title()
+    if normalized_status not in {"Received", "Cancelled"}:
+        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("Choose Received or Cancelled."), status_code=303)
+    if not normalized_record_id:
+        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("The FileMaker record could not be identified."), status_code=303)
+
+    promise_result = fetch_promise_of_order_activities(force_refresh=True)
+    activity = next(
+        (
+            item for item in promise_result.get("activities", [])
+            if str(item.get("filemaker_record_id") or "").strip() == normalized_record_id
+            and str(item.get("crm_type") or "").strip().casefold() == "promise of order"
+            and not item.get("crm_is_complete")
+        ),
+        None,
+    )
+    if not activity:
+        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("That promise is no longer open. Refresh the list and try again."), status_code=303)
+
+    current_user = get_current_session_user() or {}
+    updated_body = build_promise_status_update_body(
+        activity.get("body"), normalized_status, str(note or "")[:2000], current_user,
+    )
+    field_data = {
+        get_filemaker_promise_status_field(): normalized_status,
+        get_filemaker_crm_body_field(): updated_body,
+    }
+    result = update_layout_record(get_filemaker_emails_layout(), normalized_record_id, field_data)
+    customer = str(activity.get("customer_company") or activity.get("customer_label") or "Promise of Order").strip()
+    record_audit_event(
+        "promise-of-order-update",
+        target=f"{customer} · FileMaker record {normalized_record_id}",
+        details=f"Marked {normalized_status}. Note: {str(note or '').strip() or 'No additional note.'}",
+        user=current_user,
+        area="weekly-kpi",
+        status="success" if result.get("status") == "ok" else "failed",
+    )
+    if result.get("status") != "ok":
+        return RedirectResponse(
+            url="/weekly-kpi-promises?error=" + quote(result.get("error_message") or "FileMaker could not update the promise."),
+            status_code=303,
+        )
+
+    clear_promise_of_order_cache()
+    clear_crm_cache()
+    clear_weekly_kpi_payload_cache()
+    fetch_promise_of_order_activities(force_refresh=True)
+    return RedirectResponse(
+        url="/weekly-kpi-promises?message=" + quote(f"Promise marked {normalized_status} and updated in FileMaker."),
+        status_code=303,
+    )
 
 
 @app.get("/priority-customers-view", response_class=HTMLResponse)
@@ -26887,6 +27007,20 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .action-history-status.archived {{ color:#315f96; background:#edf4fd; }}
                     .action-history-status.completed {{ color:#08765f; background:#e7f8f1; }}
                     .action-history-table td small {{ display:block; color:var(--muted); }}
+                    .promise-update-dialog {{ width:min(560px, calc(100vw - 32px)); padding:0; border:1px solid var(--border); border-radius:18px; color:var(--text); box-shadow:0 24px 70px rgba(34,55,82,.25); }}
+                    .promised-orders-table .promise-action-cell {{ width:58px; min-width:58px; text-align:center; }}
+                    .promise-update-button {{ display:inline-grid; place-items:center; width:32px; height:32px; padding:0; border:1px solid #bcd0f5; border-radius:9px; background:#edf4ff; color:var(--blue); cursor:pointer; }}
+                    .promise-update-button:hover {{ background:#dfeaff; border-color:#8eafea; }}
+                    .promise-update-button:focus-visible {{ outline:3px solid rgba(41,94,229,.25); outline-offset:2px; }}
+                    .promise-update-button svg {{ width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }}
+                    .promise-update-dialog::backdrop {{ background:rgba(20,35,55,.42); }}
+                    .promise-update-dialog form {{ display:grid; gap:16px; padding:22px; }}
+                    .promise-update-dialog-head {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }}
+                    .promise-update-dialog-head h2, .promise-update-dialog-head p {{ margin:0; }}
+                    .promise-update-dialog label {{ display:grid; gap:6px; font-weight:750; }}
+                    .promise-update-dialog select, .promise-update-dialog textarea {{ width:100%; box-sizing:border-box; }}
+                    .promise-dialog-close {{ width:32px; height:32px; padding:0; border:0; border-radius:9px; background:#eef3fb; color:#52667e; font-size:22px; line-height:1; }}
+                    .promise-update-actions {{ display:flex; justify-content:flex-end; gap:9px; }}
                     .meeting-history-card span, .meeting-history-card small {{ color:var(--muted); }}
                     .meeting-history-card p {{ margin:0; line-height:1.45; }}
                     .meeting-record-actions {{ display:flex; gap:8px; flex-wrap:wrap; }}
