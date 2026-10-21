@@ -6179,10 +6179,12 @@ async def app_login_auth(request: Request, call_next):
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(ask: str = "", ask_run: str = ""):
-    return render_dashboard_home(
-        ask=ask,
-        ask_run=ask_run,
-    )
+    return render_dashboard_home()
+
+
+@app.get("/ask-data-view", response_class=HTMLResponse)
+def get_ask_data_view(ask: str = "", ask_run: str = ""):
+    return render_ask_data_page(ask=ask, ask_run=ask_run)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -12381,21 +12383,16 @@ def build_customer_data_question_payload(question):
     }
 
 
-def render_dashboard_home(ask="", ask_run=""):
-    should_run = str(ask_run or "").strip().lower() in {"1", "true", "yes", "on", "run"}
-    answer_payload = None
-    answer_text = ""
-
-    if should_run and str(ask or "").strip():
-        answer_payload = build_customer_data_question_payload(ask)
-        answer_text = generate_data_question_answer(answer_payload)
-
+def render_dashboard_home():
     body = f"""
         <div class="home-dashboard-shell">
-            {render_home_dashboard_sidebar()}
             <section class="home-dashboard-workspace">
                 <div class="home-dashboard-header">
                     <div class="home-dashboard-brandline">
+                        <div>
+                            <h1>Numat Systems</h1>
+                            <p>Choose a workspace to begin.</p>
+                        </div>
                         <img class="home-dashboard-brand-logo" src="/home-logo.png" alt="NuMat logo">
                     </div>
                 </div>
@@ -12418,32 +12415,6 @@ def render_dashboard_home(ask="", ask_run=""):
                         </span>
                         <strong>Enrichment</strong>
                     </a>
-                    <section class="panel home-chat-panel">
-                        <div class="home-chat-head">
-                            <div>
-                                <h2>Ask The Data</h2>
-                                <p class="small muted">Quick road questions work best: last order date, latest CRM activity, active contacts, or a short customer summary.</p>
-                            </div>
-                        </div>
-                        <div class="home-chat-thread">
-                            {render_dashboard_answer(answer_payload, answer_text, ask)}
-                        </div>
-                        <form class="home-chat-form" method="get" action="/">
-                            <input type="hidden" name="ask_run" value="1">
-                            <label class="sr-only" for="home-chat-question">Question</label>
-                            <input
-                                id="home-chat-question"
-                                type="search"
-                                name="ask"
-                                value="{escape(ask)}"
-                                placeholder="When was the last time Cintas Gadsden AL ordered from us?"
-                            >
-                            <div class="home-chat-actions">
-                                <button type="submit">Ask</button>
-                                <a class="button secondary" href="/">Clear</a>
-                            </div>
-                        </form>
-                    </section>
                     <a class="home-launch-card" href="https://fieldloop-numat.mrcoffee.chatgpt.site" target="_blank" rel="noopener noreferrer">
                         <span class="home-launch-icon" aria-hidden="true">
                             <svg viewBox="0 0 24 24" focusable="false">
@@ -12520,9 +12491,45 @@ def render_dashboard_home(ask="", ask_run=""):
         title="Home",
         body=body,
         show_title=False,
-        show_nav=False,
+        show_nav=True,
         main_class="home-shell-main",
     )
+
+
+def render_ask_data_page(ask="", ask_run=""):
+    should_run = str(ask_run or "").strip().lower() in {"1", "true", "yes", "on", "run"}
+    answer_payload = None
+    answer_text = ""
+    if should_run and str(ask or "").strip():
+        answer_payload = build_customer_data_question_payload(ask)
+        answer_text = generate_data_question_answer(answer_payload)
+
+    body = f"""
+        <section class="panel home-chat-panel ask-data-page">
+            <div class="home-chat-head">
+                <p class="small muted">Ask about order history, CRM activity, active contacts, or a customer summary.</p>
+            </div>
+            <div class="home-chat-thread">
+                {render_dashboard_answer(answer_payload, answer_text, ask)}
+            </div>
+            <form class="home-chat-form" method="get" action="/ask-data-view">
+                <input type="hidden" name="ask_run" value="1">
+                <label class="sr-only" for="ask-data-question">Question</label>
+                <input
+                    id="ask-data-question"
+                    type="search"
+                    name="ask"
+                    value="{escape(ask)}"
+                    placeholder="When was the last time Cintas Gadsden AL ordered from us?"
+                >
+                <div class="home-chat-actions">
+                    <button type="submit">Ask</button>
+                    <a class="button secondary" href="/ask-data-view">Clear</a>
+                </div>
+            </form>
+        </section>
+    """
+    return render_page(title="Ask The Data", body=body, main_class="ask-data-main")
 
 
 def render_home_dashboard_sidebar():
@@ -25291,30 +25298,64 @@ def render_global_nav(title):
             or ""
         ).strip()
 
-    nav_items = [
-        ("Home", "/"),
-        ("Action Plan", "/action-plan-view"),
-        ("Weekly KPI Dashboard", "/weekly-kpi-dashboard"),
-        ("Calendar", "/calendar-view"),
-        ("AI Analysis", "/ai-analysis-view"),
-        ("Insights", "/insights-view"),
-        ("Customer Map", "/customer-map-view"),
-        ("Strategic Contacts", "/strategic-contacts-view"),
-        ("Orders", "/orders-view"),
-        ("Customers", "/customers-view"),
-        ("Contacts", "/contacts-view"),
+    nav_modules = [
+        ("sales", "Sales", [
+            ("Home", "/"),
+            ("Action Plan", "/action-plan-view"),
+            ("Calendar", "/calendar-view"),
+            ("CRM Activities", "/crm-activities-view"),
+        ]),
+        ("customers", "Customers", [
+            ("Customers", "/customers-view"),
+            ("Contacts", "/contacts-view"),
+            ("Customer Map", "/customer-map-view"),
+            ("Strategic Contacts", "/strategic-contacts-view"),
+            ("Organisation View", "/organisation-chart-view"),
+            ("Dismissed Customers", "/dismissed-customers-view"),
+        ]),
+        ("analysis", "Analysis", [
+            ("Insights", "/insights-view"),
+            ("Orders", "/orders-view"),
+            ("AI Analysis", "/ai-analysis-view"),
+            ("Ask The Data", "/ask-data-view"),
+        ]),
+        ("management", "Management", [
+            ("Weekly KPI Dashboard", "/weekly-kpi-dashboard"),
+            ("Production Analysis", "/production-analysis-view"),
+        ]),
     ]
-    items_html = []
 
-    for label, href in nav_items:
-        if title == label:
-            items_html.append(f"<span class=\"nav-current\">{escape(label)}</span>")
-        else:
-            items_html.append(f"<a href=\"{href}\">{escape(label)}</a>")
+    normalized_title = str(title or "").strip()
+    module_title_aliases = {
+        "sales": {"Home", "Action Plan", "Calendar", "CRM Activities", "Outreach Prep"},
+        "customers": {"Customers", "Contacts", "Customer Map", "Strategic Contacts", "Organisation View", "Dismissed Customers"},
+        "analysis": {"Insights", "Orders", "AI Analysis", "Ask The Data"},
+        "management": {"Weekly KPI Dashboard", "Production Analysis", "Plant Productivity Calculation", "Overbooked Operator Days", "Meeting History", "Meeting Record", "Action History", "Promised Orders", "Priority 1 Customers"},
+    }
+    active_module = ""
+    for module_key, aliases in module_title_aliases.items():
+        if normalized_title in aliases:
+            active_module = module_key
+            break
+    if normalized_title.startswith("Customer: "):
+        active_module = "customers"
+    elif normalized_title.startswith("Outreach Prep:"):
+        active_module = "sales"
+    elif normalized_title.endswith("Production Detail"):
+        active_module = "management"
 
-    if title.startswith("Customer: "):
-        items_html.append(
-            f"<span class=\"nav-current\">{escape(title.replace('Customer: ', '', 1))}</span>"
+    module_menus = []
+    for module_key, module_label, links in nav_modules:
+        active_class = " active" if module_key == active_module else ""
+        dropdown_links = "".join(
+            f'<a href="{href}">{escape(label)}</a>'
+            for label, href in links
+        )
+        module_menus.append(
+            f'<details class="nav-module-menu{active_class}">'
+            f'<summary>{escape(module_label)}</summary>'
+            f'<div class="nav-module-dropdown">{dropdown_links}</div>'
+            '</details>'
         )
 
     admin_menu = """
@@ -25341,14 +25382,21 @@ def render_global_nav(title):
 
     user_shell = ""
     if current_display_name:
+        role_label = "Administrator" if can_manage_user_accounts(current_user) else "User"
         user_shell = (
             "<div class=\"nav-user-shell\">"
-            f"<span class=\"nav-user-name\">{escape(current_display_name)}</span>"
+            "<details class=\"nav-user-menu\">"
+            f"<summary><span class=\"nav-user-name\">{escape(current_display_name)}</span>"
+            f"<span class=\"nav-user-role\">{escape(role_label)}</span></summary>"
+            "<div class=\"nav-user-dropdown\">"
+            "<a href=\"/user-accounts\">Account &amp; Microsoft 365</a>"
             "<a class=\"nav-logout\" href=\"/logout\">Log out</a>"
+            "</div></details>"
             "</div>"
         )
 
     return (
+        "<div class=\"app-nav\">"
         "<div class=\"nav-shell\">"
         "<a class=\"brand-logo\" href=\"/\" aria-label=\"Numat home\">"
         "<svg class=\"brand-logo-svg\" viewBox=\"0 0 300 300\" aria-hidden=\"true\" focusable=\"false\">"
@@ -25361,12 +25409,14 @@ def render_global_nav(title):
         "<polygon fill=\"#fff\" points=\"259.8 170.5 150 209.8 40.2 170.5 23.1 170.5 150 224.8 276.9 170.5 259.8 170.5\"/>"
         "<polygon fill=\"#fff\" points=\"150 191.2 65.4 168.5 48.3 168.5 150 204.1 251.7 168.5 234.6 168.5 150 191.2\"/>"
         "</svg>"
+        "<span class=\"brand-copy\"><strong>Sales Focus</strong><small>Numat workspace</small></span>"
         "</a>"
-        "<p class=\"nav\">"
-        + "<span>/</span>".join(items_html)
-        + "</p>"
+        "<nav class=\"nav nav-modules\" aria-label=\"Main navigation\">"
+        + "".join(module_menus)
+        + "</nav>"
         + admin_menu
         + user_shell
+        + "</div>"
         + "</div>"
     )
 
@@ -25382,12 +25432,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
         if show_title else ""
     )
 
-    top_row_html = (
+    app_header_html = (
         f"""
+            <header class="app-header">
+                <div class="app-header-inner">
                     <div class="top-row">
-                        {render_global_nav(title)}
-                        {top_right}
+                            {render_global_nav(title)}
+                            {top_right}
                     </div>
+                </div>
+            </header>
         """
         if show_nav
         else ""
@@ -25403,7 +25457,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                 <style>
                     :root {{
                         color-scheme: light;
-                        --bg: #fbfdff;
+                        --bg: #f4f7fb;
                         --surface: #ffffff;
                         --surface-soft: #fbfdff;
                         --surface-panel: #ffffff;
@@ -25476,7 +25530,30 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         justify-content: space-between;
                         align-items: center;
                         gap: 12px;
-                        margin: 0 0 14px;
+                        margin: 0;
+                    }}
+
+                    .app-header {{
+                        position: relative;
+                        z-index: 50;
+                        width: 100%;
+                        background: #ffffff;
+                        border-bottom: 1px solid var(--border);
+                        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.035);
+                    }}
+
+                    .app-header-inner {{
+                        box-sizing: border-box;
+                        width: 100%;
+                        max-width: 1760px;
+                        margin: 0 auto;
+                        padding: 12px 32px;
+                    }}
+
+                    .app-nav {{
+                        display: grid;
+                        width: 100%;
+                        gap: 9px;
                     }}
 
                     .nav-shell {{
@@ -25493,6 +25570,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         color: var(--blue);
                         text-decoration: none;
                         flex-shrink: 0;
+                        gap: 10px;
                     }}
 
                     .brand-logo-svg {{
@@ -25500,6 +25578,24 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         height: 42px;
                         border-radius: 8px;
                         flex-shrink: 0;
+                    }}
+
+                    .brand-copy {{
+                        display: grid;
+                        gap: 1px;
+                        min-width: 112px;
+                        color: #1f3348;
+                        line-height: 1.15;
+                    }}
+
+                    .brand-copy strong {{
+                        font-size: 14px;
+                    }}
+
+                    .brand-copy small {{
+                        color: var(--muted);
+                        font-size: 10px;
+                        font-weight: 600;
                     }}
 
                     .nav {{
@@ -25516,6 +25612,128 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .nav a {{
                         color: var(--blue);
                         text-decoration: none;
+                    }}
+
+                    .nav-modules {{
+                        flex-wrap: nowrap;
+                        gap: 4px;
+                        padding: 4px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: #f8fbff;
+                    }}
+
+                    .nav-module-menu {{
+                        position: relative;
+                        flex-shrink: 0;
+                    }}
+
+                    .nav-module-menu summary,
+                    .nav-user-menu summary {{
+                        list-style: none;
+                        cursor: pointer;
+                    }}
+
+                    .nav-module-menu summary::-webkit-details-marker,
+                    .nav-user-menu summary::-webkit-details-marker {{
+                        display: none;
+                    }}
+
+                    .nav-module-menu summary {{
+                        padding: 8px 10px;
+                        border-radius: 7px;
+                        color: #40566d;
+                        font-size: 13px;
+                        font-weight: 700;
+                    }}
+
+                    .nav-module-menu summary::after {{
+                        content: "⌄";
+                        margin-left: 6px;
+                        color: #8090a1;
+                    }}
+
+                    .nav-module-menu.active summary,
+                    .nav-module-menu summary:hover {{
+                        background: #edf4ff;
+                        color: var(--blue);
+                    }}
+
+                    .nav-module-dropdown,
+                    .nav-user-dropdown {{
+                        position: absolute;
+                        top: calc(100% + 7px);
+                        min-width: 210px;
+                        display: grid;
+                        gap: 3px;
+                        padding: 8px;
+                        border: 1px solid var(--border);
+                        border-radius: 9px;
+                        background: var(--surface);
+                        box-shadow: 0 14px 30px rgba(15, 23, 42, 0.14);
+                        z-index: 30;
+                    }}
+
+                    .nav-module-dropdown {{
+                        left: 0;
+                    }}
+
+                    .nav-module-dropdown a,
+                    .nav-user-dropdown a {{
+                        padding: 8px 9px;
+                        border-radius: 6px;
+                        color: #334e68;
+                        font-size: 12px;
+                        font-weight: 600;
+                        text-decoration: none;
+                    }}
+
+                    .nav-module-dropdown a:hover,
+                    .nav-user-dropdown a:hover {{
+                        background: #f2f7fd;
+                        color: var(--blue);
+                    }}
+
+                    .module-subnav {{
+                        display: flex;
+                        align-items: center;
+                        gap: 5px;
+                        overflow-x: auto;
+                        padding: 7px 8px;
+                        border: 1px solid var(--border);
+                        border-radius: 9px;
+                        background: #f8fbff;
+                        scrollbar-width: thin;
+                    }}
+
+                    .module-subnav-label {{
+                        padding: 5px 8px;
+                        color: #718196;
+                        font-size: 10px;
+                        font-weight: 800;
+                        letter-spacing: .08em;
+                        text-transform: uppercase;
+                    }}
+
+                    .module-subnav a,
+                    .module-subnav .active {{
+                        flex: 0 0 auto;
+                        padding: 6px 9px;
+                        border-radius: 6px;
+                        color: #52667b;
+                        font-size: 12px;
+                        font-weight: 650;
+                        text-decoration: none;
+                    }}
+
+                    .module-subnav a:hover {{
+                        background: #edf4ff;
+                        color: var(--blue);
+                    }}
+
+                    .module-subnav .active {{
+                        background: #dfeaff;
+                        color: #1746ba;
                     }}
 
                     .nav-current {{
@@ -25585,6 +25803,36 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         padding-left: 10px;
                         border-left: 1px solid var(--border);
                         flex-shrink: 0;
+                    }}
+
+                    .nav-user-menu {{
+                        position: relative;
+                    }}
+
+                    .nav-user-menu summary {{
+                        display: grid;
+                        gap: 1px;
+                        padding-right: 14px;
+                    }}
+
+                    .nav-user-menu summary::after {{
+                        content: "⌄";
+                        position: absolute;
+                        top: 5px;
+                        right: 0;
+                        color: #8090a1;
+                    }}
+
+                    .nav-user-role {{
+                        color: var(--muted);
+                        font-size: 9px;
+                        font-weight: 600;
+                        text-transform: uppercase;
+                    }}
+
+                    .nav-user-dropdown {{
+                        right: 0;
+                        min-width: 205px;
                     }}
 
                     .nav-user-name {{
@@ -28598,7 +28846,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .home-dashboard-shell {{
                         display: grid;
-                        grid-template-columns: 72px minmax(0, 1fr);
+                        grid-template-columns: minmax(0, 1fr);
                         gap: 18px;
                         align-items: start;
                     }}
@@ -28729,13 +28977,30 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .home-dashboard-header {{
-                        padding: 6px 6px 2px;
+                        padding: 18px 22px;
+                        border: 1px solid var(--border);
+                        border-top: 4px solid #003786;
+                        border-radius: 14px;
+                        background: #ffffff;
+                        box-shadow: var(--shadow-card);
                     }}
 
                     .home-dashboard-brandline {{
                         display: flex;
                         align-items: center;
-                        justify-content: flex-start;
+                        justify-content: space-between;
+                        gap: 24px;
+                    }}
+
+                    .home-dashboard-brandline h1 {{
+                        margin: 0 0 5px;
+                        font-size: 20px;
+                    }}
+
+                    .home-dashboard-brandline p {{
+                        margin: 0;
+                        color: var(--muted);
+                        font-size: 14px;
                     }}
 
                     .home-dashboard-brand-logo {{
@@ -28744,6 +29009,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         height: auto;
                         flex-shrink: 0;
                         object-fit: contain;
+                    }}
+
+                    main.ask-data-main {{
+                        max-width: 980px;
+                    }}
+
+                    .ask-data-page {{
+                        min-height: 480px;
+                        grid-row: auto;
                     }}
 
                     .home-dashboard-main {{
@@ -33193,12 +33467,17 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .home-dashboard-header {{
-                            padding: 0;
+                            padding: 14px;
                         }}
 
                         .home-dashboard-brandline {{
                             align-items: center;
-                            justify-content: flex-start;
+                            justify-content: space-between;
+                            gap: 12px;
+                        }}
+
+                        .home-dashboard-brandline h1 {{
+                            font-size: 18px;
                         }}
 
                         .home-dashboard-brand-logo {{
@@ -33323,7 +33602,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         .top-row {{
                             align-items: start;
                             gap: 8px;
-                            margin-bottom: 8px;
+                            margin-bottom: 0;
+                        }}
+
+                        .app-header-inner {{
+                            padding: 10px 12px;
                         }}
 
                         .nav {{
@@ -33336,9 +33619,37 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             gap: 8px;
                         }}
 
+                        .brand-copy {{
+                            min-width: 0;
+                        }}
+
+                        .nav-modules {{
+                            display: grid;
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            order: 3;
+                            flex: 1 1 100%;
+                            width: 100%;
+                            padding-bottom: 2px;
+                        }}
+
+                        .nav-module-menu summary {{
+                            display: flex;
+                            align-items: center;
+                            justify-content: space-between;
+                        }}
+
                         .nav-admin-menu {{
-                            margin-left: 0;
+                            margin-left: auto;
                             gap: 8px;
+                        }}
+
+                        .nav-user-shell {{
+                            margin-left: 0;
+                            padding-left: 8px;
+                        }}
+
+                        .module-subnav-label {{
+                            display: none;
                         }}
 
                         .hero {{
@@ -33704,11 +34015,41 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23064493'/%3E%3Cpath d='M14 20h36v22L32 52 14 42z' fill='none' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M17 36l15 8 15-8' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 </head>
             <body>
+                {app_header_html}
                 <main class="{main_class}">
-                    {top_row_html}
                     {page_title_html}
                     {body}
                 </main>
+                <script>
+                    (() => {{
+                        const menus = Array.from(document.querySelectorAll(
+                            ".nav-module-menu, .nav-admin-menu, .nav-user-menu"
+                        ));
+
+                        menus.forEach((menu) => {{
+                            menu.addEventListener("toggle", () => {{
+                                if (!menu.open) return;
+                                menus.forEach((otherMenu) => {{
+                                    if (otherMenu !== menu) otherMenu.open = false;
+                                }});
+                            }});
+                        }});
+
+                        document.addEventListener("click", (event) => {{
+                            menus.forEach((menu) => {{
+                                if (menu.open && !menu.contains(event.target)) {{
+                                    menu.open = false;
+                                }}
+                            }});
+                        }});
+
+                        document.addEventListener("keydown", (event) => {{
+                            if (event.key === "Escape") {{
+                                menus.forEach((menu) => {{ menu.open = false; }});
+                            }}
+                        }});
+                    }})();
+                </script>
             </body>
         </html>
     """
