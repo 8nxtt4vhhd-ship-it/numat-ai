@@ -2043,12 +2043,13 @@ def strategic_contact_seniority_rank(item):
     return ranking.get(seniority_value, 5)
 
 
-def render_org_chart_group_selector(selected_group):
+def render_org_chart_group_selector(selected_group, presentation_mode=False):
     buttons = []
     for key, config in ORG_CHART_GROUPS.items():
         class_name = "button org-chart-segment active" if key == selected_group else "button secondary org-chart-segment"
+        presentation_query = "&presentation=1" if presentation_mode else ""
         buttons.append(
-            f"<a class=\"{class_name} small-button\" href=\"/organisation-chart-view?group={quote(key)}\">{escape(config['label'])}</a>"
+            f"<a class=\"{class_name} small-button\" href=\"/organisation-chart-view?group={quote(key)}{presentation_query}\">{escape(config['label'])}</a>"
         )
     return "".join(buttons)
 
@@ -6859,7 +6860,6 @@ def get_admin_audit_log_page(area: str = "", status: str = "", user: str = "", a
         status_markup = f"<p class='status ok'>{escape(message)}</p>"
     elif error:
         status_markup = f"<p class='status error'>{escape(error)}</p>"
-
     body = f"""
         <section class="panel">
             <h2>Audit log</h2>
@@ -7207,8 +7207,9 @@ def post_strategic_contacts_search(
 
 
 @app.get("/organisation-chart-view", response_class=HTMLResponse)
-def get_organisation_chart_view(group: str = "vestis-aramark", message: str = "", error: str = ""):
+def get_organisation_chart_view(group: str = "vestis-aramark", message: str = "", error: str = "", presentation: str = ""):
     selected_group = group if group in ORG_CHART_GROUPS else "vestis-aramark"
+    presentation_mode = str(presentation or "").strip().casefold() in {"1", "true", "yes", "on"}
     items = [item for item in load_strategic_contacts() if bool(item.get("active", True))]
     master_data_result = fetch_filemaker_master_data()
     filemaker_presence_map, contact_activity_map = build_strategic_contact_workspace_maps(
@@ -7220,21 +7221,27 @@ def get_organisation_chart_view(group: str = "vestis-aramark", message: str = ""
         status_markup = f"<p class='status ok'>{escape(message)}</p>"
     elif error:
         status_markup = f"<p class='status error'>{escape(error)}</p>"
+    organisation_back_control = (
+        '<button class="button secondary small-button org-chart-back-link" type="button" '
+        'onclick="window.parent.postMessage(\'close-kpi-presentation-detail\', window.location.origin)">Back to KPI dashboard</button>'
+        if presentation_mode else
+        '<a class="button secondary small-button org-chart-back-link" href="/strategic-contacts-view">Back to Strategic Contacts</a>'
+    )
 
     body = f"""
         <section class="panel strategic-pdl-discovery org-chart-toolbar-panel">
             {status_markup}
             <div class="org-chart-toolbar-row">
                 <div class="org-chart-segmented-control">
-                    {render_org_chart_group_selector(selected_group)}
+                    {render_org_chart_group_selector(selected_group, presentation_mode=presentation_mode)}
                 </div>
                 <div class="org-chart-report-actions">
-                    {('<button class="button small-button" type="button" data-add-contact>Add contact</button>' if can_manage_strategic_contacts(get_current_session_user()) else '')}
-                    <form method="post" action="/organisation-chart/report/send">
+                    {('<button class="button small-button" type="button" data-add-contact>Add contact</button>' if can_manage_strategic_contacts(get_current_session_user()) and not presentation_mode else '')}
+                    {'''<form method="post" action="/organisation-chart/report/send">
                         <input type="hidden" name="group" value="{escape(selected_group)}">
                         <button class="button small-button" type="submit">Send report</button>
-                    </form>
-                    <a class="button secondary small-button org-chart-back-link" href="/strategic-contacts-view">Back to Strategic Contacts</a>
+                    </form>''' if not presentation_mode else ''}
+                    {organisation_back_control}
                 </div>
             </div>
         </section>
@@ -7244,14 +7251,20 @@ def get_organisation_chart_view(group: str = "vestis-aramark", message: str = ""
             filemaker_presence_map=filemaker_presence_map,
             contact_activity_map=contact_activity_map,
         )}
-        {render_org_chart_structure_editor(selected_group) if can_manage_strategic_contacts(get_current_session_user()) else ''}
+        {render_org_chart_structure_editor(selected_group) if can_manage_strategic_contacts(get_current_session_user()) and not presentation_mode else ''}
         {render_organisation_contact_editor(
             items,
             selected_group=selected_group,
             filemaker_companies=master_data_result.get('companies') or [],
-        ) if can_manage_strategic_contacts(get_current_session_user()) else ''}
+        ) if can_manage_strategic_contacts(get_current_session_user()) and not presentation_mode else ''}
     """
-    return render_page(title="Organisation View", body=body, main_class="organisation-chart-main")
+    return render_page(
+        title="Organisation View",
+        body=body,
+        main_class="organisation-chart-main presentation-detail-main" if presentation_mode else "organisation-chart-main",
+        show_nav=not presentation_mode,
+        show_title=not presentation_mode,
+    )
 
 
 @app.post("/organisation-chart/structure", response_class=HTMLResponse)
@@ -9657,8 +9670,9 @@ def get_weekly_kpis():
 
 
 @app.get("/weekly-kpi-dashboard", response_class=HTMLResponse)
-def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
+def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation: str = ""):
     current_user = get_current_session_user()
+    presentation_mode = str(presentation or "").strip().casefold() in {"1", "true", "yes", "on"}
     refresh_requested = str(refresh or "").strip().casefold() in {"1", "true", "yes", "on"}
     force_refresh = bool(refresh_requested and can_manage_user_accounts(current_user))
     payload = get_cached_weekly_kpi_dashboard_payload(force_refresh=force_refresh)
@@ -9707,7 +9721,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
         <div class="kpi-page-toolbar">
             <span class="small muted">Cached dashboard updated {escape(refresh_label)} · refreshed nightly</span>
             {refresh_button}
-            <button class="button secondary small-button" type="button" onclick="document.documentElement.classList.add('kpi-presentation-mode'); document.documentElement.onfullscreenchange=()=>document.fullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); document.documentElement.onwebkitfullscreenchange=()=>document.webkitFullscreenElement||document.documentElement.classList.remove('kpi-presentation-mode'); (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement)">Presentation mode</button>
+            <button class="button secondary small-button" id="kpi-presentation-button" type="button" data-presentation-active="{'1' if presentation_mode else '0'}">Presentation mode</button>
         </div>
         <div class="kpi-dashboard-grid">
             <section class="panel kpi-promises-panel">
@@ -9723,7 +9737,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                     {render_simple_summary_item("Added in last 7 days", str(summary.get("new_last_7_days", 0)))}
                     {render_simple_summary_item("Oldest open promise", oldest_label)}
                 </div>
-                <a class="button kpi-detail-button" href="/weekly-kpi-promises" target="_blank" rel="noopener">View promised orders</a>
+                <button class="button kpi-detail-button" type="button" data-kpi-detail-url="/weekly-kpi-promises?presentation=1" data-presentation-title="Open Promises of Order" onclick="window.openKpiDashboardDetail(this)">View promised orders</button>
             </section>
 
             <div class="kpi-sales-stack">
@@ -9736,7 +9750,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                         <div><strong>{int(strategic_summary.get('added_last_7_days') or 0)}</strong><span>new this week</span></div>
                         <div><strong>{int(strategic_summary.get('reached_last_7_days') or 0)}</strong><span>reached this week</span></div>
                     </div>
-                    <a class="button secondary small-button" href="/organisation-chart-view" target="_blank" rel="noopener">Open organisation view</a>
+                    <button class="button secondary small-button" type="button" data-kpi-detail-url="/organisation-chart-view?presentation=1" data-presentation-title="Organisation view" onclick="window.openKpiDashboardDetail(this)">Open organisation view</button>
                 </section>
                 <section class="panel kpi-priority-panel">
                     <div class="kpi-promises-head">
@@ -9831,10 +9845,71 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = ""):
                 {f'<p class="status warning">{escape(str(accounts.get("warning") or "Aged debt data is currently unavailable."))}</p>' if accounts.get('status') != 'ok' else ''}
             </section>
         </div>
+        <div class="kpi-presentation-dialog" id="kpi-presentation-dialog" role="dialog" aria-modal="true" hidden>
+            <div class="kpi-presentation-dialog-head">
+                <strong id="kpi-presentation-dialog-title">Dashboard detail</strong>
+                <button type="button" id="kpi-presentation-dialog-close" aria-label="Close detail view">×</button>
+            </div>
+            <div class="kpi-presentation-dialog-loading" id="kpi-presentation-dialog-loading">Loading…</div>
+            <iframe id="kpi-presentation-dialog-frame" title="Dashboard detail"></iframe>
+        </div>
     """
     body += """
         <script>
         (() => {
+            const presentationButton = document.getElementById('kpi-presentation-button');
+            const presentationRoot = document.documentElement;
+            let presentationRequested = presentationButton?.dataset.presentationActive === '1';
+            const leavePresentation = () => {
+                if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                    presentationRoot.classList.remove('kpi-presentation-mode');
+                }
+            };
+            document.addEventListener('fullscreenchange', leavePresentation);
+            document.addEventListener('webkitfullscreenchange', leavePresentation);
+            const detailDialog = document.getElementById('kpi-presentation-dialog');
+            const detailFrame = document.getElementById('kpi-presentation-dialog-frame');
+            const detailTitle = document.getElementById('kpi-presentation-dialog-title');
+            const detailLoading = document.getElementById('kpi-presentation-dialog-loading');
+            const closeDetail = () => {
+                if (detailDialog) {
+                    detailDialog.hidden = true;
+                    detailDialog.classList.remove('is-open');
+                }
+                if (detailFrame) detailFrame.src = 'about:blank';
+            };
+            document.getElementById('kpi-presentation-dialog-close')?.addEventListener('click', closeDetail);
+            detailFrame?.addEventListener('load', () => {
+                if (detailLoading && detailFrame.src !== 'about:blank') detailLoading.hidden = true;
+            });
+            window.openKpiDashboardDetail = button => {
+                if (!detailDialog || !detailFrame) return;
+                const url = new URL(button.dataset.kpiDetailUrl, window.location.origin);
+                if (detailTitle) detailTitle.textContent = button.dataset.presentationTitle || 'Dashboard detail';
+                if (detailLoading) detailLoading.hidden = false;
+                detailFrame.src = url.toString();
+                detailDialog.hidden = false;
+                detailDialog.classList.add('is-open');
+            };
+            if (presentationRequested) {
+                presentationRoot.classList.add('kpi-presentation-mode');
+            }
+            window.addEventListener('message', event => {
+                if (event.origin === window.location.origin && event.data === 'close-kpi-presentation-detail') closeDetail();
+            });
+            presentationButton?.addEventListener('click', () => {
+                presentationRequested = true;
+                presentationButton.dataset.presentationActive = '1';
+                const root = presentationRoot;
+                root.classList.add('kpi-presentation-mode');
+                const requestFullscreen = root.requestFullscreen || root.webkitRequestFullscreen;
+                if (requestFullscreen) {
+                    const request = requestFullscreen.call(root);
+                    if (request && typeof request.catch === 'function') {
+                        request.catch(() => root.classList.remove('kpi-presentation-mode'));
+                    }
+                }
+            });
             const start = document.getElementById('meeting-record-start');
             const stop = document.getElementById('meeting-record-stop');
             const status = document.getElementById('meeting-record-status');
@@ -10033,12 +10108,22 @@ def build_promise_status_update_body(existing_body, status, note, user, updated_
 
 
 @app.get("/weekly-kpi-promises", response_class=HTMLResponse)
-def get_weekly_kpi_promises_page(message: str = "", error: str = ""):
-    crm_result = fetch_promise_of_order_activities()
-    if crm_result.get("status") != "ok":
-        crm_result = fetch_crm_activities()
-    master_data_result = fetch_filemaker_master_data()
-    promises = build_open_promises(crm_result, master_data_result)
+def get_weekly_kpi_promises_page(message: str = "", error: str = "", presentation: str = ""):
+    presentation_mode = str(presentation or "").strip().casefold() in {"1", "true", "yes", "on"}
+    promises_back_control = (
+        '<button class="button secondary small-button" type="button" '
+        'onclick="window.parent.postMessage(\'close-kpi-presentation-detail\', window.location.origin)">Back to KPI dashboard</button>'
+        if presentation_mode else
+        '<a class="button secondary small-button" href="/weekly-kpi-dashboard">Back to KPI dashboard</a>'
+    )
+    dashboard_payload = get_cached_weekly_kpi_dashboard_payload()
+    promises = dashboard_payload.get("open_promises")
+    if promises is None:
+        crm_result = fetch_promise_of_order_activities()
+        if crm_result.get("status") != "ok":
+            crm_result = fetch_crm_activities()
+        master_data_result = fetch_filemaker_master_data()
+        promises = build_open_promises(crm_result, master_data_result)
     rows = []
     for item in promises:
         customer = str(item.get("customer") or "Customer not identified")
@@ -10066,7 +10151,7 @@ def get_weekly_kpi_promises_page(message: str = "", error: str = ""):
     )
     body = f"""
         <section class="panel">
-            <div class="kpi-production-head"><div><h2>Open Promises of Order</h2><p class="muted">Detailed list including the date each promise was created.</p></div><a class="button secondary small-button" href="/weekly-kpi-dashboard">Back to KPI dashboard</a></div>
+            <div class="kpi-production-head"><div><h2>Open Promises of Order</h2><p class="muted">Detailed list including the date each promise was created.</p></div>{promises_back_control}</div>
             {f'<p class="status success">{escape(message)}</p>' if message else ''}
             {f'<p class="status error">{escape(error)}</p>' if error else ''}
             {table}
@@ -10074,6 +10159,7 @@ def get_weekly_kpi_promises_page(message: str = "", error: str = ""):
         <dialog class="promise-update-dialog" id="promise-update-dialog">
             <form method="post" action="/weekly-kpi-promises/update">
                 <input type="hidden" name="record_id" id="promise-update-record-id">
+                <input type="hidden" name="presentation" value="{'1' if presentation_mode else ''}">
                 <div class="promise-update-dialog-head"><div><h2>Update promised order</h2><p class="small muted" id="promise-update-customer"></p></div><button type="button" class="promise-dialog-close" aria-label="Close">×</button></div>
                 <label>Outcome<select name="status" required><option value="">Select an outcome</option><option value="Received">Received — order received</option><option value="Cancelled">Cancelled — no longer expected</option></select></label>
                 <label>Update note <span class="muted">(optional)</span><textarea name="note" maxlength="2000" rows="5" placeholder="Add any useful detail for the FileMaker CRM record…"></textarea></label>
@@ -10100,17 +10186,24 @@ def get_weekly_kpi_promises_page(message: str = "", error: str = ""):
         }})();
         </script>
     """
-    return render_page(title="Promised Orders", body=body)
+    return render_page(
+        title="Promised Orders",
+        body=body,
+        main_class="presentation-detail-main" if presentation_mode else "",
+        show_nav=not presentation_mode,
+        show_title=not presentation_mode,
+    )
 
 
 @app.post("/weekly-kpi-promises/update")
-def post_weekly_kpi_promise_update(record_id: str = Form(""), status: str = Form(""), note: str = Form("")):
+def post_weekly_kpi_promise_update(record_id: str = Form(""), status: str = Form(""), note: str = Form(""), presentation: str = Form("")):
     normalized_record_id = str(record_id or "").strip()
     normalized_status = str(status or "").strip().title()
+    presentation_query = "&presentation=1" if str(presentation or "").strip().casefold() in {"1", "true", "yes", "on"} else ""
     if normalized_status not in {"Received", "Cancelled"}:
-        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("Choose Received or Cancelled."), status_code=303)
+        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("Choose Received or Cancelled.") + presentation_query, status_code=303)
     if not normalized_record_id:
-        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("The FileMaker record could not be identified."), status_code=303)
+        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("The FileMaker record could not be identified.") + presentation_query, status_code=303)
 
     promise_result = fetch_promise_of_order_activities(force_refresh=True)
     activity = next(
@@ -10123,7 +10216,7 @@ def post_weekly_kpi_promise_update(record_id: str = Form(""), status: str = Form
         None,
     )
     if not activity:
-        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("That promise is no longer open. Refresh the list and try again."), status_code=303)
+        return RedirectResponse(url="/weekly-kpi-promises?error=" + quote("That promise is no longer open. Refresh the list and try again.") + presentation_query, status_code=303)
 
     current_user = get_current_session_user() or {}
     updated_body = build_promise_status_update_body(
@@ -10145,7 +10238,7 @@ def post_weekly_kpi_promise_update(record_id: str = Form(""), status: str = Form
     )
     if result.get("status") != "ok":
         return RedirectResponse(
-            url="/weekly-kpi-promises?error=" + quote(result.get("error_message") or "FileMaker could not update the promise."),
+            url="/weekly-kpi-promises?error=" + quote(result.get("error_message") or "FileMaker could not update the promise.") + presentation_query,
             status_code=303,
         )
 
@@ -10154,7 +10247,7 @@ def post_weekly_kpi_promise_update(record_id: str = Form(""), status: str = Form
     clear_weekly_kpi_payload_cache()
     fetch_promise_of_order_activities(force_refresh=True)
     return RedirectResponse(
-        url="/weekly-kpi-promises?message=" + quote(f"Promise marked {normalized_status} and updated in FileMaker."),
+        url="/weekly-kpi-promises?message=" + quote(f"Promise marked {normalized_status} and updated in FileMaker.") + presentation_query,
         status_code=303,
     )
 
@@ -25624,6 +25717,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         padding: 20px 24px 40px;
                     }}
 
+                    main.presentation-detail-main {{
+                        box-sizing: border-box;
+                        width: 100%;
+                        max-width: none;
+                        padding: 14px 18px 28px;
+                    }}
+
                     h1 {{
                         margin: 0 0 18px;
                         font-size: var(--type-page-title);
@@ -27020,6 +27120,32 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .promise-update-dialog label {{ display:grid; gap:6px; font-weight:750; }}
                     .promise-update-dialog select, .promise-update-dialog textarea {{ width:100%; box-sizing:border-box; }}
                     .promise-dialog-close {{ width:32px; height:32px; padding:0; border:0; border-radius:9px; background:#eef3fb; color:#52667e; font-size:22px; line-height:1; }}
+                    .kpi-presentation-dialog {{
+                        position:fixed;
+                        z-index:10000;
+                        inset:12px;
+                        box-sizing:border-box;
+                        width:auto;
+                        max-width:none;
+                        height:auto;
+                        max-height:none;
+                        margin:0;
+                        padding:0;
+                        overflow:hidden;
+                        border:1px solid var(--border-strong);
+                        border-radius:16px;
+                        background:var(--bg);
+                        color:var(--text);
+                        box-shadow:0 24px 80px rgba(20,35,55,.3);
+                    }}
+                    .kpi-presentation-dialog[hidden] {{ display:none; }}
+                    .kpi-presentation-dialog.is-open {{ display:grid; grid-template-rows:auto minmax(0, 1fr); }}
+                    .kpi-presentation-dialog-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:42px; padding:7px 10px 7px 16px; background:#fff; border-bottom:1px solid var(--border); }}
+                    .kpi-presentation-dialog-head strong {{ color:var(--blue); font-size:16px; }}
+                    .kpi-presentation-dialog-head button {{ width:34px; height:34px; padding:0; border:0; border-radius:9px; background:#eef3fb; color:#52667e; font-size:24px; line-height:1; cursor:pointer; }}
+                    .kpi-presentation-dialog iframe {{ width:100%; height:100%; border:0; background:var(--bg); }}
+                    .kpi-presentation-dialog-loading {{ position:absolute; inset:50% auto auto 50%; transform:translate(-50%, -50%); padding:10px 16px; border-radius:10px; background:#fff; box-shadow:var(--shadow-card); color:var(--muted); font-weight:700; }}
+                    .kpi-presentation-dialog-loading[hidden] {{ display:none; }}
                     .promise-update-actions {{ display:flex; justify-content:flex-end; gap:9px; }}
                     .meeting-history-card span, .meeting-history-card small {{ color:var(--muted); }}
                     .meeting-history-card p {{ margin:0; line-height:1.45; }}
