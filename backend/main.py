@@ -26794,13 +26794,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .kpi-section-mark.production {{
-                        background: linear-gradient(180deg, #8b5cf6, #b69cff);
-                        box-shadow: 0 5px 14px rgba(139, 92, 246, 0.25);
+                        background: linear-gradient(180deg, #078f68, #24bd8d);
+                        box-shadow: 0 5px 14px rgba(7, 143, 104, 0.24);
                     }}
 
                     .kpi-section-mark.accounts {{
-                        background: linear-gradient(180deg, #0f7896, #55b5cc);
-                        box-shadow: 0 5px 14px rgba(15, 120, 150, 0.25);
+                        background: linear-gradient(180deg, #d99a08, #f4c64f);
+                        box-shadow: 0 5px 14px rgba(217, 154, 8, 0.24);
                     }}
 
                     .kpi-section-mark.priority {{
@@ -27162,13 +27162,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .kpi-production-panel {{
                         grid-area: production;
                         padding: 24px;
-                        border-top: 4px solid #8b5cf6;
+                        border-top: 4px solid #0aa678;
                     }}
 
                     .kpi-accounts-panel {{
                         grid-area: accounts;
                         padding: 24px;
-                        border-top: 4px solid #0f7896;
+                        border-top: 4px solid #e2a51b;
                     }}
 
                     .kpi-accounts-grid {{
@@ -28279,6 +28279,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .production-kpi-grid > :nth-child(4) {{ border-top-color: #8b5cf6; }}
                     .production-kpi-grid > :nth-child(5) {{ border-top-color: #e05757; background: linear-gradient(145deg, #fff6f6, #ffffff); }}
                     .production-kpi-grid > :nth-child(6) {{ border-top-color: #2e829f; }}
+
+                    .production-kpi-grid.kpi-production-mtd-grid > * {{
+                        border-top-color: #0aa678;
+                        background: linear-gradient(145deg, #f3fbf8, #ffffff);
+                    }}
+
+                    .production-kpi-grid.kpi-accounts-grid > * {{
+                        border-top-color: #e2a51b;
+                        background: linear-gradient(145deg, #fffaf0, #ffffff);
+                    }}
 
                     .production-kpi-card-link {{
                         display: block;
