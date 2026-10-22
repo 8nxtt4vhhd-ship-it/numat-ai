@@ -79,6 +79,50 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertIn("Difference: +1.50 hrs", report["body_text"])
         self.assertIn("prompts for verification", report["body_html"])
 
+    def test_email_footer_counts_total_and_sales_related_emails_for_peter_and_ben(self):
+        production_result, detail = sample_results()
+        activities = [
+            {
+                "date_created": "2026-10-15 09:00:00", "direction": "outbound",
+                "crm_type": "Outlook", "activity_category": "sales_outreach",
+                "sender_email": "pbinnington@numatsystems.com",
+            },
+            {
+                "date_created": "2026-10-15 10:00:00", "direction": "outbound",
+                "crm_type": "Email", "activity_category": "customer_services",
+                "sender_email": "pbinnington@numatsystems.com",
+            },
+            {
+                "date_created": "2026-10-15 11:00:00", "direction": "outbound",
+                "crm_type": "Outlook", "activity_category": "sales_outreach",
+                "sender_email": "barnold@numatsystems.com",
+            },
+            {
+                "date_created": "2026-10-15 12:00:00", "direction": "outbound",
+                "crm_type": "Meeting", "activity_category": "sales_outreach",
+                "sender_email": "barnold@numatsystems.com",
+            },
+            {
+                "date_created": "2026-10-14 15:00:00", "direction": "outbound",
+                "crm_type": "Outlook", "activity_category": "sales_outreach",
+                "sender_email": "barnold@numatsystems.com",
+            },
+        ]
+        facts = issues.build_daily_issue_facts(
+            production_result, detail, report_day=issues.date(2026, 10, 15),
+            crm_result={"activities": activities},
+        )
+        report = issues.build_email_report(facts, {"summary": "", "issues": []})
+
+        self.assertEqual(facts["sales_email_summary"], [
+            {"name": "Ben Arnold", "total": 1, "sales_related": 1},
+            {"name": "Peter Binnington", "total": 2, "sales_related": 1},
+        ])
+        self.assertIn("Ben Arnold: 1 total emails sent; 1 sales-related", report["body_text"])
+        self.assertIn("Peter Binnington: 2 total emails sent; 1 sales-related", report["body_text"])
+        self.assertIn("Emails sent today", report["body_html"])
+        self.assertIn("Sales-related", report["body_html"])
+
     def test_single_press_low_output_is_not_flagged_when_total_output_is_normal(self):
         production_result, detail = sample_results()
         current = production_result["production_rows"][-1]

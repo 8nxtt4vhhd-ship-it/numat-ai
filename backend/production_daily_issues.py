@@ -110,6 +110,26 @@ def crm_preview(item):
     return text[:320]
 
 
+def build_sales_email_summary(crm_result, report_key):
+    summary = {
+        email: {"name": name, "total": 0, "sales_related": 0}
+        for email, name in SALES_PERSON_NAMES.items()
+    }
+    for item in (crm_result or {}).get("activities", []):
+        sender = str(item.get("sender_email") or "").strip().lower()
+        if sender not in summary or crm_activity_day(item) != report_key:
+            continue
+        if str(item.get("direction") or "").strip().lower() != "outbound":
+            continue
+        activity_type = str(item.get("crm_type") or "").strip().lower()
+        if activity_type not in {"email", "outlook", "mail"}:
+            continue
+        summary[sender]["total"] += 1
+        if str(item.get("activity_category") or "").strip().lower() == "sales_outreach":
+            summary[sender]["sales_related"] += 1
+    return list(summary.values())
+
+
 def add_commercial_candidates(candidates, report_key, crm_result=None, finance_result=None):
     activities = [
         item for item in (crm_result or {}).get("activities", [])
@@ -405,6 +425,7 @@ def build_daily_issue_facts(production_result, productivity_detail, report_day=N
         "generated_at": datetime.now(PLANT_TIMEZONE).isoformat(timespec="seconds"),
         "comparison_days": len(history),
         "production_context": str(production_context or "").strip(),
+        "sales_email_summary": build_sales_email_summary(crm_result, report_key),
         "current_snapshot": {
             "press_linear_feet": current_press,
             "plant_productivity": current_productivity,
@@ -427,6 +448,32 @@ def build_email_report(facts, selection):
     report_date = datetime.strptime(facts["report_date"], "%Y-%m-%d")
     display_date = report_date.strftime("%-d %B %Y")
     subject = f"NuMat management checks - {display_date}"
+    email_summary = facts.get("sales_email_summary", [])
+    email_summary_text = "\n".join(
+        f"- {item['name']}: {int(item.get('total') or 0)} total emails sent; "
+        f"{int(item.get('sales_related') or 0)} sales-related"
+        for item in email_summary
+    )
+    email_summary_html = "".join(
+        f"<tr><td style='padding:5px 18px 5px 0'>{escape(str(item['name']))}</td>"
+        f"<td style='padding:5px 18px;text-align:right'>{int(item.get('total') or 0)}</td>"
+        f"<td style='padding:5px 0 5px 18px;text-align:right'>{int(item.get('sales_related') or 0)}</td></tr>"
+        for item in email_summary
+    )
+    summary_text_footer = (
+        f"\n\nEmails sent today\n{email_summary_text}"
+        if email_summary_text else ""
+    )
+    summary_html_footer = (
+        "<div style='margin-top:24px;padding-top:16px;border-top:1px solid #dbe6f2'>"
+        "<h2 style='margin:0 0 8px;font-size:16px;color:#17324d'>Emails sent today</h2>"
+        "<table style='border-collapse:collapse;font-size:14px'>"
+        "<thead><tr><th style='padding:5px 18px 5px 0;text-align:left'>Salesperson</th>"
+        "<th style='padding:5px 18px;text-align:right'>Total</th>"
+        "<th style='padding:5px 0 5px 18px;text-align:right'>Sales-related</th></tr></thead>"
+        f"<tbody>{email_summary_html}</tbody></table></div>"
+        if email_summary_html else ""
+    )
     if selected:
         plain_sections = []
         html_sections = []
@@ -445,19 +492,22 @@ def build_email_report(facts, selection):
             f"NuMat management checks - {display_date}\n\n{selection.get('summary') or ''}\n\n"
             + "\n\n".join(plain_sections)
             + "\n\nThese are prompts for verification, not confirmed causes. Figures use the completed-day record and recent completed production days."
+            + summary_text_footer
         )
         body_html = (
             "<div style='font-family:Arial,sans-serif;max-width:760px;color:#1f2933'>"
             f"<h1 style='color:#245cff;margin-bottom:4px'>Management checks</h1><p style='color:#5e7184;margin-top:0'>{escape(display_date)}</p>"
             f"<p>{escape(str(selection.get('summary') or ''))}</p>{''.join(html_sections)}"
-            "<p style='font-size:12px;color:#5e7184'>These are prompts for verification, not confirmed causes. Figures use the completed-day record and recent completed production days.</p></div>"
+            "<p style='font-size:12px;color:#5e7184'>These are prompts for verification, not confirmed causes. Figures use the completed-day record and recent completed production days.</p>"
+            f"{summary_html_footer}</div>"
         )
     else:
-        body_text = f"NuMat management checks - {display_date}\n\nNo material exceptions were identified in the available management data."
+        body_text = f"NuMat management checks - {display_date}\n\nNo material exceptions were identified in the available management data.{summary_text_footer}"
         body_html = (
             "<div style='font-family:Arial,sans-serif;max-width:760px;color:#1f2933'>"
             f"<h1 style='color:#245cff'>Management checks</h1><p>{escape(display_date)}</p>"
-            "<p>No material exceptions were identified in the available management data.</p></div>"
+            "<p>No material exceptions were identified in the available management data.</p>"
+            f"{summary_html_footer}</div>"
         )
     return {"subject": subject, "body_text": body_text, "body_html": body_html, "issues": selected}
 
