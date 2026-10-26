@@ -489,25 +489,19 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIs(result, cached)
         rebuild.assert_not_called()
 
-    def test_customer_detail_contextual_activity_map_is_reused(self):
-        order_result = {
-            "status": "ok",
-            "orders": [{"customer": "Example", "customer_primary_key": "customer-1"}],
-        }
+    def test_customer_detail_contextual_activity_fallback_is_reused(self):
+        customer_orders = [
+            {"customer": "Example", "customer_primary_key": "customer-1"},
+        ]
         activity = {
-            "customer_primary_key": "customer-1",
+            "customer_primary_key": "legacy-key",
+            "customer_company": "Example",
             "date_created": "2026-10-20 09:00:00",
         }
         crm_result = {
             "status": "ok",
             "activities": [activity],
-            "activity_map": {"customer-1": [activity]},
-        }
-        master_result = {
-            "status": "ok",
-            "customers_by_key": {
-                "customer-1": {"company": "Example", "primary_key": "customer-1"},
-            },
+            "activity_map": {"legacy-key": [activity]},
         }
 
         with patch.object(
@@ -515,16 +509,32 @@ class CustomersViewTests(unittest.TestCase):
             "build_contextual_crm_activity_map",
             wraps=main.build_contextual_crm_activity_map,
         ) as build_contextual:
-            first = main.build_cached_customer_contextual_activity_map(
-                order_result, crm_result, master_result
+            first = main.get_cached_customer_detail_crm_activities(
+                crm_result, "Example", "customer-1", customer_orders
             )
-            second = main.build_cached_customer_contextual_activity_map(
-                order_result, crm_result, master_result
+            second = main.get_cached_customer_detail_crm_activities(
+                crm_result, "Example", "customer-1", customer_orders
             )
 
         self.assertIs(first, second)
-        self.assertEqual(first["customer-1"], [activity])
+        self.assertEqual(first, (activity,))
         build_contextual.assert_called_once()
+
+    def test_customer_detail_uses_prebuilt_crm_index_without_contextual_scan(self):
+        activity = {"customer_primary_key": "customer-1"}
+        crm_result = {
+            "status": "ok",
+            "activities": [activity],
+            "activity_map": {"customer-1": [activity]},
+        }
+
+        with patch.object(main, "build_contextual_crm_activity_map") as contextual:
+            result = main.get_cached_customer_detail_crm_activities(
+                crm_result, "Example", "customer-1", []
+            )
+
+        self.assertEqual(result, [activity])
+        contextual.assert_not_called()
 
 
 if __name__ == "__main__":

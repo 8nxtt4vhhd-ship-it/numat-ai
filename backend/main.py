@@ -230,8 +230,7 @@ _CUSTOMER_SUMMARIES_CACHE = {
 
 _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK = Lock()
 _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE = {
-    "key": None,
-    "result": None,
+    "entries": {},
 }
 
 _STRATEGIC_DISCOVERY_RESULTS_CACHE = {
@@ -15300,13 +15299,14 @@ def get_customer_view(
 ):
     view_started_at = time.perf_counter()
     stage_started_at = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         order_future = executor.submit(get_orders_for_analysis)
         crm_future = executor.submit(fetch_crm_activities)
-        customer_data_future = executor.submit(fetch_filemaker_customer_data)
         result = order_future.result()
         crm_result = crm_future.result()
-        master_data_result = customer_data_future.result()
+    # The order loader has already warmed this lightweight customer-only cache
+    # in production. Loading it afterwards avoids two cold requests racing.
+    master_data_result = fetch_filemaker_customer_data()
     log_perf_metric("customer_detail.load_data_sources_parallel", stage_started_at)
     crm_limit = max(12, min(crm_limit, 120))
     crm_page = max(1, crm_page)
@@ -15351,12 +15351,12 @@ def get_customer_view(
     average_value = average_order_amount(customer_orders)
     last_activity = get_last_activity(customer_orders) if customer_orders else None
     if crm_result["status"] == "ok":
-        contextual_activity_map = build_cached_customer_contextual_activity_map(
-            result,
+        crm_activities = get_cached_customer_detail_crm_activities(
             crm_result,
-            master_data_result,
+            customer,
+            customer_primary_key,
+            customer_orders,
         )
-        crm_activities = contextual_activity_map.get(customer_primary_key, [])
     else:
         crm_activities = []
     sales_crm_activities = get_sales_outreach_activities(crm_activities)
@@ -15642,8 +15642,7 @@ def clear_customer_summaries_cache():
 
 def clear_customer_contextual_activity_cache():
     with _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK:
-        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["key"] = None
-        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["result"] = None
+        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["entries"].clear()
 
 
 def should_enable_startup_prewarm():
@@ -15981,49 +15980,54 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
     return contextual_map
 
 
-def build_cached_customer_contextual_activity_map(
-    order_result,
+def get_cached_customer_detail_crm_activities(
     crm_result,
-    master_data_result,
+    customer,
+    customer_primary_key,
+    customer_orders,
 ):
-    """Build branch-aware CRM history once for all customer detail pages."""
-    orders = order_result.get("orders", [])
+    """Return pre-indexed CRM history, with a cached legacy-branch fallback."""
+    activity_map = crm_result.get("activity_map", {})
+    direct_activities = activity_map.get(customer_primary_key)
+    if direct_activities:
+        return direct_activities
+
     activities = crm_result.get("activities", [])
-    customers_by_key = master_data_result.get("customers_by_key", {})
     cache_key = (
         CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_VERSION,
-        id(orders),
-        len(orders),
         id(activities),
         len(activities),
-        id(customers_by_key),
-        len(customers_by_key),
+        str(customer_primary_key or "").strip(),
+        str(customer or "").strip().casefold(),
         crm_result.get("synced_at", ""),
         crm_result.get("cache_updated_at", ""),
         crm_result.get("recent_updated_at", ""),
     )
 
-    cached = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("result")
-    if _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("key") == cache_key and cached is not None:
+    entries = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["entries"]
+    cached = entries.get(cache_key)
+    if cached is not None:
         return cached
 
     with _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK:
-        cached = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("result")
-        if _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("key") == cache_key and cached is not None:
+        entries = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["entries"]
+        cached = entries.get(cache_key)
+        if cached is not None:
             return cached
 
-        grouped_orders = group_by_customer(orders)
-        customer_entries = build_customer_lookup_entries(
-            grouped_orders,
-            master_data_result,
-        )
-        result = build_contextual_crm_activity_map(
-            crm_result.get("activity_map", {}),
+        contextual_map = build_contextual_crm_activity_map(
+            activity_map,
             activities,
-            customer_entries,
+            [{
+                "customer": customer,
+                "customer_primary_key": customer_primary_key,
+                "orders": customer_orders,
+            }],
         )
-        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["key"] = cache_key
-        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["result"] = result
+        result = contextual_map.get(customer_primary_key, [])
+        # Use a sentinel tuple so an empty result is cached as well.
+        result = tuple(result)
+        entries[cache_key] = result
         return result
 
 
