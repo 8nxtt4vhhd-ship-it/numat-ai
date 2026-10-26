@@ -217,6 +217,11 @@ _HOME_QUEUE_SUMMARIES_CACHE = {
     "result": None,
 }
 
+_HOME_ACTION_PLAN_CACHE_LOCK = Lock()
+_HOME_ACTION_PLAN_CACHE = {
+    "entries": {},
+}
+
 _CUSTOMER_SUMMARIES_CACHE = {
     "key": None,
     "expires_at": 0,
@@ -237,6 +242,7 @@ _STRATEGIC_CONTACT_WORKSPACE_CACHE = {
 }
 
 HOME_QUEUE_SUMMARIES_CACHE_VERSION = "2026-05-13-contact-policy-2"
+HOME_ACTION_PLAN_CACHE_VERSION = "2026-10-26-workflow-1"
 CUSTOMER_SUMMARIES_CACHE_VERSION = "2026-10-26-v7-shared-contacts"
 
 APOLLO_BRANCH_RESULTS_CACHE_LOCK = Lock()
@@ -12067,13 +12073,6 @@ def render_home_page(selected_customer="", view="focus", group="all", territory=
         crm_result = crm_future.result()
     log_perf_metric("home.load_data_sources_parallel", stage_started_at)
 
-    stage_started_at = time.perf_counter()
-    attention_result = build_customers_needing_attention_response(
-        order_result=order_result,
-        crm_result=crm_result,
-    )
-    log_perf_metric("home.build_attention_response", stage_started_at)
-
     if order_result["status"] != "ok":
         log_perf_metric("home.total_error", home_started_at)
         return render_page(
@@ -12085,62 +12084,22 @@ def render_home_page(selected_customer="", view="focus", group="all", territory=
             )
         )
 
-    orders = order_result["orders"]
-    attention_customers = attention_result["late_customers"]
     normalized_group = normalize_action_plan_group_filter(group)
     normalized_territory = normalize_action_plan_territory_filter(territory)
 
     stage_started_at = time.perf_counter()
-    grouped_orders = group_by_customer(orders)
-    log_perf_metric("home.group_by_customer", stage_started_at)
-
-    master_data_result = None
-    customers_by_key = {}
-    if normalized_group != "all":
-        stage_started_at = time.perf_counter()
-        master_data_result = fetch_filemaker_master_data()
-        log_perf_metric("home.fetch_filemaker_master_data", stage_started_at)
-        customers_by_key = (
-            master_data_result.get("customers_by_key", {})
-            if master_data_result.get("status") == "ok"
-            else {}
-        )
-
-    stage_started_at = time.perf_counter()
-    crm_activity_map = (
-        crm_result.get("activity_map", {})
-        if crm_result.get("status") == "ok" else {}
-    )
-
-    stage_started_at = time.perf_counter()
-    action_plan = build_home_action_plan(
-        attention_customers,
-        grouped_orders,
-        crm_activity_map,
-        attention_result.get("dismissed_customers", []),
+    workflow = build_cached_home_action_plan_workflow(
+        order_result,
+        crm_result,
         group_filter=normalized_group,
         territory_filter=normalized_territory,
-        customers_by_key=customers_by_key,
     )
-    log_perf_metric("home.build_action_plan", stage_started_at)
-
-    customer_options = sorted(
-        (
-            str(customer.get("customer", "")).strip()
-            for customer in action_plan.get("due_today", [])
-            if str(customer.get("customer", "")).strip()
-        ),
-        key=lambda item: str(item or "").lower(),
-    )
-
-    stage_started_at = time.perf_counter()
-    queue_summaries = build_home_queue_summaries(
-        action_plan.get("due_today", []),
-        grouped_orders,
-        crm_activity_map,
-        master_data_result=master_data_result,
-    )
-    log_perf_metric("home.build_queue_summaries", stage_started_at)
+    log_perf_metric("home.build_cached_workflow", stage_started_at)
+    attention_customers = workflow["attention_customers"]
+    grouped_orders = workflow["grouped_orders"]
+    action_plan = workflow["action_plan"]
+    customer_options = workflow["customer_options"]
+    queue_summaries = workflow["queue_summaries"]
 
     selected_customer = get_home_selected_customer_name(
         queue_summaries,
@@ -15645,12 +15604,19 @@ def clear_attention_response_cache():
     _ATTENTION_RESPONSE_CACHE["key"] = None
     _ATTENTION_RESPONSE_CACHE["expires_at"] = 0
     _ATTENTION_RESPONSE_CACHE["result"] = None
+    clear_home_action_plan_cache()
 
 
 def clear_home_queue_summaries_cache():
     _HOME_QUEUE_SUMMARIES_CACHE["key"] = None
     _HOME_QUEUE_SUMMARIES_CACHE["expires_at"] = 0
     _HOME_QUEUE_SUMMARIES_CACHE["result"] = None
+    clear_home_action_plan_cache()
+
+
+def clear_home_action_plan_cache():
+    with _HOME_ACTION_PLAN_CACHE_LOCK:
+        _HOME_ACTION_PLAN_CACHE["entries"].clear()
 
 
 def clear_customer_summaries_cache():
@@ -19937,6 +19903,98 @@ def build_home_action_plan(
         "due_today": due_today_customers,
         "dismissed": dismissed_customers,
     }
+
+
+def build_cached_home_action_plan_workflow(
+    order_result,
+    crm_result,
+    group_filter="all",
+    territory_filter="all",
+):
+    """Build the shared Action Plan model once per data/filter version.
+
+    Selected customer and focus/list view are deliberately excluded so ordinary
+    navigation can reuse the expensive grouping, policy and queue calculations.
+    The lock prevents concurrent users from rebuilding the same cold cache.
+    """
+    normalized_group = normalize_action_plan_group_filter(group_filter)
+    normalized_territory = normalize_action_plan_territory_filter(territory_filter)
+    cache_key = (
+        HOME_ACTION_PLAN_CACHE_VERSION,
+        build_attention_cache_key(order_result, crm_result),
+        normalized_group,
+        normalized_territory,
+    )
+
+    cached = _HOME_ACTION_PLAN_CACHE["entries"].get(cache_key)
+    if cached is not None:
+        return cached
+
+    with _HOME_ACTION_PLAN_CACHE_LOCK:
+        entries = _HOME_ACTION_PLAN_CACHE["entries"]
+        cached = entries.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # Retain filter variants only for the current order/CRM data version.
+        # This bounds memory if upstream cache versions change repeatedly.
+        if any(existing_key[:2] != cache_key[:2] for existing_key in entries):
+            entries.clear()
+
+        attention_result = build_customers_needing_attention_response(
+            order_result=order_result,
+            crm_result=crm_result,
+        )
+        attention_customers = attention_result["late_customers"]
+        grouped_orders = group_by_customer(order_result["orders"])
+        crm_activity_map = (
+            crm_result.get("activity_map", {})
+            if crm_result.get("status") == "ok"
+            else {}
+        )
+
+        master_data_result = None
+        customers_by_key = {}
+        if normalized_group != "all":
+            master_data_result = fetch_filemaker_master_data()
+            customers_by_key = (
+                master_data_result.get("customers_by_key", {})
+                if master_data_result.get("status") == "ok"
+                else {}
+            )
+
+        action_plan = build_home_action_plan(
+            attention_customers,
+            grouped_orders,
+            crm_activity_map,
+            attention_result.get("dismissed_customers", []),
+            group_filter=normalized_group,
+            territory_filter=normalized_territory,
+            customers_by_key=customers_by_key,
+        )
+        customer_options = sorted(
+            (
+                str(customer.get("customer", "")).strip()
+                for customer in action_plan.get("due_today", [])
+                if str(customer.get("customer", "")).strip()
+            ),
+            key=lambda item: str(item or "").lower(),
+        )
+        queue_summaries = build_home_queue_summaries(
+            action_plan.get("due_today", []),
+            grouped_orders,
+            crm_activity_map,
+            master_data_result=master_data_result,
+        )
+        result = {
+            "attention_customers": attention_customers,
+            "grouped_orders": grouped_orders,
+            "action_plan": action_plan,
+            "customer_options": customer_options,
+            "queue_summaries": queue_summaries,
+        }
+        entries[cache_key] = result
+        return result
 
 
 def get_customer_territory(customer_orders):

@@ -1,4 +1,6 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+import time
 from unittest.mock import patch
 
 import main
@@ -6,6 +8,12 @@ import crm
 
 
 class ActionPlanRecentContactTests(unittest.TestCase):
+    def setUp(self):
+        main.clear_home_action_plan_cache()
+
+    def tearDown(self):
+        main.clear_home_action_plan_cache()
+
     def test_contact_ten_days_ago_is_excluded(self):
         outbound = [{"date_created": "recent", "crm_type": "Email"}]
         with patch.object(main, "get_crm_days_since_latest_activity", return_value=10):
@@ -76,6 +84,87 @@ class ActionPlanRecentContactTests(unittest.TestCase):
         self.assertEqual(result, sync_result)
         synchronous_filemaker_fetch.assert_not_called()
         trigger_refresh.assert_not_called()
+
+    def test_action_plan_workflow_is_reused_for_navigation(self):
+        order_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "cache_updated_at": "orders-v1",
+            "orders": [],
+        }
+        crm_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "cache_updated_at": "crm-v1",
+            "counts": {"kept_rows": 0},
+            "activity_map": {},
+        }
+        attention_result = {"late_customers": [], "dismissed_customers": []}
+
+        with patch.object(
+            main,
+            "build_customers_needing_attention_response",
+            return_value=attention_result,
+        ) as build_attention, patch.object(
+            main, "group_by_customer", return_value={}
+        ) as group_orders, patch.object(
+            main,
+            "build_home_action_plan",
+            return_value={"due_today": [], "dismissed": []},
+        ) as build_plan, patch.object(
+            main, "build_home_queue_summaries", return_value=[]
+        ) as build_summaries:
+            first = main.build_cached_home_action_plan_workflow(order_result, crm_result)
+            second = main.build_cached_home_action_plan_workflow(order_result, crm_result)
+
+        self.assertIs(first, second)
+        build_attention.assert_called_once()
+        group_orders.assert_called_once()
+        build_plan.assert_called_once()
+        build_summaries.assert_called_once()
+
+    def test_concurrent_action_plan_requests_only_build_once(self):
+        order_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "cache_updated_at": "orders-v2",
+            "orders": [],
+        }
+        crm_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "cache_updated_at": "crm-v2",
+            "counts": {"kept_rows": 0},
+            "activity_map": {},
+        }
+        attention_result = {"late_customers": [], "dismissed_customers": []}
+
+        def slow_attention(**_kwargs):
+            time.sleep(0.05)
+            return attention_result
+
+        with patch.object(
+            main,
+            "build_customers_needing_attention_response",
+            side_effect=slow_attention,
+        ) as build_attention, patch.object(
+            main, "group_by_customer", return_value={}
+        ), patch.object(
+            main,
+            "build_home_action_plan",
+            return_value={"due_today": [], "dismissed": []},
+        ), patch.object(main, "build_home_queue_summaries", return_value=[]):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(
+                    lambda _index: main.build_cached_home_action_plan_workflow(
+                        order_result,
+                        crm_result,
+                    ),
+                    range(2),
+                ))
+
+        self.assertIs(results[0], results[1])
+        build_attention.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+from threading import Lock
 import time
 from pathlib import Path
 
@@ -25,6 +26,7 @@ _FILEMAKER_ORDER_CACHE = {
     "expires_at": 0,
     "result": None,
 }
+_FILEMAKER_ORDER_CACHE_LOCK = Lock()
 
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
@@ -106,9 +108,10 @@ def get_filemaker_cache_seconds():
 
 
 def clear_filemaker_orders_cache():
-    _FILEMAKER_ORDER_CACHE["key"] = None
-    _FILEMAKER_ORDER_CACHE["expires_at"] = 0
-    _FILEMAKER_ORDER_CACHE["result"] = None
+    with _FILEMAKER_ORDER_CACHE_LOCK:
+        _FILEMAKER_ORDER_CACHE["key"] = None
+        _FILEMAKER_ORDER_CACHE["expires_at"] = 0
+        _FILEMAKER_ORDER_CACHE["result"] = None
 
 
 def fetch_cached_filemaker_orders():
@@ -125,32 +128,43 @@ def fetch_cached_filemaker_orders():
     ):
         return _FILEMAKER_ORDER_CACHE["result"]
 
-    result = fetch_order_records(limit=limit)
+    with _FILEMAKER_ORDER_CACHE_LOCK:
+        # Another request may have filled the cache while this one waited.
+        now = time.time()
+        if (
+            cache_seconds
+            and _FILEMAKER_ORDER_CACHE["key"] == cache_key
+            and _FILEMAKER_ORDER_CACHE["result"] is not None
+            and _FILEMAKER_ORDER_CACHE["expires_at"] > now
+        ):
+            return _FILEMAKER_ORDER_CACHE["result"]
 
-    if result.get("status") == "ok":
-        write_filemaker_orders_cache(result)
+        result = fetch_order_records(limit=limit)
 
-    if result.get("status") == "ok" and cache_seconds:
-        _FILEMAKER_ORDER_CACHE["key"] = cache_key
-        _FILEMAKER_ORDER_CACHE["expires_at"] = now + cache_seconds
-        _FILEMAKER_ORDER_CACHE["result"] = result
+        if result.get("status") == "ok":
+            write_filemaker_orders_cache(result)
+
+        if result.get("status") == "ok" and cache_seconds:
+            _FILEMAKER_ORDER_CACHE["key"] = cache_key
+            _FILEMAKER_ORDER_CACHE["expires_at"] = now + cache_seconds
+            _FILEMAKER_ORDER_CACHE["result"] = result
+            return result
+
+        cached_snapshot = read_filemaker_orders_cache()
+
+        if cached_snapshot is not None:
+            return {
+                "connected": False,
+                "status": "ok",
+                "orders": cached_snapshot.get("orders", []),
+                "stale": True,
+                "cache_updated_at": cached_snapshot.get("updated_at", ""),
+                "warning": (
+                    "FileMaker is currently unavailable. Showing the last successful cached order data."
+                ),
+            }
+
         return result
-
-    cached_snapshot = read_filemaker_orders_cache()
-
-    if cached_snapshot is not None:
-        return {
-            "connected": False,
-            "status": "ok",
-            "orders": cached_snapshot.get("orders", []),
-            "stale": True,
-            "cache_updated_at": cached_snapshot.get("updated_at", ""),
-            "warning": (
-                "FileMaker is currently unavailable. Showing the last successful cached order data."
-            ),
-        }
-
-    return result
 
 
 def build_filemaker_cache_key(limit):
