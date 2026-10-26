@@ -17,6 +17,12 @@ _FILEMAKER_MASTER_DATA_CACHE = {
     "result": None,
 }
 
+_FILEMAKER_CUSTOMER_DATA_CACHE = {
+    "key": None,
+    "expires_at": 0,
+    "result": None,
+}
+
 
 def get_filemaker_config():
     return {
@@ -783,6 +789,9 @@ def clear_filemaker_master_data_cache():
     _FILEMAKER_MASTER_DATA_CACHE["key"] = None
     _FILEMAKER_MASTER_DATA_CACHE["expires_at"] = 0
     _FILEMAKER_MASTER_DATA_CACHE["result"] = None
+    _FILEMAKER_CUSTOMER_DATA_CACHE["key"] = None
+    _FILEMAKER_CUSTOMER_DATA_CACHE["expires_at"] = 0
+    _FILEMAKER_CUSTOMER_DATA_CACHE["result"] = None
 
 
 def build_filemaker_master_data_cache_key():
@@ -971,6 +980,70 @@ def is_truthy_contact_flag(value):
         return False
 
     return text not in {"0", "false", "no", "n", "off"}
+
+
+def fetch_filemaker_customer_data(force_refresh=False):
+    """Fetch active Customer/Corporate records without loading the contacts layout."""
+    config = get_filemaker_config()
+    cache_key = build_filemaker_master_data_cache_key()
+    now = time.time()
+
+    if (
+        not force_refresh
+        and _FILEMAKER_CUSTOMER_DATA_CACHE["key"] == cache_key
+        and _FILEMAKER_CUSTOMER_DATA_CACHE["result"] is not None
+    ):
+        return _FILEMAKER_CUSTOMER_DATA_CACHE["result"]
+
+    if not force_refresh and _FILEMAKER_MASTER_DATA_CACHE["key"] == cache_key:
+        cached_master = _FILEMAKER_MASTER_DATA_CACHE["result"]
+        if cached_master is not None and _FILEMAKER_MASTER_DATA_CACHE["expires_at"] > now:
+            return cached_master
+
+    if not config["customers_layout"]:
+        return build_empty_filemaker_master_data("missing_master_layout")
+
+    customers_result = fetch_all_layout_records(
+        config["customers_layout"],
+        batch_size=500,
+    )
+    if customers_result["status"] != "ok":
+        return build_empty_filemaker_master_data(customers_result["status"])
+
+    companies = []
+    customers_by_key = {}
+    inactive_customer_keys = set()
+    inactive_customer_names = set()
+
+    for raw_record in customers_result.get("records", []):
+        customer = map_filemaker_customer_master_record(raw_record)
+        customer["filemaker_record_id"] = str(raw_record.get("recordId") or "").strip()
+        if is_inactive_filemaker_customer(customer):
+            if customer["primary_key"]:
+                inactive_customer_keys.add(customer["primary_key"])
+            if customer["company"]:
+                inactive_customer_names.add(customer["company"].casefold())
+            continue
+
+        companies.append(customer)
+        if (
+            is_supported_filemaker_customer_type(customer)
+            and customer["primary_key"]
+        ):
+            customers_by_key[customer["primary_key"]] = customer
+
+    result = build_empty_filemaker_master_data("ok")
+    result.update({
+        "connected": True,
+        "companies": companies,
+        "customers_by_key": customers_by_key,
+        "inactive_customer_keys": sorted(inactive_customer_keys),
+        "inactive_customer_names": sorted(inactive_customer_names),
+    })
+    _FILEMAKER_CUSTOMER_DATA_CACHE["key"] = cache_key
+    _FILEMAKER_CUSTOMER_DATA_CACHE["expires_at"] = float("inf")
+    _FILEMAKER_CUSTOMER_DATA_CACHE["result"] = result
+    return result
 
 
 def fetch_filemaker_master_data(force_refresh=False):

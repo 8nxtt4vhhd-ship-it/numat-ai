@@ -310,7 +310,10 @@ def fetch_crm_activities():
     cached_result = get_cached_crm_result(cache_key)
 
     if cached_result is not None:
-        return filter_inactive_filemaker_customer_activities(cached_result, source)
+        # Cached CRM results have already been filtered and their shared-contact
+        # activity map has already been built. Repeating that work here makes
+        # every customer-list request walk the complete CRM history again.
+        return cached_result
 
     if source == "filemaker":
         if get_filemaker_crm_use_sync_cache():
@@ -328,7 +331,6 @@ def fetch_crm_activities():
                     source,
                 )
                 cache_crm_result(cache_key, filtered_sync_result)
-                trigger_recent_crm_refresh()
                 return filtered_sync_result
 
         result = build_filemaker_crm_result()
@@ -382,12 +384,37 @@ def filter_inactive_filemaker_customer_activities(result, source):
     inactive_customer_keys = set(master_data.get("inactive_customer_keys") or [])
     inactive_customer_names = set(master_data.get("inactive_customer_names") or [])
     customers_by_key = master_data.get("customers_by_key") or {}
+    active_contact_emails = {
+        str(contact.get("email") or "").strip().lower()
+        for contact in master_data.get("all_contacts") or []
+        if (
+            str(contact.get("email") or "").strip()
+            and str(contact.get("customer_ref") or "").strip() in customers_by_key
+            and str(contact.get("active") or "").strip().lower() == "active"
+        )
+    }
+
+    def should_keep_activity(activity):
+        customer_key = str(activity.get("customer_primary_key") or "").strip()
+        customer_name = str(
+            activity.get("customer")
+            or activity.get("customer_company")
+            or ""
+        ).strip().casefold()
+        source_is_inactive = (
+            customer_key in inactive_customer_keys
+            or customer_name in inactive_customer_names
+        )
+        if not source_is_inactive:
+            return True
+
+        participant_emails = set(extract_emails(activity.get("sender_email", "")))
+        participant_emails.update(extract_emails(activity.get("to", "")))
+        return bool(participant_emails & active_contact_emails)
+
     activities = [
         activity for activity in result.get("activities", [])
-        if (
-            str(activity.get("customer_primary_key") or "").strip() not in inactive_customer_keys
-            and str(activity.get("customer") or "").strip().casefold() not in inactive_customer_names
-        )
+        if should_keep_activity(activity)
     ]
     for activity in activities:
         customer_key = str(activity.get("customer_primary_key") or "").strip()
@@ -398,8 +425,50 @@ def filter_inactive_filemaker_customer_activities(result, source):
             activity["customer"] = current_name
     filtered_result = dict(result)
     filtered_result["activities"] = activities
-    filtered_result["activity_map"] = build_activity_map(activities)
+    filtered_result["activity_map"] = build_shared_contact_activity_map(
+        activities,
+        master_data,
+    )
     return filtered_result
+
+
+def build_shared_contact_activity_map(activities, master_data):
+    """Index activity against every active customer location sharing the contact."""
+    activity_map = build_activity_map(activities)
+    customers_by_key = (master_data or {}).get("customers_by_key") or {}
+    customer_keys_by_email = {}
+
+    for contact in (master_data or {}).get("all_contacts") or []:
+        email = str(contact.get("email") or "").strip().lower()
+        customer_key = str(contact.get("customer_ref") or "").strip()
+        if not email or customer_key not in customers_by_key:
+            continue
+        customer_keys_by_email.setdefault(email, set()).add(customer_key)
+
+    if not customer_keys_by_email:
+        return activity_map
+
+    for activity in activities or []:
+        participant_emails = set(extract_emails(activity.get("sender_email", "")))
+        participant_emails.update(extract_emails(activity.get("to", "")))
+        linked_customer_keys = set()
+        for email in participant_emails:
+            # The CRM row can be keyed to one branch while the contact
+            # directory returns that person on another branch. Do not require
+            # duplicate contact rows to be present in the same paginated load;
+            # index the activity to every active directory location we do have.
+            linked_customer_keys.update(customer_keys_by_email.get(email, set()))
+        for customer_key in linked_customer_keys:
+            activity_map.setdefault(customer_key, []).append(activity)
+
+    for customer_key, items in activity_map.items():
+        deduped = {
+            build_crm_activity_dedupe_key(activity): activity
+            for activity in items
+        }
+        activity_map[customer_key] = sort_crm_activities(list(deduped.values()))
+
+    return activity_map
 
 
 def merge_crm_activity_results(base_result, recent_result):
@@ -443,7 +512,10 @@ def cache_crm_result(cache_key, result):
         return
 
     _CRM_CACHE["key"] = cache_key
-    _CRM_CACHE["expires_at"] = time.time() + cache_seconds
+    # The cache key contains the backing-file signature and every cache writer
+    # explicitly clears this process cache. Keep the expensive, fully indexed
+    # result until one of those inputs changes or the user requests a sync.
+    _CRM_CACHE["expires_at"] = float("inf")
     _CRM_CACHE["result"] = result
 
 
@@ -526,9 +598,9 @@ def build_csv_crm_result(path):
     )
 
 
-def build_filemaker_crm_result():
+def build_filemaker_crm_result(limit_override=None):
     layout = get_filemaker_emails_layout()
-    limit = get_filemaker_crm_limit()
+    limit = max(1, int(limit_override)) if limit_override is not None else get_filemaker_crm_limit()
     fetch_all = get_filemaker_crm_fetch_all()
     batch_size = get_filemaker_crm_batch_size()
     rows = []
@@ -602,6 +674,64 @@ def build_filemaker_crm_result():
     if cached_recent_result is not None:
         return cached_recent_result
 
+    return result
+
+
+def sync_filemaker_crm_recent_cache():
+    """Refresh a broad recent overlay without rewriting the large history file."""
+    raw_limit = os.getenv("FILEMAKER_CRM_MANUAL_SYNC_LIMIT", "2000").strip()
+    try:
+        manual_limit = max(get_filemaker_crm_limit(), int(raw_limit))
+    except ValueError:
+        manual_limit = max(get_filemaker_crm_limit(), 2000)
+
+    # Large FileMaker responses can time out or consume excessive memory while
+    # being decoded. Page through the same newest-first result set instead.
+    layout = get_filemaker_emails_layout()
+    page_size = min(500, manual_limit)
+    raw_body_limit = os.getenv("FILEMAKER_CRM_RECENT_BODY_CHARS", "4000").strip()
+    try:
+        body_limit = max(500, int(raw_body_limit))
+    except ValueError:
+        body_limit = 4000
+    sort_field = get_filemaker_crm_sort_field()
+    rows = []
+    offset = 1
+    while len(rows) < manual_limit:
+        batch_limit = min(page_size, manual_limit - len(rows))
+        result = fetch_layout_records(
+            layout,
+            limit=batch_limit,
+            offset=offset,
+            sort_fields=[{
+                "fieldName": sort_field,
+                "sortOrder": "descend",
+            }] if sort_field else None,
+        )
+        if result.get("status") != "ok":
+            cached_recent_result = read_filemaker_crm_recent_cache()
+            return cached_recent_result or empty_crm_result(
+                "filemaker", layout, result.get("status", "fetch_failed")
+            )
+        batch_rows = [
+            record.get("fieldData", {})
+            for record in result.get("records", [])
+        ]
+        for row in batch_rows:
+            # Outlook HTML bodies can be hundreds of KB each. The recent
+            # overlay is for matching and timeline previews, not archiving the
+            # original message, so keep a bounded prefix in this cache.
+            for body_field in ("body", "emails::body"):
+                if body_field in row and len(str(row.get(body_field) or "")) > body_limit:
+                    row[body_field] = str(row.get(body_field) or "")[:body_limit]
+        rows.extend(batch_rows)
+        if len(batch_rows) < batch_limit:
+            break
+        offset += batch_limit
+
+    result = build_crm_result_from_rows(rows, source="filemaker", path=layout)
+    if result.get("status") == "ok":
+        write_filemaker_crm_recent_cache(result)
     return result
 
 
@@ -836,17 +966,46 @@ def sync_filemaker_crm_cache_incremental(existing_sync_result):
 def write_filemaker_crm_recent_cache(result):
     cache_path = get_filemaker_crm_recent_cache_path()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_activities = []
+    if cache_path.exists():
+        try:
+            existing_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            existing_activities = existing_payload.get("activities", [])
+        except (OSError, ValueError):
+            existing_activities = []
+
+    merged_by_key = {
+        build_crm_activity_dedupe_key(activity): activity
+        for activity in existing_activities
+    }
+    for activity in result.get("activities", []):
+        merged_by_key[build_crm_activity_dedupe_key(activity)] = activity
+    activities = sort_crm_activities(list(merged_by_key.values()))
+    activity_map = build_activity_map(activities)
+    result_counts = result.get("counts", {})
     payload = {
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": "filemaker_recent_cache",
         "status": "ok",
         "path": result.get("path", ""),
-        "counts": result.get("counts", {}),
-        "activities": result.get("activities", []),
+        "counts": {
+            "total_rows": len(activities),
+            "kept_rows": len(activities),
+            "excluded_internal_only": result_counts.get("excluded_internal_only", 0),
+            "customer_count": len(activity_map),
+            "unknown_direction_count": sum(
+                1 for activity in activities
+                if activity.get("direction") == "unknown"
+            ),
+        },
+        "activities": activities,
         "stale": False,
         "warning": "",
     }
     cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    # The running web process may already hold an activity map built from the
+    # previous overlay. Ensure the next request rebuilds shared-contact links.
+    clear_crm_cache()
 
 
 def read_filemaker_crm_recent_cache():

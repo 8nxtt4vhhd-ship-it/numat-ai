@@ -54,7 +54,7 @@ class ActionPlanRecentContactTests(unittest.TestCase):
         self.assertEqual(result["activities"][0]["subject"], "Recent")
         self.assertEqual(len(result["activity_map"]["A1"]), 2)
 
-    def test_cached_crm_load_does_not_wait_for_filemaker(self):
+    def test_cached_crm_load_does_not_contact_filemaker(self):
         sync_result = {"status": "ok", "activities": [], "counts": {}}
         with patch.object(crm, "get_crm_data_source", return_value="filemaker"), patch.object(
             crm, "get_crm_cache_key", return_value="test-cache-key"
@@ -75,7 +75,7 @@ class ActionPlanRecentContactTests(unittest.TestCase):
 
         self.assertEqual(result, sync_result)
         synchronous_filemaker_fetch.assert_not_called()
-        trigger_refresh.assert_called_once_with()
+        trigger_refresh.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -36,6 +36,8 @@ from ai import generate_data_question_answer
 from ai import generate_production_analysis_report
 from ai import generate_action_plan_email_draft
 from ai import generate_meeting_actions_from_audio
+from ai import generate_meeting_actions_from_transcript
+from ai import transcribe_meeting_audio
 from ai import generate_outreach_prep
 from analysis import (
     analyze_order_cycle,
@@ -76,6 +78,7 @@ from data_comparison import (
 )
 from crm import (
     MAX_CRM_SAMPLE_ROWS,
+    build_shared_contact_activity_map,
     clear_crm_cache,
     clear_promise_of_order_cache,
     extract_emails,
@@ -92,6 +95,7 @@ from crm import (
     get_uploaded_crm_csv_path,
     read_filemaker_crm_sync_cache,
     sync_filemaker_crm_cache,
+    sync_filemaker_crm_recent_cache,
     validate_crm_csv_content,
     validate_crm_csv_path,
 )
@@ -106,6 +110,7 @@ from filemaker import (
     check_filemaker_connection,
     clear_filemaker_master_data_cache,
     create_layout_record,
+    fetch_filemaker_customer_data,
     fetch_filemaker_master_data,
     fetch_order_records,
     find_layout_records,
@@ -232,7 +237,7 @@ _STRATEGIC_CONTACT_WORKSPACE_CACHE = {
 }
 
 HOME_QUEUE_SUMMARIES_CACHE_VERSION = "2026-05-13-contact-policy-2"
-CUSTOMER_SUMMARIES_CACHE_VERSION = "2026-05-13-v1"
+CUSTOMER_SUMMARIES_CACHE_VERSION = "2026-10-26-v7-shared-contacts"
 
 APOLLO_BRANCH_RESULTS_CACHE_LOCK = Lock()
 APOLLO_BRANCH_RESULTS_CACHE = {
@@ -8646,7 +8651,12 @@ def render_calendar_agenda(events, month_start):
                 <strong>{escape(str(event.get('subject') or 'Untitled event'))}</strong>
                 <small>{escape(location or 'No location')}</small>
             </a>''')
-        sections.append(f"<section class='calendar-agenda-day'><h3>{escape(label)}</h3>{''.join(items)}</section>")
+        sections.append(
+            f"<section class='calendar-agenda-day'>"
+            f"<h3>{escape(label)}</h3>"
+            f"<div class='calendar-agenda-events'>{''.join(items)}</div>"
+            f"</section>"
+        )
     return "<div class='calendar-agenda'>" + "".join(sections) + "</div>"
 
 
@@ -9610,6 +9620,10 @@ async def post_weekly_kpi_todos_from_audio(audio: UploadFile = File(...)):
     if len(content) > 25 * 1024 * 1024:
         return JSONResponse({"status": "too_large", "error_message": "Recording must be smaller than 25 MB."}, status_code=413)
     result = generate_meeting_actions_from_audio(content, filename=audio.filename or "meeting.webm")
+    return save_weekly_kpi_meeting_result(result)
+
+
+def save_weekly_kpi_meeting_result(result):
     if result.get("status") == "ok":
         current_user = get_current_session_user() or {}
         now = datetime.now(UK_TIMEZONE)
@@ -9635,6 +9649,26 @@ async def post_weekly_kpi_todos_from_audio(audio: UploadFile = File(...)):
         result["meeting_id"] = meeting_id
         result.pop("transcript", None)
     return JSONResponse(result, status_code=200 if result.get("status") == "ok" else 400)
+
+
+@app.post("/api/weekly-kpi/meetings/transcribe-segment")
+async def post_weekly_kpi_meeting_transcribe_segment(audio: UploadFile = File(...)):
+    content = await audio.read()
+    if len(content) > 24 * 1024 * 1024:
+        return JSONResponse(
+            {"status": "too_large", "transcript": "", "error_message": "This recording segment is larger than 24 MB."},
+            status_code=413,
+        )
+    result = transcribe_meeting_audio(content, filename=audio.filename or "meeting-segment.webm")
+    return JSONResponse(result, status_code=200 if result.get("status") == "ok" else 400)
+
+
+@app.post("/api/weekly-kpi/meetings/from-transcript")
+async def post_weekly_kpi_meeting_from_transcript(request: Request):
+    payload = await request.json()
+    transcript = str((payload or {}).get("transcript") or "").strip() if isinstance(payload, dict) else ""
+    result = generate_meeting_actions_from_transcript(transcript)
+    return save_weekly_kpi_meeting_result(result)
 
 
 @app.post("/api/weekly-kpi/todos/batch")
@@ -9789,7 +9823,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                     <div class="kpi-section-title"><span class="kpi-section-mark todo" aria-hidden="true"></span><div><h2>Weekly meeting actions</h2><p class="small muted">Shared checklist for this meeting and the next.</p></div></div>
                     <details class="kpi-meeting-ai" id="meeting-ai-panel"><summary>AI meeting notes</summary><div class="kpi-meeting-ai-body">
                         <div class="kpi-meeting-ai-panel-head"><p class="small muted">Record the meeting, then review the proposed actions before adding them.</p><button class="kpi-meeting-ai-close" type="button" id="meeting-ai-close" aria-label="Close AI meeting notes">×</button></div>
-                        <div class="kpi-record-actions"><button class="button secondary small-button" type="button" id="meeting-record-start">Start recording</button><button class="button secondary small-button" type="button" id="meeting-record-stop" disabled>Stop & analyse</button><span class="small muted" id="meeting-record-status"></span></div>
+                        <div class="kpi-record-actions"><button class="button secondary small-button" type="button" id="meeting-record-start">Start recording</button><button class="button secondary small-button" type="button" id="meeting-record-stop" disabled>Stop & analyse</button><button class="button secondary small-button" type="button" id="meeting-record-retry" hidden>Retry transcription</button><button class="button secondary small-button" type="button" id="meeting-record-download" hidden>Download recording</button><button class="button secondary small-button" type="button" id="meeting-record-discard" hidden>Discard saved recording</button><span class="small muted" id="meeting-record-status"></span></div>
                         <div id="meeting-action-proposals"></div>
                     </div></details>
                 </div>
@@ -9973,40 +10007,195 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                 event.preventDefault(); submitTodoRemoval(form, true);
             }));
             if (!start || !navigator.mediaDevices || !window.MediaRecorder) return;
-            let recorder, chunks = [], stream;
+            const retry = document.getElementById('meeting-record-retry');
+            const download = document.getElementById('meeting-record-download');
+            const discard = document.getElementById('meeting-record-discard');
+            const recordingDbName = 'numat-weekly-meeting-audio-v1';
+            const recordingStoreName = 'chunks';
+            const recordingMetaKey = 'numat-weekly-meeting-recording';
+            const segmentDurationMs = 10 * 60 * 1000;
+            let recorder, stream, segmentTimer, finalStopResolve;
+            let recordingActive = false;
+            let hasPendingRecording = Boolean(localStorage.getItem(recordingMetaKey));
+            let segmentIndex = 0;
+            let chunkSequence = 0;
+            let pendingWrites = [];
+
+            const openRecordingDb = () => new Promise((resolve, reject) => {
+                const request = indexedDB.open(recordingDbName, 1);
+                request.onupgradeneeded = () => {
+                    if (!request.result.objectStoreNames.contains(recordingStoreName)) {
+                        request.result.createObjectStore(recordingStoreName, {keyPath: 'id', autoIncrement: true});
+                    }
+                };
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+            const saveRecordingChunk = async (blob, currentSegment, sequence, mimeType) => {
+                const db = await openRecordingDb();
+                await new Promise((resolve, reject) => {
+                    const transaction = db.transaction(recordingStoreName, 'readwrite');
+                    transaction.objectStore(recordingStoreName).add({segmentIndex: currentSegment, sequence, mimeType, blob});
+                    transaction.oncomplete = resolve;
+                    transaction.onerror = () => reject(transaction.error);
+                });
+                db.close();
+            };
+            const loadRecordingChunks = async () => {
+                const db = await openRecordingDb();
+                const rows = await new Promise((resolve, reject) => {
+                    const request = db.transaction(recordingStoreName, 'readonly').objectStore(recordingStoreName).getAll();
+                    request.onsuccess = () => resolve(request.result || []);
+                    request.onerror = () => reject(request.error);
+                });
+                db.close();
+                return rows.sort((a, b) => a.segmentIndex - b.segmentIndex || a.sequence - b.sequence);
+            };
+            const clearSavedRecording = async () => {
+                const db = await openRecordingDb();
+                await new Promise((resolve, reject) => {
+                    const transaction = db.transaction(recordingStoreName, 'readwrite');
+                    transaction.objectStore(recordingStoreName).clear();
+                    transaction.oncomplete = resolve;
+                    transaction.onerror = () => reject(transaction.error);
+                });
+                db.close();
+                localStorage.removeItem(recordingMetaKey);
+                hasPendingRecording = false;
+                retry.hidden = download.hidden = discard.hidden = true;
+            };
+            const groupedRecordingSegments = async () => {
+                const rows = await loadRecordingChunks();
+                const groups = new Map();
+                rows.forEach(row => {
+                    if (!groups.has(row.segmentIndex)) groups.set(row.segmentIndex, []);
+                    groups.get(row.segmentIndex).push(row);
+                });
+                return [...groups.entries()].map(([index, items]) => ({
+                    index,
+                    blob: new Blob(items.map(item => item.blob), {type: items[0]?.mimeType || 'audio/webm'}),
+                })).filter(item => item.blob.size);
+            };
+            const showRecoveryControls = message => {
+                retry.hidden = download.hidden = discard.hidden = false;
+                status.textContent = message;
+            };
+            const renderMeetingResult = data => {
+                const actions = data.actions || [];
+                const list = items => (items || []).length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '<p class="small muted">None recorded.</p>';
+                const summary = `<div class="kpi-meeting-result"><h3>Meeting summary</h3><p>${escapeHtml(data.summary || 'No summary was produced.')}</p><h3>Key decisions</h3>${list(data.decisions)}<h3>Notable updates</h3>${list(data.updates)}<p><a href="/weekly-kpi-meetings/${encodeURIComponent(data.meeting_id)}" target="_blank" rel="noopener">Open saved meeting record</a></p></div>`;
+                const actionMarkup = actions.length ? actions.map((action, index) => `<label class="kpi-proposal"><input type="checkbox" checked data-index="${index}"><span><strong>${escapeHtml(action.text)}</strong>${action.owner ? `<small>${escapeHtml(action.owner)}</small>` : ''}</span></label>`).join('') + '<button class="button small-button" type="button" id="meeting-actions-add">Add selected actions</button>' : '<p class="small muted">No explicit actions were found.</p>';
+                proposals.innerHTML = summary + '<h3>Proposed actions</h3>' + actionMarkup;
+                proposals.dataset.actions = JSON.stringify(actions);
+                status.textContent = 'Review the proposed actions.';
+                document.getElementById('meeting-actions-add')?.addEventListener('click', async () => {
+                    const selected = actions.filter((_, index) => proposals.querySelector(`input[data-index="${index}"]`)?.checked);
+                    const saved = await fetch('/api/weekly-kpi/todos/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({actions:selected, meeting_id:data.meeting_id})});
+                    if (saved.ok) location.href = '/weekly-kpi-dashboard#weekly-actions';
+                });
+            };
+            const transcribeSavedRecording = async () => {
+                retry.disabled = true;
+                start.disabled = true;
+                try {
+                    const segments = await groupedRecordingSegments();
+                    if (!segments.length) throw new Error('No saved meeting audio was found.');
+                    const transcripts = [];
+                    for (let index = 0; index < segments.length; index += 1) {
+                        status.textContent = `Transcribing section ${index + 1} of ${segments.length}…`;
+                        const form = new FormData();
+                        form.append('audio', segments[index].blob, `weekly-meeting-${index + 1}.webm`);
+                        const response = await fetch('/api/weekly-kpi/meetings/transcribe-segment', {method: 'POST', body: form});
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.error_message || `Section ${index + 1} could not be transcribed.`);
+                        transcripts.push(data.transcript || '');
+                    }
+                    status.textContent = 'Creating the meeting summary and actions…';
+                    const response = await fetch('/api/weekly-kpi/meetings/from-transcript', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({transcript: transcripts.filter(Boolean).join('\n\n')}),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.error_message || 'Meeting analysis failed.');
+                    renderMeetingResult(data);
+                    await clearSavedRecording();
+                } catch (error) {
+                    showRecoveryControls(`${error.message} The recording is still saved in this browser.`);
+                } finally {
+                    retry.disabled = false;
+                    start.disabled = false;
+                }
+            };
+            const startRecorderSegment = () => {
+                const options = {};
+                if (MediaRecorder.isTypeSupported?.('audio/webm;codecs=opus')) options.mimeType = 'audio/webm;codecs=opus';
+                options.audioBitsPerSecond = 32000;
+                recorder = new MediaRecorder(stream, options);
+                const currentSegment = segmentIndex;
+                recorder.ondataavailable = event => {
+                    if (!event.data.size) return;
+                    const write = saveRecordingChunk(event.data, currentSegment, chunkSequence++, recorder.mimeType || 'audio/webm');
+                    pendingWrites.push(write);
+                };
+                recorder.onstop = async () => {
+                    clearTimeout(segmentTimer);
+                    await Promise.allSettled(pendingWrites);
+                    pendingWrites = [];
+                    if (recordingActive) {
+                        segmentIndex += 1;
+                        startRecorderSegment();
+                    } else if (finalStopResolve) {
+                        finalStopResolve(); finalStopResolve = null;
+                    }
+                };
+                recorder.start(5000);
+                segmentTimer = setTimeout(() => recorder.state === 'recording' && recorder.stop(), segmentDurationMs);
+            };
             start.addEventListener('click', async () => {
                 try {
+                    if (hasPendingRecording && !window.confirm('Replace the saved recording that is waiting to be transcribed?')) return;
+                    if (hasPendingRecording) await clearSavedRecording();
                     stream = await navigator.mediaDevices.getUserMedia({audio: true});
-                    chunks = []; recorder = new MediaRecorder(stream);
-                    recorder.ondataavailable = event => event.data.size && chunks.push(event.data);
-                    recorder.start(); start.disabled = true; stop.disabled = false; status.textContent = 'Recording…';
+                    segmentIndex = 0; chunkSequence = 0; pendingWrites = []; recordingActive = true;
+                    localStorage.setItem(recordingMetaKey, JSON.stringify({startedAt: new Date().toISOString()}));
+                    hasPendingRecording = true;
+                    startRecorderSegment();
+                    start.disabled = true; stop.disabled = false; retry.hidden = download.hidden = discard.hidden = true;
+                    status.textContent = 'Recording… audio is being saved safely in this browser.';
                 } catch (error) { status.textContent = 'Microphone permission was not granted.'; }
             });
-            stop.addEventListener('click', () => {
-                stop.disabled = true; status.textContent = 'Transcribing and finding actions…'; recorder.stop();
-                recorder.onstop = async () => {
-                    stream.getTracks().forEach(track => track.stop());
-                    const blob = new Blob(chunks, {type: recorder.mimeType || 'audio/webm'});
-                    const form = new FormData(); form.append('audio', blob, 'weekly-meeting.webm');
-                    try {
-                        const response = await fetch('/api/weekly-kpi/todos/from-audio', {method: 'POST', body: form});
-                        const data = await response.json();
-                        if (!response.ok) throw new Error(data.error_message || 'Analysis failed');
-                        const actions = data.actions || [];
-                        const list = items => (items || []).length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '<p class="small muted">None recorded.</p>';
-                        const summary = `<div class="kpi-meeting-result"><h3>Meeting summary</h3><p>${escapeHtml(data.summary || 'No summary was produced.')}</p><h3>Key decisions</h3>${list(data.decisions)}<h3>Notable updates</h3>${list(data.updates)}<p><a href="/weekly-kpi-meetings/${encodeURIComponent(data.meeting_id)}" target="_blank" rel="noopener">Open saved meeting record</a></p></div>`;
-                        const actionMarkup = actions.length ? actions.map((action, index) => `<label class="kpi-proposal"><input type="checkbox" checked data-index="${index}"><span><strong>${escapeHtml(action.text)}</strong>${action.owner ? `<small>${escapeHtml(action.owner)}</small>` : ''}</span></label>`).join('') + '<button class="button small-button" type="button" id="meeting-actions-add">Add selected actions</button>' : '<p class="small muted">No explicit actions were found.</p>';
-                        proposals.innerHTML = summary + '<h3>Proposed actions</h3>' + actionMarkup;
-                        proposals.dataset.actions = JSON.stringify(actions); status.textContent = 'Review the proposed actions.';
-                        document.getElementById('meeting-actions-add')?.addEventListener('click', async () => {
-                            const selected = actions.filter((_, index) => proposals.querySelector(`input[data-index="${index}"]`)?.checked);
-                            const saved = await fetch('/api/weekly-kpi/todos/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({actions:selected, meeting_id:data.meeting_id})});
-                            if (saved.ok) location.href = '/weekly-kpi-dashboard#weekly-actions';
-                        });
-                    } catch (error) { status.textContent = error.message; }
-                    start.disabled = false;
-                };
+            stop.addEventListener('click', async () => {
+                stop.disabled = true; recordingActive = false; clearTimeout(segmentTimer);
+                status.textContent = 'Finishing and saving the recording…';
+                if (recorder?.state === 'recording') {
+                    await new Promise(resolve => { finalStopResolve = resolve; recorder.stop(); });
+                }
+                stream?.getTracks().forEach(track => track.stop());
+                retry.hidden = download.hidden = discard.hidden = false;
+                await transcribeSavedRecording();
             });
+            retry.addEventListener('click', transcribeSavedRecording);
+            download.addEventListener('click', async () => {
+                const segments = await groupedRecordingSegments();
+                segments.forEach((segment, index) => {
+                    const link = document.createElement('a');
+                    link.href = URL.createObjectURL(segment.blob);
+                    link.download = `weekly-meeting-${index + 1}-of-${segments.length}.webm`;
+                    link.click();
+                    setTimeout(() => URL.revokeObjectURL(link.href), 30000);
+                });
+                status.textContent = `Downloaded ${segments.length} saved recording section${segments.length === 1 ? '' : 's'}.`;
+            });
+            discard.addEventListener('click', async () => {
+                if (!window.confirm('Permanently discard the saved meeting recording?')) return;
+                await clearSavedRecording();
+                status.textContent = 'Saved recording discarded.';
+            });
+            window.addEventListener('beforeunload', event => {
+                if (!recordingActive && !hasPendingRecording) return;
+                event.preventDefault(); event.returnValue = '';
+            });
+            if (hasPendingRecording) showRecoveryControls('A saved meeting recording is ready to retry or download.');
             function escapeHtml(value) { const el = document.createElement('span'); el.textContent = value || ''; return el.innerHTML; }
         })();
         </script>
@@ -14399,12 +14588,72 @@ def get_dismissed_customers_view():
     return render_page(title="Dismissed Customers", body=body)
 
 
+@app.post("/customers-view/sync")
+def post_customers_view_sync(
+    customer: str = Form(""),
+    state: str = Form(""),
+    sort: str = Form("last_order"),
+    direction: str = Form("desc"),
+    page: int = Form(1),
+):
+    # This is the explicit, potentially slower refresh path. Keep normal page
+    # loads cache-only, but refresh the contact directory and a broad CRM
+    # overlay here so activity older than the small automatic window is kept.
+    clear_filemaker_master_data_cache()
+    result = fetch_filemaker_customer_data(force_refresh=True)
+    crm_result = (
+        sync_filemaker_crm_recent_cache()
+        if get_crm_data_source() == "filemaker"
+        else {"status": "not_applicable"}
+    )
+    customer_sync_ok = result.get("status") == "ok"
+    crm_sync_ok = crm_result.get("status") in {"ok", "not_applicable"}
+
+    if customer_sync_ok and crm_sync_ok:
+        clear_attention_response_cache()
+        clear_customer_summaries_cache()
+        message = (
+            f"Customer and CRM data synced. "
+            f"{len(result.get('customers_by_key', {}))} active customers loaded."
+        )
+        error = ""
+    else:
+        clear_attention_response_cache()
+        clear_customer_summaries_cache()
+        completed = []
+        failures = []
+        if customer_sync_ok:
+            completed.append("customer data")
+        else:
+            failures.append(f"customer data ({result.get('status', 'unknown error')})")
+        if crm_sync_ok:
+            completed.append("CRM data")
+        else:
+            failures.append(f"CRM data ({crm_result.get('status', 'unknown error')})")
+        message = f"Synced {' and '.join(completed)}." if completed else ""
+        error = f"Could not sync {' and '.join(failures)}."
+
+    query = urlencode({
+        "customer": customer,
+        "state": state,
+        "sort": sort,
+        "direction": direction,
+        "page": max(1, page),
+        "message": message,
+        "error": error,
+    })
+    return RedirectResponse(url=f"/customers-view?{query}", status_code=303)
+
+
 @app.get("/customers-view", response_class=HTMLResponse)
 def get_customers_view(
     customer: str = "",
     state: str = "",
     sort: str = "last_order",
     direction: str = "desc",
+    page: int = 1,
+    message: str = "",
+    error: str = "",
 ):
     view_started_at = time.perf_counter()
     stage_started_at = time.perf_counter()
@@ -14425,6 +14674,9 @@ def get_customers_view(
     crm_result = fetch_crm_activities()
     log_perf_metric("customers.fetch_crm_activities", stage_started_at)
     stage_started_at = time.perf_counter()
+    master_data_result = fetch_filemaker_customer_data()
+    log_perf_metric("customers.fetch_filemaker_customer_data", stage_started_at)
+    stage_started_at = time.perf_counter()
     attention_result = build_customers_needing_attention_response(
         order_result=order_result,
         crm_result=crm_result,
@@ -14439,6 +14691,7 @@ def get_customers_view(
         order_result=order_result,
         crm_result=crm_result,
         attention_result=attention_result,
+        master_data_result=master_data_result,
     )
     log_perf_metric("customers.build_cached_customer_summaries", stage_started_at)
     stage_started_at = time.perf_counter()
@@ -14453,9 +14706,15 @@ def get_customers_view(
         direction=direction
     )
     log_perf_metric("customers.filter_and_sort", stage_started_at)
+    page_size = 50
+    total_filtered = len(sorted_summaries)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start_index = (page - 1) * page_size
+    paged_summaries = sorted_summaries[start_index:start_index + page_size]
     rows = "".join(
         render_customer_summary_row(summary)
-        for summary in sorted_summaries
+        for summary in paged_summaries
     )
 
     if not rows:
@@ -14465,10 +14724,17 @@ def get_customers_view(
             "</tr>"
         )
 
-    body = f"""
-        {render_data_availability_banner(order_result, crm_result)}
+    status_markup = ""
+    if message:
+        status_markup = f'<p class="status ok">{escape(message)}</p>'
+    elif error:
+        status_markup = f'<p class="status error">{escape(error)}</p>'
 
-        <div class="summary customer-summary">
+    body = f"""
+        {status_markup}
+        {render_data_availability_banner(order_result, crm_result, master_data_result)}
+
+        <div class="summary customer-summary customers-page-summary">
             <div>
                 <span class="label">Source</span>
                 <strong>{escape(order_result["source"])}</strong>
@@ -14479,7 +14745,7 @@ def get_customers_view(
             </div>
             <div>
                 <span class="label">Showing</span>
-                <strong>{len(sorted_summaries)}</strong>
+                <strong>{total_filtered}</strong>
             </div>
             <div>
                 <span class="label">Need Attention</span>
@@ -14489,24 +14755,25 @@ def get_customers_view(
 
         {render_customers_filter_form(customer, state, sort, direction)}
 
-        <div class="table-wrap tall-table">
+        <div class="table-wrap customers-table-wrap">
         <table class="customers-table">
             <thead>
                 <tr>
-                    <th>Customer</th>
-                    <th>Orders</th>
-                    <th>CRM</th>
-                    <th>State</th>
-                    <th>Last Order</th>
-                    <th>Avg Cycle</th>
-                    <th>Total Value</th>
-                    <th>Avg Value / Order</th>
-                    <th>Last Activity</th>
+                    {render_customer_sort_header("Customer", "customer", customer, state, sort, direction)}
+                    {render_customer_sort_header("Orders", "order_count", customer, state, sort, direction)}
+                    {render_customer_sort_header("CRM", "crm_count", customer, state, sort, direction)}
+                    {render_customer_sort_header("State", "state", customer, state, sort, direction)}
+                    {render_customer_sort_header("Last Order", "last_order", customer, state, sort, direction)}
+                    {render_customer_sort_header("Avg Cycle", "avg_cycle", customer, state, sort, direction)}
+                    {render_customer_sort_header("Total Value", "total_value", customer, state, sort, direction)}
+                    {render_customer_sort_header("Avg Value / Order", "avg_value", customer, state, sort, direction)}
+                    {render_customer_sort_header("Last Activity", "last_activity", customer, state, sort, direction)}
                 </tr>
             </thead>
             <tbody>{rows}</tbody>
         </table>
         </div>
+        {render_customers_pagination(customer, state, sort, direction, page, total_pages, total_filtered, start_index, len(paged_summaries))}
     """
 
     log_perf_metric("customers.total", view_started_at)
@@ -15089,33 +15356,46 @@ def get_customer_view(
         sort_key=sort,
         direction=direction
     )
-
-    if not customer_orders:
-        return render_page(
-            title="Customer Orders",
-            body=(
-                f"<p class='status'>No orders found for "
-                f"{escape(customer)}.</p>"
-            )
-        )
-
-    rows = "".join(
-        render_customer_order_row(order)
-        for order in sorted_orders
+    master_data_result = fetch_filemaker_customer_data()
+    customer_master_record = next((
+        record
+        for record in master_data_result.get("customers_by_key", {}).values()
+        if str(record.get("company") or "").strip().casefold() == customer.strip().casefold()
+    ), {})
+    customer_primary_key = (
+        get_customer_primary_key(customer_orders)
+        or str(customer_master_record.get("primary_key") or "").strip()
     )
+
     total_value = sum_order_amounts(customer_orders)
-    first_order = min(order["order_date"] for order in customer_orders)
-    last_order = max(order["order_date"] for order in customer_orders)
-    average_gap = calculate_average_gap(customer_orders)
-    cycle = analyze_order_cycle(customer_orders)
+    first_order = min((order["order_date"] for order in customer_orders), default="")
+    last_order = max((order["order_date"] for order in customer_orders), default="")
+    average_gap = calculate_average_gap(customer_orders) if customer_orders else None
+    cycle = analyze_order_cycle(customer_orders) if customer_orders else {
+        "pattern_label": "No orders",
+    }
     average_value = average_order_amount(customer_orders)
-    last_activity = get_last_activity(customer_orders)
-    last_activity_info = get_last_activity_info(customer_orders)
-    customer_primary_key = get_customer_primary_key(customer_orders)
-    crm_activities = (
-        crm_result.get("activity_map", {}).get(customer_primary_key, [])
-        if crm_result["status"] == "ok" else []
-    )
+    last_activity = get_last_activity(customer_orders) if customer_orders else None
+    if crm_result["status"] == "ok":
+        detail_activity_map = crm_result.get("activity_map", {})
+        contact_directory = fetch_filemaker_master_data()
+        if contact_directory.get("status") == "ok":
+            detail_activity_map = build_shared_contact_activity_map(
+                crm_result.get("activities", []),
+                contact_directory,
+            )
+        contextual_activity_map = build_contextual_crm_activity_map(
+            detail_activity_map,
+            crm_result.get("activities", []),
+            [{
+                "customer": customer,
+                "customer_primary_key": customer_primary_key,
+                "orders": customer_orders,
+            }],
+        )
+        crm_activities = contextual_activity_map.get(customer_primary_key, [])
+    else:
+        crm_activities = []
     sales_crm_activities = get_sales_outreach_activities(crm_activities)
     filtered_crm_activities = filter_customer_crm_activities(
         crm_activities,
@@ -15127,16 +15407,36 @@ def get_customer_view(
     latest_sales_crm_activity_date = parse_crm_datetime(
         latest_sales_crm_activity.get("date_created", "")
     ) if latest_sales_crm_activity else None
-    display_last_activity = last_activity or latest_sales_crm_activity_date
+    display_last_activity = latest_sales_crm_activity_date
     enrichment_href = build_customer_enrichment_href(
         customer,
         customer_orders,
         crm_activities=crm_activities,
+        customer_primary_key=customer_primary_key,
     )
+
+    if customer_orders:
+        rows = "".join(render_customer_order_row(order) for order in sorted_orders)
+        order_history_html = f"""
+            {render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category)}
+            <div class="table-wrap tall-table">
+            <table>
+                <thead><tr><th>Record</th><th>Customer</th><th>Order Date</th><th>Amount</th><th>Order No</th><th>Status</th><th>Price List</th><th>State</th><th>Territory</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+            </div>
+        """
+    else:
+        order_history_html = """
+            <section class="panel">
+                <h2>Order History</h2>
+                <p class="empty">No order history is linked to this customer yet.</p>
+            </section>
+        """
 
     body = f"""
         <div class="customer-detail-page">
-        {render_data_availability_banner(result, crm_result)}
+        {render_data_availability_banner(result, crm_result, master_data_result)}
 
         <div class="summary customer-summary">
             <div>
@@ -15149,11 +15449,11 @@ def get_customer_view(
             </div>
             <div>
                 <span class="label">First Order</span>
-                <strong>{escape(first_order)}</strong>
+                <strong>{format_customer_list_date(first_order, "No orders")}</strong>
             </div>
             <div>
                 <span class="label">Last Order</span>
-                <strong>{escape(last_order)}</strong>
+                <strong>{format_customer_list_date(last_order, "No orders")}</strong>
             </div>
             <div>
                 <span class="label">Typical Cycle</span>
@@ -15190,6 +15490,7 @@ def get_customer_view(
             customer=customer,
             attention=build_customers_needing_attention_response_map().get(customer),
             latest_crm_activity=latest_crm_activity,
+            latest_sales_crm_activity=latest_sales_crm_activity,
             crm_activities=crm_activities,
             last_order=last_order,
             average_gap=average_gap,
@@ -15207,26 +15508,7 @@ def get_customer_view(
             direction,
         )}
 
-        {render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category)}
-
-        <div class="table-wrap tall-table">
-        <table>
-            <thead>
-                <tr>
-                    <th>Record</th>
-                    <th>Customer</th>
-                    <th>Order Date</th>
-                    <th>Amount</th>
-                    <th>Order No</th>
-                    <th>Status</th>
-                    <th>Price List</th>
-                    <th>State</th>
-                    <th>Territory</th>
-                </tr>
-            </thead>
-            <tbody>{rows}</tbody>
-        </table>
-        </div>
+        {order_history_html}
         </div>
     """
 
@@ -15543,7 +15825,9 @@ def build_customers_needing_attention_response(order_result=None, crm_result=Non
 
     if cache_seconds:
         _ATTENTION_RESPONSE_CACHE["key"] = cache_key
-        _ATTENTION_RESPONSE_CACHE["expires_at"] = now + cache_seconds
+        # This calculation is derived entirely from versioned/cached inputs.
+        # Keep it until those inputs change or an explicit sync clears it.
+        _ATTENTION_RESPONSE_CACHE["expires_at"] = float("inf")
         _ATTENTION_RESPONSE_CACHE["result"] = result
 
     return result
@@ -15630,41 +15914,135 @@ def render_customer_order_row(order):
     """
 
 
-def build_customer_summaries(orders, attention_by_customer, crm_activity_map=None):
+def normalize_crm_organization_name(value):
+    organization = normalize_apollo_location_value(get_customer_organization_label(value))
+    tokens = set(organization.split())
+    if "vestis" in tokens or "aramark" in tokens:
+        return "vestis"
+    return organization
+
+
+def build_contextual_crm_activity_map(activity_map, activities, customer_entries):
+    """Recover branch-specific and uniquely identifiable legacy CRM history."""
+    contextual_map = {
+        str(key): list(items or [])
+        for key, items in (activity_map or {}).items()
+    }
+    branches_by_organization = defaultdict(list)
+    activities_by_organization = defaultdict(list)
+    activity_keys_by_organization = defaultdict(set)
+
+    for entry in customer_entries or []:
+        customer_name = str(entry.get("customer") or "").strip()
+        customer_key = str(entry.get("customer_primary_key") or "").strip()
+        branch = extract_customer_branch_parts(customer_name, entry.get("orders", []))
+        organization = normalize_crm_organization_name(customer_name)
+        city = normalize_apollo_location_value(branch.get("city"))
+        if organization and city and customer_key:
+            branches_by_organization[organization].append((customer_key, city))
+
+    for activity in activities or []:
+        activity_company = str(
+            activity.get("customer_company")
+            or activity.get("customer_label")
+            or ""
+        ).strip()
+        organization = normalize_crm_organization_name(activity_company)
+        activity_key = str(activity.get("customer_primary_key") or "").strip()
+        if organization:
+            activities_by_organization[organization].append(activity)
+            if activity_key:
+                activity_keys_by_organization[organization].add(activity_key)
+        candidate_branches = branches_by_organization.get(organization, [])
+        if not candidate_branches:
+            continue
+
+        searchable_text = normalize_apollo_location_value(" ".join(str(activity.get(field) or "") for field in (
+            "subject", "body", "customer_label", "customer_company"
+        )))
+        direct_key = str(activity.get("customer_primary_key") or "").strip()
+        for customer_key, city in candidate_branches:
+            if customer_key != direct_key and f" {city} " in f" {searchable_text} ":
+                contextual_map.setdefault(customer_key, []).append(activity)
+
+    for entry in customer_entries or []:
+        customer_name = str(entry.get("customer") or "").strip()
+        customer_key = str(entry.get("customer_primary_key") or "").strip()
+        organization = normalize_crm_organization_name(customer_name)
+        if not customer_key or (activity_map or {}).get(customer_key):
+            continue
+        historical_keys = activity_keys_by_organization.get(organization, set())
+        if len(historical_keys) == 1 and customer_key not in historical_keys:
+            contextual_map[customer_key] = list(activities_by_organization.get(organization, []))
+
+    for customer_key, items in contextual_map.items():
+        deduped = {}
+        for activity in items:
+            dedupe_key = (
+                str(activity.get("date_created") or ""),
+                str(activity.get("subject") or ""),
+                str(activity.get("sender_email") or ""),
+                str(activity.get("to") or ""),
+            )
+            deduped[dedupe_key] = activity
+        contextual_map[customer_key] = sorted(
+            deduped.values(),
+            key=lambda item: str(item.get("date_created") or ""),
+            reverse=True,
+        )
+
+    return contextual_map
+
+
+def build_customer_summaries(orders, attention_by_customer, crm_activity_map=None, master_data_result=None, crm_activities=None):
     grouped_customers = group_by_customer(orders)
-    crm_activity_map = crm_activity_map or {}
     summaries = []
 
-    for customer_name, customer_orders in grouped_customers.items():
-        cycle = analyze_order_cycle(customer_orders)
+    customer_entries = build_customer_lookup_entries(grouped_customers, master_data_result)
+    crm_activity_map = build_contextual_crm_activity_map(
+        crm_activity_map or {},
+        crm_activities or [],
+        customer_entries,
+    )
+    customers_by_key = (master_data_result or {}).get("customers_by_key", {})
+
+    for entry in customer_entries:
+        customer_name = entry["customer"]
+        customer_orders = entry.get("orders", [])
+        customer_primary_key = entry.get("customer_primary_key", "")
+        customer_record = customers_by_key.get(customer_primary_key, {})
+        cycle = analyze_order_cycle(customer_orders) if customer_orders else {
+            "cycle_days": None,
+            "pattern_label": "No orders",
+        }
         state_counts = Counter(
             get_order_state(order)
             for order in customer_orders
             if get_order_state(order)
         )
-        last_activity = get_last_activity(customer_orders)
         attention = attention_by_customer.get(customer_name)
-        customer_primary_key = get_customer_primary_key(customer_orders)
         crm_activities = crm_activity_map.get(customer_primary_key, [])
         sales_crm_activities = get_sales_outreach_activities(crm_activities)
         latest_sales_crm_activity = sales_crm_activities[0] if sales_crm_activities else None
         latest_sales_crm_activity_date = parse_crm_datetime(
             latest_sales_crm_activity.get("date_created", "")
         ) if latest_sales_crm_activity else None
-        display_last_activity = last_activity or latest_sales_crm_activity_date
 
         summaries.append({
             "customer": customer_name,
             "order_count": len(customer_orders),
             "crm_count": len(crm_activities),
-            "state": state_counts.most_common(1)[0][0] if state_counts else "",
-            "last_order": max(order["order_date"] for order in customer_orders),
+            "state": (
+                state_counts.most_common(1)[0][0]
+                if state_counts else str(customer_record.get("state") or entry.get("state") or "")
+            ),
+            "last_order": max((order["order_date"] for order in customer_orders), default=""),
             "avg_cycle": cycle["cycle_days"],
             "cycle_pattern_label": cycle["pattern_label"],
             "total_value": sum_order_amounts(customer_orders),
             "avg_value": average_order_amount(customer_orders),
-            "last_activity": last_activity,
-            "display_last_activity": display_last_activity,
+            "last_activity": latest_sales_crm_activity_date,
+            "display_last_activity": latest_sales_crm_activity_date,
             "latest_crm_activity": (
                 latest_sales_crm_activity.get("date_created", "")
                 if latest_sales_crm_activity else ""
@@ -15837,7 +16215,7 @@ def build_customer_map_rows(order_result=None, master_data_result=None):
     return rows
 
 
-def build_cached_customer_summaries(order_result, crm_result, attention_result=None):
+def build_cached_customer_summaries(order_result, crm_result, attention_result=None, master_data_result=None):
     started_at = time.perf_counter()
     cache_seconds = get_customer_summaries_cache_seconds()
     now = time.time()
@@ -15860,6 +16238,8 @@ def build_cached_customer_summaries(order_result, crm_result, attention_result=N
         crm_result.get("synced_at", ""),
         crm_result.get("cache_updated_at", ""),
         crm_result.get("counts", {}).get("kept_rows", 0),
+        (master_data_result or {}).get("status", ""),
+        len((master_data_result or {}).get("customers_by_key", {})),
         len(attention_by_customer),
     )
 
@@ -15879,6 +16259,8 @@ def build_cached_customer_summaries(order_result, crm_result, attention_result=N
             if crm_result.get("status") == "ok"
             else {}
         ),
+        master_data_result,
+        crm_result.get("activities", []) if crm_result.get("status") == "ok" else [],
     )
 
     log_perf_metric(
@@ -15888,7 +16270,9 @@ def build_cached_customer_summaries(order_result, crm_result, attention_result=N
 
     if cache_seconds:
         _CUSTOMER_SUMMARIES_CACHE["key"] = cache_key
-        _CUSTOMER_SUMMARIES_CACHE["expires_at"] = now + cache_seconds
+        # Filtering, sorting and pagination should reuse the completed customer
+        # index. Sync and data-update paths explicitly clear this cache.
+        _CUSTOMER_SUMMARIES_CACHE["expires_at"] = float("inf")
         _CUSTOMER_SUMMARIES_CACHE["result"] = summaries
 
     return summaries
@@ -15896,21 +16280,21 @@ def build_cached_customer_summaries(order_result, crm_result, attention_result=N
 
 def render_customer_summary_row(summary):
     customer_name = str(summary["customer"])
-    customer_url = f"/customer-view?customer={quote(customer_name)}"
+    customer_markup = f'<a href="/customer-view?customer={quote(customer_name)}"><strong>{escape(customer_name)}</strong></a>'
 
     return f"""
         <tr>
-            <td><a href="{customer_url}"><strong>{escape(customer_name)}</strong></a></td>
+            <td>{customer_markup}</td>
             <td>{summary["order_count"]}</td>
             <td>{summary["crm_count"]}</td>
             <td>{escape(str(summary["state"]))}</td>
-            <td>{escape(str(summary["last_order"]))}</td>
+            <td>{format_customer_list_date(summary.get("last_order"), "No orders")}</td>
             <td>{format_average_gap(summary["avg_cycle"])} <span class="muted-soft">({escape(str(summary.get("cycle_pattern_label") or "Not enough orders"))})</span></td>
             <td>{format_currency(summary["total_value"])}</td>
             <td>{format_currency(summary["avg_value"])}</td>
             <td>
                 <div class="customers-last-activity">
-                    <span>{format_optional_date(summary.get("display_last_activity"))}</span>
+                    <span>{format_customer_list_date(summary.get("display_last_activity"), "No sales outreach")}</span>
                     {render_recent_activity_badge_for_date(summary.get("display_last_activity"))}
                 </div>
             </td>
@@ -16172,6 +16556,13 @@ def render_customer_crm_timeline_controls(customer, crm_direction, crm_category,
             </label>
 
             <button type="submit">Apply</button>
+            <a class="button secondary" href="/customer-view?{urlencode({
+                'customer': customer,
+                'sort': sort,
+                'direction': direction,
+                'crm_limit': crm_limit,
+                'crm_page': 1,
+            })}#crm-timeline">Reset</a>
         </form>
     """
 
@@ -16269,6 +16660,7 @@ def render_contact_ready_panel(
     customer,
     attention,
     latest_crm_activity,
+    latest_sales_crm_activity,
     crm_activities,
     last_order,
     average_gap,
@@ -16278,6 +16670,7 @@ def render_contact_ready_panel(
         customer=customer,
         attention=attention,
         latest_crm_activity=latest_crm_activity,
+        latest_sales_crm_activity=latest_sales_crm_activity,
         crm_activities=crm_activities,
         last_order=last_order,
         average_gap=average_gap,
@@ -16312,6 +16705,7 @@ def build_contact_recommendation(
     customer,
     attention,
     latest_crm_activity,
+    latest_sales_crm_activity,
     crm_activities,
     last_order,
     average_gap,
@@ -16324,11 +16718,21 @@ def build_contact_recommendation(
     if attention:
         priority_label = str(attention.get("action") or "Needs attention")
 
-    if latest_crm_activity:
+    latest_sales_date = parse_crm_datetime(
+        latest_sales_crm_activity.get("date_created", "")
+    ) if latest_sales_crm_activity else None
+    days_since_sales_contact = (
+        (get_analysis_today().date() - latest_sales_date.date()).days
+        if latest_sales_date else None
+    )
+
+    if latest_crm_activity and latest_sales_date:
         crm_summary = (
-            f"{len(crm_activities)} email(s), latest on "
-            f"{format_optional_datetime(latest_crm_activity.get('date_created', ''))}"
+            f"{len(crm_activities)} activities • latest sales outreach "
+            f"{format_optional_date(latest_sales_date)}"
         )
+    elif latest_crm_activity:
+        crm_summary = f"{len(crm_activities)} activities • no sales outreach linked"
     else:
         crm_summary = "No linked CRM emails yet"
 
@@ -16350,18 +16754,35 @@ def build_contact_recommendation(
             "This customer looks beyond its typical repair rhythm, but not deeply overdue."
             " A short message referencing the last conversation should be enough."
         )
-    elif latest_crm_activity:
-        next_step = "Use the CRM thread for context before any outreach"
+    elif days_since_sales_contact is None or days_since_sales_contact >= 120:
+        priority_label = "Reach out"
+        next_step = "Send a tailored sales check-in"
+        contact_age = (
+            f"The last sales outreach was {days_since_sales_contact} days ago. "
+            if days_since_sales_contact is not None else
+            "No sales outreach is linked to this customer. "
+        )
         guidance = (
-            "The order pattern is not currently urgent, but there is useful email"
-            " history you can use to match tone and avoid repeating questions."
+            contact_age
+            + "Review the latest sales conversation for names and context, then send a fresh message with a clear reason to reconnect."
+        )
+    elif latest_sales_crm_activity:
+        next_step = "Review the latest sales conversation before following up"
+        guidance = (
+            "Recent sales outreach exists. Read that conversation first, then decide whether a follow-up is needed so the customer does not receive duplicate outreach."
         )
 
-    draft_prompt = (
-        f"Draft angle for {customer}: mention the last order on {last_order}, note the customer's"
-        f" typical repair rhythm of {round(average_gap, 1) if average_gap else 'n/a'} days, and tie the"
-        f" message back to the latest CRM conversation."
-    )
+    if last_order:
+        draft_prompt = (
+            f"Draft angle for {customer}: mention the last order on {last_order}, note the customer's"
+            f" typical repair rhythm of {round(average_gap, 1) if average_gap else 'n/a'} days, and use the"
+            f" latest sales conversation to personalise the follow-up."
+        )
+    else:
+        draft_prompt = (
+            f"Draft angle for {customer}: there is no linked order history, so use the latest CRM"
+            " conversation and known relationship context as the starting point."
+        )
 
     if last_activity:
         draft_prompt += (
@@ -16872,7 +17293,10 @@ def get_contact_row_branch_candidates(rows, organization_name="", expected_city=
 
 def extract_customer_branch_parts(customer_name, customer_orders=None):
     customer_name = str(customer_name or "").strip()
-    match = re.search(r"\(([^()]+)\)\s*$", customer_name)
+    # Branch codes such as "MC 581" often follow the location parentheses.
+    # Treat the final parenthesized location as authoritative even with that
+    # suffix present.
+    match = re.search(r"\(([^()]+)\)(?:\s+[^()]*)?$", customer_name)
     city = ""
     state = ""
 
@@ -16883,7 +17307,12 @@ def extract_customer_branch_parts(customer_name, customer_orders=None):
             city = city_part.strip()
             state = state_part.strip()
         else:
-            state = location_text.strip()
+            location_match = re.match(r"^(.+?)\s+([A-Za-z]{2})$", location_text)
+            if location_match:
+                city = location_match.group(1).strip()
+                state = location_match.group(2).strip()
+            else:
+                state = location_text.strip()
 
     if not state and customer_orders:
         state = str(get_order_state(customer_orders[-1]) or "").strip()
@@ -16896,7 +17325,7 @@ def extract_customer_branch_parts(customer_name, customer_orders=None):
 
 def get_customer_organization_label(customer_name):
     customer_name = str(customer_name or "").strip()
-    return re.sub(r"\s*\([^()]+\)\s*$", "", customer_name).strip()
+    return re.sub(r"\s*\([^()]+\)(?:\s+[^()]*)?$", "", customer_name).strip()
 
 
 def extract_domain_from_email(email):
@@ -17036,8 +17465,8 @@ def infer_customer_domain(customer_primary_key, crm_activities=None):
     return Counter(contact_domains).most_common(1)[0][0]
 
 
-def build_customer_enrichment_prefill(customer_name, customer_orders, crm_activities=None):
-    customer_primary_key = get_customer_primary_key(customer_orders)
+def build_customer_enrichment_prefill(customer_name, customer_orders, crm_activities=None, customer_primary_key=""):
+    customer_primary_key = customer_primary_key or get_customer_primary_key(customer_orders)
     branch_parts = extract_customer_branch_parts(customer_name, customer_orders=customer_orders)
     return {
         "customer": str(customer_name or "").strip(),
@@ -17049,11 +17478,12 @@ def build_customer_enrichment_prefill(customer_name, customer_orders, crm_activi
     }
 
 
-def build_customer_enrichment_href(customer_name, customer_orders, crm_activities=None):
+def build_customer_enrichment_href(customer_name, customer_orders, crm_activities=None, customer_primary_key=""):
     prefill = build_customer_enrichment_prefill(
         customer_name,
         customer_orders,
         crm_activities=crm_activities,
+        customer_primary_key=customer_primary_key,
     )
     query = {
         "customer": prefill.get("customer", ""),
@@ -17434,6 +17864,17 @@ def format_optional_date(value):
         return parsed_value.strftime("%m/%d/%Y")
 
     return str(value)
+
+
+def format_customer_list_date(value, empty_label):
+    if not value:
+        return escape(empty_label)
+
+    parsed_value = parse_display_datetime(value)
+    if parsed_value:
+        return parsed_value.strftime("%m/%d/%Y")
+
+    return escape(str(value))
 
 
 def format_optional_datetime(value):
@@ -22382,25 +22823,10 @@ def render_late_customers_filter_form(customer, action, sort, direction):
 
 
 def render_customers_filter_form(customer, state, sort, direction):
-    sort_options = {
-        "last_order": "Last Order",
-        "attention": "Attention Priority",
-        "customer": "Customer",
-        "order_count": "Order Count",
-        "crm_count": "CRM Emails",
-        "state": "State",
-        "avg_cycle": "Typical Cycle",
-        "total_value": "Total Value",
-        "avg_value": "Avg Value / Order",
-        "last_activity": "Last Activity",
-    }
-    direction_options = {
-        "desc": "Descending",
-        "asc": "Ascending",
-    }
-
     return f"""
-        <form class="controls" method="get" action="/customers-view">
+        <form class="controls customers-controls" method="get" action="/customers-view">
+            <input type="hidden" name="sort" value="{escape(sort)}">
+            <input type="hidden" name="direction" value="{escape(direction)}">
             <label>
                 <span>Customer</span>
                 <input
@@ -22421,23 +22847,61 @@ def render_customers_filter_form(customer, state, sort, direction):
                 >
             </label>
 
-            <label>
-                <span>Sort</span>
-                <select name="sort">
-                    {render_select_options(sort_options, sort)}
-                </select>
-            </label>
-
-            <label>
-                <span>Direction</span>
-                <select name="direction">
-                    {render_select_options(direction_options, direction)}
-                </select>
-            </label>
-
             <button type="submit">Apply</button>
             <a class="button secondary" href="/customers-view">Reset</a>
+            <button
+                type="submit"
+                class="button secondary"
+                formmethod="post"
+                formaction="/customers-view/sync"
+            >Sync customer data</button>
         </form>
+    """
+
+
+def render_customer_sort_header(label, sort_key, customer, state, current_sort, current_direction):
+    next_direction = "asc" if current_sort != sort_key or current_direction == "desc" else "desc"
+    indicator = ""
+    aria_sort = "none"
+    if current_sort == sort_key:
+        indicator = " ↑" if current_direction == "asc" else " ↓"
+        aria_sort = "ascending" if current_direction == "asc" else "descending"
+    query = urlencode({
+        "customer": customer,
+        "state": state,
+        "sort": sort_key,
+        "direction": next_direction,
+        "page": 1,
+    })
+    return (
+        f'<th aria-sort="{aria_sort}"><a class="table-sort-link" '
+        f'href="/customers-view?{escape(query)}">{escape(label)}{indicator}</a></th>'
+    )
+
+
+def render_customers_pagination(customer, state, sort, direction, page, total_pages, total_filtered, start_index, shown_count):
+    base_query = urlencode({
+        "customer": customer,
+        "state": state,
+        "sort": sort,
+        "direction": direction,
+    })
+    previous_link = (
+        f'<a class="button secondary pager-button" href="/customers-view?{base_query}&page={page - 1}">Previous</a>'
+        if page > 1 else '<span></span>'
+    )
+    next_link = (
+        f'<a class="button secondary pager-button" href="/customers-view?{base_query}&page={page + 1}">Next</a>'
+        if page < total_pages else '<span></span>'
+    )
+    return f"""
+        <div class="pager customers-pager">
+            <span class="small muted">
+                Showing {start_index + 1 if total_filtered else 0} to {start_index + shown_count} of {total_filtered} customers
+            </span>
+            <span class="small muted">Page {page} of {total_pages}</span>
+            <div class="pager-actions">{previous_link}{next_link}</div>
+        </div>
     """
 
 
@@ -27884,6 +28348,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 14px;
                     }}
 
+                    .calendar-agenda-events {{
+                        display: grid;
+                        grid-column: 2;
+                        gap: 10px;
+                        min-width: 0;
+                    }}
+
                     .calendar-agenda-event {{
                         display: grid;
                         grid-template-columns: 100px minmax(0, 1fr) minmax(120px, 0.6fr);
@@ -28052,6 +28523,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .calendar-agenda-day {{
                             grid-template-columns: minmax(0, 1fr);
+                        }}
+
+                        .calendar-agenda-events {{
+                            grid-column: 1;
                         }}
 
                         .calendar-agenda-event {{
@@ -31456,6 +31931,62 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         grid-template-columns: repeat(auto-fit, minmax(180px, 240px));
                     }}
 
+                    .customers-page-summary {{
+                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        gap: 8px;
+                        margin-bottom: 8px;
+                    }}
+
+                    .customers-page-summary div {{
+                        padding: 8px 10px;
+                    }}
+
+                    .customers-controls {{
+                        grid-template-columns: repeat(2, minmax(180px, 1fr)) repeat(3, minmax(130px, .75fr));
+                        gap: 8px;
+                        margin-bottom: 10px;
+                        padding: 10px;
+                    }}
+
+                    .customers-controls label {{
+                        gap: 4px;
+                    }}
+
+                    .customers-controls input,
+                    .customers-controls select,
+                    .customers-controls button,
+                    .customers-controls .button {{
+                        height: 38px;
+                        min-height: 38px;
+                    }}
+
+                    .controls.customers-controls button,
+                    .controls.customers-controls .button {{
+                        align-self: end;
+                    }}
+
+                    .controls.crm-timeline-controls button {{
+                        align-self: end;
+                    }}
+
+                    .customers-table-wrap {{
+                        max-height: none;
+                        overflow-x: auto;
+                        overflow-y: visible;
+                    }}
+
+                    .table-sort-link {{
+                        display: inline-flex;
+                        color: inherit;
+                        text-decoration: none;
+                        white-space: nowrap;
+                    }}
+
+                    .table-sort-link:hover {{
+                        color: var(--blue);
+                        text-decoration: underline;
+                    }}
+
                     .apollo-controls {{
                         grid-template-columns: repeat(4, minmax(0, 1fr));
                         gap: 8px;
@@ -34233,6 +34764,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .controls.compact {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .customers-page-summary,
+                        .customers-controls {{
                             grid-template-columns: 1fr;
                         }}
 

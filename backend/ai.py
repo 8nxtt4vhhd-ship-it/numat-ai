@@ -649,13 +649,13 @@ def generate_customer_explanation(customer):
         return fallback_explanation(customer)
 
 
-def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
-    """Transcribe a meeting and return a summary, decisions, updates and reviewable actions."""
+def transcribe_meeting_audio(audio_bytes, filename="meeting.webm"):
+    """Transcribe one safely sized meeting-audio segment."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        return {"status": "missing_api_key", "transcript": "", "actions": [], "error_message": "OpenAI is not configured."}
+        return {"status": "missing_api_key", "transcript": "", "error_message": "OpenAI is not configured."}
     if not audio_bytes:
-        return {"status": "empty_audio", "transcript": "", "actions": [], "error_message": "No meeting audio was received."}
+        return {"status": "empty_audio", "transcript": "", "error_message": "No meeting audio was received."}
 
     try:
         from openai import OpenAI
@@ -691,7 +691,6 @@ def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
                     return {
                         "status": "transcription_model_unavailable",
                         "transcript": "",
-                        "actions": [],
                         "error_message": (
                             "Meeting transcription is not enabled for this app's OpenAI project. "
                             "Please ask an administrator to enable an audio transcription model."
@@ -700,7 +699,24 @@ def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
                 raise
         transcript = str(getattr(transcription, "text", "") or "").strip()
         if not transcript:
-            return {"status": "no_transcript", "transcript": "", "actions": [], "error_message": "No speech could be transcribed."}
+            return {"status": "no_transcript", "transcript": "", "error_message": "No speech could be transcribed."}
+        return {"status": "ok", "transcript": transcript, "error_message": ""}
+    except Exception as error:
+        print(f"Meeting transcription failed: {error}")
+        return {"status": "error", "transcript": "", "error_message": str(error)}
+
+
+def generate_meeting_actions_from_transcript(transcript):
+    """Create a meeting record summary and actions from a combined transcript."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    transcript = str(transcript or "").strip()
+    if not api_key:
+        return {"status": "missing_api_key", "transcript": transcript, "actions": [], "error_message": "OpenAI is not configured."}
+    if not transcript:
+        return {"status": "no_transcript", "transcript": "", "actions": [], "error_message": "No speech could be transcribed."}
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
         response = client.responses.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
             input=[
@@ -742,7 +758,16 @@ def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
         }
     except Exception as error:
         print(f"Meeting action extraction failed: {error}")
-        return {"status": "error", "transcript": "", "actions": [], "error_message": str(error)}
+        return {"status": "error", "transcript": transcript, "actions": [], "error_message": str(error)}
+
+
+def generate_meeting_actions_from_audio(audio_bytes, filename="meeting.webm"):
+    """Transcribe a meeting and return a summary, decisions, updates and reviewable actions."""
+    transcription = transcribe_meeting_audio(audio_bytes, filename=filename)
+    if transcription.get("status") != "ok":
+        transcription.setdefault("actions", [])
+        return transcription
+    return generate_meeting_actions_from_transcript(transcription.get("transcript"))
 
 
 def add_ai_explanations(customers):
