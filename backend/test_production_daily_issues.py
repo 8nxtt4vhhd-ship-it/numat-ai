@@ -322,6 +322,14 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertTrue(issues.schedule_is_due(datetime(2026, 10, 15, 18, 30, tzinfo=timezone), settings))
         self.assertTrue(issues.schedule_is_due(datetime(2026, 10, 15, 18, 59, tzinfo=timezone), settings))
         self.assertFalse(issues.schedule_is_due(datetime(2026, 10, 15, 19, 0, tzinfo=timezone), settings))
+
+    def test_schedule_skips_saturdays_and_sundays(self):
+        settings = {"enabled": True, "send_time": "18:30"}
+        timezone = ZoneInfo("America/Chicago")
+
+        self.assertFalse(issues.schedule_is_due(datetime(2026, 10, 24, 18, 30, tzinfo=timezone), settings))
+        self.assertFalse(issues.schedule_is_due(datetime(2026, 10, 25, 18, 30, tzinfo=timezone), settings))
+        self.assertTrue(issues.schedule_is_due(datetime(2026, 10, 26, 18, 30, tzinfo=timezone), settings))
         self.assertFalse(issues.schedule_is_due(datetime(2026, 10, 15, 18, 45, tzinfo=timezone), {"enabled": False, "send_time": "18:30"}))
 
     def test_delivery_sends_html_to_configured_distribution_list(self):

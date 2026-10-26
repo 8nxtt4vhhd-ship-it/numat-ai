@@ -615,6 +615,8 @@ def schedule_is_due(now=None, settings=None):
     if not settings.get("enabled"):
         return False
     current = (now or datetime.now(PLANT_TIMEZONE)).astimezone(PLANT_TIMEZONE)
+    if current.weekday() >= 5:
+        return False
     scheduled_hour, scheduled_minute = (int(part) for part in settings["send_time"].split(":"))
     scheduled = current.replace(hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0)
     return scheduled <= current < scheduled + timedelta(minutes=30)
