@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from analysis import orders as mock_orders
 from filemaker import (
     fetch_order_records,
-    fetch_filemaker_master_data,
+    fetch_filemaker_customer_data,
     get_field_value,
     get_filemaker_config,
     map_filemaker_record_to_order,
@@ -44,7 +44,7 @@ def get_orders_for_analysis():
     if source == "filemaker":
         result = fetch_cached_filemaker_orders()
         orders = result["orders"]
-        master_data = fetch_filemaker_master_data()
+        master_data = fetch_filemaker_customer_data()
         if master_data.get("status") == "ok":
             inactive_customer_keys = set(master_data.get("inactive_customer_keys") or [])
             inactive_customer_names = set(master_data.get("inactive_customer_names") or [])

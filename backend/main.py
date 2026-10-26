@@ -228,6 +228,12 @@ _CUSTOMER_SUMMARIES_CACHE = {
     "result": None,
 }
 
+_CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK = Lock()
+_CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE = {
+    "key": None,
+    "result": None,
+}
+
 _STRATEGIC_DISCOVERY_RESULTS_CACHE = {
     "entries": {},
 }
@@ -244,6 +250,7 @@ _STRATEGIC_CONTACT_WORKSPACE_CACHE = {
 HOME_QUEUE_SUMMARIES_CACHE_VERSION = "2026-05-13-contact-policy-2"
 HOME_ACTION_PLAN_CACHE_VERSION = "2026-10-26-workflow-1"
 CUSTOMER_SUMMARIES_CACHE_VERSION = "2026-10-26-v7-shared-contacts"
+CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_VERSION = "2026-10-26-v1"
 
 APOLLO_BRANCH_RESULTS_CACHE_LOCK = Lock()
 APOLLO_BRANCH_RESULTS_CACHE = {
@@ -15291,8 +15298,16 @@ def get_customer_view(
     crm_direction: str = "",
     crm_category: str = "",
 ):
-    result = get_orders_for_analysis()
-    crm_result = fetch_crm_activities()
+    view_started_at = time.perf_counter()
+    stage_started_at = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        order_future = executor.submit(get_orders_for_analysis)
+        crm_future = executor.submit(fetch_crm_activities)
+        customer_data_future = executor.submit(fetch_filemaker_customer_data)
+        result = order_future.result()
+        crm_result = crm_future.result()
+        master_data_result = customer_data_future.result()
+    log_perf_metric("customer_detail.load_data_sources_parallel", stage_started_at)
     crm_limit = max(12, min(crm_limit, 120))
     crm_page = max(1, crm_page)
 
@@ -15305,6 +15320,7 @@ def get_customer_view(
             )
         )
 
+    stage_started_at = time.perf_counter()
     customer_orders = [
         order
         for order in result["orders"]
@@ -15315,7 +15331,6 @@ def get_customer_view(
         sort_key=sort,
         direction=direction
     )
-    master_data_result = fetch_filemaker_customer_data()
     customer_master_record = next((
         record
         for record in master_data_result.get("customers_by_key", {}).values()
@@ -15336,21 +15351,10 @@ def get_customer_view(
     average_value = average_order_amount(customer_orders)
     last_activity = get_last_activity(customer_orders) if customer_orders else None
     if crm_result["status"] == "ok":
-        detail_activity_map = crm_result.get("activity_map", {})
-        contact_directory = fetch_filemaker_master_data()
-        if contact_directory.get("status") == "ok":
-            detail_activity_map = build_shared_contact_activity_map(
-                crm_result.get("activities", []),
-                contact_directory,
-            )
-        contextual_activity_map = build_contextual_crm_activity_map(
-            detail_activity_map,
-            crm_result.get("activities", []),
-            [{
-                "customer": customer,
-                "customer_primary_key": customer_primary_key,
-                "orders": customer_orders,
-            }],
+        contextual_activity_map = build_cached_customer_contextual_activity_map(
+            result,
+            crm_result,
+            master_data_result,
         )
         crm_activities = contextual_activity_map.get(customer_primary_key, [])
     else:
@@ -15373,6 +15377,15 @@ def get_customer_view(
         crm_activities=crm_activities,
         customer_primary_key=customer_primary_key,
     )
+    attention_result = build_customers_needing_attention_response(
+        order_result=result,
+        crm_result=crm_result,
+    )
+    attention_by_customer = {
+        item["customer"]: item
+        for item in attention_result["late_customers"]
+    }
+    log_perf_metric("customer_detail.build_payload", stage_started_at)
 
     if customer_orders:
         rows = "".join(render_customer_order_row(order) for order in sorted_orders)
@@ -15447,7 +15460,7 @@ def get_customer_view(
 
         {render_contact_ready_panel(
             customer=customer,
-            attention=build_customers_needing_attention_response_map().get(customer),
+            attention=attention_by_customer.get(customer),
             latest_crm_activity=latest_crm_activity,
             latest_sales_crm_activity=latest_sales_crm_activity,
             crm_activities=crm_activities,
@@ -15482,6 +15495,7 @@ def get_customer_view(
         '</a>'
     )
 
+    log_perf_metric("customer_detail.total", view_started_at)
     return render_page(title=f"Customer: {customer}", body=body, top_right=top_right)
 
 
@@ -15623,6 +15637,13 @@ def clear_customer_summaries_cache():
     _CUSTOMER_SUMMARIES_CACHE["key"] = None
     _CUSTOMER_SUMMARIES_CACHE["expires_at"] = 0
     _CUSTOMER_SUMMARIES_CACHE["result"] = None
+    clear_customer_contextual_activity_cache()
+
+
+def clear_customer_contextual_activity_cache():
+    with _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK:
+        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["key"] = None
+        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["result"] = None
 
 
 def should_enable_startup_prewarm():
@@ -15958,6 +15979,52 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
         )
 
     return contextual_map
+
+
+def build_cached_customer_contextual_activity_map(
+    order_result,
+    crm_result,
+    master_data_result,
+):
+    """Build branch-aware CRM history once for all customer detail pages."""
+    orders = order_result.get("orders", [])
+    activities = crm_result.get("activities", [])
+    customers_by_key = master_data_result.get("customers_by_key", {})
+    cache_key = (
+        CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_VERSION,
+        id(orders),
+        len(orders),
+        id(activities),
+        len(activities),
+        id(customers_by_key),
+        len(customers_by_key),
+        crm_result.get("synced_at", ""),
+        crm_result.get("cache_updated_at", ""),
+        crm_result.get("recent_updated_at", ""),
+    )
+
+    cached = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("result")
+    if _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("key") == cache_key and cached is not None:
+        return cached
+
+    with _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK:
+        cached = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("result")
+        if _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE.get("key") == cache_key and cached is not None:
+            return cached
+
+        grouped_orders = group_by_customer(orders)
+        customer_entries = build_customer_lookup_entries(
+            grouped_orders,
+            master_data_result,
+        )
+        result = build_contextual_crm_activity_map(
+            crm_result.get("activity_map", {}),
+            activities,
+            customer_entries,
+        )
+        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["key"] = cache_key
+        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["result"] = result
+        return result
 
 
 def build_customer_summaries(orders, attention_by_customer, crm_activity_map=None, master_data_result=None, crm_activities=None):

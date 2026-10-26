@@ -10,6 +10,7 @@ import crm
 class CustomersViewTests(unittest.TestCase):
     def tearDown(self):
         filemaker.clear_filemaker_master_data_cache()
+        main.clear_customer_contextual_activity_cache()
 
     def test_customer_summaries_include_master_customer_without_orders(self):
         master_data = {
@@ -254,7 +255,12 @@ class CustomersViewTests(unittest.TestCase):
             "status": "ok",
             "source": "filemaker_sync_cache",
             "activities": [activity],
-            "activity_map": {"other-location-key": [activity]},
+            # Normal CRM cache creation has already indexed a shared contact
+            # against every active customer location.
+            "activity_map": {
+                "other-location-key": [activity],
+                "customer-key": [activity],
+            },
         }
         master_result = {
             "status": "ok",
@@ -276,7 +282,7 @@ class CustomersViewTests(unittest.TestCase):
             patch.object(main, "get_orders_for_analysis", return_value=order_result),
             patch.object(main, "fetch_crm_activities", return_value=crm_result),
             patch.object(main, "fetch_filemaker_customer_data", return_value=master_result),
-            patch.object(main, "fetch_filemaker_master_data", return_value=contact_directory),
+            patch.object(main, "fetch_filemaker_master_data", return_value=contact_directory) as full_directory,
             patch.object(main, "build_customers_needing_attention_response_map", return_value={}),
             patch.object(main, "build_customer_enrichment_href", return_value="/enrichment-view"),
         ):
@@ -286,6 +292,7 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn("No order history is linked to this customer yet", html)
         self.assertIn("Checking in", html)
         self.assertIn("<strong>1</strong>", html)
+        full_directory.assert_not_called()
 
     def test_stale_sales_outreach_recommends_reaching_out(self):
         latest_activity = {
@@ -481,6 +488,43 @@ class CustomersViewTests(unittest.TestCase):
 
         self.assertIs(result, cached)
         rebuild.assert_not_called()
+
+    def test_customer_detail_contextual_activity_map_is_reused(self):
+        order_result = {
+            "status": "ok",
+            "orders": [{"customer": "Example", "customer_primary_key": "customer-1"}],
+        }
+        activity = {
+            "customer_primary_key": "customer-1",
+            "date_created": "2026-10-20 09:00:00",
+        }
+        crm_result = {
+            "status": "ok",
+            "activities": [activity],
+            "activity_map": {"customer-1": [activity]},
+        }
+        master_result = {
+            "status": "ok",
+            "customers_by_key": {
+                "customer-1": {"company": "Example", "primary_key": "customer-1"},
+            },
+        }
+
+        with patch.object(
+            main,
+            "build_contextual_crm_activity_map",
+            wraps=main.build_contextual_crm_activity_map,
+        ) as build_contextual:
+            first = main.build_cached_customer_contextual_activity_map(
+                order_result, crm_result, master_result
+            )
+            second = main.build_cached_customer_contextual_activity_map(
+                order_result, crm_result, master_result
+            )
+
+        self.assertIs(first, second)
+        self.assertEqual(first["customer-1"], [activity])
+        build_contextual.assert_called_once()
 
 
 if __name__ == "__main__":

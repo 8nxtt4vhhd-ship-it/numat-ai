@@ -72,7 +72,7 @@ class InactiveCustomerFilteringTests(unittest.TestCase):
             return_value={"status": "ok", "orders": orders},
         ), patch.object(
             data_sources,
-            "fetch_filemaker_master_data",
+            "fetch_filemaker_customer_data",
             return_value={
                 "status": "ok",
                 "inactive_customer_keys": ["I1"],

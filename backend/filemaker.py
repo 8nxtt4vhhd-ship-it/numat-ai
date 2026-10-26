@@ -1205,7 +1205,9 @@ def fetch_order_records(limit=100, offset=1):
         for record in result["records"]
     ]
 
-    master_data = fetch_filemaker_master_data()
+    # Order filtering only needs customer status and current names. Avoid the
+    # much heavier contacts-layout fetch used by the full master directory.
+    master_data = fetch_filemaker_customer_data()
     if master_data.get("status") == "ok":
         inactive_customer_keys = set(master_data.get("inactive_customer_keys") or [])
         inactive_customer_names = set(master_data.get("inactive_customer_names") or [])
