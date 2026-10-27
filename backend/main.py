@@ -10133,7 +10133,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                     status.textContent = 'Creating the meeting summary and actions…';
                     const response = await fetch('/api/weekly-kpi/meetings/from-transcript', {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({transcript: transcripts.filter(Boolean).join('\n\n')}),
+                        body: JSON.stringify({transcript: transcripts.filter(Boolean).join('\\n\\n')}),
                     });
                     const data = await response.json();
                     if (!response.ok) throw new Error(data.error_message || 'Meeting analysis failed.');
