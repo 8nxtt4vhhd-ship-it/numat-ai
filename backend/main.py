@@ -753,6 +753,25 @@ def update_weekly_kpi_meeting_actions(meeting_id, approved_actions):
     return updated
 
 
+def update_weekly_kpi_meeting_transcript(meeting_id, transcript, user=None):
+    meeting_id = str(meeting_id or "").strip()
+    records = load_weekly_kpi_meetings()
+    updated = None
+    current_user = user or get_current_session_user() or {}
+    for record in records:
+        if str(record.get("id") or "") == meeting_id:
+            record["transcript"] = str(transcript or "").strip()
+            record["transcript_edited_at"] = datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+            record["transcript_edited_by"] = str(
+                current_user.get("display_name") or current_user.get("username") or "Administrator"
+            ).strip()
+            updated = record
+            break
+    if updated:
+        save_weekly_kpi_meetings(records)
+    return updated
+
+
 def parse_dashboard_datetime(value):
     return parse_crm_datetime(value) if value else None
 
@@ -10275,26 +10294,75 @@ def get_weekly_kpi_actions_history_page():
     return render_page(title="Action History", body=body)
 
 
+@app.post("/weekly-kpi-meetings/{meeting_id}/transcript", response_class=HTMLResponse)
+def post_weekly_kpi_meeting_transcript(meeting_id: str, transcript: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return render_page(
+            title="Meeting Record",
+            body="<p class='status error'>You do not have permission to edit meeting transcripts.</p>",
+        )
+    if not get_weekly_kpi_meeting(meeting_id):
+        return render_page(
+            title="Meeting Record",
+            body="<p class='status error'>That meeting record could not be found.</p>",
+        )
+    updated = update_weekly_kpi_meeting_transcript(meeting_id, transcript, user=current_user)
+    if updated:
+        record_audit_event(
+            "meeting-transcript-edit",
+            target=str(updated.get("title") or meeting_id),
+            details="Edited a saved weekly meeting transcript.",
+            user=current_user,
+            area="weekly-kpi",
+        )
+    return RedirectResponse(
+        url=f"/weekly-kpi-meetings/{quote(str(meeting_id))}?message={quote('Transcript updated.')}",
+        status_code=303,
+    )
+
+
 @app.get("/weekly-kpi-meetings/{meeting_id}", response_class=HTMLResponse)
-def get_weekly_kpi_meeting_page(meeting_id: str):
+def get_weekly_kpi_meeting_page(meeting_id: str, message: str = ""):
     record = get_weekly_kpi_meeting(meeting_id)
     if not record:
         return render_page(title="Meeting Record", body="<p class='status error'>That meeting record could not be found.</p>")
+    current_user = get_current_session_user()
     actions = record.get("approved_actions") or []
     proposed_note = ""
     if not record.get("finalized_at") and record.get("proposed_actions"):
         actions = record.get("proposed_actions") or []
         proposed_note = "<p class='small muted'>These actions were proposed by AI but were not yet confirmed from the dashboard.</p>"
+    transcript = str(record.get("transcript") or "")
+    transcript_edit_note = ""
+    if record.get("transcript_edited_at"):
+        transcript_edit_note = (
+            f'<p class="small muted meeting-transcript-edited">Last edited {escape(str(record.get("transcript_edited_at") or ""))}'
+            f'{f" by {escape(str(record.get("transcript_edited_by") or ""))}" if record.get("transcript_edited_by") else ""}.</p>'
+        )
+    transcript_editor = ""
+    if can_manage_user_accounts(current_user):
+        transcript_editor = f"""
+            <details class="meeting-transcript-editor">
+                <summary class="button secondary small-button">Edit transcript</summary>
+                <form method="post" action="/weekly-kpi-meetings/{quote(str(meeting_id))}/transcript">
+                    <label><span class="label">Transcript</span><textarea name="transcript" rows="18" required>{escape(transcript)}</textarea></label>
+                    <div class="meeting-transcript-editor-actions"><button class="button small-button" type="submit">Save transcript</button></div>
+                </form>
+            </details>
+        """
+    status_markup = f'<p class="status ok">{escape(message)}</p>' if message else ""
     body = f"""
         <section class="panel meeting-record-panel">
             <div class="kpi-production-head"><div><h2>{escape(str(record.get('title') or 'Weekly management meeting'))}</h2><p class="muted">{escape(str(record.get('created_at') or ''))}{f' · Recorded by {escape(str(record.get("recorded_by") or ""))}' if record.get('recorded_by') else ''}</p></div><div class="meeting-record-actions"><a class="button secondary small-button" href="/weekly-kpi-meetings">Meeting history</a><a class="button secondary small-button" href="/weekly-kpi-dashboard#weekly-actions">KPI dashboard</a></div></div>
+            {status_markup}
             <div class="meeting-record-section"><h3>Summary</h3><p>{escape(str(record.get('summary') or 'No summary recorded.'))}</p></div>
             <div class="meeting-record-columns">
                 <div class="meeting-record-section"><h3>Key decisions</h3>{render_meeting_record_list(record.get('decisions'))}</div>
                 <div class="meeting-record-section"><h3>Notable updates</h3>{render_meeting_record_list(record.get('updates'))}</div>
             </div>
             <div class="meeting-record-section"><h3>Actions</h3>{proposed_note}{render_meeting_action_list(actions)}</div>
-            <details class="meeting-transcript"><summary>View transcript</summary><div>{escape(str(record.get('transcript') or 'No transcript recorded.'))}</div></details>
+            <details class="meeting-transcript"><summary>View transcript</summary><div class="meeting-transcript-copy">{escape(transcript or 'No transcript recorded.')}</div>{transcript_edit_note}{transcript_editor}</details>
         </section>
     """
     return render_page(title="Meeting Record", body=body)
@@ -27759,8 +27827,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .meeting-record-columns {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }}
                     .meeting-record-list {{ margin:0; padding-left:20px; display:grid; gap:7px; }}
                     .meeting-transcript {{ margin-top:16px; padding:14px 16px; border:1px solid var(--border); border-radius:14px; background:white; }}
-                    .meeting-transcript summary {{ cursor:pointer; color:var(--blue); font-weight:800; }}
-                    .meeting-transcript div {{ margin-top:12px; white-space:pre-wrap; line-height:1.55; color:#34465b; }}
+                    .meeting-transcript > summary {{ cursor:pointer; color:var(--blue); font-weight:800; }}
+                    .meeting-transcript-copy {{ margin-top:12px; white-space:pre-wrap; line-height:1.55; color:#34465b; }}
+                    .meeting-transcript-edited {{ margin:10px 0 0; }}
+                    .meeting-transcript-editor {{ margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }}
+                    .meeting-transcript-editor > summary {{ display:inline-flex; width:auto; list-style:none; cursor:pointer; }}
+                    .meeting-transcript-editor > summary::-webkit-details-marker {{ display:none; }}
+                    .meeting-transcript-editor form {{ display:grid; gap:12px; margin-top:12px; }}
+                    .meeting-transcript-editor label {{ display:grid; gap:6px; }}
+                    .meeting-transcript-editor textarea {{ width:100%; box-sizing:border-box; resize:vertical; font:inherit; line-height:1.45; }}
+                    .meeting-transcript-editor-actions {{ display:flex; justify-content:flex-end; }}
 
                     .kpi-production-panel {{
                         grid-area: production;

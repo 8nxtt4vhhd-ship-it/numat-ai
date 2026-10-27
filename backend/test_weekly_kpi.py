@@ -136,6 +136,49 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
             self.assertEqual(updated["approved_actions"][0]["owner"], "Kelly")
             self.assertTrue(updated["finalized_at"])
 
+    def test_admin_can_edit_saved_meeting_transcript(self):
+        with TemporaryDirectory() as temp_dir, patch.object(
+            main, "get_weekly_kpi_meetings_path", return_value=Path(temp_dir) / "meetings.json"
+        ), patch.object(main, "record_audit_event") as audit:
+            main.save_weekly_kpi_meetings([{
+                "id": "meeting-1",
+                "title": "Weekly meeting",
+                "created_at": "2026-10-27 10:00:00",
+                "transcript": "Original transcript",
+            }])
+
+            with patch.object(main, "get_current_session_user", return_value={"role": "admin", "display_name": "Kelly"}):
+                response = main.post_weekly_kpi_meeting_transcript("meeting-1", "Edited transcript")
+
+            saved = main.get_weekly_kpi_meeting("meeting-1")
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(saved["transcript"], "Edited transcript")
+            self.assertEqual(saved["transcript_edited_by"], "Kelly")
+            self.assertTrue(saved["transcript_edited_at"])
+            audit.assert_called_once()
+
+    def test_transcript_editor_is_only_rendered_for_admins(self):
+        record = {"id": "meeting-1", "created_at": "2026-10-27 10:00:00", "transcript": "Meeting text"}
+        with patch.object(main, "get_weekly_kpi_meeting", return_value=record), patch.object(
+            main, "get_app_login_enabled", return_value=True
+        ):
+            with patch.object(main, "get_current_session_user", return_value={"role": "admin"}):
+                admin_html = main.get_weekly_kpi_meeting_page("meeting-1")
+            with patch.object(main, "get_current_session_user", return_value={"role": "user"}):
+                user_html = main.get_weekly_kpi_meeting_page("meeting-1")
+
+        self.assertIn("Edit transcript", admin_html)
+        self.assertNotIn("Edit transcript", user_html)
+
+    def test_non_admin_cannot_edit_saved_meeting_transcript(self):
+        with patch.object(main, "get_app_login_enabled", return_value=True), patch.object(
+            main, "get_current_session_user", return_value={"role": "user"}
+        ), patch.object(main, "update_weekly_kpi_meeting_transcript") as update:
+            response = main.post_weekly_kpi_meeting_transcript("meeting-1", "Changed")
+
+        self.assertIn("do not have permission", response)
+        update.assert_not_called()
+
     def test_forced_refresh_rebuilds_and_replaces_complete_payload(self):
         old_payload = {"status": "ok", "summary": {"open_count": 3}}
         new_payload = {"status": "ok", "summary": {"open_count": 4}}
