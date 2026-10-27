@@ -9783,7 +9783,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                     {render_simple_summary_item("Added in last 7 days", str(summary.get("new_last_7_days", 0)))}
                     {render_simple_summary_item("Oldest open promise", oldest_label)}
                 </div>
-                <button class="button kpi-detail-button" type="button" data-kpi-detail-url="/weekly-kpi-promises?presentation=1" data-presentation-title="Open Promises of Order" onclick="window.openKpiDashboardDetail(this)">View promised orders</button>
+                <button class="button kpi-detail-button" type="button" data-kpi-detail-url="/weekly-kpi-promises?presentation=1" data-presentation-title="Open Promises of Order">View promised orders</button>
             </section>
 
             <div class="kpi-sales-stack">
@@ -9796,7 +9796,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                         <div><strong>{int(strategic_summary.get('added_last_7_days') or 0)}</strong><span>new this week</span></div>
                         <div><strong>{int(strategic_summary.get('reached_last_7_days') or 0)}</strong><span>reached this week</span></div>
                     </div>
-                    <button class="button secondary small-button" type="button" data-kpi-detail-url="/organisation-chart-view?presentation=1" data-presentation-title="Organisation view" onclick="window.openKpiDashboardDetail(this)">Open organisation view</button>
+                    <button class="button secondary small-button" type="button" data-kpi-detail-url="/organisation-chart-view?presentation=1" data-presentation-title="Organisation view">Open organisation view</button>
                 </section>
                 <section class="panel kpi-priority-panel">
                     <div class="kpi-promises-head">
@@ -9929,14 +9929,22 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                 if (detailLoading && detailFrame.src !== 'about:blank') detailLoading.hidden = true;
             });
             window.openKpiDashboardDetail = button => {
-                if (!detailDialog || !detailFrame) return;
-                const url = new URL(button.dataset.kpiDetailUrl, window.location.origin);
+                const detailUrl = button?.dataset.kpiDetailUrl;
+                if (!detailUrl) return;
+                const url = new URL(detailUrl, window.location.origin);
+                if (!detailDialog || !detailFrame) {
+                    window.location.assign(url.toString());
+                    return;
+                }
                 if (detailTitle) detailTitle.textContent = button.dataset.presentationTitle || 'Dashboard detail';
                 if (detailLoading) detailLoading.hidden = false;
                 detailFrame.src = url.toString();
                 detailDialog.hidden = false;
                 detailDialog.classList.add('is-open');
             };
+            document.querySelectorAll('[data-kpi-detail-url]').forEach(button => {
+                button.addEventListener('click', () => window.openKpiDashboardDetail(button));
+            });
             if (presentationRequested) {
                 presentationRoot.classList.add('kpi-presentation-mode');
             }
