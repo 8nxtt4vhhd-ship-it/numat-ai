@@ -1,5 +1,6 @@
 import unittest
 
+import crm
 import main
 
 
@@ -13,6 +14,41 @@ class CrmActivitiesFilterTests(unittest.TestCase):
         filtered = main.filter_crm_activities(activities, sender="SMITH@EXAMPLE")
 
         self.assertEqual(filtered, activities[:1])
+
+    def test_activities_without_a_date_are_excluded(self):
+        dated = {
+            "subject": "Valid activity",
+            "date_created": "2026-10-01 09:00:00",
+        }
+        undated = {
+            "subject": "trash mats?",
+            "date_created": "",
+        }
+
+        filtered = main.filter_crm_activities([undated, dated])
+
+        self.assertEqual(filtered, [dated])
+
+    def test_shared_crm_result_excludes_undated_activities(self):
+        dated = {
+            "customer_primary_key": "customer-1",
+            "date_created": "2026-10-01 09:00:00",
+        }
+        undated = {
+            "customer_primary_key": "customer-1",
+            "date_created": "",
+        }
+        result = crm.filter_undated_crm_activities({
+            "status": "ok",
+            "activities": [undated, dated],
+            "activity_map": {"customer-1": [undated, dated]},
+            "counts": {"total_rows": 2, "kept_rows": 2},
+        })
+
+        self.assertEqual(result["activities"], [dated])
+        self.assertEqual(result["activity_map"]["customer-1"], [dated])
+        self.assertEqual(result["counts"]["kept_rows"], 1)
+        self.assertEqual(result["counts"]["excluded_missing_date"], 1)
 
     def test_sender_filter_is_preserved_in_filter_links(self):
         form = main.render_crm_filter_form(

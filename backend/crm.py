@@ -326,6 +326,7 @@ def fetch_crm_activities():
                         cached_sync_result,
                         recent_result,
                     )
+                cached_sync_result = filter_undated_crm_activities(cached_sync_result)
                 filtered_sync_result = filter_inactive_filemaker_customer_activities(
                     cached_sync_result,
                     source,
@@ -338,10 +339,39 @@ def fetch_crm_activities():
         path = get_crm_sample_csv_path()
         result = build_csv_crm_result(path)
 
+    result = filter_undated_crm_activities(result)
     result = filter_inactive_filemaker_customer_activities(result, source)
 
     cache_crm_result(cache_key, result)
     return result
+
+
+def filter_undated_crm_activities(result):
+    """Exclude malformed CRM rows that have no usable activity date."""
+    if result.get("status") != "ok":
+        return result
+
+    activities = list(result.get("activities") or [])
+    dated_activities = [
+        activity
+        for activity in activities
+        if str(activity.get("date_created") or "").strip()
+    ]
+    excluded_count = len(activities) - len(dated_activities)
+    if not excluded_count:
+        return result
+
+    filtered_result = dict(result)
+    filtered_result["activities"] = dated_activities
+    filtered_result["activity_map"] = build_activity_map(dated_activities)
+    counts = dict(result.get("counts") or {})
+    counts["kept_rows"] = len(dated_activities)
+    counts["excluded_missing_date"] = (
+        int(counts.get("excluded_missing_date") or 0) + excluded_count
+    )
+    counts["customer_count"] = len(filtered_result["activity_map"])
+    filtered_result["counts"] = counts
+    return filtered_result
 
 
 def trigger_recent_crm_refresh():

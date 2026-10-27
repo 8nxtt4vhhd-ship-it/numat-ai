@@ -17099,6 +17099,10 @@ def filter_crm_activities(activities, customer="", sender="", direction="", cate
     filtered_activities = []
 
     for activity in activities:
+        activity_date = parse_crm_datetime(activity.get("date_created", ""))
+        if activity_date is None:
+            continue
+
         customer_value = str(
             activity.get("customer_company")
             or activity.get("customer_label")
@@ -17123,8 +17127,6 @@ def filter_crm_activities(activities, customer="", sender="", direction="", cate
 
         if subject_filter and subject_filter not in subject_value:
             continue
-
-        activity_date = parse_crm_datetime(activity.get("date_created", ""))
 
         if date_from_value and activity_date and activity_date.date() < date_from_value.date():
             continue
