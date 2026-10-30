@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import crm
 import main
@@ -28,6 +29,33 @@ class CrmActivitiesFilterTests(unittest.TestCase):
         filtered = main.filter_crm_activities([undated, dated])
 
         self.assertEqual(filtered, [dated])
+
+    def test_unfiltered_activity_list_does_not_recalculate_dates_or_categories(self):
+        activities = [{
+            "subject": "Existing cached activity",
+            "date_created": "2026-10-01 09:00:00",
+            "body": "A deliberately large body that should not be inspected.",
+        }]
+
+        with (
+            patch.object(main, "parse_crm_datetime") as parse_date,
+            patch.object(main, "get_activity_category") as get_category,
+        ):
+            filtered = main.filter_crm_activities(activities)
+
+        self.assertEqual(filtered, activities)
+        parse_date.assert_not_called()
+        get_category.assert_not_called()
+
+    def test_crm_activity_preview_cleanup_is_reused(self):
+        main._CRM_ACTIVITY_PREVIEW_CACHE.clear()
+        with patch.object(main, "clean_activity_content", return_value="Clean body") as clean:
+            first = main.get_cached_crm_activity_preview("<p>Body</p>")
+            second = main.get_cached_crm_activity_preview("<p>Body</p>")
+
+        self.assertEqual(first, "Clean body")
+        self.assertEqual(second, "Clean body")
+        clean.assert_called_once_with("<p>Body</p>")
 
     def test_shared_crm_result_excludes_undated_activities(self):
         dated = {

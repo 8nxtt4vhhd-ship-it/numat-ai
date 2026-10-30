@@ -107,11 +107,17 @@ def get_filemaker_cache_seconds():
         return 120
 
 
-def clear_filemaker_orders_cache():
+def clear_filemaker_orders_cache(clear_persisted=False):
     with _FILEMAKER_ORDER_CACHE_LOCK:
         _FILEMAKER_ORDER_CACHE["key"] = None
         _FILEMAKER_ORDER_CACHE["expires_at"] = 0
         _FILEMAKER_ORDER_CACHE["result"] = None
+    if clear_persisted:
+        cache_path = get_filemaker_orders_cache_path()
+        try:
+            cache_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def fetch_cached_filemaker_orders():
@@ -127,6 +133,24 @@ def fetch_cached_filemaker_orders():
         and _FILEMAKER_ORDER_CACHE["expires_at"] > now
     ):
         return _FILEMAKER_ORDER_CACHE["result"]
+
+    # A successful order snapshot is the durable shared cache between process
+    # restarts. Explicit refresh paths delete it before fetching FileMaker.
+    cached_snapshot = read_filemaker_orders_cache()
+    if cache_seconds and cached_snapshot is not None:
+        cached_result = {
+            "connected": True,
+            "status": "ok",
+            "orders": cached_snapshot.get("orders", []),
+            "stale": False,
+            "cache_updated_at": cached_snapshot.get("updated_at", ""),
+            "warning": "",
+        }
+        with _FILEMAKER_ORDER_CACHE_LOCK:
+            _FILEMAKER_ORDER_CACHE["key"] = cache_key
+            _FILEMAKER_ORDER_CACHE["expires_at"] = float("inf")
+            _FILEMAKER_ORDER_CACHE["result"] = cached_result
+        return cached_result
 
     with _FILEMAKER_ORDER_CACHE_LOCK:
         # Another request may have filled the cache while this one waited.
@@ -146,7 +170,10 @@ def fetch_cached_filemaker_orders():
 
         if result.get("status") == "ok" and cache_seconds:
             _FILEMAKER_ORDER_CACHE["key"] = cache_key
-            _FILEMAKER_ORDER_CACHE["expires_at"] = now + cache_seconds
+            # Orders are refreshed explicitly by the customer Sync action.
+            # Keep the shared result so ordinary page loads never block on
+            # FileMaker simply because a short timer elapsed.
+            _FILEMAKER_ORDER_CACHE["expires_at"] = float("inf")
             _FILEMAKER_ORDER_CACHE["result"] = result
             return result
 

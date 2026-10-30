@@ -233,6 +233,10 @@ _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE = {
     "entries": {},
 }
 
+_CRM_ACTIVITY_PREVIEW_CACHE_LOCK = Lock()
+_CRM_ACTIVITY_PREVIEW_CACHE = {}
+CRM_ACTIVITY_PREVIEW_CACHE_LIMIT = 2000
+
 _STRATEGIC_DISCOVERY_RESULTS_CACHE = {
     "entries": {},
 }
@@ -1589,7 +1593,7 @@ def mark_enrichment_contact_moved_on_in_filemaker(
             "error": f"FileMaker moved-on update failed: {write_result.get('status', 'error')}{f'. {detail}' if detail else ''}",
         }
 
-    clear_filemaker_master_data_cache()
+    clear_filemaker_master_data_cache(clear_persisted=True)
     return {
         "ok": True,
         "message": f"Contact marked inactive in FileMaker after move to {moved_to_label}.",
@@ -1798,7 +1802,7 @@ def sync_enrichment_branch_contact_to_filemaker(
             "error": f"FileMaker sync failed: {write_result.get('status', 'error')}{f'. {detail}' if detail else ''}",
         }
 
-    clear_filemaker_master_data_cache()
+    clear_filemaker_master_data_cache(clear_persisted=True)
     return {
         "ok": True,
         "message": success_message,
@@ -1910,7 +1914,7 @@ def sync_strategic_contact_to_filemaker(contact_id, allow_create=True):
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if not filemaker_primary_key:
-        clear_filemaker_master_data_cache()
+        clear_filemaker_master_data_cache(clear_persisted=True)
         refreshed_master_data = fetch_filemaker_master_data(force_refresh=True)
         refreshed_contact = find_existing_filemaker_contact_for_strategic_contact(
             {**contact, "filemaker_contact_record_id": filemaker_record_id},
@@ -1942,7 +1946,7 @@ def sync_strategic_contact_to_filemaker(contact_id, allow_create=True):
         )
 
     save_strategic_contacts(updated_items)
-    clear_filemaker_master_data_cache()
+    clear_filemaker_master_data_cache(clear_persisted=True)
     clear_strategic_contact_workspace_cache()
     return {
         "ok": True,
@@ -9339,7 +9343,7 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     invoiced_revenue_mtd = production_mtd.get("summary", {}).get("invoiced_revenue_mtd") or 0.0
     priority_customers, priority_result = get_priority_one_customers(master_data_result)
     if order_result is None and force_refresh:
-        clear_filemaker_orders_cache()
+        clear_filemaker_orders_cache(clear_persisted=True)
     order_result = order_result if order_result is not None else get_orders_for_analysis()
     new_and_returning_customers = build_new_and_returning_customers(
         order_result,
@@ -14640,7 +14644,9 @@ def post_customers_view_sync(
     # This is the explicit, potentially slower refresh path. Keep normal page
     # loads cache-only, but refresh the contact directory and a broad CRM
     # overlay here so activity older than the small automatic window is kept.
-    clear_filemaker_master_data_cache()
+    clear_filemaker_orders_cache(clear_persisted=True)
+    order_result = get_orders_for_analysis()
+    clear_filemaker_master_data_cache(clear_persisted=True)
     result = fetch_filemaker_customer_data(force_refresh=True)
     crm_result = (
         sync_filemaker_crm_recent_cache()
@@ -14648,9 +14654,10 @@ def post_customers_view_sync(
         else {"status": "not_applicable"}
     )
     customer_sync_ok = result.get("status") == "ok"
+    order_sync_ok = order_result.get("status") == "ok"
     crm_sync_ok = crm_result.get("status") in {"ok", "not_applicable"}
 
-    if customer_sync_ok and crm_sync_ok:
+    if order_sync_ok and customer_sync_ok and crm_sync_ok:
         clear_attention_response_cache()
         clear_customer_summaries_cache()
         message = (
@@ -14663,6 +14670,10 @@ def post_customers_view_sync(
         clear_customer_summaries_cache()
         completed = []
         failures = []
+        if order_sync_ok:
+            completed.append("order data")
+        else:
+            failures.append(f"order data ({order_result.get('status', 'unknown error')})")
         if customer_sync_ok:
             completed.append("customer data")
         else:
@@ -15752,6 +15763,7 @@ def prewarm_app_caches():
                     order_result=order_result,
                     crm_result=crm_result,
                     attention_result=attention_result,
+                    master_data_result=master_data_result,
                 )
     except Exception as error:
         print(f"Startup prewarm skipped after error: {error.__class__.__name__}")
@@ -17125,8 +17137,7 @@ def render_crm_pagination(customer, sender, direction, category, subject, date_f
 
 
 def render_crm_activity_row(activity):
-    preview = clean_activity_content(activity.get("body", ""))
-    preview = truncate_text(preview, 320)
+    preview = get_cached_crm_activity_preview(activity.get("body", ""), limit=320)
     direction_class = "crm-direction"
 
     if activity.get("direction") == "inbound":
@@ -17151,6 +17162,25 @@ def render_crm_activity_row(activity):
     """
 
 
+def get_cached_crm_activity_preview(content, limit=320):
+    content = str(content or "")
+    if not content:
+        return ""
+    cache_key = (hashlib.sha1(content.encode("utf-8", errors="ignore")).hexdigest(), int(limit))
+    with _CRM_ACTIVITY_PREVIEW_CACHE_LOCK:
+        cached = _CRM_ACTIVITY_PREVIEW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    preview = truncate_text(clean_activity_content(content), int(limit))
+    with _CRM_ACTIVITY_PREVIEW_CACHE_LOCK:
+        if len(_CRM_ACTIVITY_PREVIEW_CACHE) >= CRM_ACTIVITY_PREVIEW_CACHE_LIMIT:
+            oldest_key = next(iter(_CRM_ACTIVITY_PREVIEW_CACHE))
+            _CRM_ACTIVITY_PREVIEW_CACHE.pop(oldest_key, None)
+        _CRM_ACTIVITY_PREVIEW_CACHE[cache_key] = preview
+    return preview
+
+
 def filter_crm_activities(activities, customer="", sender="", direction="", category="", subject="", date_from="", date_to="", range_key="all"):
     customer_filter = customer.strip().lower()
     sender_filter = sender.strip().lower()
@@ -17164,43 +17194,51 @@ def filter_crm_activities(activities, customer="", sender="", direction="", cate
     )
     date_from_value = parse_iso_date(effective_date_from)
     date_to_value = parse_iso_date(effective_date_to)
+    needs_date_comparison = bool(date_from_value or date_to_value)
     filtered_activities = []
 
     for activity in activities:
-        activity_date = parse_crm_datetime(activity.get("date_created", ""))
-        if activity_date is None:
+        raw_activity_date = str(activity.get("date_created") or "").strip()
+        if not raw_activity_date:
             continue
 
-        customer_value = str(
+        if customer_filter and customer_filter not in str(
             activity.get("customer_company")
             or activity.get("customer_label")
             or ""
-        ).lower()
-        subject_value = str(activity.get("subject") or "").lower()
-        sender_value = str(activity.get("sender_email") or "").lower()
-        direction_value = str(activity.get("direction") or "").lower()
-        category_value = get_activity_category(activity)
-
-        if customer_filter and customer_filter not in customer_value:
+        ).lower():
             continue
 
-        if sender_filter and sender_filter not in sender_value:
+        if sender_filter and sender_filter not in str(
+            activity.get("sender_email") or ""
+        ).lower():
             continue
 
-        if direction_filter and direction_filter != direction_value:
+        if direction_filter and direction_filter != str(
+            activity.get("direction") or ""
+        ).lower():
             continue
 
-        if category_filter and category_filter != category_value:
+        # Category inference can inspect a full email body. Only perform it
+        # when the user has actually selected a category filter.
+        if category_filter and category_filter != get_activity_category(activity):
             continue
 
-        if subject_filter and subject_filter not in subject_value:
+        if subject_filter and subject_filter not in str(
+            activity.get("subject") or ""
+        ).lower():
             continue
 
-        if date_from_value and activity_date and activity_date.date() < date_from_value.date():
-            continue
+        if needs_date_comparison:
+            activity_date = parse_crm_datetime(raw_activity_date)
+            if activity_date is None:
+                continue
 
-        if date_to_value and activity_date and activity_date.date() > date_to_value.date():
-            continue
+            if date_from_value and activity_date.date() < date_from_value.date():
+                continue
+
+            if date_to_value and activity_date.date() > date_to_value.date():
+                continue
 
         filtered_activities.append(activity)
 

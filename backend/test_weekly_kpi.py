@@ -248,7 +248,7 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         finance_loader.assert_called_once_with(force_refresh=True)
         master_loader.assert_called_once_with(force_refresh=True)
         self.assertTrue(calendar_loader.call_args.kwargs["force_refresh"])
-        clear_orders.assert_called_once_with()
+        clear_orders.assert_called_once_with(clear_persisted=True)
 
     def test_promise_status_received_or_cancelled_is_closed(self):
         for status in ("Received", "Cancelled"):

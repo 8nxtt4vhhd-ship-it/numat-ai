@@ -11,6 +11,8 @@ from requests.auth import HTTPBasicAuth
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
+DEFAULT_FILEMAKER_MASTER_CACHE_PATH = Path(__file__).resolve().parent / "data" / "filemaker_master_cache.json"
+
 _FILEMAKER_MASTER_DATA_CACHE = {
     "key": None,
     "expires_at": 0,
@@ -785,13 +787,52 @@ def get_filemaker_master_data_cache_seconds():
     return max(0, get_int_env("FILEMAKER_MASTER_DATA_CACHE_SECONDS", 300))
 
 
-def clear_filemaker_master_data_cache():
+def get_filemaker_master_cache_path():
+    configured = str(os.getenv("FILEMAKER_MASTER_CACHE_PATH", "")).strip()
+    return Path(configured) if configured else DEFAULT_FILEMAKER_MASTER_CACHE_PATH
+
+
+def read_filemaker_master_data_disk_cache(cache_key):
+    cache_path = get_filemaker_master_cache_path()
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if payload.get("cache_key") != list(cache_key):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return None
+    return result
+
+
+def write_filemaker_master_data_disk_cache(cache_key, result):
+    cache_path = get_filemaker_master_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps({
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "cache_key": list(cache_key),
+        "result": result,
+    }), encoding="utf-8")
+    temporary_path.replace(cache_path)
+
+
+def clear_filemaker_master_data_cache(clear_persisted=False):
     _FILEMAKER_MASTER_DATA_CACHE["key"] = None
     _FILEMAKER_MASTER_DATA_CACHE["expires_at"] = 0
     _FILEMAKER_MASTER_DATA_CACHE["result"] = None
     _FILEMAKER_CUSTOMER_DATA_CACHE["key"] = None
     _FILEMAKER_CUSTOMER_DATA_CACHE["expires_at"] = 0
     _FILEMAKER_CUSTOMER_DATA_CACHE["result"] = None
+    if clear_persisted:
+        cache_path = get_filemaker_master_cache_path()
+        try:
+            cache_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def build_filemaker_master_data_cache_key():
@@ -1062,6 +1103,14 @@ def fetch_filemaker_master_data(force_refresh=False):
     ):
         return _FILEMAKER_MASTER_DATA_CACHE["result"]
 
+    if not force_refresh and cache_seconds:
+        disk_result = read_filemaker_master_data_disk_cache(cache_key)
+        if disk_result is not None:
+            _FILEMAKER_MASTER_DATA_CACHE["key"] = cache_key
+            _FILEMAKER_MASTER_DATA_CACHE["expires_at"] = float("inf")
+            _FILEMAKER_MASTER_DATA_CACHE["result"] = disk_result
+            return disk_result
+
     if not config["customers_layout"] or not config["contacts_layout"]:
         return build_empty_filemaker_master_data("missing_master_layout")
 
@@ -1166,8 +1215,12 @@ def fetch_filemaker_master_data(force_refresh=False):
 
     if cache_seconds:
         _FILEMAKER_MASTER_DATA_CACHE["key"] = cache_key
-        _FILEMAKER_MASTER_DATA_CACHE["expires_at"] = now + cache_seconds
+        # The directory is expensive to rebuild and is shared by CRM/customer
+        # views. Data-changing actions and the explicit Sync button clear this
+        # cache, so do not make ordinary page loads refresh it on a timer.
+        _FILEMAKER_MASTER_DATA_CACHE["expires_at"] = float("inf")
         _FILEMAKER_MASTER_DATA_CACHE["result"] = result
+        write_filemaker_master_data_disk_cache(cache_key, result)
 
     return result
 

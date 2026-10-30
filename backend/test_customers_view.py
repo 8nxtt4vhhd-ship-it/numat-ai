@@ -1,15 +1,19 @@
 import unittest
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import filemaker
 import main
 import crm
+import data_sources
 
 
 class CustomersViewTests(unittest.TestCase):
     def tearDown(self):
         filemaker.clear_filemaker_master_data_cache()
+        data_sources.clear_filemaker_orders_cache()
         main.clear_customer_contextual_activity_cache()
 
     def test_customer_summaries_include_master_customer_without_orders(self):
@@ -389,9 +393,59 @@ class CustomersViewTests(unittest.TestCase):
         self.assertEqual(refreshed["customers_by_key"]["customer-1"]["company"], "Cached Customer")
         self.assertEqual(fetch_records.call_count, 2)
 
+    def test_full_filemaker_directory_cache_survives_process_memory_reset(self):
+        cache_key = ("server", "database", "customers", "contacts")
+        result = {
+            "status": "ok",
+            "customers_by_key": {"customer-1": {"company": "Cached Customer"}},
+            "all_contacts": [{"email": "contact@example.com"}],
+        }
+        with TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "master.json"
+            with patch.object(filemaker, "get_filemaker_master_cache_path", return_value=cache_path):
+                filemaker.write_filemaker_master_data_disk_cache(cache_key, result)
+                loaded = filemaker.read_filemaker_master_data_disk_cache(cache_key)
+
+        self.assertEqual(loaded, result)
+
+    def test_order_cache_remains_until_explicitly_cleared(self):
+        result = {"status": "ok", "orders": [{"order_number": "1"}]}
+        with (
+            patch.object(data_sources, "get_filemaker_order_limit", return_value=1000),
+            patch.object(data_sources, "get_filemaker_cache_seconds", return_value=120),
+            patch.object(data_sources, "build_filemaker_cache_key", return_value=("orders",)),
+            patch.object(data_sources, "read_filemaker_orders_cache", return_value=None),
+            patch.object(data_sources, "fetch_order_records", return_value=result),
+            patch.object(data_sources, "write_filemaker_orders_cache"),
+        ):
+            loaded = data_sources.fetch_cached_filemaker_orders()
+
+        self.assertIs(loaded, result)
+        self.assertEqual(data_sources._FILEMAKER_ORDER_CACHE["expires_at"], float("inf"))
+
+    def test_order_snapshot_is_used_after_process_cache_reset(self):
+        snapshot = {
+            "updated_at": "2026-10-30 08:00:00",
+            "orders": [{"order_number": "1"}],
+        }
+        with (
+            patch.object(data_sources, "get_filemaker_order_limit", return_value=1000),
+            patch.object(data_sources, "get_filemaker_cache_seconds", return_value=120),
+            patch.object(data_sources, "build_filemaker_cache_key", return_value=("orders",)),
+            patch.object(data_sources, "read_filemaker_orders_cache", return_value=snapshot),
+            patch.object(data_sources, "fetch_order_records") as fetch,
+        ):
+            loaded = data_sources.fetch_cached_filemaker_orders()
+
+        self.assertEqual(loaded["orders"], snapshot["orders"])
+        self.assertEqual(loaded["cache_updated_at"], snapshot["updated_at"])
+        fetch.assert_not_called()
+
     def test_customer_sync_redirects_back_with_confirmation(self):
         result = {"status": "ok", "customers_by_key": {"one": {}, "two": {}}}
         with (
+            patch.object(main, "clear_filemaker_orders_cache") as clear_orders,
+            patch.object(main, "get_orders_for_analysis", return_value={"status": "ok", "orders": []}) as sync_orders,
             patch.object(main, "clear_filemaker_master_data_cache") as clear_master,
             patch.object(main, "fetch_filemaker_customer_data", return_value=result) as sync,
             patch.object(main, "get_crm_data_source", return_value="filemaker"),
@@ -402,7 +456,9 @@ class CustomersViewTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 303)
         self.assertIn("Customer+and+CRM+data+synced", response.headers["location"])
-        clear_master.assert_called_once_with()
+        clear_orders.assert_called_once_with(clear_persisted=True)
+        sync_orders.assert_called_once_with()
+        clear_master.assert_called_once_with(clear_persisted=True)
         sync.assert_called_once_with(force_refresh=True)
         sync_crm.assert_called_once_with()
         clear_summaries.assert_called_once_with()
@@ -410,6 +466,8 @@ class CustomersViewTests(unittest.TestCase):
     def test_customer_sync_reports_a_partial_crm_failure(self):
         result = {"status": "ok", "customers_by_key": {"one": {}}}
         with (
+            patch.object(main, "clear_filemaker_orders_cache"),
+            patch.object(main, "get_orders_for_analysis", return_value={"status": "ok", "orders": []}),
             patch.object(main, "clear_filemaker_master_data_cache"),
             patch.object(main, "fetch_filemaker_customer_data", return_value=result),
             patch.object(main, "get_crm_data_source", return_value="filemaker"),
@@ -418,7 +476,7 @@ class CustomersViewTests(unittest.TestCase):
         ):
             response = main.post_customers_view_sync("", "", "last_order", "desc", 1)
 
-        self.assertIn("Synced+customer+data", response.headers["location"])
+        self.assertIn("Synced+order+data+and+customer+data", response.headers["location"])
         self.assertIn("CRM+data+%28connection_error%29", response.headers["location"])
 
     def test_manual_crm_sync_uses_a_broad_recent_overlay(self):
