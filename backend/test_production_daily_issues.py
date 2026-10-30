@@ -103,6 +103,16 @@ class ProductionDailyIssueTests(unittest.TestCase):
                 "sender_email": "barnold@numatsystems.com",
             },
             {
+                "date_created": "2026-10-15 12:30:00", "direction": "outbound",
+                "crm_type": "", "activity_category": "sales_outreach",
+                "sender_email": "barnold@numatsystems.com",
+            },
+            {
+                "date_created": "2026-10-15 12:45:00", "direction": "outbound",
+                "crm_type": "Telephone Call", "activity_category": "sales_outreach",
+                "sender_email": "barnold@numatsystems.com",
+            },
+            {
                 "date_created": "2026-10-14 15:00:00", "direction": "outbound",
                 "crm_type": "Outlook", "activity_category": "sales_outreach",
                 "sender_email": "barnold@numatsystems.com",
@@ -115,13 +125,37 @@ class ProductionDailyIssueTests(unittest.TestCase):
         report = issues.build_email_report(facts, {"summary": "", "issues": []})
 
         self.assertEqual(facts["sales_email_summary"], [
-            {"name": "Ben Arnold", "total": 1, "sales_related": 1},
+            {"name": "Ben Arnold", "total": 2, "sales_related": 2},
             {"name": "Peter Binnington", "total": 2, "sales_related": 1},
         ])
-        self.assertIn("Ben Arnold: 1 total emails sent; 1 sales-related", report["body_text"])
+        self.assertIn("Ben Arnold: 2 total emails sent; 2 sales-related", report["body_text"])
         self.assertIn("Peter Binnington: 2 total emails sent; 1 sales-related", report["body_text"])
         self.assertIn("Emails sent today", report["body_html"])
         self.assertIn("Sales-related", report["body_html"])
+
+    def test_management_report_refreshes_recent_filemaker_crm_before_counting(self):
+        refreshed_result = {"status": "ok", "activities": [{"subject": "Latest email"}]}
+        with (
+            patch.object(issues, "get_crm_data_source", return_value="filemaker"),
+            patch.object(issues, "sync_filemaker_crm_recent_cache") as refresh,
+            patch.object(issues, "fetch_crm_activities", return_value=refreshed_result) as fetch,
+        ):
+            result = issues.fetch_fresh_crm_activities_for_report()
+
+        self.assertIs(result, refreshed_result)
+        refresh.assert_called_once_with()
+        fetch.assert_called_once_with()
+
+    def test_management_report_uses_cached_crm_if_recent_refresh_fails(self):
+        cached_result = {"status": "ok", "activities": []}
+        with (
+            patch.object(issues, "get_crm_data_source", return_value="filemaker"),
+            patch.object(issues, "sync_filemaker_crm_recent_cache", side_effect=RuntimeError("offline")),
+            patch.object(issues, "fetch_crm_activities", return_value=cached_result),
+        ):
+            result = issues.fetch_fresh_crm_activities_for_report()
+
+        self.assertIs(result, cached_result)
 
     def test_single_press_low_output_is_not_flagged_when_total_output_is_normal(self):
         production_result, detail = sample_results()

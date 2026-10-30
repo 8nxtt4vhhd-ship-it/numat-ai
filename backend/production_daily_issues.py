@@ -17,7 +17,7 @@ load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 from ai import generate_daily_production_issue_selection
 from app_settings import get_production_daily_issues_settings, normalize_email_recipients
-from crm import fetch_crm_activities
+from crm import fetch_crm_activities, get_crm_data_source, sync_filemaker_crm_recent_cache
 from finance import fetch_aged_debt_summary
 from m365 import has_m365_reporting_config, send_m365_reporting_mail
 from monthly_reports import failure_recipients
@@ -110,6 +110,25 @@ def crm_preview(item):
     return text[:320]
 
 
+def is_email_activity(item):
+    activity_type = str((item or {}).get("crm_type") or "").strip().lower()
+    # Ordinary messages in FileMaker pre-date the CRM Type field and therefore
+    # legitimately have no type. Named non-email activities (for example
+    # Telephone Call) remain excluded.
+    return not activity_type or activity_type in {"email", "outlook", "mail"}
+
+
+def fetch_fresh_crm_activities_for_report():
+    if get_crm_data_source() == "filemaker":
+        try:
+            sync_filemaker_crm_recent_cache()
+        except Exception:
+            # A management report should still be delivered from the last good
+            # cache if FileMaker is temporarily unavailable.
+            pass
+    return fetch_crm_activities()
+
+
 def build_sales_email_summary(crm_result, report_key):
     summary = {
         email: {"name": name, "total": 0, "sales_related": 0}
@@ -121,8 +140,7 @@ def build_sales_email_summary(crm_result, report_key):
             continue
         if str(item.get("direction") or "").strip().lower() != "outbound":
             continue
-        activity_type = str(item.get("crm_type") or "").strip().lower()
-        if activity_type not in {"email", "outlook", "mail"}:
+        if not is_email_activity(item):
             continue
         summary[sender]["total"] += 1
         if str(item.get("activity_category") or "").strip().lower() == "sales_outreach":
@@ -530,7 +548,7 @@ def generate_report(requested_day=None, force_refresh=True):
         period_start=report_key,
         period_end=report_key,
     )
-    crm_result = fetch_crm_activities()
+    crm_result = fetch_fresh_crm_activities_for_report()
     finance_result = fetch_aged_debt_summary(force_refresh=force_refresh)
     settings = get_production_daily_issues_settings()
     facts = build_daily_issue_facts(
