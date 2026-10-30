@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import crm
@@ -77,6 +79,36 @@ class CrmActivitiesFilterTests(unittest.TestCase):
         self.assertEqual(result["activity_map"]["customer-1"], [dated])
         self.assertEqual(result["counts"]["kept_rows"], 1)
         self.assertEqual(result["counts"]["excluded_missing_date"], 1)
+
+    def test_cached_crm_bodies_are_bounded(self):
+        activity = {"body": "x" * 5000, "subject": "Example"}
+
+        crm.compact_crm_activities_in_place([activity], body_limit=1000)
+
+        self.assertEqual(len(activity["body"]), 1000)
+
+    def test_crm_dedupe_key_does_not_copy_the_full_body(self):
+        activity = {
+            "date_created": "2026-10-01 09:00:00",
+            "subject": "Example",
+            "body": "x" * 100000,
+        }
+
+        key = crm.build_crm_activity_dedupe_key(activity)
+
+        self.assertLess(len(key), 200)
+
+    def test_oversized_recent_overlay_is_ignored(self):
+        with TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "recent.json"
+            cache_path.write_text('{"activities":[]}', encoding="utf-8")
+            with (
+                patch.object(crm, "get_filemaker_crm_recent_cache_path", return_value=cache_path),
+                patch.object(crm, "get_filemaker_crm_recent_cache_max_bytes", return_value=1),
+            ):
+                result = crm.read_filemaker_crm_recent_cache()
+
+        self.assertIsNone(result)
 
     def test_sender_filter_is_preserved_in_filter_links(self):
         form = main.render_crm_filter_form(

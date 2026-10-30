@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import os
@@ -302,6 +303,39 @@ def get_crm_cache_seconds():
         return max(0, int(raw_seconds))
     except ValueError:
         return 120
+
+
+def get_filemaker_crm_cached_body_chars():
+    raw_limit = os.getenv("FILEMAKER_CRM_CACHED_BODY_CHARS", "4000").strip()
+    try:
+        return max(500, int(raw_limit))
+    except ValueError:
+        return 4000
+
+
+def get_filemaker_crm_recent_cache_max_activities():
+    raw_limit = os.getenv("FILEMAKER_CRM_RECENT_CACHE_MAX_ACTIVITIES", "2000").strip()
+    try:
+        return max(100, int(raw_limit))
+    except ValueError:
+        return 2000
+
+
+def get_filemaker_crm_recent_cache_max_bytes():
+    raw_limit = os.getenv("FILEMAKER_CRM_RECENT_CACHE_MAX_BYTES", str(64 * 1024 * 1024)).strip()
+    try:
+        return max(1024 * 1024, int(raw_limit))
+    except ValueError:
+        return 64 * 1024 * 1024
+
+
+def compact_crm_activities_in_place(activities, body_limit=None):
+    body_limit = body_limit or get_filemaker_crm_cached_body_chars()
+    for activity in activities or []:
+        body = str(activity.get("body") or "")
+        if len(body) > body_limit:
+            activity["body"] = body[:body_limit]
+    return activities
 
 
 def fetch_crm_activities():
@@ -856,13 +890,15 @@ def sync_filemaker_crm_cache():
 
 
 def build_crm_activity_dedupe_key(activity):
+    body = str(activity.get("body") or "").strip()
+    body_digest = hashlib.sha1(body.encode("utf-8", errors="ignore")).hexdigest()
     return "|".join([
         str(activity.get("date_created") or "").strip(),
         str(activity.get("customer_primary_key") or "").strip(),
         str(activity.get("sender_email") or "").strip().lower(),
         str(activity.get("to") or "").strip().lower(),
         str(activity.get("subject") or "").strip(),
-        str(activity.get("body") or "").strip(),
+        body_digest,
     ])
 
 
@@ -885,13 +921,14 @@ def get_latest_cached_crm_activity_timestamp(existing_sync_result):
 def write_filemaker_crm_sync_payload(result):
     cache_path = get_filemaker_crm_cache_path()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    activities = compact_crm_activities_in_place(result.get("activities", []))
     payload = {
         "synced_at": result.get("synced_at", ""),
         "source": result.get("source", "filemaker_sync_cache"),
         "status": result.get("status", "ok"),
         "path": result.get("path", str(cache_path)),
         "counts": result.get("counts", {}),
-        "activities": result.get("activities", []),
+        "activities": activities,
     }
     cache_path.write_text(json.dumps(payload), encoding="utf-8")
     clear_crm_cache()
@@ -997,10 +1034,15 @@ def write_filemaker_crm_recent_cache(result):
     cache_path = get_filemaker_crm_recent_cache_path()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     existing_activities = []
-    if cache_path.exists():
+    if (
+        cache_path.exists()
+        and cache_path.stat().st_size <= get_filemaker_crm_recent_cache_max_bytes()
+    ):
         try:
             existing_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            existing_activities = existing_payload.get("activities", [])
+            existing_activities = compact_crm_activities_in_place(
+                existing_payload.get("activities", [])
+            )
         except (OSError, ValueError):
             existing_activities = []
 
@@ -1008,9 +1050,11 @@ def write_filemaker_crm_recent_cache(result):
         build_crm_activity_dedupe_key(activity): activity
         for activity in existing_activities
     }
-    for activity in result.get("activities", []):
+    for activity in compact_crm_activities_in_place(result.get("activities", [])):
         merged_by_key[build_crm_activity_dedupe_key(activity)] = activity
-    activities = sort_crm_activities(list(merged_by_key.values()))
+    activities = sort_crm_activities(list(merged_by_key.values()))[
+        :get_filemaker_crm_recent_cache_max_activities()
+    ]
     activity_map = build_activity_map(activities)
     result_counts = result.get("counts", {})
     payload = {
@@ -1044,12 +1088,23 @@ def read_filemaker_crm_recent_cache():
     if not cache_path.exists():
         return None
 
+    # An old unbounded overlay can be hundreds of MB and duplicate nearly the
+    # entire full cache. Ignore it rather than risking another startup OOM; the
+    # next explicit sync rewrites a bounded overlay.
+    try:
+        if cache_path.stat().st_size > get_filemaker_crm_recent_cache_max_bytes():
+            return None
+    except OSError:
+        return None
+
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
-    activities = sort_crm_activities(payload.get("activities", []))
+    activities = sort_crm_activities(compact_crm_activities_in_place(
+        payload.get("activities", [])
+    ))
     activity_map = build_activity_map(activities)
     counts = payload.get("counts", {})
 
@@ -1083,7 +1138,9 @@ def read_filemaker_crm_sync_cache():
     except (OSError, ValueError):
         return None
 
-    activities = sort_crm_activities(payload.get("activities", []))
+    activities = sort_crm_activities(compact_crm_activities_in_place(
+        payload.get("activities", [])
+    ))
     activity_map = build_activity_map(activities)
     counts = payload.get("counts", {})
 
@@ -1429,7 +1486,7 @@ def normalize_crm_row(row, index):
             get_row_value(row, "emails::Date Created", "Date Created")
         ),
         "subject": subject,
-        "body": body,
+        "body": body[:get_filemaker_crm_cached_body_chars()],
         "crm_category": str(
             get_row_value(row, "emails::CRM Category", "CRM Category")
         ).strip(),
