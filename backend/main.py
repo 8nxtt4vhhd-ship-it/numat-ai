@@ -9439,6 +9439,10 @@ def build_weekly_kpi_dashboard_payload(crm_result=None, production_result=None, 
     finance_result = finance_result if finance_result is not None else loaded["finance_result"]
     master_data_result = master_data_result if master_data_result is not None else loaded["master_data_result"]
     strategic_crm_result = strategic_crm_result if strategic_crm_result is not None else loaded["strategic_crm_result"]
+    productivity_detail = apply_press_value_fallback(
+        productivity_detail,
+        production_result.get("production_rows", []),
+    )
     log_perf_metric("weekly_kpi.load_data_sources_parallel", started_at)
 
     promises = build_open_promises(crm_result, master_data_result)

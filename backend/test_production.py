@@ -31,6 +31,30 @@ class ProductionKpiTests(unittest.TestCase):
         self.assertEqual(result["summary"]["press_repair_value_source"], "completed_day_summary")
         self.assertAlmostEqual(result["summary"]["labour_percentage"], 29.898, places=3)
 
+    def test_labour_percentage_replaces_nonzero_partial_cycle_value_after_timeout(self):
+        detail = {
+            "period_start": "2026-10-01",
+            "period_end": "2026-10-31",
+            "cycle_status": "timeout",
+            "summary": {
+                "press_repair_value": 83796.73,
+                "total_labour_cost": 43276.875,
+                "labour_percentage": 51.64506419283903,
+            },
+        }
+        rows = [
+            {"date": "2026-10-01", "production_revenue_today": 60000},
+            {"date": "2026-10-15", "production_revenue_today": 62557},
+            {"date": "2026-10-16", "production_revenue_today": None},
+        ]
+
+        result = apply_press_value_fallback(detail, rows)
+
+        self.assertEqual(result["summary"]["press_repair_value_partial"], 83796.73)
+        self.assertEqual(result["summary"]["press_repair_value"], 122557)
+        self.assertEqual(result["summary"]["press_repair_value_source"], "completed_day_summary")
+        self.assertAlmostEqual(result["summary"]["labour_percentage"], 35.31163050662141)
+
     def test_production_cache_survives_application_restart(self):
         previous_production = dict(production._PRODUCTION_CACHE)
         previous_details = dict(production._PRODUCTIVITY_DETAIL_CACHE)

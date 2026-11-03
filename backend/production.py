@@ -824,7 +824,9 @@ def apply_cycle_press_totals(rows, cycles):
 def apply_press_value_fallback(productivity_detail, production_rows):
     """Use completed-day repair value when cycle detail is temporarily unavailable."""
     summary = productivity_detail.get("summary", {})
-    if (summary.get("press_repair_value") or 0) > 0:
+    cycle_status = str(productivity_detail.get("cycle_status") or "").strip().lower()
+    cycle_result_is_incomplete = bool(cycle_status and cycle_status != "ok")
+    if not cycle_result_is_incomplete and (summary.get("press_repair_value") or 0) > 0:
         return productivity_detail
     period_start = str(productivity_detail.get("period_start") or "")
     period_end = str(productivity_detail.get("period_end") or "")
@@ -837,6 +839,9 @@ def apply_press_value_fallback(productivity_detail, production_rows):
         return productivity_detail
     result = dict(productivity_detail)
     result_summary = dict(summary)
+    partial_cycle_value = float(result_summary.get("press_repair_value") or 0)
+    if partial_cycle_value > 0:
+        result_summary["press_repair_value_partial"] = partial_cycle_value
     result_summary["press_repair_value"] = fallback_value
     result_summary["press_repair_value_source"] = "completed_day_summary"
     total_labour_cost = float(result_summary.get("total_labour_cost") or 0)
