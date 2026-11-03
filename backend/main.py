@@ -1141,11 +1141,7 @@ def get_org_chart_structure(group_key):
         for item in saved.get("layers") or [] if isinstance(item, dict)
     ]
     sections = [item for item in sections if item["key"] and item["label"]] or default["business_sections"]
-    layers = [item for item in layers if item["key"] and item["label"]]
-    required = {item["key"] for item in layers}
-    for item in default["layers"]:
-        if item["key"] in {"section-lead", "regional", "branch"} and item["key"] not in required:
-            layers.append(item)
+    layers = [item for item in layers if item["key"] and item["label"]] or default["layers"]
     return {"business_sections": sections, "layers": layers}
 
 
@@ -2096,16 +2092,26 @@ def render_org_chart_group_selector(selected_group, presentation_mode=False):
 
 def render_org_chart_structure_editor(selected_group):
     structure = get_org_chart_structure(selected_group)
+    removable_layer_keys = (
+        {item["key"] for item in structure["layers"] if item["key"] in {"regional", "branch"}}
+        if len(structure["layers"]) > 2 else set()
+    )
     layer_rows = []
     for layer in structure["layers"]:
+        remove_button = ""
+        if layer["key"] in removable_layer_keys:
+            remove_button = f"""
+                <button class="button secondary small-button org-structure-remove" type="submit" name="action" value="remove-layer"
+                    onclick="return confirm('Remove this layer? Contacts in it will move to Unassigned.');">Remove</button>
+            """
         layer_rows.append(f"""
             <form method="post" action="/organisation-chart/structure" class="org-structure-row">
                 <input type="hidden" name="group" value="{escape(selected_group)}">
-                <input type="hidden" name="action" value="rename-layer">
                 <input type="hidden" name="key" value="{escape(layer['key'])}">
                 <span class="small muted">Layer</span>
                 <input name="label" value="{escape(layer['label'])}" maxlength="50" required>
-                <button class="button secondary small-button" type="submit">Save title</button>
+                <button class="button secondary small-button" type="submit" name="action" value="rename-layer">Save title</button>
+                {remove_button}
             </form>
         """)
     section_rows = []
@@ -2121,6 +2127,20 @@ def render_org_chart_structure_editor(selected_group):
             </form>
         """)
     has_intermediate = any(item["key"] not in {"section-lead", "regional", "branch"} for item in structure["layers"])
+    current_layer_keys = {item["key"] for item in structure["layers"]}
+    missing_default_optional_layers = [
+        item for item in get_default_org_chart_structure(selected_group)["layers"]
+        if item["key"] not in current_layer_keys
+    ]
+    restore_layers = "".join(f"""
+        <form method="post" action="/organisation-chart/structure" class="org-structure-restore-row">
+            <input type="hidden" name="group" value="{escape(selected_group)}">
+            <input type="hidden" name="action" value="restore-layer">
+            <input type="hidden" name="key" value="{escape(layer['key'])}">
+            <input type="hidden" name="label" value="{escape(layer['label'])}">
+            <button class="button secondary small-button" type="submit">Restore {escape(layer['label'])}</button>
+        </form>
+    """ for layer in missing_default_optional_layers)
     add_layer = ""
     if not has_intermediate:
         add_layer = f"""
@@ -2134,9 +2154,9 @@ def render_org_chart_structure_editor(selected_group):
     return f"""
         <details class="panel org-structure-editor">
             <summary>Edit structure and titles</summary>
-            <p class="small muted">Changes apply only to this customer group. Renaming a title does not move its contacts.</p>
+            <p class="small muted">Changes apply only to this customer group. Lower reporting layers can be removed from the bottom upwards; their contacts move to Unassigned and can be repositioned.</p>
             <div class="org-structure-editor-grid">
-                <div><h4>Layer titles</h4>{''.join(layer_rows)}{add_layer}</div>
+                <div><h4>Layer titles</h4>{''.join(layer_rows)}{restore_layers}{add_layer}</div>
                 <div><h4>Business section titles</h4>{''.join(section_rows)}</div>
             </div>
         </details>
@@ -3148,6 +3168,8 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
     section_labels = dict(business_sections)
     layer_labels = {item["key"]: item["label"] for item in structure["layers"]}
     section_lead_enabled = "section-lead" in layer_labels
+    regional_enabled = "regional" in layer_labels
+    branch_enabled = "branch" in layer_labels
     section_lead_label = layer_labels.get("section-lead", "Division lead")
     regional_label = layer_labels.get("regional", "Regional manager")
     branch_label = layer_labels.get("branch", "Branch contacts")
@@ -3169,10 +3191,11 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
             section_leads[section].append(item)
         elif tier in layer_labels and tier not in {"regional", "branch", "section-lead"} and section in section_labels:
             intermediate[tier][section].append(item)
-        elif tier == "regional" and section in section_labels:
+        elif tier == "regional" and regional_enabled and section in section_labels:
             regional[section].append(item)
         elif (
             tier == "branch"
+            and branch_enabled
             and parent_id in contacts_by_id
             and str(contacts_by_id[parent_id].get("org_chart_tier") or "").strip().lower() == "regional"
         ):
@@ -3202,9 +3225,9 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
             for manager in sorted(managers, key=sort_key):
                 manager_id = str(manager.get("id") or "").strip()
                 child_cards = "".join(card(child) for child in sorted(branch[manager_id], key=sort_key))
-                manager_cards.append(f"""
-                    <div class="hierarchy-manager-group">
-                        {card(manager)}
+                branch_markup = ""
+                if branch_enabled:
+                    branch_markup = f"""
                         <details class="hierarchy-branch-area drop-zone" data-tier="branch" data-section="{escape(section_key)}" data-parent-id="{escape(manager_id)}">
                             <summary class="hierarchy-subordinate-head">
                                 <span>{escape(branch_label)} reporting to {escape(str(manager.get('name') or regional_label))}</span>
@@ -3213,6 +3236,11 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                             <div class="hierarchy-child-stack">{child_cards}</div>
                             <p class="hierarchy-drop-hint">Drop a {escape(branch_label.lower().rstrip('s'))} here</p>
                         </details>
+                    """
+                manager_cards.append(f"""
+                    <div class="hierarchy-manager-group">
+                        {card(manager)}
+                        {branch_markup}
                     </div>
                 """)
             return "".join(manager_cards)
@@ -3226,11 +3254,11 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
             layer_groups = []
             for leader in sorted(intermediate[active_key][section_key], key=sort_key):
                 leader_id = str(leader.get("id") or "").strip()
-                reports = [item for item in regional[section_key] if str(item.get("org_chart_parent_id") or "").strip() == leader_id]
+                reports = [item for item in regional[section_key] if str(item.get("org_chart_parent_id") or "").strip() == leader_id] if regional_enabled else []
                 parented_regional_ids.update(str(item.get("id") or "").strip() for item in reports)
-                layer_groups.append(f"""
-                    <div class="hierarchy-intermediate-group">
-                        {card(leader)}
+                reports_markup = ""
+                if regional_enabled:
+                    reports_markup = f"""
                         <details class="hierarchy-nested-management-zone drop-zone" data-tier="regional" data-section="{escape(section_key)}" data-parent-id="{escape(leader_id)}">
                             <summary class="hierarchy-subordinate-head">
                                 <span>{escape(regional_label)}s reporting to {escape(str(leader.get('name') or active_label))}</span>
@@ -3239,6 +3267,11 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                             <div class="hierarchy-regional-zone">{render_manager_cards(reports)}</div>
                             <p class="hierarchy-drop-hint">Drop {escape(regional_label.lower())}s here</p>
                         </details>
+                    """
+                layer_groups.append(f"""
+                    <div class="hierarchy-intermediate-group">
+                        {card(leader)}
+                        {reports_markup}
                     </div>
                 """)
             intermediate_markup = f"""
@@ -3247,7 +3280,7 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     {''.join(layer_groups)}
                     <p class="hierarchy-drop-hint">Drop {escape(active_label.lower())} contacts here</p>
                 </div>
-                <div class="hierarchy-reporting-connector"><span>{escape(regional_label)}s report to {escape(active_label.lower())}</span></div>
+                {f'<div class="hierarchy-reporting-connector"><span>{escape(regional_label)}s report to {escape(active_label.lower())}</span></div>' if regional_enabled else ''}
             """
 
         unparented_managers = [item for item in regional[section_key] if str(item.get("id") or "").strip() not in parented_regional_ids]
@@ -3260,25 +3293,34 @@ def render_organisation_chart(items, selected_group, filemaker_presence_map=None
                     {lead_cards}
                     {f'<p class="hierarchy-drop-hint">Drop the {escape(section_lead_label.lower())} here</p>' if not lead_cards else ''}
                 </div>
-                <div class="hierarchy-reporting-connector">
-                    <span>{escape((intermediate_layers[-1]['label'] if intermediate_layers else regional_label))}s report to the {escape(section_lead_label.lower())}</span>
-                </div>
+                {f'<div class="hierarchy-reporting-connector"><span>{escape((intermediate_layers[-1]["label"] if intermediate_layers else regional_label))}s report to the {escape(section_lead_label.lower())}</span></div>' if intermediate_layers or regional_enabled else ''}
             """
-        business_columns.append(f"""
-            <section class="org-chart-lane hierarchy-business-column">
-                <div class="org-chart-lane-head">
-                    <div class="org-chart-lane-title-group">
-                        <h3>{escape(section_label)}</h3>
-                        <span class="org-chart-lane-count">{len(regional[section_key])} {escape(regional_label.lower())}</span>
-                    </div>
-                </div>
-                {section_lead_markup}
-                {intermediate_markup}
+        regional_markup = ""
+        if regional_enabled:
+            regional_markup = f"""
                 <div class="hierarchy-layer-heading">{escape(regional_label)}</div>
                 <div class="hierarchy-regional-zone drop-zone" data-tier="regional" data-section="{escape(section_key)}" data-parent-id="">
                     {render_manager_cards(unparented_managers)}
                     <p class="hierarchy-drop-hint">Drop unassigned {escape(regional_label.lower())} contacts here</p>
                 </div>
+            """
+        active_count = len(regional[section_key]) if regional_enabled else (
+            len(intermediate[intermediate_layers[-1]["key"]][section_key]) if intermediate_layers else len(section_leads[section_key])
+        )
+        active_count_label = regional_label if regional_enabled else (
+            intermediate_layers[-1]["label"] if intermediate_layers else section_lead_label
+        )
+        business_columns.append(f"""
+            <section class="org-chart-lane hierarchy-business-column">
+                <div class="org-chart-lane-head">
+                    <div class="org-chart-lane-title-group">
+                        <h3>{escape(section_label)}</h3>
+                        <span class="org-chart-lane-count">{active_count} {escape(active_count_label.lower())}</span>
+                    </div>
+                </div>
+                {section_lead_markup}
+                {intermediate_markup}
+                {regional_markup}
             </section>
         """)
 
@@ -7345,6 +7387,61 @@ def post_organisation_chart_structure(
             suffix += 1
         regional_index = next((index for index, item in enumerate(structure["layers"]) if item["key"] == "regional"), len(structure["layers"]))
         structure["layers"].insert(regional_index, {"key": slug, "label": label})
+    elif action == "remove-layer":
+        matched = next((item for item in structure["layers"] if item["key"] == key), None)
+        if not matched:
+            return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=Layer+not+found.", status_code=303)
+        if key not in {"regional", "branch"} or len(structure["layers"]) <= 2:
+            return RedirectResponse(
+                url=f"/organisation-chart-view?group={quote(selected_group)}&error={quote('The upper two layers form the minimum chart structure and cannot be removed.')}",
+                status_code=303,
+            )
+        if key == "regional" and any(item["key"] == "branch" for item in structure["layers"]):
+            return RedirectResponse(
+                url=f"/organisation-chart-view?group={quote(selected_group)}&error={quote('Remove the Branch contacts layer before removing the Group VP layer.')}",
+                status_code=303,
+            )
+        structure["layers"] = [item for item in structure["layers"] if item["key"] != key]
+        contacts = load_strategic_contacts()
+        removed_contact_ids = {
+            str(item.get("id") or "").strip()
+            for item in contacts
+            if get_org_chart_group_key(item.get("organization")) == selected_group
+            and str(item.get("org_chart_tier") or "").strip().lower() == key
+        }
+        updated_contacts = []
+        for item in contacts:
+            updated = dict(item)
+            item_group = get_org_chart_group_key(item.get("organization"))
+            item_tier = str(item.get("org_chart_tier") or "").strip().lower()
+            parent_id = str(item.get("org_chart_parent_id") or "").strip()
+            if item_group == selected_group and item_tier == key:
+                updated.update({"org_chart_tier": "", "org_chart_section": "", "org_chart_parent_id": "", "org_chart_order": 0})
+            elif item_group == selected_group and parent_id in removed_contact_ids:
+                updated["org_chart_parent_id"] = ""
+            updated_contacts.append(normalize_strategic_contact_record(updated))
+        save_strategic_contacts(updated_contacts)
+        clear_strategic_contact_workspace_cache()
+    elif action == "restore-layer":
+        default_layers = get_default_org_chart_structure(selected_group)["layers"]
+        default_layer = next(
+            (item for item in default_layers if item["key"] == key),
+            None,
+        )
+        if not default_layer:
+            return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=That+layer+cannot+be+restored.", status_code=303)
+        if any(item["key"] == key for item in structure["layers"]):
+            return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=That+layer+already+exists.", status_code=303)
+        default_order = {item["key"]: index for index, item in enumerate(default_layers)}
+        target_order = default_order.get(key, len(default_order))
+        insert_at = next(
+            (
+                index for index, item in enumerate(structure["layers"])
+                if default_order.get(item["key"], len(default_order)) > target_order
+            ),
+            len(structure["layers"]),
+        )
+        structure["layers"].insert(insert_at, dict(default_layer))
     else:
         return RedirectResponse(url=f"/organisation-chart-view?group={quote(selected_group)}&error=Unknown+structure+change.", status_code=303)
     structures[selected_group] = structure
@@ -9105,6 +9202,32 @@ def build_open_promises(crm_result, master_data_result=None):
     return promises
 
 
+def build_closed_promises(crm_result, master_data_result=None):
+    activities = crm_result.get("activities", []) if crm_result.get("status") == "ok" else []
+    promises = []
+    for activity in activities:
+        if str(activity.get("crm_type") or "").strip().casefold() != "promise of order":
+            continue
+        if not bool(activity.get("crm_is_complete")):
+            continue
+        customer, customer_primary_key = resolve_current_promise_customer(
+            activity,
+            master_data_result,
+        )
+        promises.append({
+            "filemaker_record_id": str(activity.get("filemaker_record_id") or "").strip(),
+            "customer": customer,
+            "customer_primary_key": customer_primary_key,
+            "promise": str(activity.get("subject") or activity.get("body") or "Promise details not recorded").strip(),
+            "created_at": str(activity.get("date_created") or "").strip(),
+            "created_label": format_optional_datetime(activity.get("date_created")),
+            "owner": str(activity.get("sender_email") or "Owner not recorded").strip(),
+            "outcome": str(activity.get("crm_complete") or "Closed").strip() or "Closed",
+        })
+    promises.sort(key=lambda item: parse_crm_datetime(item.get("created_at")) or datetime.min, reverse=True)
+    return promises
+
+
 def get_priority_one_customers(master_data_result=None):
     master_data_result = master_data_result or fetch_filemaker_master_data()
     if master_data_result.get("status") != "ok":
@@ -10399,12 +10522,13 @@ def get_weekly_kpi_promises_page(message: str = "", error: str = "", presentatio
     )
     dashboard_payload = get_cached_weekly_kpi_dashboard_payload()
     promises = dashboard_payload.get("open_promises")
+    crm_result = fetch_promise_of_order_activities()
+    if crm_result.get("status") != "ok":
+        crm_result = fetch_crm_activities()
+    master_data_result = fetch_filemaker_master_data()
     if promises is None:
-        crm_result = fetch_promise_of_order_activities()
-        if crm_result.get("status") != "ok":
-            crm_result = fetch_crm_activities()
-        master_data_result = fetch_filemaker_master_data()
         promises = build_open_promises(crm_result, master_data_result)
+    closed_promises = build_closed_promises(crm_result, master_data_result)
     rows = []
     for item in promises:
         customer = str(item.get("customer") or "Customer not identified")
@@ -10430,12 +10554,33 @@ def get_weekly_kpi_promises_page(message: str = "", error: str = "", presentatio
         f"<div class='table-wrap'><table class='contacts-table promised-orders-table'><thead><tr><th>Date</th><th>Customer</th><th>Promise</th><th>Age</th><th>Owner</th><th class='promise-action-cell'>Action</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
         if rows else "<p class='empty-action'>No open promises of order were found.</p>"
     )
+    closed_rows = []
+    for item in closed_promises:
+        customer = str(item.get("customer") or "Customer not identified")
+        customer_key = str(item.get("customer_primary_key") or "").strip()
+        closed_rows.append(f"""
+            <tr>
+                <td data-label="Date">{escape(item.get('created_label') or 'Date unavailable')}</td>
+                <td data-label="Customer"><a href="/customer-profile-view?customer_primary_key={quote(customer_key)}&customer={quote(customer)}"><strong>{escape(customer)}</strong></a></td>
+                <td data-label="Promise">{escape(str(item.get('promise') or ''))}</td>
+                <td data-label="Outcome"><span class="status-pill">{escape(str(item.get('outcome') or 'Closed'))}</span></td>
+                <td data-label="Owner">{escape(str(item.get('owner') or ''))}</td>
+            </tr>
+        """)
+    closed_table = (
+        f"<div class='table-wrap'><table class='contacts-table promised-orders-table closed-promises-table'><thead><tr><th>Date</th><th>Customer</th><th>Promise</th><th>Outcome</th><th>Owner</th></tr></thead><tbody>{''.join(closed_rows)}</tbody></table></div>"
+        if closed_rows else "<p class='empty-action'>No closed promises of order were found.</p>"
+    )
     body = f"""
         <section class="panel">
             <div class="kpi-production-head"><div><h2>Open Promises of Order</h2><p class="muted">Detailed list including the date each promise was created.</p></div>{promises_back_control}</div>
             {f'<p class="status success">{escape(message)}</p>' if message else ''}
             {f'<p class="status error">{escape(error)}</p>' if error else ''}
             {table}
+        </section>
+        <section class="panel">
+            <div class="kpi-production-head"><div><h2>Closed Promises of Order</h2><p class="muted">Promises marked Received or Cancelled in FileMaker.</p></div></div>
+            {closed_table}
         </section>
         <dialog class="promise-update-dialog" id="promise-update-dialog">
             <form method="post" action="/weekly-kpi-promises/update">
@@ -12540,19 +12685,19 @@ STATE_CENTER_COORDS = {
 
 CUSTOMER_GROUP_META = {
     "A": {"label": "A - Vestis", "color": "#1d4ed8"},
-    "B": {"label": "B - Alsco", "color": "#2563eb"},
-    "C": {"label": "C - Cintas & UniFirst", "color": "#0f766e"},
+    "B": {"label": "B - Independents", "color": "#2563eb"},
+    "C": {"label": "C - Cintas, UniFirst & Prudential", "color": "#0f766e"},
     "D": {"label": "D - CSC Customers", "color": "#7c3aed"},
-    "E": {"label": "E - Independents / Other", "color": "#0ea5e9"},
+    "E": {"label": "E - Alsco", "color": "#0ea5e9"},
 }
 
 ACTION_PLAN_GROUP_FILTERS = {
     "all": {"label": "All"},
     "A": {"label": "Vestis"},
-    "B": {"label": "Alsco"},
-    "C": {"label": "Cintas / UniFirst"},
+    "B": {"label": "Independents"},
+    "C": {"label": "Cintas / UniFirst / Prudential"},
     "D": {"label": "CSC"},
-    "E": {"label": "Independents"},
+    "E": {"label": "Alsco"},
 }
 
 ACTION_PLAN_TERRITORY_FILTERS = {
@@ -13521,7 +13666,8 @@ async def run_ai_company_comparison(
         target=upload["filename"],
         details=(
             f"Compared {summary['uploaded']} uploaded companies; "
-            f"{summary['matched']} matched and {summary['price_list_d']} were Price List D."
+            f"{summary['matched']} matched, {summary['price_list_d']} were Price List D, "
+            f"and {summary['price_list_e']} were Price List E."
         ),
         area="ai-analysis",
         status="success",
@@ -16243,20 +16389,29 @@ def infer_customer_group_code(customer_name, customer_orders=None, customer_reco
     customer_type = normalize_apollo_location_value(
         (customer_record or {}).get("type", "")
     )
-    price_list = get_customer_latest_price_list(customer_orders)
+    current_price_list = str((customer_record or {}).get("price_list") or "").strip().upper()
+    if current_price_list in {"A", "B", "C", "D", "E"}:
+        return current_price_list
 
     if "vestis" in customer_text or "aramark" in customer_text:
         return "A"
     if "alsco" in customer_text:
-        return "B"
-    if "cintas" in customer_text or "unifirst" in customer_text or "uni first" in customer_text:
+        return "E"
+    if (
+        "cintas" in customer_text
+        or "unifirst" in customer_text
+        or "uni first" in customer_text
+        or "prudential" in customer_text
+    ):
         return "C"
     if "csc" in customer_text or "csc" in customer_type:
         return "D"
-    if price_list == "D":
-        return "D"
 
-    return "E"
+    historical_price_list = get_customer_latest_price_list(customer_orders)
+    if historical_price_list in {"A", "B", "C", "D", "E"}:
+        return historical_price_list
+
+    return "B"
 
 
 def build_customer_map_rows(order_result=None, master_data_result=None):
@@ -19629,6 +19784,7 @@ def render_monthly_orders_chart(orders):
         "B": "#06b6d4",
         "C": "#16a34a",
         "D": "#f59e0b",
+        "E": "#8b5cf6",
         "Other": "#94a3b8",
     }
 
@@ -19641,13 +19797,13 @@ def render_monthly_orders_chart(orders):
         month_key = order_date.strftime("%Y-%m")
         monthly_counts[month_key] += 1
         price_list = str(get_order_price_list(order) or "").strip().upper()
-        if price_list not in {"A", "B", "C", "D"}:
+        if price_list not in {"A", "B", "C", "D", "E"}:
             price_list = "Other"
         monthly_price_lists[month_key][price_list] += 1
 
     months = sorted(monthly_counts.keys())[-12:]
     max_count = max([monthly_counts[month] for month in months], default=1)
-    ordered_buckets = ["A", "B", "C", "D", "Other"]
+    ordered_buckets = ["A", "B", "C", "D", "E", "Other"]
 
     legend_items = []
     for bucket in ordered_buckets:
@@ -22494,6 +22650,7 @@ def render_ai_analysis_page(
                     <td>{escape(str(row.get('matched_state') or ''))}</td>
                     <td>{escape(str(row.get('price_list') or ''))}</td>
                     <td>{'Yes' if row.get('is_price_list_d') else 'No'}</td>
+                    <td>{'Yes' if row.get('is_price_list_e') else 'No'}</td>
                     <td>{int(row.get('order_count') or 0):,}</td>
                     <td>{escape(format_currency(row.get('total_spend') or 0))}</td>
                     <td>{escape(str(row.get('confidence') or ''))}%</td>
@@ -22517,6 +22674,7 @@ def render_ai_analysis_page(
                 <div><span class="label">Possible matches</span><strong>{summary.get('possible', 0):,}</strong></div>
                 <div><span class="label">No match</span><strong>{summary.get('unmatched', 0):,}</strong></div>
                 <div><span class="label">Confirmed Price List D</span><strong>{summary.get('price_list_d', 0):,}</strong></div>
+                <div><span class="label">Confirmed Price List E</span><strong>{summary.get('price_list_e', 0):,}</strong></div>
             </div>
             <section class="panel">
                 <div class="panel-heading-row">
@@ -22530,7 +22688,7 @@ def render_ai_analysis_page(
                     <table>
                         <thead><tr>
                             <th>Uploaded company</th><th>Status</th><th>Matched company</th><th>City</th>
-                            <th>State</th><th>Price list</th><th>Price List D</th><th>Orders</th><th>Total spend</th>
+                            <th>State</th><th>Price list</th><th>Price List D</th><th>Price List E</th><th>Orders</th><th>Total spend</th>
                             <th>Confidence</th><th>Reason</th>
                         </tr></thead>
                         <tbody>{row_markup}</tbody>
@@ -30945,7 +31103,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .org-structure-row,
                     .org-structure-add-row {{
                         display: grid;
-                        grid-template-columns: 52px minmax(0, 1fr) auto;
+                        grid-template-columns: 52px minmax(0, 1fr) auto auto;
                         gap: 7px;
                         align-items: center;
                         margin: 7px 0;
@@ -30954,6 +31112,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .org-structure-add-row {{
                         grid-template-columns: minmax(0, 1fr) auto;
                         margin-top: 12px;
+                    }}
+
+                    .org-structure-remove {{
+                        color: #a53a3a;
+                        border-color: #e5bcbc;
+                    }}
+
+                    .org-structure-restore-row {{
+                        margin: 7px 0;
                     }}
 
                     .org-chart-segmented-control {{

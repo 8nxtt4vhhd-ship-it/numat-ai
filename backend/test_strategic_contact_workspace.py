@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -401,6 +402,114 @@ class StrategicContactWorkspaceTests(unittest.TestCase):
         self.assertEqual(branch_response.status_code, 303)
         self.assertEqual([item["label"] for item in structure["layers"]], ["Division lead", "Regional VP", "Group VP", "Location leaders"])
         self.assertEqual([item["label"] for item in alsco_structure["layers"]], ["Regional manager", "Branch contacts"])
+
+    def test_optional_layers_can_be_removed_without_orphaning_contacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            structures_path = Path(temp_dir) / "org_chart_structures.json"
+            contacts_path = Path(temp_dir) / "strategic_contacts.json"
+            structures_path.write_text(json.dumps({
+                "vestis-aramark": {
+                    "business_sections": [{"key": "operations", "label": "Operations"}],
+                    "layers": [
+                        {"key": "section-lead", "label": "Division lead"},
+                        {"key": "branch-contacts", "label": "Director"},
+                        {"key": "regional", "label": "Regional VP"},
+                        {"key": "branch", "label": "Group VP"},
+                    ],
+                }
+            }))
+            with patch.dict(os.environ, {
+                "ORG_CHART_STRUCTURES_PATH": str(structures_path),
+                "STRATEGIC_CONTACTS_PATH": str(contacts_path),
+            }), patch.object(main, "can_manage_strategic_contacts", return_value=True), patch.object(
+                main, "record_audit_event"
+            ):
+                main.save_strategic_contacts([
+                    main.normalize_strategic_contact_record({
+                        "id": "director-1", "organization": "Vestis Corporate", "name": "Director",
+                        "org_chart_tier": "branch-contacts", "org_chart_section": "operations",
+                    }),
+                    main.normalize_strategic_contact_record({
+                        "id": "regional-1", "organization": "Vestis Corporate", "name": "Regional VP",
+                        "org_chart_tier": "regional", "org_chart_section": "operations",
+                        "org_chart_parent_id": "director-1",
+                    }),
+                    main.normalize_strategic_contact_record({
+                        "id": "branch-1", "organization": "Vestis Corporate", "name": "Group VP",
+                        "org_chart_tier": "branch", "org_chart_section": "operations",
+                        "org_chart_parent_id": "regional-1",
+                    }),
+                ])
+                branch_response = main.post_organisation_chart_structure(
+                    group="vestis-aramark", action="remove-layer", key="branch", label="Group VP"
+                )
+                regional_response = main.post_organisation_chart_structure(
+                    group="vestis-aramark", action="remove-layer", key="regional", label="Regional VP"
+                )
+                structure = main.get_org_chart_structure("vestis-aramark")
+                contacts = {item["id"]: item for item in main.load_strategic_contacts()}
+
+        self.assertEqual(branch_response.status_code, 303)
+        self.assertEqual(regional_response.status_code, 303)
+        self.assertEqual([item["key"] for item in structure["layers"]], ["section-lead", "branch-contacts"])
+        self.assertEqual(contacts["director-1"]["org_chart_tier"], "branch-contacts")
+        self.assertEqual(contacts["regional-1"]["org_chart_tier"], "")
+        self.assertEqual(contacts["branch-1"]["org_chart_tier"], "")
+
+    def test_remove_controls_are_on_the_bottom_two_layers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            structures_path = Path(temp_dir) / "org_chart_structures.json"
+            structures_path.write_text(json.dumps({
+                "vestis-aramark": {
+                    "business_sections": [{"key": "operations", "label": "Operations"}],
+                    "layers": [
+                        {"key": "section-lead", "label": "Division lead"},
+                        {"key": "branch-contacts", "label": "Regional VP"},
+                        {"key": "regional", "label": "Group VP"},
+                        {"key": "branch", "label": "Branch contacts"},
+                    ],
+                }
+            }))
+            with patch.dict(os.environ, {"ORG_CHART_STRUCTURES_PATH": str(structures_path)}):
+                html = main.render_org_chart_structure_editor("vestis-aramark")
+
+        self.assertEqual(html.count('value="remove-layer"'), 2)
+        section_lead_form = html.split('value="section-lead"', 1)[1].split("</form>", 1)[0]
+        intermediate_form = html.split('value="branch-contacts"', 1)[1].split("</form>", 1)[0]
+        regional_form = html.split('value="regional"', 1)[1].split("</form>", 1)[0]
+        branch_form = html.split('value="branch"', 1)[1].split("</form>", 1)[0]
+        self.assertNotIn('value="remove-layer"', section_lead_form)
+        self.assertNotIn('value="remove-layer"', intermediate_form)
+        self.assertIn('value="remove-layer"', regional_form)
+        self.assertIn('value="remove-layer"', branch_form)
+
+    def test_removed_default_layer_can_be_restored_in_original_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            structures_path = Path(temp_dir) / "org_chart_structures.json"
+            structures_path.write_text(json.dumps({
+                "vestis-aramark": {
+                    "business_sections": [{"key": "operations", "label": "Operations"}],
+                    "layers": [
+                        {"key": "section-lead", "label": "Division lead"},
+                        {"key": "branch-contacts", "label": "Regional VP"},
+                    ],
+                }
+            }))
+            with patch.dict(os.environ, {"ORG_CHART_STRUCTURES_PATH": str(structures_path)}), patch.object(
+                main, "can_manage_strategic_contacts", return_value=True
+            ), patch.object(main, "record_audit_event"):
+                main.post_organisation_chart_structure(
+                    group="vestis-aramark", action="restore-layer", key="regional", label="Group VP"
+                )
+                main.post_organisation_chart_structure(
+                    group="vestis-aramark", action="restore-layer", key="branch", label="Branch contacts"
+                )
+                structure = main.get_org_chart_structure("vestis-aramark")
+
+        self.assertEqual(
+            [item["key"] for item in structure["layers"]],
+            ["section-lead", "branch-contacts", "regional", "branch"],
+        )
 
     def test_added_layer_renders_parent_drop_zone_for_renamed_regional_layer(self):
         contacts = [

@@ -265,6 +265,69 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         }, index=1)
         self.assertFalse(activity["crm_is_complete"])
 
+    def test_closed_promises_include_received_and_cancelled_only(self):
+        crm_result = {
+            "status": "ok",
+            "activities": [
+                {
+                    "crm_type": "Promise of Order",
+                    "crm_is_complete": True,
+                    "crm_complete": "Received",
+                    "date_created": "2026-10-20 09:00:00",
+                    "subject": "Order promised",
+                    "customer_company": "Customer A",
+                    "customer_primary_key": "customer-a",
+                    "sender_email": "owner@example.com",
+                },
+                {
+                    "crm_type": "Promise of Order",
+                    "crm_is_complete": True,
+                    "crm_complete": "Cancelled",
+                    "date_created": "2026-10-19 09:00:00",
+                    "subject": "Cancelled promise",
+                    "customer_company": "Customer B",
+                    "customer_primary_key": "customer-b",
+                },
+                {
+                    "crm_type": "Promise of Order",
+                    "crm_is_complete": False,
+                    "crm_complete": "",
+                    "date_created": "2026-10-21 09:00:00",
+                    "subject": "Still open",
+                },
+            ],
+        }
+
+        promises = main.build_closed_promises(crm_result)
+
+        self.assertEqual([item["outcome"] for item in promises], ["Received", "Cancelled"])
+        self.assertEqual(promises[0]["customer"], "Customer A")
+
+    def test_promises_page_renders_separate_closed_table(self):
+        promise_result = {
+            "status": "ok",
+            "activities": [{
+                "crm_type": "Promise of Order",
+                "crm_is_complete": True,
+                "crm_complete": "Received",
+                "date_created": "2026-10-20 09:00:00",
+                "subject": "Closed promise details",
+                "customer_company": "Customer A",
+                "customer_primary_key": "customer-a",
+                "sender_email": "owner@example.com",
+            }],
+        }
+        with patch.object(main, "get_cached_weekly_kpi_dashboard_payload", return_value={"open_promises": []}), patch.object(
+            main, "fetch_promise_of_order_activities", return_value=promise_result
+        ), patch.object(main, "fetch_filemaker_master_data", return_value={"status": "error"}):
+            response = main.get_weekly_kpi_promises_page()
+
+        html = response
+        self.assertIn("Closed Promises of Order", html)
+        self.assertIn("closed-promises-table", html)
+        self.assertIn("Closed promise details", html)
+        self.assertIn("Received", html)
+
     def test_promise_query_preserves_filemaker_record_id(self):
         source = {"status": "ok", "records": [{
             "recordId": "987",
