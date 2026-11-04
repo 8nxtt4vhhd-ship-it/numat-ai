@@ -42,6 +42,7 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         self.assertIn('name="report_date"', html)
         self.assertIn("Preview selected date", html)
         self.assertIn("Send selected date now", html)
+        self.assertIn("All enabled reports", html)
 
     def test_admin_menu_links_directly_to_production_email_settings(self):
         with patch.object(main, "get_current_session_user", return_value={"username": "admin", "role": "admin"}):
@@ -111,6 +112,29 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         deliver.assert_called_once_with(requested_day=date(2026, 10, 8), force=True, report_type="combined")
         self.assertIn("10/08/2026", response.headers["location"])
+
+    def test_manual_all_send_uses_same_multi_report_path_as_nightly_job(self):
+        result = {
+            "status": "ok",
+            "reports": {
+                "production": {"status": "ok", "recipients": ["plant@example.com"]},
+                "sales": {"status": "ok", "recipients": ["sales@example.com"]},
+                "combined": {"status": "ok", "recipients": ["directors@example.com"]},
+            },
+        }
+        with (
+            patch.object(main, "get_current_session_user", return_value={"username": "admin", "role": "admin"}),
+            patch.object(main, "has_m365_reporting_config", return_value=True),
+            patch.object(main, "deliver_all_production_daily_issues", return_value=result) as deliver_all,
+            patch.object(main, "deliver_production_daily_issues") as deliver_one,
+            patch.object(main, "record_audit_event"),
+        ):
+            response = main.post_admin_production_daily_issues_test(report_date="2026-11-03", report_type="all")
+
+        self.assertEqual(response.status_code, 303)
+        deliver_all.assert_called_once_with(requested_day=date(2026, 11, 3), force=True)
+        deliver_one.assert_not_called()
+        self.assertIn("3%20management%20checks%20reports", response.headers["location"])
 
     def test_manual_send_uses_connected_admin_mailbox_when_reporting_mailbox_is_disabled(self):
         report = {

@@ -162,6 +162,7 @@ from production_reports import (
     clean_filename,
 )
 from production_daily_issues import deliver as deliver_production_daily_issues
+from production_daily_issues import deliver_all as deliver_all_production_daily_issues
 from production_daily_issues import generate_report as generate_production_daily_issues_report
 from management_checks import (
     add_issue_comment,
@@ -6553,7 +6554,7 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                     </form>
                     <form method="post" action="/admin-settings/production-daily-issues-test" class="login-form" style="margin-top:12px">
                         <input type="hidden" name="report_date" value="{daily_issue_test_date}" data-production-test-date-copy />
-                        <label><span class="label">Report to send</span><select name="report_type"><option value="production">Production</option><option value="sales">Sales</option><option value="combined" selected>Combined</option></select></label>
+                        <label><span class="label">Report to send</span><select name="report_type"><option value="all" selected>All enabled reports</option><option value="production">Production only</option><option value="sales">Sales only</option><option value="combined">Combined only</option></select></label>
                         <button class="button secondary" type="submit">Send selected date now</button>
                     </form>
                     <script>document.addEventListener('change',function(event){{if(event.target.matches('input[name="report_date"]')){{document.querySelectorAll('[data-production-test-date-copy]').forEach(function(input){{input.value=event.target.value;}});}}}});</script>
@@ -6654,14 +6655,19 @@ def post_admin_production_daily_issues_test(report_date: str = Form(""), report_
     except ValueError as error:
         return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#production-daily-issues", status_code=303)
     if has_m365_reporting_config():
-        result = deliver_production_daily_issues(requested_day=selected_date, force=True, report_type=report_type)
+        result = (
+            deliver_all_production_daily_issues(requested_day=selected_date, force=True)
+            if report_type == "all" else
+            deliver_production_daily_issues(requested_day=selected_date, force=True, report_type=report_type)
+        )
     else:
         settings = get_production_daily_issues_settings()
-        recipients = settings.get("reports", {}).get(report_type, {}).get("recipients", [])
         token_result = ensure_valid_access_token(str((current_user or {}).get("username") or ""))
-        if not recipients:
-            result = {"status": "missing_recipients", "recipients": []}
-        elif token_result.get("status") != "ok":
+        requested_types = (
+            [name for name, item in settings.get("reports", {}).items() if item.get("enabled")]
+            if report_type == "all" else [report_type]
+        )
+        if token_result.get("status") != "ok":
             result = {
                 "status": token_result.get("status") or "m365_user_not_connected",
                 "error": "The reporting mailbox is not configured locally and the signed-in Microsoft 365 account is unavailable.",
@@ -6669,42 +6675,52 @@ def post_admin_production_daily_issues_test(report_date: str = Form(""), report_
             }
         else:
             try:
-                report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True, report_type=report_type)
-                save_report(report_type, report, recipients=recipients, delivery_status="generated")
-                send_results = [
-                    send_m365_mail(
-                        token_result.get("access_token"),
-                        recipient,
-                        report["subject"],
-                        report["body_html"],
-                        body_content_type="HTML",
+                local_results = {}
+                for selected_type in requested_types:
+                    recipients = settings.get("reports", {}).get(selected_type, {}).get("recipients", [])
+                    if not recipients:
+                        local_results[selected_type] = {"status": "missing_recipients", "recipients": []}
+                        continue
+                    report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True, report_type=selected_type)
+                    save_report(selected_type, report, recipients=recipients, delivery_status="generated")
+                    send_results = [
+                        send_m365_mail(
+                            token_result.get("access_token"), recipient, report["subject"],
+                            report["body_html"], body_content_type="HTML",
+                        )
+                        for recipient in recipients
+                    ]
+                    failed = next((item for item in send_results if item.get("status") != "ok"), None)
+                    local_results[selected_type] = (
+                        {"status": "ok", "recipients": recipients}
+                        if failed is None else
+                        {"status": failed.get("status") or "send_failed", "error": failed.get("error_message") or failed.get("status") or "The email could not be sent.", "recipients": []}
                     )
-                    for recipient in recipients
-                ]
-                failed = next((item for item in send_results if item.get("status") != "ok"), None)
-                result = (
-                    {"status": "ok", "recipients": recipients}
-                    if failed is None else
-                    {
-                        "status": failed.get("status") or "send_failed",
-                        "error": failed.get("error_message") or failed.get("status") or "The email could not be sent.",
-                        "recipients": [],
-                    }
-                )
-                if result.get("status") == "ok":
-                    save_report(report_type, report, recipients=recipients, delivery_status="sent")
+                    if local_results[selected_type]["status"] == "ok":
+                        save_report(selected_type, report, recipients=recipients, delivery_status="sent")
+                result = {
+                    "status": "ok" if local_results and all(item.get("status") == "ok" for item in local_results.values()) else "partial",
+                    "reports": local_results,
+                }
             except Exception as error:
                 result = {"status": "generation_error", "error": str(error), "recipients": []}
+    report_results = result.get("reports", {}) if isinstance(result.get("reports"), dict) else {}
+    recipient_count = (
+        sum(len(item.get("recipients", [])) for item in report_results.values())
+        if report_results else len(result.get("recipients", []))
+    )
+    sent_report_count = len([item for item in report_results.values() if item.get("status") == "ok"]) if report_results else (1 if result.get("status") == "ok" else 0)
     record_audit_event(
         "production-daily-issues-test",
         target="Daily management checks email",
-        details=f"Manual send for {selected_date.isoformat()}: {result.get('status')}; recipients: {len(result.get('recipients', []))}.",
+        details=f"Manual send for {selected_date.isoformat()}: {result.get('status')}; reports: {sent_report_count}; recipient deliveries: {recipient_count}.",
         user=current_user,
         area="system-settings",
         status="success" if result.get("status") == "ok" else "failed",
     )
     if result.get("status") == "ok":
-        return RedirectResponse(url="/admin-settings?message=" + quote(f"Management checks email for {selected_date.strftime('%m/%d/%Y')} sent to {len(result.get('recipients', []))} recipient(s).") + "#production-daily-issues", status_code=303)
+        report_word = "report" if sent_report_count == 1 else "reports"
+        return RedirectResponse(url="/admin-settings?message=" + quote(f"{sent_report_count} management checks {report_word} for {selected_date.strftime('%m/%d/%Y')} sent across {recipient_count} recipient delivery(s).") + "#production-daily-issues", status_code=303)
     error = result.get("error") or result.get("error_message") or result.get("status") or "The email could not be sent."
     return RedirectResponse(url="/admin-settings?error=" + quote(f"Management checks email was not sent: {error}") + "#production-daily-issues", status_code=303)
 
