@@ -22,6 +22,7 @@ from finance import fetch_aged_debt_summary
 from m365 import has_m365_reporting_config, send_m365_reporting_mail
 from monthly_reports import failure_recipients
 from production import fetch_productivity_detail, fetch_production_analysis_data
+from management_checks import comment_url, save_report
 
 
 DEFAULT_DELIVERY_LOG_PATH = BASE_DIR / "data" / "production_daily_issue_deliveries.json"
@@ -30,6 +31,37 @@ SALES_PERSON_NAMES = {
     "barnold@numatsystems.com": "Ben Arnold",
     "pbinnington@numatsystems.com": "Peter Binnington",
 }
+REPORT_TYPES = ("production", "sales", "combined")
+REPORT_LABELS = {
+    "production": "Production management checks",
+    "sales": "Sales management checks",
+    "combined": "Combined management checks",
+}
+
+
+def normalize_report_type(value):
+    report_type = str(value or "combined").strip().lower()
+    if report_type not in REPORT_TYPES:
+        raise ValueError("Report type must be production, sales or combined.")
+    return report_type
+
+
+def management_area(candidate):
+    return "sales" if str(candidate.get("category") or "").strip().lower() in {"sales", "finance"} else "production"
+
+
+def filter_facts_for_report(facts, report_type):
+    report_type = normalize_report_type(report_type)
+    filtered = dict(facts)
+    if report_type == "combined":
+        candidates = list(facts.get("candidates", []))
+    else:
+        candidates = [item for item in facts.get("candidates", []) if management_area(item) == report_type]
+    filtered["candidates"] = candidates
+    filtered["report_type"] = report_type
+    if report_type == "production":
+        filtered["sales_email_summary"] = []
+    return filtered
 
 
 def delivery_log_path():
@@ -455,7 +487,8 @@ def build_daily_issue_facts(production_result, productivity_detail, report_day=N
     }
 
 
-def build_email_report(facts, selection):
+def build_email_report(facts, selection, report_type="combined"):
+    report_type = normalize_report_type(report_type)
     candidate_by_id = {str(item.get("id")): item for item in facts.get("candidates", [])}
     selected = []
     for item in selection.get("issues", []):
@@ -465,7 +498,8 @@ def build_email_report(facts, selection):
         selected.append(candidate)
     report_date = datetime.strptime(facts["report_date"], "%Y-%m-%d")
     display_date = report_date.strftime("%-d %B %Y")
-    subject = f"NuMat management checks - {display_date}"
+    report_label = REPORT_LABELS[report_type]
+    subject = f"NuMat {report_label.lower()} - {display_date}"
     email_summary = facts.get("sales_email_summary", [])
     email_summary_text = "\n".join(
         f"- {item['name']}: {int(item.get('total') or 0)} total emails sent; "
@@ -499,38 +533,40 @@ def build_email_report(facts, selection):
             evidence_text = "\n".join(f"   - {line}" for line in issue.get("evidence", []))
             plain_sections.append(f"{index}. {issue['title']}\nCheck: {issue['check']}\nWhy: {issue['why']}\nEvidence:\n{evidence_text}")
             evidence_html = "".join(f"<li>{escape(line)}</li>" for line in issue.get("evidence", []))
+            response_url = comment_url(facts["report_date"], report_type, issue.get("id"))
             html_sections.append(
                 f"<div style='margin:0 0 20px;padding:16px;border:1px solid #dbe6f2;border-left:4px solid #245cff;border-radius:8px'>"
                 f"<h2 style='margin:0 0 8px;font-size:18px;color:#17324d'>{index}. {escape(issue['title'])}</h2>"
                 f"<p style='margin:0 0 6px'><strong>Check:</strong> {escape(issue['check'])}</p>"
                 f"<p style='margin:0 0 8px'><strong>Why:</strong> {escape(issue['why'])}</p>"
-                f"<ul style='margin:0;padding-left:20px'>{evidence_html}</ul></div>"
+                f"<ul style='margin:0 0 14px;padding-left:20px'>{evidence_html}</ul>"
+                f"<a href='{escape(response_url)}' style='display:inline-block;padding:9px 14px;background:#245cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold'>Add comment or update status</a></div>"
             )
         body_text = (
-            f"NuMat management checks - {display_date}\n\n{selection.get('summary') or ''}\n\n"
+            f"NuMat {report_label.lower()} - {display_date}\n\n{selection.get('summary') or ''}\n\n"
             + "\n\n".join(plain_sections)
             + "\n\nThese are prompts for verification, not confirmed causes. Figures use the completed-day record and recent completed production days."
             + summary_text_footer
         )
         body_html = (
             "<div style='font-family:Arial,sans-serif;max-width:760px;color:#1f2933'>"
-            f"<h1 style='color:#245cff;margin-bottom:4px'>Management checks</h1><p style='color:#5e7184;margin-top:0'>{escape(display_date)}</p>"
+            f"<h1 style='color:#245cff;margin-bottom:4px'>{escape(report_label)}</h1><p style='color:#5e7184;margin-top:0'>{escape(display_date)}</p>"
             f"<p>{escape(str(selection.get('summary') or ''))}</p>{''.join(html_sections)}"
             "<p style='font-size:12px;color:#5e7184'>These are prompts for verification, not confirmed causes. Figures use the completed-day record and recent completed production days.</p>"
             f"{summary_html_footer}</div>"
         )
     else:
-        body_text = f"NuMat management checks - {display_date}\n\nNo material exceptions were identified in the available management data.{summary_text_footer}"
+        body_text = f"NuMat {report_label.lower()} - {display_date}\n\nNo material exceptions were identified in the available management data.{summary_text_footer}"
         body_html = (
             "<div style='font-family:Arial,sans-serif;max-width:760px;color:#1f2933'>"
-            f"<h1 style='color:#245cff'>Management checks</h1><p>{escape(display_date)}</p>"
+            f"<h1 style='color:#245cff'>{escape(report_label)}</h1><p>{escape(display_date)}</p>"
             "<p>No material exceptions were identified in the available management data.</p>"
             f"{summary_html_footer}</div>"
         )
     return {"subject": subject, "body_text": body_text, "body_html": body_html, "issues": selected}
 
 
-def generate_report(requested_day=None, force_refresh=True):
+def load_report_facts(requested_day=None, force_refresh=True):
     production_result = fetch_production_analysis_data(force_refresh=force_refresh, include_today=True)
     if production_result.get("status") not in {"ok", "partial"}:
         raise RuntimeError(production_result.get("warning") or production_result.get("status") or "Production data is unavailable.")
@@ -559,8 +595,29 @@ def generate_report(requested_day=None, force_refresh=True):
         crm_result=crm_result,
         finance_result=finance_result,
     )
-    selection = generate_daily_production_issue_selection(facts)
-    return {"facts": facts, "selection": selection, **build_email_report(facts, selection)}
+    return facts
+
+
+def build_typed_report(facts, report_type="combined"):
+    report_type = normalize_report_type(report_type)
+    typed_facts = filter_facts_for_report(facts, report_type)
+    selection = generate_daily_production_issue_selection(typed_facts)
+    return {
+        "report_type": report_type,
+        "facts": typed_facts,
+        "selection": selection,
+        **build_email_report(typed_facts, selection, report_type=report_type),
+    }
+
+
+def generate_report(requested_day=None, force_refresh=True, report_type="combined"):
+    facts = load_report_facts(requested_day=requested_day, force_refresh=force_refresh)
+    return build_typed_report(facts, report_type=report_type)
+
+
+def generate_all_reports(requested_day=None, force_refresh=True):
+    facts = load_report_facts(requested_day=requested_day, force_refresh=force_refresh)
+    return {report_type: build_typed_report(facts, report_type) for report_type in REPORT_TYPES}
 
 
 def notify_failure(report_day, reason):
@@ -574,19 +631,22 @@ def notify_failure(report_day, reason):
     )
 
 
-def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, recipients=None, force_refresh=True):
+def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, recipients=None, force_refresh=True, report_type="combined", report=None):
+    report_type = normalize_report_type(report_type)
     report_day = requested_day or datetime.now(PLANT_TIMEZONE).date()
-    key = f"production-daily-issues:{report_day.isoformat()}"
+    key = f"management-checks:{report_type}:{report_day.isoformat()}"
     log = load_delivery_log()
     existing_status = (log.get(key) or {}).get("status")
     if not dry_run and not force and existing_status in {"sent", "no_data"}:
         return {"status": "already_sent" if existing_status == "sent" else "no_data", "key": key}
     settings = get_production_daily_issues_settings()
-    recipient_list = normalize_email_recipients(recipients if recipients is not None else settings["recipients"])
+    report_settings = settings.get("reports", {}).get(report_type, {})
+    default_recipients = report_settings.get("recipients", settings.get("recipients", []))
+    recipient_list = normalize_email_recipients(recipients if recipients is not None else default_recipients)
     if not recipient_list:
         return {"status": "missing_recipients", "key": key}
     try:
-        report = generate_report(requested_day=report_day, force_refresh=force_refresh)
+        report = report or generate_report(requested_day=report_day, force_refresh=force_refresh, report_type=report_type)
     except Exception as error:
         if str(error).startswith("No completed production record is available"):
             if not dry_run:
@@ -604,11 +664,12 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
     if dry_run:
         destination = Path(output_dir or BASE_DIR.parent / "output" / "production-daily-issues")
         destination.mkdir(parents=True, exist_ok=True)
-        path = destination / f"production-checks-{report_day.isoformat()}.html"
+        path = destination / f"{report_type}-management-checks-{report_day.isoformat()}.html"
         path.write_text(report["body_html"], encoding="utf-8")
         return {"status": "dry_run", "key": key, "path": str(path), "recipients": recipient_list, "report": report}
     if not has_m365_reporting_config():
         return {"status": "m365_reporting_disabled", "key": key}
+    save_report(report_type, report, recipients=recipient_list, delivery_status="generated")
     send_result = send_m365_reporting_mail(
         recipient_list,
         report["subject"],
@@ -623,9 +684,42 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
         "error": str(send_result.get("error_message") or send_result.get("status") or ""),
     }
     save_delivery_log(log)
+    if send_result.get("status") == "ok":
+        save_report(report_type, report, recipients=recipient_list, delivery_status="sent")
     if send_result.get("status") != "ok":
         notify_failure(report_day.isoformat(), log[key]["error"])
     return {**send_result, "key": key, "recipients": recipient_list, "issue_count": len(report.get("issues", []))}
+
+
+def deliver_all(requested_day=None, dry_run=False, output_dir=None, force=False, force_refresh=True):
+    settings = get_production_daily_issues_settings()
+    enabled_types = [
+        report_type for report_type in REPORT_TYPES
+        if settings.get("reports", {}).get(report_type, {}).get("enabled")
+    ]
+    if not enabled_types:
+        return {"status": "disabled", "reports": {}}
+    try:
+        reports = generate_all_reports(requested_day=requested_day, force_refresh=force_refresh)
+    except Exception as error:
+        return {"status": "generation_error", "error": str(error), "reports": {}}
+    outcomes = {
+        report_type: deliver(
+            requested_day=requested_day,
+            dry_run=dry_run,
+            output_dir=output_dir,
+            force=force,
+            force_refresh=False,
+            report_type=report_type,
+            report=reports[report_type],
+        )
+        for report_type in enabled_types
+    }
+    successful = {"ok", "dry_run", "already_sent", "no_data"}
+    return {
+        "status": "ok" if all(item.get("status") in successful for item in outcomes.values()) else "partial",
+        "reports": outcomes,
+    }
 
 
 def schedule_is_due(now=None, settings=None):
@@ -646,6 +740,7 @@ def main(argv=None):
     parser.add_argument("--recipient", action="append", dest="recipients", help="Override recipient; may be repeated.")
     parser.add_argument("--dry-run", action="store_true", help="Generate the email preview without sending it.")
     parser.add_argument("--output-dir")
+    parser.add_argument("--report-type", choices=(*REPORT_TYPES, "all"), default="combined")
     parser.add_argument("--force", action="store_true", help="Send even if this date is already recorded as sent.")
     parser.add_argument("--run-if-due", action="store_true", help="Exit without sending unless the enabled configured schedule is currently due.")
     args = parser.parse_args(argv)
@@ -653,15 +748,25 @@ def main(argv=None):
     if args.run_if_due and not schedule_is_due(settings=settings):
         print(json.dumps({"status": "not_due", "enabled": settings.get("enabled"), "send_time": settings.get("send_time")}))
         return 0
-    outcome = deliver(
-        requested_day=args.date,
-        dry_run=args.dry_run,
-        output_dir=args.output_dir,
-        force=args.force,
-        recipients=args.recipients,
-    )
+    run_all = args.report_type == "all" or (args.run_if_due and not args.recipients)
+    if run_all:
+        outcome = deliver_all(
+            requested_day=args.date,
+            dry_run=args.dry_run,
+            output_dir=args.output_dir,
+            force=args.force,
+        )
+    else:
+        outcome = deliver(
+            requested_day=args.date,
+            dry_run=args.dry_run,
+            output_dir=args.output_dir,
+            force=args.force,
+            recipients=args.recipients,
+            report_type=args.report_type,
+        )
     print(json.dumps({key: value for key, value in outcome.items() if key != "report"}, default=str))
-    return 0 if outcome.get("status") in {"ok", "dry_run", "already_sent", "not_due", "no_data"} else 1
+    return 0 if outcome.get("status") in {"ok", "dry_run", "already_sent", "not_due", "no_data", "disabled"} else 1
 
 
 if __name__ == "__main__":

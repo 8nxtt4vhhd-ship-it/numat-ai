@@ -59,6 +59,25 @@ class AppSettingsTests(unittest.TestCase):
         self.assertIn("Around 1 hour of unbooked paid time", loaded["context"])
         self.assertIn("more than 1.5 hours", loaded["context"])
 
+    def test_three_management_report_lists_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            with patch.object(app_settings, "get_settings_path", return_value=path):
+                loaded = app_settings.set_production_daily_issues_settings(
+                    send_time="18:30",
+                    context="Normal context",
+                    reports={
+                        "production": {"enabled": True, "recipients": "plant@example.com"},
+                        "sales": {"enabled": True, "recipients": "sales@example.com"},
+                        "combined": {"enabled": True, "recipients": "directors@example.com"},
+                    },
+                )
+
+        self.assertEqual(loaded["reports"]["production"]["recipients"], ["plant@example.com"])
+        self.assertEqual(loaded["reports"]["sales"]["recipients"], ["sales@example.com"])
+        self.assertEqual(loaded["reports"]["combined"]["recipients"], ["directors@example.com"])
+        self.assertTrue(loaded["enabled"])
+
     def test_enabled_daily_issue_email_requires_recipient_and_valid_time(self):
         with self.assertRaises(ValueError):
             app_settings.set_production_daily_issues_settings(enabled=True, recipients="", send_time="18:30")

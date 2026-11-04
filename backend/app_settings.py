@@ -9,6 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SETTINGS_PATH = BASE_DIR / "data" / "app_settings.json"
 DEFAULT_DAILY_INVOICE_TARGET = 8000.0
 DEFAULT_PRODUCTION_ISSUES_SEND_TIME = "18:30"
+MANAGEMENT_CHECK_REPORT_TYPES = ("production", "sales", "combined")
 PRODUCTION_BREAK_CONTEXT_LINE = "Around 1 hour of unbooked paid time per operator per day is normal because paid breaks are not deducted. Allow up to and including 1.5 hours; only report an unbooked-time anomaly when the daily gap is more than 1.5 hours."
 DEFAULT_PRODUCTION_ISSUES_CONTEXT = """NuMat repairs rubber-backed carpeted mats; it is not a new-product manufacturing operation.
 Orders are commonly shared by several operators and may run across FF1, FF2 and FF3. This is normal and must not be raised as an issue by itself.
@@ -85,10 +86,22 @@ def get_production_daily_issues_settings():
     settings = load_app_settings().get("production_daily_issues", {})
     if not isinstance(settings, dict):
         settings = {}
-    try:
-        recipients = normalize_email_recipients(settings.get("recipients", []))
-    except ValueError:
-        recipients = []
+    configured_reports = settings.get("reports") if isinstance(settings.get("reports"), dict) else None
+    reports = {}
+    for report_type in MANAGEMENT_CHECK_REPORT_TYPES:
+        report_settings = (configured_reports or {}).get(report_type, {})
+        if not isinstance(report_settings, dict):
+            report_settings = {}
+        if configured_reports is None and report_type == "combined":
+            report_settings = {"enabled": settings.get("enabled", False), "recipients": settings.get("recipients", [])}
+        try:
+            report_recipients = normalize_email_recipients(report_settings.get("recipients", []))
+        except ValueError:
+            report_recipients = []
+        reports[report_type] = {
+            "enabled": bool(report_settings.get("enabled", False)),
+            "recipients": report_recipients,
+        }
     send_time = str(settings.get("send_time") or DEFAULT_PRODUCTION_ISSUES_SEND_TIME).strip()
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", send_time):
         send_time = DEFAULT_PRODUCTION_ISSUES_SEND_TIME
@@ -96,28 +109,46 @@ def get_production_daily_issues_settings():
     if PRODUCTION_BREAK_CONTEXT_LINE not in context:
         context = f"{context}\n{PRODUCTION_BREAK_CONTEXT_LINE}".strip()
     return {
-        "enabled": bool(settings.get("enabled", False)),
-        "recipients": recipients,
+        "enabled": any(item["enabled"] for item in reports.values()),
+        "recipients": reports["combined"]["recipients"],
+        "reports": reports,
         "send_time": send_time,
         "timezone": "America/Chicago",
         "context": context,
     }
 
 
-def set_production_daily_issues_settings(enabled=False, recipients=None, send_time="", context=""):
-    recipient_list = normalize_email_recipients(recipients)
+def set_production_daily_issues_settings(
+    enabled=False, recipients=None, send_time="", context="", reports=None,
+):
     normalized_time = str(send_time or "").strip()
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized_time):
         raise ValueError("Enter the nightly send time in 24-hour HH:MM format.")
-    if enabled and not recipient_list:
-        raise ValueError("Add at least one recipient before enabling the nightly email.")
+    if reports is None:
+        reports = {
+            "production": {"enabled": False, "recipients": []},
+            "sales": {"enabled": False, "recipients": []},
+            "combined": {"enabled": enabled, "recipients": recipients},
+        }
+    normalized_reports = {}
+    for report_type in MANAGEMENT_CHECK_REPORT_TYPES:
+        report_settings = reports.get(report_type, {}) if isinstance(reports, dict) else {}
+        report_enabled = bool(report_settings.get("enabled", False))
+        report_recipients = normalize_email_recipients(report_settings.get("recipients", []))
+        if report_enabled and not report_recipients:
+            raise ValueError(f"Add at least one recipient before enabling the {report_type} report.")
+        normalized_reports[report_type] = {
+            "enabled": report_enabled,
+            "recipients": report_recipients,
+        }
     normalized_context = str(context or DEFAULT_PRODUCTION_ISSUES_CONTEXT).strip()
     if PRODUCTION_BREAK_CONTEXT_LINE not in normalized_context:
         normalized_context = f"{normalized_context}\n{PRODUCTION_BREAK_CONTEXT_LINE}".strip()
     payload = load_app_settings()
     payload["production_daily_issues"] = {
-        "enabled": bool(enabled),
-        "recipients": recipient_list,
+        "enabled": any(item["enabled"] for item in normalized_reports.values()),
+        "recipients": normalized_reports["combined"]["recipients"],
+        "reports": normalized_reports,
         "send_time": normalized_time,
         "context": normalized_context,
     }

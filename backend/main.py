@@ -163,6 +163,7 @@ from production_reports import (
 )
 from production_daily_issues import deliver as deliver_production_daily_issues
 from production_daily_issues import generate_report as generate_production_daily_issues_report
+from management_checks import add_issue_comment, get_issue_by_token, list_report_history, save_report
 from strategic_contacts_report import build_strategic_contacts_pdf
 from pdl import (
     check_pdl_connection,
@@ -328,6 +329,9 @@ def is_preview_auth_enabled():
 
 def is_preview_auth_exempt(path):
     if path in PREVIEW_AUTH_EXEMPT_PATHS:
+        return True
+
+    if path.startswith("/management-check-comment/"):
         return True
 
     return path.startswith("/docs") or path.startswith("/openapi")
@@ -647,6 +651,8 @@ def has_any_active_users():
 
 def is_app_login_exempt(path):
     if path in APP_LOGIN_EXEMPT_PATHS:
+        return True
+    if path.startswith("/management-check-comment/"):
         return True
     return path.startswith("/docs") or path.startswith("/openapi")
 
@@ -6462,8 +6468,16 @@ def get_admin_settings_page(message: str = "", error: str = ""):
         )
     daily_target = get_daily_invoice_target()
     daily_issue_settings = get_production_daily_issues_settings()
-    daily_issue_recipients = "\n".join(daily_issue_settings["recipients"])
-    daily_issue_enabled = " checked" if daily_issue_settings["enabled"] else ""
+    daily_reports = daily_issue_settings.get("reports", {})
+    production_report = daily_reports.get("production", {})
+    sales_report = daily_reports.get("sales", {})
+    combined_report = daily_reports.get("combined", {})
+    production_recipients = "\n".join(production_report.get("recipients", []))
+    sales_recipients = "\n".join(sales_report.get("recipients", []))
+    combined_recipients = "\n".join(combined_report.get("recipients", daily_issue_settings.get("recipients", [])))
+    production_enabled = " checked" if production_report.get("enabled") else ""
+    sales_enabled = " checked" if sales_report.get("enabled") else ""
+    combined_enabled = " checked" if combined_report.get("enabled") else ""
     daily_issue_test_date = datetime.now().strftime("%Y-%m-%d")
     through_date = (datetime.now() - timedelta(days=1)).date()
     elapsed_target = calculate_elapsed_invoice_target(through_date, daily_target)
@@ -6502,14 +6516,14 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                 </div>
             </div>
             <div class="action-column" id="production-daily-issues" style="margin-top:18px;scroll-margin-top:18px">
-                <h3>Daily management checks email</h3>
-                <p class="subtle">Each evening, AI ranks up to two calculated management exceptions in each represented area—production, sales outreach and aged debt—then sends the plant manager an evidence-backed check list. The scheduled job uses America/Chicago plant time.</p>
+                <div class="panel-head"><div><h3>Daily management checks emails</h3><p class="subtle">Three focused reports share one nightly schedule. Saturday and Sunday are excluded. Each reported issue includes a secure one-click comment link.</p></div><a class="button secondary small-button" href="/management-checks-history">View report history</a></div>
                 <form method="post" action="/admin-settings/production-daily-issues" class="login-form">
-                    <label>
-                        <span class="label">Distribution list</span>
-                        <textarea name="recipients" rows="4" placeholder="manager@numatsystems.com">{escape(daily_issue_recipients)}</textarea>
-                        <span class="subtle">Enter one address per line, or separate addresses with commas.</span>
-                    </label>
+                    <div class="action-columns user-account-columns">
+                        <div class="action-column"><h4>Production report</h4><p class="subtle">Production, productivity, time-booking and quality checks.</p><label><span class="label">Distribution list</span><textarea name="production_recipients" rows="4">{escape(production_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="production_enabled" value="1"{production_enabled}> Enable production report</label></div>
+                        <div class="action-column"><h4>Sales report</h4><p class="subtle">Sales outreach, customer concerns and aged debt.</p><label><span class="label">Distribution list</span><textarea name="sales_recipients" rows="4">{escape(sales_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="sales_enabled" value="1"{sales_enabled}> Enable sales report</label></div>
+                        <div class="action-column"><h4>Combined report</h4><p class="subtle">Production and sales checks for senior management.</p><label><span class="label">Distribution list</span><textarea name="combined_recipients" rows="4">{escape(combined_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="combined_enabled" value="1"{combined_enabled}> Enable combined report</label></div>
+                    </div>
+                    <p class="subtle">Enter one address per line, or separate addresses with commas.</p>
                     <label>
                         <span class="label">Nightly send time</span>
                         <input type="time" name="send_time" value="{escape(daily_issue_settings['send_time'])}" required />
@@ -6519,18 +6533,19 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                         <textarea name="context" rows="12" required>{escape(daily_issue_settings['context'])}</textarea>
                         <span class="subtle">Describe normal working practices, genuine warning signs and anything the AI must not treat as a problem. This context is included in every nightly analysis.</span>
                     </label>
-                    <label class="checkbox-row"><input type="checkbox" name="enabled" value="1"{daily_issue_enabled}> Enable nightly management checks</label>
-                    <button class="button" type="submit">Save email settings</button>
+                    <button class="button" type="submit">Save management report settings</button>
                 </form>
                 <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
                     <h4 style="margin:0 0 8px">Test a report date</h4>
                     <p class="subtle">This affects only the preview or manual test email. It does not change the nightly schedule.</p>
                     <form method="get" action="/admin-settings/production-daily-issues-preview" class="login-form">
                         <label><span class="label">Test report date</span><input type="date" name="report_date" value="{daily_issue_test_date}" required /></label>
+                        <label><span class="label">Report</span><select name="report_type"><option value="production">Production</option><option value="sales">Sales</option><option value="combined" selected>Combined</option></select></label>
                         <button class="button secondary" type="submit">Preview selected date</button>
                     </form>
                     <form method="post" action="/admin-settings/production-daily-issues-test" class="login-form" style="margin-top:12px">
                         <input type="hidden" name="report_date" value="{daily_issue_test_date}" data-production-test-date-copy />
+                        <label><span class="label">Report to send</span><select name="report_type"><option value="production">Production</option><option value="sales">Sales</option><option value="combined" selected>Combined</option></select></label>
                         <button class="button secondary" type="submit">Send selected date now</button>
                     </form>
                     <script>document.addEventListener('change',function(event){{if(event.target.matches('input[name="report_date"]')){{document.querySelectorAll('[data-production-test-date-copy]').forEach(function(input){{input.value=event.target.value;}});}}}});</script>
@@ -6561,23 +6576,31 @@ def post_admin_invoice_target(daily_invoice_target: str = Form("")):
 
 
 @app.post("/admin-settings/production-daily-issues")
-def post_admin_production_daily_issues(enabled: str = Form(""), recipients: str = Form(""), send_time: str = Form(""), context: str = Form("")):
+def post_admin_production_daily_issues(
+    production_enabled: str = Form(""), production_recipients: str = Form(""),
+    sales_enabled: str = Form(""), sales_recipients: str = Form(""),
+    combined_enabled: str = Form(""), combined_recipients: str = Form(""),
+    send_time: str = Form(""), context: str = Form(""),
+):
     current_user = get_current_session_user()
     if not can_manage_user_accounts(current_user):
         return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to change system settings."), status_code=303)
     try:
         settings = set_production_daily_issues_settings(
-            enabled=str(enabled or "").strip().lower() in {"1", "true", "yes", "on"},
-            recipients=recipients,
             send_time=send_time,
             context=context,
+            reports={
+                "production": {"enabled": bool(production_enabled), "recipients": production_recipients},
+                "sales": {"enabled": bool(sales_enabled), "recipients": sales_recipients},
+                "combined": {"enabled": bool(combined_enabled), "recipients": combined_recipients},
+            },
         )
     except ValueError as error:
         return RedirectResponse(url="/admin-settings?error=" + quote(str(error)), status_code=303)
     record_audit_event(
         "settings-update",
         target="Daily management checks email",
-        details=f"{'Enabled' if settings['enabled'] else 'Disabled'} at {settings['send_time']} America/Chicago for {len(settings['recipients'])} recipient(s).",
+        details=f"{'Enabled' if settings['enabled'] else 'Disabled'} at {settings['send_time']} America/Chicago with production, sales and combined distribution lists.",
         user=current_user,
         area="system-settings",
     )
@@ -6592,13 +6615,13 @@ def parse_production_daily_issue_test_date(value):
 
 
 @app.get("/admin-settings/production-daily-issues-preview", response_class=HTMLResponse)
-def get_admin_production_daily_issues_preview(report_date: str = ""):
+def get_admin_production_daily_issues_preview(report_date: str = "", report_type: str = "combined"):
     current_user = get_current_session_user()
     if not can_manage_user_accounts(current_user):
         return render_page(title="Management Email Preview", body="<p class='status error'>You do not have permission to preview this email.</p>")
     try:
         selected_date = parse_production_daily_issue_test_date(report_date) if report_date else datetime.now().date()
-        report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True)
+        report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True, report_type=report_type)
         issue_count = len(report.get("issues", []))
         body = f"""
             <section class="panel user-accounts-panel">
@@ -6613,19 +6636,20 @@ def get_admin_production_daily_issues_preview(report_date: str = ""):
 
 
 @app.post("/admin-settings/production-daily-issues-test")
-def post_admin_production_daily_issues_test(report_date: str = Form("")):
+def post_admin_production_daily_issues_test(report_date: str = Form(""), report_type: str = Form("combined")):
     current_user = get_current_session_user()
     if not can_manage_user_accounts(current_user):
         return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to send this email."), status_code=303)
+    report_type = report_type if isinstance(report_type, str) else "combined"
     try:
         selected_date = parse_production_daily_issue_test_date(report_date) if report_date else datetime.now().date()
     except ValueError as error:
         return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#production-daily-issues", status_code=303)
     if has_m365_reporting_config():
-        result = deliver_production_daily_issues(requested_day=selected_date, force=True)
+        result = deliver_production_daily_issues(requested_day=selected_date, force=True, report_type=report_type)
     else:
         settings = get_production_daily_issues_settings()
-        recipients = settings.get("recipients", [])
+        recipients = settings.get("reports", {}).get(report_type, {}).get("recipients", [])
         token_result = ensure_valid_access_token(str((current_user or {}).get("username") or ""))
         if not recipients:
             result = {"status": "missing_recipients", "recipients": []}
@@ -6637,7 +6661,8 @@ def post_admin_production_daily_issues_test(report_date: str = Form("")):
             }
         else:
             try:
-                report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True)
+                report = generate_production_daily_issues_report(requested_day=selected_date, force_refresh=True, report_type=report_type)
+                save_report(report_type, report, recipients=recipients, delivery_status="generated")
                 send_results = [
                     send_m365_mail(
                         token_result.get("access_token"),
@@ -6658,6 +6683,8 @@ def post_admin_production_daily_issues_test(report_date: str = Form("")):
                         "recipients": [],
                     }
                 )
+                if result.get("status") == "ok":
+                    save_report(report_type, report, recipients=recipients, delivery_status="sent")
             except Exception as error:
                 result = {"status": "generation_error", "error": str(error), "recipients": []}
     record_audit_event(
@@ -6672,6 +6699,58 @@ def post_admin_production_daily_issues_test(report_date: str = Form("")):
         return RedirectResponse(url="/admin-settings?message=" + quote(f"Management checks email for {selected_date.strftime('%m/%d/%Y')} sent to {len(result.get('recipients', []))} recipient(s).") + "#production-daily-issues", status_code=303)
     error = result.get("error") or result.get("error_message") or result.get("status") or "The email could not be sent."
     return RedirectResponse(url="/admin-settings?error=" + quote(f"Management checks email was not sent: {error}") + "#production-daily-issues", status_code=303)
+
+
+def render_management_comment_page(token, message="", error=""):
+    result = get_issue_by_token(token)
+    if result.get("status") != "ok":
+        reason = "This comment link has expired." if result.get("status") == "expired" else "This comment link is invalid or the issue is no longer available."
+        return HTMLResponse(f"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Management check</title></head><body style='font-family:Arial,sans-serif;background:#f5f8fc;padding:24px'><main style='max-width:680px;margin:auto;background:#fff;padding:24px;border-radius:12px'><h1>Management check</h1><p>{escape(reason)}</p></main></body></html>", status_code=404)
+    issue = result["issue"]
+    evidence = "".join(f"<li>{escape(str(item))}</li>" for item in issue.get("evidence", []))
+    existing = "".join(
+        f"<div style='padding:12px 0;border-top:1px solid #e3eaf2'><strong>{escape(str(item.get('commenter_name') or 'Manager'))}</strong> · {escape(str(item.get('status') or ''))}<p style='margin:6px 0 0'>{escape(str(item.get('comment_text') or ''))}</p></div>"
+        for item in issue.get("comments", [])
+    )
+    status_options = "".join(
+        f"<option value='{escape(value)}'{' selected' if value == 'Acknowledged' else ''}>{escape(value)}</option>"
+        for value in ("Open", "Acknowledged", "Resolved", "No action required")
+    )
+    notice = f"<p style='padding:10px;background:#e8f7ee;color:#176b3a;border-radius:7px'>{escape(message)}</p>" if message else f"<p style='padding:10px;background:#fff2f2;color:#9b1c1c;border-radius:7px'>{escape(error)}</p>" if error else ""
+    return HTMLResponse(f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Respond to management check</title></head><body style="font-family:Arial,sans-serif;background:#f5f8fc;color:#1f2933;padding:16px"><main style="max-width:680px;margin:auto;background:#fff;padding:24px;border-radius:12px;box-shadow:0 4px 20px rgba(20,45,75,.08)"><div style="color:#245cff;font-weight:bold;text-transform:uppercase;font-size:12px">{escape(str(issue.get('report_type') or ''))} management check · {escape(str(issue.get('report_date') or ''))}</div><h1 style="font-size:24px">{escape(str(issue.get('title') or 'Management check'))}</h1><p><strong>Check:</strong> {escape(str(issue.get('check_text') or ''))}</p><p><strong>Why:</strong> {escape(str(issue.get('why_text') or ''))}</p><ul>{evidence}</ul>{notice}<form method="post" style="display:grid;gap:14px;margin-top:22px"><label><strong>Your name</strong><input name="commenter_name" required style="display:block;width:100%;box-sizing:border-box;padding:11px;margin-top:5px;border:1px solid #b9c7d6;border-radius:6px"></label><label><strong>Email (optional)</strong><input type="email" name="commenter_email" style="display:block;width:100%;box-sizing:border-box;padding:11px;margin-top:5px;border:1px solid #b9c7d6;border-radius:6px"></label><label><strong>Status</strong><select name="status" style="display:block;width:100%;padding:11px;margin-top:5px;border:1px solid #b9c7d6;border-radius:6px">{status_options}</select></label><label><strong>Comment</strong><textarea name="comment_text" required rows="4" style="display:block;width:100%;box-sizing:border-box;padding:11px;margin-top:5px;border:1px solid #b9c7d6;border-radius:6px"></textarea></label><button style="padding:12px 18px;background:#245cff;color:#fff;border:0;border-radius:7px;font-weight:bold;font-size:16px">Save response</button></form>{('<h2 style="margin-top:28px;font-size:18px">Previous responses</h2>' + existing) if existing else ''}</main></body></html>""")
+
+
+@app.get("/management-check-comment/{token}", response_class=HTMLResponse)
+def get_management_check_comment(token: str):
+    return render_management_comment_page(token)
+
+
+@app.post("/management-check-comment/{token}", response_class=HTMLResponse)
+def post_management_check_comment(
+    token: str, commenter_name: str = Form(""), commenter_email: str = Form(""),
+    status: str = Form("Acknowledged"), comment_text: str = Form(""),
+):
+    result = add_issue_comment(token, commenter_name, commenter_email, comment_text, status)
+    if result.get("status") == "ok":
+        return render_management_comment_page(token, message="Your response has been saved. Thank you.")
+    return render_management_comment_page(token, error="Enter your name and a short comment before saving.")
+
+
+@app.get("/management-checks-history", response_class=HTMLResponse)
+def get_management_checks_history():
+    reports = list_report_history()
+    report_markup = []
+    for report in reports:
+        issues = []
+        for issue in report.get("issues", []):
+            comments = "".join(
+                f"<li><strong>{escape(str(item.get('commenter_name') or 'Manager'))}</strong> · {escape(str(item.get('status') or ''))}: {escape(str(item.get('comment_text') or ''))}</li>"
+                for item in issue.get("comments", [])
+            ) or "<li class='subtle'>No response yet.</li>"
+            issues.append(f"<div style='padding:14px 0;border-top:1px solid var(--border)'><div class='panel-head'><strong>{escape(str(issue.get('title') or 'Issue'))}</strong><span class='status'>{escape(str(issue.get('status') or 'Open'))}</span></div><p>{escape(str(issue.get('check_text') or ''))}</p><ul>{comments}</ul></div>")
+        report_markup.append(f"<section class='panel' style='margin-bottom:16px'><div class='panel-head'><div><span class='home-focus-inline-kicker'>{escape(str(report.get('report_type') or '').title())}</span><h2>{escape(str(report.get('report_date') or ''))}</h2></div><span class='subtle'>{len(report.get('issues', []))} issue(s) · {escape(str(report.get('delivery_status') or ''))}</span></div>{''.join(issues) or '<p class="subtle">No issues selected.</p>'}</section>")
+    body = f"<div class='panel-head'><div><h1>Management checks history</h1><p class='subtle'>Reported issues, statuses and manager responses.</p></div><a class='button secondary' href='/admin-settings#production-daily-issues'>Email settings</a></div>{''.join(report_markup) or '<section class="panel"><p>No reports have been stored yet.</p></section>'}"
+    return render_page(title="Management Checks History", body=body)
 
 
 @app.post("/admin-settings/refresh-weekly-kpi")

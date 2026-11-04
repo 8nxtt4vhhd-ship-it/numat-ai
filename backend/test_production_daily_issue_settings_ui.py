@@ -12,6 +12,11 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
             patch.object(main, "get_production_daily_issues_settings", return_value={
                 "enabled": True,
                 "recipients": ["manager@example.com", "team@example.com"],
+                "reports": {
+                    "production": {"enabled": True, "recipients": ["production@example.com"]},
+                    "sales": {"enabled": True, "recipients": ["sales@example.com"]},
+                    "combined": {"enabled": True, "recipients": ["manager@example.com", "team@example.com"]},
+                },
                 "send_time": "18:45",
                 "timezone": "America/Chicago",
                 "context": "Orders are normally shared between operators.",
@@ -23,6 +28,9 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         self.assertIn("Daily management checks email", html)
         self.assertIn('id="production-daily-issues"', html)
         self.assertIn("manager@example.com", html)
+        self.assertIn("production@example.com", html)
+        self.assertIn("sales@example.com", html)
+        self.assertIn("View report history", html)
         self.assertIn('value="18:45"', html)
         self.assertIn("Management AI context", html)
         self.assertIn("Orders are normally shared between operators.", html)
@@ -46,14 +54,22 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
             patch.object(main, "record_audit_event") as audit,
         ):
             response = main.post_admin_production_daily_issues(
-                enabled="1",
-                recipients="manager@example.com",
+                production_enabled="1", production_recipients="production@example.com",
+                sales_enabled="1", sales_recipients="sales@example.com",
+                combined_enabled="1", combined_recipients="manager@example.com",
                 send_time="18:30",
                 context="Normal plant context",
             )
 
         self.assertEqual(response.status_code, 303)
-        setter.assert_called_once_with(enabled=True, recipients="manager@example.com", send_time="18:30", context="Normal plant context")
+        setter.assert_called_once_with(
+            send_time="18:30", context="Normal plant context",
+            reports={
+                "production": {"enabled": True, "recipients": "production@example.com"},
+                "sales": {"enabled": True, "recipients": "sales@example.com"},
+                "combined": {"enabled": True, "recipients": "manager@example.com"},
+            },
+        )
         audit.assert_called_once()
 
     def test_preview_renders_generated_email_without_sending(self):
@@ -76,6 +92,7 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         generate.assert_called_once_with(
             requested_day=date(2026, 10, 8),
             force_refresh=True,
+            report_type="combined",
         )
 
     def test_manual_send_uses_selected_historical_date(self):
@@ -88,7 +105,7 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
             response = main.post_admin_production_daily_issues_test(report_date="2026-10-08")
 
         self.assertEqual(response.status_code, 303)
-        deliver.assert_called_once_with(requested_day=date(2026, 10, 8), force=True)
+        deliver.assert_called_once_with(requested_day=date(2026, 10, 8), force=True, report_type="combined")
         self.assertIn("10/08/2026", response.headers["location"])
 
     def test_manual_send_uses_connected_admin_mailbox_when_reporting_mailbox_is_disabled(self):
@@ -99,10 +116,11 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         with (
             patch.object(main, "get_current_session_user", return_value={"username": "admin", "role": "admin"}),
             patch.object(main, "has_m365_reporting_config", return_value=False),
-            patch.object(main, "get_production_daily_issues_settings", return_value={"recipients": ["manager@example.com"]}),
+            patch.object(main, "get_production_daily_issues_settings", return_value={"reports": {"combined": {"recipients": ["manager@example.com"]}}}),
             patch.object(main, "ensure_valid_access_token", return_value={"status": "ok", "access_token": "token"}),
             patch.object(main, "generate_production_daily_issues_report", return_value=report),
             patch.object(main, "send_m365_mail", return_value={"status": "ok"}) as send,
+            patch.object(main, "save_report"),
             patch.object(main, "record_audit_event"),
         ):
             response = main.post_admin_production_daily_issues_test(report_date="2026-10-08")

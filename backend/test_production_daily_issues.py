@@ -78,6 +78,24 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertIn("Booked: 9.50 hrs", report["body_text"])
         self.assertIn("Difference: +1.50 hrs", report["body_text"])
         self.assertIn("prompts for verification", report["body_html"])
+        self.assertIn("Add comment or update status", report["body_html"])
+
+    def test_report_types_filter_candidates_and_sales_summary(self):
+        production_result, detail = sample_results()
+        facts = issues.build_daily_issue_facts(
+            production_result, detail, report_day=issues.date(2026, 10, 15),
+            crm_result={"activities": []},
+            finance_result={"status": "ok", "sixtyone_ninety": 100, "ninety_plus": 0},
+        )
+        production = issues.filter_facts_for_report(facts, "production")
+        sales = issues.filter_facts_for_report(facts, "sales")
+        combined = issues.filter_facts_for_report(facts, "combined")
+
+        self.assertTrue(production["candidates"])
+        self.assertTrue(all(issues.management_area(item) == "production" for item in production["candidates"]))
+        self.assertTrue(all(issues.management_area(item) == "sales" for item in sales["candidates"]))
+        self.assertEqual(len(combined["candidates"]), len(facts["candidates"]))
+        self.assertEqual(production["sales_email_summary"], [])
 
     def test_email_footer_counts_total_and_sales_related_emails_for_peter_and_ben(self):
         production_result, detail = sample_results()
@@ -383,6 +401,7 @@ class ProductionDailyIssueTests(unittest.TestCase):
                 patch.object(issues, "generate_report", return_value=report),
                 patch.object(issues, "has_m365_reporting_config", return_value=True),
                 patch.object(issues, "send_m365_reporting_mail", return_value={"status": "ok"}) as send,
+                patch.object(issues, "save_report"),
             ):
                 result = issues.deliver(requested_day=issues.date(2026, 10, 15))
 
@@ -409,6 +428,26 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertEqual(first["status"], "no_data")
         self.assertEqual(second["status"], "no_data")
         notify.assert_not_called()
+
+    def test_deliver_all_generates_sources_once_and_sends_each_enabled_report(self):
+        reports = {name: {"report_type": name} for name in issues.REPORT_TYPES}
+        settings = {
+            "reports": {
+                "production": {"enabled": True, "recipients": ["plant@example.com"]},
+                "sales": {"enabled": True, "recipients": ["sales@example.com"]},
+                "combined": {"enabled": False, "recipients": []},
+            }
+        }
+        with (
+            patch.object(issues, "get_production_daily_issues_settings", return_value=settings),
+            patch.object(issues, "generate_all_reports", return_value=reports) as generate,
+            patch.object(issues, "deliver", side_effect=[{"status": "ok"}, {"status": "ok"}]) as deliver,
+        ):
+            result = issues.deliver_all(requested_day=issues.date(2026, 11, 4))
+
+        self.assertEqual(result["status"], "ok")
+        generate.assert_called_once_with(requested_day=issues.date(2026, 11, 4), force_refresh=True)
+        self.assertEqual([call.kwargs["report_type"] for call in deliver.call_args_list], ["production", "sales"])
 
 
 if __name__ == "__main__":
