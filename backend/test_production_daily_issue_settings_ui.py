@@ -135,6 +135,27 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         )
         self.assertIn("sent", response.headers["location"])
 
+    def test_comment_page_marks_previously_responded_issue_and_collapses_new_form(self):
+        issue = {
+            "report_type": "production", "report_date": "2026-11-04",
+            "title": "Check press output", "check_text": "Review the cycles.",
+            "why_text": "Output was below normal.", "evidence": ["2,000 LF"],
+            "status": "Resolved",
+            "comments": [{
+                "commenter_name": "Lois", "status": "Resolved",
+                "comment_text": "The cycle entry has been corrected.",
+            }],
+        }
+        with patch.object(main, "get_issue_by_token", return_value={"status": "ok", "issue": issue}):
+            response = main.render_management_comment_page("token")
+
+        html = response.body.decode()
+        self.assertIn("Already responded", html)
+        self.assertIn("Current status: Resolved", html)
+        self.assertIn("The cycle entry has been corrected.", html)
+        self.assertIn("Add another response or change status", html)
+        self.assertIn("<details", html)
+
 
 if __name__ == "__main__":
     unittest.main()
