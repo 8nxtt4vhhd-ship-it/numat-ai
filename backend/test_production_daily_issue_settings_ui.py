@@ -160,6 +160,31 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         self.assertIn("Add another response or change status", html)
         self.assertIn("<details", html)
 
+    def test_completed_responses_email_combined_distribution_once(self):
+        update = {
+            "status": "ready", "report_date": "2026-11-04", "notification": {},
+            "issues": [{
+                "title": "Check press output", "status": "Resolved",
+                "latest_comment": {"commenter_name": "Lois", "comment_text": "Cycle corrected."},
+            }],
+        }
+        settings = {"reports": {"combined": {"recipients": ["directors@example.com"]}}}
+        with (
+            patch.object(main, "get_completion_update", return_value=update),
+            patch.object(main, "get_production_daily_issues_settings", return_value=settings),
+            patch.object(main, "has_m365_reporting_config", return_value=True),
+            patch.object(main, "begin_completion_notification", return_value={"status": "claimed"}),
+            patch.object(main, "finish_completion_notification") as finish,
+            patch.object(main, "send_m365_reporting_mail", return_value={"status": "ok"}) as send,
+        ):
+            result = main.send_management_completion_update_if_ready("2026-11-04")
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(send.call_args.args[0], ["directors@example.com"])
+        self.assertIn("management checks update", send.call_args.args[1].lower())
+        self.assertIn("Cycle corrected.", send.call_args.args[2])
+        finish.assert_called_once_with("2026-11-04", True, "")
+
 
 if __name__ == "__main__":
     unittest.main()

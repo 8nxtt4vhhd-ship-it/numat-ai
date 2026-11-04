@@ -163,7 +163,15 @@ from production_reports import (
 )
 from production_daily_issues import deliver as deliver_production_daily_issues
 from production_daily_issues import generate_report as generate_production_daily_issues_report
-from management_checks import add_issue_comment, get_issue_by_token, list_report_history, save_report
+from management_checks import (
+    add_issue_comment,
+    begin_completion_notification,
+    finish_completion_notification,
+    get_completion_update,
+    get_issue_by_token,
+    list_report_history,
+    save_report,
+)
 from strategic_contacts_report import build_strategic_contacts_pdf
 from pdl import (
     check_pdl_connection,
@@ -6735,6 +6743,51 @@ def get_management_check_comment(token: str):
     return render_management_comment_page(token)
 
 
+def send_management_completion_update_if_ready(report_date):
+    update = get_completion_update(report_date)
+    if update.get("status") != "ready":
+        return update
+    if update.get("notification", {}).get("status") == "sent":
+        return {**update, "status": "already_sent"}
+    settings = get_production_daily_issues_settings()
+    recipients = settings.get("reports", {}).get("combined", {}).get("recipients", [])
+    if not recipients:
+        return {**update, "status": "missing_recipients"}
+    if not has_m365_reporting_config():
+        return {**update, "status": "m365_reporting_disabled"}
+    claim = begin_completion_notification(report_date)
+    if claim.get("status") != "claimed":
+        return {**update, "status": claim.get("status")}
+    try:
+        display_date = datetime.strptime(str(report_date), "%Y-%m-%d").strftime("%-d %B %Y")
+    except ValueError:
+        display_date = str(report_date)
+    issue_sections = []
+    for index, issue in enumerate(update.get("issues", []), start=1):
+        comment = issue.get("latest_comment", {})
+        issue_sections.append(
+            f"<div style='margin:0 0 16px;padding:14px;border:1px solid #dbe6f2;border-left:4px solid #245cff;border-radius:8px'>"
+            f"<h2 style='margin:0 0 8px;font-size:17px;color:#17324d'>{index}. {escape(str(issue.get('title') or 'Management check'))}</h2>"
+            f"<p style='margin:0 0 6px'><strong>Status:</strong> {escape(str(issue.get('status') or comment.get('status') or 'Acknowledged'))}</p>"
+            f"<p style='margin:0 0 6px'><strong>Updated by:</strong> {escape(str(comment.get('commenter_name') or 'Manager'))}</p>"
+            f"<p style='margin:0'><strong>Update:</strong> {escape(str(comment.get('comment_text') or ''))}</p></div>"
+        )
+    subject = f"NuMat management checks update - {display_date}"
+    body = (
+        "<div style='font-family:Arial,sans-serif;max-width:760px;color:#1f2933'>"
+        "<h1 style='color:#245cff;margin-bottom:4px'>Management checks update</h1>"
+        f"<p style='color:#5e7184;margin-top:0'>{escape(display_date)}</p>"
+        "<p>All reported production and sales issues have now received a response. The latest status and management notes are below.</p>"
+        f"{''.join(issue_sections)}"
+        "<p style='font-size:12px;color:#5e7184'>This update was sent automatically after the final outstanding response was recorded.</p></div>"
+    )
+    send_result = send_m365_reporting_mail(recipients, subject, body, body_content_type="HTML")
+    sent = send_result.get("status") == "ok"
+    error_text = "" if sent else (send_result.get("error_message") or send_result.get("status") or "")
+    finish_completion_notification(report_date, sent, error_text)
+    return {**update, **send_result, "status": "sent" if sent else "send_failed", "recipients": recipients}
+
+
 @app.post("/management-check-comment/{token}", response_class=HTMLResponse)
 def post_management_check_comment(
     token: str, commenter_name: str = Form(""), commenter_email: str = Form(""),
@@ -6742,7 +6795,14 @@ def post_management_check_comment(
 ):
     result = add_issue_comment(token, commenter_name, commenter_email, comment_text, status)
     if result.get("status") == "ok":
-        return render_management_comment_page(token, message="Your response has been saved. Thank you.")
+        issue_result = get_issue_by_token(token)
+        completion = send_management_completion_update_if_ready(
+            issue_result.get("issue", {}).get("report_date") if issue_result.get("status") == "ok" else ""
+        )
+        message = "Your response has been saved. Thank you."
+        if completion.get("status") == "sent":
+            message += " All responses are now complete, so an update has been emailed to the combined distribution list."
+        return render_management_comment_page(token, message=message)
     return render_management_comment_page(token, error="Enter your name and a short comment before saving.")
 
 

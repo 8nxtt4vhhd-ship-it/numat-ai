@@ -80,6 +80,13 @@ def connect_db():
         );
         CREATE INDEX IF NOT EXISTS idx_issues_report_key ON issues(report_key);
         CREATE INDEX IF NOT EXISTS idx_comments_issue_key ON comments(issue_key);
+        CREATE TABLE IF NOT EXISTS completion_notifications (
+            report_date TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            attempted_at TEXT NOT NULL,
+            sent_at TEXT NOT NULL DEFAULT '',
+            error_text TEXT NOT NULL DEFAULT ''
+        );
         """
     )
     return connection
@@ -227,3 +234,90 @@ def list_report_history(limit=100):
                 report_item["issues"].append(issue_item)
             results.append(report_item)
     return results
+
+
+def get_completion_update(report_date):
+    report_date = str(report_date or "").strip()
+    with DB_LOCK, closing(connect_db()) as db:
+        source_types = [
+            row["report_type"] for row in db.execute(
+                "SELECT DISTINCT report_type FROM reports WHERE report_date=? AND report_type IN ('production','sales')",
+                (report_date,),
+            ).fetchall()
+        ]
+        if not source_types:
+            source_types = [
+                row["report_type"] for row in db.execute(
+                    "SELECT DISTINCT report_type FROM reports WHERE report_date=? AND report_type='combined'",
+                    (report_date,),
+                ).fetchall()
+            ]
+        if not source_types:
+            return {"status": "no_reports", "report_date": report_date}
+        placeholders = ",".join("?" for _ in source_types)
+        issues = db.execute(
+            f"""SELECT i.*, r.report_type
+                FROM issues i JOIN reports r ON r.report_key=i.report_key
+                WHERE r.report_date=? AND r.report_type IN ({placeholders})
+                ORDER BY r.report_type, i.rowid""",
+            (report_date, *source_types),
+        ).fetchall()
+        if not issues:
+            return {"status": "no_issues", "report_date": report_date, "report_types": source_types}
+        completed = []
+        pending = []
+        for issue_row in issues:
+            issue = dict(issue_row)
+            latest = db.execute(
+                "SELECT * FROM comments WHERE issue_key=? ORDER BY id DESC LIMIT 1",
+                (issue["issue_key"],),
+            ).fetchone()
+            if not latest:
+                pending.append(issue)
+                continue
+            issue["latest_comment"] = dict(latest)
+            completed.append(issue)
+        notification = db.execute(
+            "SELECT * FROM completion_notifications WHERE report_date=?",
+            (report_date,),
+        ).fetchone()
+    return {
+        "status": "ready" if not pending else "pending",
+        "report_date": report_date,
+        "report_types": source_types,
+        "issues": completed,
+        "pending_count": len(pending),
+        "total_count": len(issues),
+        "notification": dict(notification) if notification else {},
+    }
+
+
+def begin_completion_notification(report_date):
+    report_date = str(report_date or "").strip()
+    attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with DB_LOCK, closing(connect_db()) as db:
+        existing = db.execute(
+            "SELECT status FROM completion_notifications WHERE report_date=?",
+            (report_date,),
+        ).fetchone()
+        if existing and existing["status"] in {"sent", "sending"}:
+            return {"status": "already_sent" if existing["status"] == "sent" else "in_progress"}
+        db.execute(
+            """INSERT INTO completion_notifications (report_date, status, attempted_at, sent_at, error_text)
+               VALUES (?, 'sending', ?, '', '')
+               ON CONFLICT(report_date) DO UPDATE SET status='sending', attempted_at=excluded.attempted_at, error_text=''""",
+            (report_date, attempted_at),
+        )
+        db.commit()
+    return {"status": "claimed"}
+
+
+def finish_completion_notification(report_date, sent, error_text=""):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with DB_LOCK, closing(connect_db()) as db:
+        db.execute(
+            """UPDATE completion_notifications
+               SET status=?, sent_at=?, error_text=? WHERE report_date=?""",
+            ("sent" if sent else "failed", now if sent else "", str(error_text or ""), str(report_date or "")),
+        )
+        db.commit()
