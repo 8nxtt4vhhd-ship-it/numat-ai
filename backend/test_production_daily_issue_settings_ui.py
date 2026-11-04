@@ -183,6 +183,21 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         self.assertIn("The cycle entry has been corrected.", html)
         self.assertIn("Add another response or change status", html)
         self.assertIn("<details", html)
+        self.assertIn("<option value='Resolved' selected>", html)
+
+    def test_first_comment_defaults_status_to_acknowledged(self):
+        issue = {
+            "report_type": "production", "report_date": "2026-11-04",
+            "title": "Check press output", "check_text": "Review the cycles.",
+            "why_text": "Output was below normal.", "evidence": [],
+            "status": "Open", "comments": [],
+        }
+        with patch.object(main, "get_issue_by_token", return_value={"status": "ok", "issue": issue}):
+            response = main.render_management_comment_page("token")
+
+        html = response.body.decode()
+        self.assertIn("<option value='Acknowledged' selected>", html)
+        self.assertNotIn("<option value='Open' selected>", html)
 
     def test_completed_responses_email_combined_distribution_once(self):
         update = {

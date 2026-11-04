@@ -6736,9 +6736,10 @@ def render_management_comment_page(token, message="", error=""):
         f"<div style='padding:12px 0;border-top:1px solid #e3eaf2'><strong>{escape(str(item.get('commenter_name') or 'Manager'))}</strong> · {escape(str(item.get('status') or ''))}<p style='margin:6px 0 0'>{escape(str(item.get('comment_text') or ''))}</p></div>"
         for item in issue.get("comments", [])
     )
-    current_status = str(issue.get("status") or "Acknowledged")
+    current_status = str(issue.get("status") or "Open")
+    selected_status = current_status if existing else "Acknowledged"
     status_options = "".join(
-        f"<option value='{escape(value)}'{' selected' if value == current_status else ''}>{escape(value)}</option>"
+        f"<option value='{escape(value)}'{' selected' if value == selected_status else ''}>{escape(value)}</option>"
         for value in ("Open", "Acknowledged", "Resolved", "No action required")
     )
     notice = f"<p style='padding:10px;background:#e8f7ee;color:#176b3a;border-radius:7px'>{escape(message)}</p>" if message else f"<p style='padding:10px;background:#fff2f2;color:#9b1c1c;border-radius:7px'>{escape(error)}</p>" if error else ""
