@@ -6483,7 +6483,7 @@ def get_admin_settings_page(message: str = "", error: str = ""):
     elapsed_target = calculate_elapsed_invoice_target(through_date, daily_target)
     status_markup = f"<p class='status ok'>{escape(message)}</p>" if message else f"<p class='status error'>{escape(error)}</p>" if error else ""
     body = f"""
-        <section class="panel user-accounts-panel">
+        <section class="panel user-accounts-panel settings-compact">
             <h2>System settings</h2>
             <p class="subtle">Admin-only settings used by the KPI dashboard and scheduled reports.</p>
             {status_markup}
@@ -6518,10 +6518,10 @@ def get_admin_settings_page(message: str = "", error: str = ""):
             <div class="action-column" id="production-daily-issues" style="margin-top:18px;scroll-margin-top:18px">
                 <div class="panel-head"><div><h3>Daily management checks emails</h3><p class="subtle">Three focused reports share one nightly schedule. Saturday and Sunday are excluded. Each reported issue includes a secure one-click comment link.</p></div><a class="button secondary small-button" href="/management-checks-history">View report history</a></div>
                 <form method="post" action="/admin-settings/production-daily-issues" class="login-form">
-                    <div class="action-columns user-account-columns">
-                        <div class="action-column"><h4>Production report</h4><p class="subtle">Production, productivity, time-booking and quality checks.</p><label><span class="label">Distribution list</span><textarea name="production_recipients" rows="4">{escape(production_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="production_enabled" value="1"{production_enabled}> Enable production report</label></div>
-                        <div class="action-column"><h4>Sales report</h4><p class="subtle">Sales outreach, customer concerns and aged debt.</p><label><span class="label">Distribution list</span><textarea name="sales_recipients" rows="4">{escape(sales_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="sales_enabled" value="1"{sales_enabled}> Enable sales report</label></div>
-                        <div class="action-column"><h4>Combined report</h4><p class="subtle">Production and sales checks for senior management.</p><label><span class="label">Distribution list</span><textarea name="combined_recipients" rows="4">{escape(combined_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="combined_enabled" value="1"{combined_enabled}> Enable combined report</label></div>
+                    <div class="action-columns settings-report-grid">
+                        <div class="action-column"><h4>Production report</h4><p class="subtle">Production, productivity, time-booking and quality checks.</p><label><span class="label">Distribution list</span><textarea name="production_recipients" rows="2">{escape(production_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="production_enabled" value="1"{production_enabled}> Enable production report</label></div>
+                        <div class="action-column"><h4>Sales report</h4><p class="subtle">Sales outreach, customer concerns and aged debt.</p><label><span class="label">Distribution list</span><textarea name="sales_recipients" rows="2">{escape(sales_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="sales_enabled" value="1"{sales_enabled}> Enable sales report</label></div>
+                        <div class="action-column"><h4>Combined report</h4><p class="subtle">Production and sales checks for senior management.</p><label><span class="label">Distribution list</span><textarea name="combined_recipients" rows="2">{escape(combined_recipients)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="combined_enabled" value="1"{combined_enabled}> Enable combined report</label></div>
                     </div>
                     <p class="subtle">Enter one address per line, or separate addresses with commas.</p>
                     <label>
@@ -6530,12 +6530,12 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                     </label>
                     <label>
                         <span class="label">Management AI context</span>
-                        <textarea name="context" rows="12" required>{escape(daily_issue_settings['context'])}</textarea>
+                        <textarea name="context" rows="6" required>{escape(daily_issue_settings['context'])}</textarea>
                         <span class="subtle">Describe normal working practices, genuine warning signs and anything the AI must not treat as a problem. This context is included in every nightly analysis.</span>
                     </label>
                     <button class="button" type="submit">Save management report settings</button>
                 </form>
-                <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
+                <div class="settings-test-area" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
                     <h4 style="margin:0 0 8px">Test a report date</h4>
                     <p class="subtle">This affects only the preview or manual test email. It does not change the nightly schedule.</p>
                     <form method="get" action="/admin-settings/production-daily-issues-preview" class="login-form">
@@ -33162,6 +33162,110 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         align-items: start;
                     }}
 
+                    .settings-compact {{
+                        max-width: 1500px;
+                        padding: 18px;
+                        font-size: 13px;
+                    }}
+
+                    .settings-compact > h2 {{
+                        margin-bottom: 4px;
+                        font-size: 23px;
+                    }}
+
+                    .settings-compact > .subtle {{
+                        margin-bottom: 12px;
+                        font-size: 13px;
+                    }}
+
+                    .settings-compact > .action-columns,
+                    .settings-compact .settings-report-grid {{
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        gap: 12px;
+                    }}
+
+                    .settings-compact .action-column {{
+                        padding: 12px;
+                    }}
+
+                    .settings-compact h3 {{
+                        margin: 0 0 8px;
+                        font-size: 18px;
+                        line-height: 1.2;
+                    }}
+
+                    .settings-compact h4 {{
+                        margin: 0 0 6px;
+                        font-size: 15px;
+                    }}
+
+                    .settings-compact p,
+                    .settings-compact .subtle,
+                    .settings-compact .label {{
+                        font-size: 12px;
+                        line-height: 1.35;
+                    }}
+
+                    .settings-compact .login-form {{
+                        gap: 10px;
+                    }}
+
+                    .settings-compact .login-form label {{
+                        gap: 4px;
+                    }}
+
+                    .settings-compact input:not([type="checkbox"]),
+                    .settings-compact textarea,
+                    .settings-compact select {{
+                        min-height: 36px;
+                        padding: 7px 9px;
+                        font-size: 13px;
+                    }}
+
+                    .settings-compact textarea {{
+                        min-height: 0;
+                        line-height: 1.3;
+                    }}
+
+                    .settings-compact .button {{
+                        min-width: 0;
+                        padding: 8px 12px;
+                        font-size: 13px;
+                    }}
+
+                    .settings-compact .summary {{
+                        gap: 8px;
+                    }}
+
+                    .settings-compact .summary > div {{
+                        padding: 10px;
+                    }}
+
+                    .settings-compact .summary strong {{
+                        font-size: 17px;
+                    }}
+
+                    .settings-compact .status {{
+                        margin-bottom: 12px;
+                        padding: 10px 12px;
+                        font-size: 13px;
+                    }}
+
+                    .settings-test-area {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px 14px;
+                    }}
+
+                    .settings-test-area h4,
+                    .settings-test-area > p {{
+                        grid-column: 1 / -1;
+                    }}
+
+                    .settings-test-area form {{
+                        margin-top: 0 !important;
+                    }}
+
                     .m365-account-columns {{
                         grid-template-columns: 1fr;
                     }}
@@ -34526,6 +34630,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .user-account-columns {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .settings-compact > .action-columns,
+                        .settings-compact .settings-report-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .settings-test-area {{
                             grid-template-columns: 1fr;
                         }}
 

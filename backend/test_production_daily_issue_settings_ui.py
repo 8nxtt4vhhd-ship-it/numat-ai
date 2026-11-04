@@ -26,6 +26,10 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
 
         html = response.body.decode() if hasattr(response, "body") else str(response)
         self.assertIn("Daily management checks email", html)
+        self.assertIn("settings-compact", html)
+        self.assertIn("settings-report-grid", html)
+        self.assertIn('rows="2"', html)
+        self.assertIn('rows="6"', html)
         self.assertIn('id="production-daily-issues"', html)
         self.assertIn("manager@example.com", html)
         self.assertIn("production@example.com", html)
