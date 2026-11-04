@@ -124,7 +124,7 @@ def save_report(report_type, report, recipients=None, delivery_status="generated
     report_date = str(facts.get("report_date") or "").strip()
     key = report_key(report_date, report_type)
     generated_at = str(facts.get("generated_at") or datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    selected_issues = report.get("issues", [])
+    selected_issues = [] if str(report_type).strip().lower() == "combined" else report.get("issues", [])
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with DB_LOCK, closing(connect_db()) as db:
         db.execute(
@@ -143,6 +143,16 @@ def save_report(report_type, report, recipients=None, delivery_status="generated
                 now if delivery_status == "sent" else "", delivery_status,
             ),
         )
+        if str(report_type).strip().lower() == "combined":
+            combined_issue_keys = [
+                row["issue_key"] for row in db.execute(
+                    "SELECT issue_key FROM issues WHERE report_key=?", (key,)
+                ).fetchall()
+            ]
+            if combined_issue_keys:
+                placeholders = ",".join("?" for _ in combined_issue_keys)
+                db.execute(f"DELETE FROM comments WHERE issue_key IN ({placeholders})", combined_issue_keys)
+                db.execute(f"DELETE FROM issues WHERE issue_key IN ({placeholders})", combined_issue_keys)
         for issue in selected_issues:
             item_key = issue_key(report_date, report_type, issue.get("id"))
             db.execute(
@@ -212,6 +222,19 @@ def add_issue_comment(token, commenter_name, commenter_email, comment_text, stat
 
 def list_report_history(limit=100):
     with DB_LOCK, closing(connect_db()) as db:
+        db.execute(
+            """DELETE FROM comments WHERE issue_key IN (
+                   SELECT i.issue_key FROM issues i
+                   JOIN reports r ON r.report_key=i.report_key
+                   WHERE r.report_type='combined'
+               )"""
+        )
+        db.execute(
+            """DELETE FROM issues WHERE report_key IN (
+                   SELECT report_key FROM reports WHERE report_type='combined'
+               )"""
+        )
+        db.commit()
         report_rows = db.execute(
             "SELECT * FROM reports ORDER BY report_date DESC, report_type LIMIT ?",
             (max(1, min(int(limit), 500)),),

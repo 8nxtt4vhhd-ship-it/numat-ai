@@ -70,7 +70,7 @@ class ProductionDailyIssueTests(unittest.TestCase):
         report = issues.build_email_report(facts, {
             "summary": "Three checks need attention.",
             "issues": [{"id": "overbooked-zachholmes", "check": "Review Zach's bookings.", "reason": "The daily reconciliation is overbooked."}],
-        })
+        }, report_type="production")
 
         self.assertIn("15 October 2026", report["subject"])
         self.assertIn("Check Zach Holmes's individual bookings", report["body_text"])
@@ -79,6 +79,17 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertIn("Difference: +1.50 hrs", report["body_text"])
         self.assertIn("prompts for verification", report["body_html"])
         self.assertIn("Add comment or update status", report["body_html"])
+
+    def test_combined_report_is_read_only_without_response_links(self):
+        production_result, detail = sample_results()
+        facts = issues.build_daily_issue_facts(production_result, detail, report_day=issues.date(2026, 10, 15))
+        report = issues.build_email_report(facts, {
+            "summary": "Combined checks.",
+            "issues": [{"id": "overbooked-zachholmes"}],
+        }, report_type="combined")
+
+        self.assertNotIn("Add comment or update status", report["body_html"])
+        self.assertIn("Responses are recorded through the Production and Sales reports", report["body_html"])
 
     def test_report_types_filter_candidates_and_sales_summary(self):
         production_result, detail = sample_results()

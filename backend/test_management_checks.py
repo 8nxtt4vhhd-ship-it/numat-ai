@@ -79,6 +79,26 @@ class ManagementChecksTests(unittest.TestCase):
         with patch.dict("os.environ", {"MANAGEMENT_CHECKS_COMMENT_SECRET": "test-secret"}):
             self.assertEqual(management_checks.decode_comment_token("not-a-token")["status"], "invalid")
 
+    def test_combined_report_does_not_create_actionable_issues(self):
+        report = {
+            "subject": "Combined checks",
+            "facts": {"report_date": "2026-11-04", "generated_at": "2026-11-04T18:30:00-06:00"},
+            "selection": {"summary": "Combined"},
+            "issues": [{
+                "id": "duplicate", "title": "Duplicate", "check": "Check", "why": "Why",
+                "evidence": [], "category": "Sales",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            management_checks, "get_db_path", return_value=Path(directory) / "checks.db"
+        ):
+            management_checks.save_report("combined", report, ["directors@example.com"], "sent")
+            history = management_checks.list_report_history()
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["report_type"], "combined")
+        self.assertEqual(history[0]["issues"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

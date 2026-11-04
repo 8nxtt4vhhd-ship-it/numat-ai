@@ -533,14 +533,19 @@ def build_email_report(facts, selection, report_type="combined"):
             evidence_text = "\n".join(f"   - {line}" for line in issue.get("evidence", []))
             plain_sections.append(f"{index}. {issue['title']}\nCheck: {issue['check']}\nWhy: {issue['why']}\nEvidence:\n{evidence_text}")
             evidence_html = "".join(f"<li>{escape(line)}</li>" for line in issue.get("evidence", []))
-            response_url = comment_url(facts["report_date"], report_type, issue.get("id"))
+            response_url = comment_url(facts["report_date"], report_type, issue.get("id")) if report_type != "combined" else ""
+            response_action = (
+                f"<a href='{escape(response_url)}' style='display:inline-block;padding:9px 14px;background:#245cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold'>Add comment or update status</a>"
+                if response_url else
+                "<p style='margin:12px 0 0;font-size:12px;color:#5e7184'>Responses are recorded through the Production and Sales reports.</p>"
+            )
             html_sections.append(
                 f"<div style='margin:0 0 20px;padding:16px;border:1px solid #dbe6f2;border-left:4px solid #245cff;border-radius:8px'>"
                 f"<h2 style='margin:0 0 8px;font-size:18px;color:#17324d'>{index}. {escape(issue['title'])}</h2>"
                 f"<p style='margin:0 0 6px'><strong>Check:</strong> {escape(issue['check'])}</p>"
                 f"<p style='margin:0 0 8px'><strong>Why:</strong> {escape(issue['why'])}</p>"
                 f"<ul style='margin:0 0 14px;padding-left:20px'>{evidence_html}</ul>"
-                f"<a href='{escape(response_url)}' style='display:inline-block;padding:9px 14px;background:#245cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold'>Add comment or update status</a></div>"
+                f"{response_action}</div>"
             )
         body_text = (
             f"NuMat {report_label.lower()} - {display_date}\n\n{selection.get('summary') or ''}\n\n"
