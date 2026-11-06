@@ -16,6 +16,132 @@ class CustomersViewTests(unittest.TestCase):
         data_sources.clear_filemaker_orders_cache()
         main.clear_customer_contextual_activity_cache()
 
+    def test_customers_page_skips_unused_attention_calculation(self):
+        order_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "orders": [],
+        }
+        crm_result = {
+            "source": "filemaker_sync_cache",
+            "status": "ok",
+            "activities": [],
+            "activity_map": {},
+            "counts": {},
+        }
+        master_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "companies": [],
+            "customers_by_key": {},
+        }
+
+        with (
+            patch.object(main, "get_orders_for_analysis", return_value=order_result),
+            patch.object(main, "fetch_crm_activities", return_value=crm_result),
+            patch.object(main, "fetch_filemaker_customer_data", return_value=master_result),
+            patch.object(
+                main,
+                "build_customers_needing_attention_response",
+                side_effect=AssertionError("attention should not be built for the directory"),
+            ),
+            patch.object(main, "build_cached_customer_summaries", return_value=[]) as summaries,
+        ):
+            html = main.get_customers_view()
+
+        self.assertIn("No customers match the current filters", html)
+        self.assertEqual(
+            summaries.call_args.kwargs["attention_result"],
+            {"status": "ok", "late_customers": []},
+        )
+
+    def test_startup_prewarms_exact_customer_directory_summary(self):
+        order_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "orders": [
+                {"customer": "Customer", "extra": {"Customer Ref": "customer-key"}},
+                {"customer": "Corporate", "extra": {"Customer Ref": "corporate-key"}},
+            ],
+        }
+        crm_result = {
+            "source": "filemaker_sync_cache",
+            "status": "ok",
+            "activities": [],
+            "activity_map": {},
+            "counts": {},
+        }
+        customer = {"primary_key": "customer-key", "company": "Customer", "type": "Customer"}
+        corporate = {"primary_key": "corporate-key", "company": "Corporate", "type": "Corporate"}
+        customer_data = {
+            "source": "filemaker",
+            "status": "ok",
+            "companies": [customer, corporate],
+            "customers_by_key": {"customer-key": customer, "corporate-key": corporate},
+        }
+
+        with (
+            patch.object(main, "get_orders_for_analysis", return_value=order_result),
+            patch.object(main, "fetch_crm_activities", return_value=crm_result),
+            patch.object(main, "fetch_filemaker_customer_data", return_value=customer_data),
+            patch.object(main, "fetch_filemaker_master_data", return_value=customer_data),
+            patch.object(main, "load_strategic_contacts", return_value=[]),
+            patch.object(main, "build_strategic_contact_workspace_maps"),
+            patch.object(main, "build_cached_customer_summaries", return_value=[]) as summaries,
+        ):
+            main.prewarm_app_caches()
+
+        warmed_orders = summaries.call_args.kwargs["order_result"]["orders"]
+        warmed_master = summaries.call_args.kwargs["master_data_result"]
+        self.assertEqual([item["customer"] for item in warmed_orders], ["Customer"])
+        self.assertEqual(list(warmed_master["customers_by_key"]), ["customer-key"])
+        self.assertEqual(
+            summaries.call_args.kwargs["attention_result"],
+            {"status": "ok", "late_customers": []},
+        )
+
+    def test_filemaker_sales_views_only_keep_type_customer_orders(self):
+        order_result = {
+            "source": "filemaker",
+            "status": "ok",
+            "orders": [
+                {"customer": "Real Customer", "extra": {"Customer Ref": "customer-key"}},
+                {"customer": "Corporate Parent", "extra": {"Customer Ref": "corporate-key"}},
+                {"customer": "Other Record", "extra": {"Customer Ref": "other-key"}},
+            ],
+        }
+        master_data = {
+            "status": "ok",
+            "companies": [
+                {"primary_key": "customer-key", "type": "Customer"},
+                {"primary_key": "corporate-key", "type": "Corporate"},
+                {"primary_key": "other-key", "type": "Other"},
+            ],
+        }
+
+        filtered = main.filter_order_result_to_customer_type(order_result, master_data)
+
+        self.assertEqual([order["customer"] for order in filtered["orders"]], ["Real Customer"])
+        self.assertEqual(len(order_result["orders"]), 3)
+
+    def test_customers_page_master_data_only_keeps_type_customer(self):
+        customer = {"primary_key": "customer-key", "type": "Customer"}
+        corporate = {"primary_key": "corporate-key", "type": "Corporate"}
+        other = {"primary_key": "other-key", "type": "Other"}
+        master_data = {
+            "status": "ok",
+            "companies": [customer, corporate, other],
+            "customers_by_key": {
+                "customer-key": customer,
+                "corporate-key": corporate,
+            },
+        }
+
+        filtered = main.filter_master_data_to_customer_type(master_data)
+
+        self.assertEqual(filtered["companies"], [customer])
+        self.assertEqual(filtered["customers_by_key"], {"customer-key": customer})
+
     def test_customer_summaries_include_master_customer_without_orders(self):
         master_data = {
             "status": "ok",
@@ -164,8 +290,8 @@ class CustomersViewTests(unittest.TestCase):
         master_data = {
             "customers_by_key": {"branch-a": {}, "branch-b": {}},
             "all_contacts": [
-                {"email": "shared@example.com", "customer_ref": "branch-a"},
-                {"email": "SHARED@example.com", "customer_ref": "branch-b"},
+                {"email": "shared@example.com", "customer_ref": "branch-a", "active": "Active"},
+                {"email": "SHARED@example.com", "customer_ref": "branch-b", "active": "Active"},
             ],
         }
 
@@ -187,6 +313,7 @@ class CustomersViewTests(unittest.TestCase):
             "all_contacts": [{
                 "email": "pam.martin@vestis.com",
                 "customer_ref": "memphis-mc581",
+                "active": "Active",
             }],
         }
 
@@ -194,6 +321,33 @@ class CustomersViewTests(unittest.TestCase):
 
         self.assertEqual(activity_map["memphis-276"], [activity])
         self.assertEqual(activity_map["memphis-mc581"], [activity])
+
+    def test_shared_contact_activity_ignores_inactive_old_branch(self):
+        activity = {
+            "customer_primary_key": "lawrenceville-key",
+            "sender_email": "sales@numatsystems.com",
+            "to": "bauschm@cintas.com",
+        }
+        master_data = {
+            "customers_by_key": {"vidalia-key": {}, "lawrenceville-key": {}},
+            "all_contacts": [
+                {
+                    "email": "bauschm@cintas.com",
+                    "customer_ref": "vidalia-key",
+                    "active": "Inactive",
+                },
+                {
+                    "email": "bauschm@cintas.com",
+                    "customer_ref": "lawrenceville-key",
+                    "active": "Active",
+                },
+            ],
+        }
+
+        activity_map = crm.build_shared_contact_activity_map([activity], master_data)
+
+        self.assertNotIn("vidalia-key", activity_map)
+        self.assertEqual(activity_map["lawrenceville-key"], [activity])
 
     def test_inactive_source_activity_is_kept_for_contact_at_active_location(self):
         activity = {
@@ -296,7 +450,39 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn("No order history is linked to this customer yet", html)
         self.assertIn("Checking in", html)
         self.assertIn("<strong>1</strong>", html)
-        full_directory.assert_not_called()
+        self.assertIn("Email outreach", html)
+        self.assertIn("Schedule follow-up", html)
+        self.assertNotIn("<span>Enrich</span>", html)
+        self.assertNotIn("Back to customers", html)
+        full_directory.assert_called()
+
+        with (
+            patch.object(main, "get_orders_for_analysis", return_value=order_result),
+            patch.object(main, "fetch_crm_activities", return_value=crm_result),
+            patch.object(main, "fetch_filemaker_customer_data", return_value=master_result),
+            patch.object(main, "fetch_filemaker_master_data", return_value=contact_directory),
+        ):
+            from_customers = main.get_customer_view(
+                "No Order Customer",
+                return_to="/customers-view?group=A&territory=east&page=2",
+            )
+
+        self.assertIn("Back to customers", from_customers)
+        self.assertIn("group=A&amp;territory=east&amp;page=2", from_customers)
+
+        with (
+            patch.object(main, "get_orders_for_analysis", return_value=order_result),
+            patch.object(main, "fetch_crm_activities", return_value=crm_result),
+            patch.object(main, "fetch_filemaker_customer_data", return_value=master_result),
+            patch.object(main, "fetch_filemaker_master_data", return_value=contact_directory),
+        ):
+            from_action_plan = main.get_customer_view(
+                "No Order Customer",
+                return_to="/action-plan-view?selected_customer=No+Order+Customer#focus-preview",
+            )
+
+        self.assertIn("Back to Action Plan", from_action_plan)
+        self.assertIn("selected_customer=No+Order+Customer#focus-preview", from_action_plan)
 
     def test_stale_sales_outreach_recommends_reaching_out(self):
         latest_activity = {
@@ -350,6 +536,41 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn("Showing 51 to 100 of 120 customers", pager)
         self.assertIn("Page 2 of 3", pager)
 
+    def test_customer_toolbar_uses_territory_and_group_filters(self):
+        toolbar = main.render_customers_filter_toolbar(
+            group="C",
+            territory="east",
+            sort="customer",
+            direction="asc",
+        )
+
+        self.assertIn('aria-label="Territory"', toolbar)
+        self.assertIn('aria-label="Customer group"', toolbar)
+        self.assertIn('class="toggle-chip active"', toolbar)
+        self.assertIn("Cintas / UniFirst / Prudential", toolbar)
+        self.assertNotIn("Search customer", toolbar)
+        self.assertNotIn(">Apply<", toolbar)
+        self.assertNotIn(">Reset<", toolbar)
+
+        sync_form = main.render_customers_sync_form("C", "east", "customer", "asc")
+        self.assertIn("Sync customer data", sync_form)
+        self.assertIn("small-button", sync_form)
+
+    def test_customer_filters_match_group_and_territory(self):
+        summaries = [
+            {"customer": "East Vestis", "state": "OH", "group_code": "A", "territory": "East"},
+            {"customer": "West Vestis", "state": "CA", "group_code": "A", "territory": "West"},
+            {"customer": "East Alsco", "state": "NY", "group_code": "E", "territory": "East"},
+        ]
+
+        filtered = main.filter_customer_summaries(
+            summaries,
+            group="A",
+            territory="east",
+        )
+
+        self.assertEqual([item["customer"] for item in filtered], ["East Vestis"])
+
     def test_customer_name_remains_linked_without_orders(self):
         row = main.render_customer_summary_row({
             "customer": "No Order Customer",
@@ -365,6 +586,37 @@ class CustomersViewTests(unittest.TestCase):
         })
 
         self.assertIn('/customer-view?customer=No%20Order%20Customer', row)
+        self.assertIn('class="customer-name-link"', row)
+        self.assertNotIn("<strong>No Order Customer</strong>", row)
+
+    def test_customer_link_carries_customers_page_filters_and_back_link_is_safe(self):
+        return_to = "/customers-view?group=A&territory=west&sort=last_order&direction=desc&page=3"
+        row = main.render_customer_summary_row({
+            "customer": "Filtered Customer",
+            "order_count": 1,
+            "crm_count": 0,
+            "state": "CA",
+            "last_order": "2026-11-01",
+            "avg_cycle": None,
+            "cycle_pattern_label": "Not enough orders",
+            "total_value": 100,
+            "avg_value": 100,
+            "display_last_activity": None,
+        }, return_to=return_to)
+
+        self.assertIn("return_to=%2Fcustomers-view%3Fgroup%3DA%26territory%3Dwest", row)
+        self.assertIn("%23customer-filtered-customer", row)
+        self.assertIn('id="customer-filtered-customer"', row)
+        self.assertEqual(main.normalize_customers_return_to(return_to), return_to)
+        self.assertEqual(main.normalize_customers_return_to("https://example.com/customers-view"), "")
+        self.assertEqual(main.normalize_customers_return_to("/orders-view"), "")
+        self.assertEqual(
+            main.normalize_customer_detail_return_to(
+                "/action-plan-view?selected_customer=Filtered+Customer#focus-preview"
+            ),
+            "/action-plan-view?selected_customer=Filtered+Customer#focus-preview",
+        )
+        self.assertEqual(main.normalize_customer_detail_return_to("https://example.com/action-plan-view"), "")
 
     def test_customer_directory_cache_remains_until_forced_refresh(self):
         config = {"customers_layout": "Customers"}

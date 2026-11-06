@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 BASE_DIR = Path(__file__).resolve().parent
 _OUTREACH_PREP_CACHE = {}
-_OUTREACH_PREP_PROMPT_VERSION = "2026-08-18-recent-thread-first-17"
+_OUTREACH_PREP_PROMPT_VERSION = "2026-11-06-unanswered-streak-19"
 _STRATEGIC_DISCOVERY_PROMPT_VERSION = "2026-10-02-openai-strategic-discovery-3"
 
 
@@ -74,6 +74,7 @@ OUTREACH_EMAIL_STYLE_GUIDANCE = (
 
 RECENT_REPLY_ANCHOR_DAYS = 30
 RECENT_OUTREACH_ANCHOR_DAYS = 30
+RECENT_ORDER_ACKNOWLEDGEMENT_DAYS = 7
 
 
 def has_stale_logistics_signal(context):
@@ -508,6 +509,36 @@ def format_elapsed_time_label(days_value):
     return f"about {years} years"
 
 
+def is_recent_order_acknowledgement_context(context):
+    days_since_last_order = (context or {}).get("days_since_last_order")
+    return (
+        isinstance(days_since_last_order, (int, float))
+        and 0 <= days_since_last_order <= RECENT_ORDER_ACKNOWLEDGEMENT_DAYS
+    )
+
+
+def build_recent_order_acknowledgement_email(context, recommended_contact_name=""):
+    greeting_name = get_contact_first_name(recommended_contact_name)
+    greeting = f"Hi {greeting_name}," if greeting_name else "Hi,"
+    days_since_last_order = int((context or {}).get("days_since_last_order") or 0)
+    timing = (
+        "today"
+        if days_since_last_order == 0 else
+        "yesterday"
+        if days_since_last_order == 1 else
+        "recently"
+    )
+    return {
+        "email_subject": "Thank you for your recent order",
+        "email_body": (
+            f"{greeting}\n\n"
+            f"Thank you for the repair order you sent {timing}. "
+            "We appreciate your continued business.\n\n"
+            "Thanks,"
+        ),
+    }
+
+
 def build_text_tone_email_body(context, recommended_contact_name="", is_stale=False):
     greeting_name = get_contact_first_name(recommended_contact_name)
     greeting = f"Hi {greeting_name}," if greeting_name else "Hi,"
@@ -529,8 +560,15 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
     days_since_last_order = context.get("days_since_last_order")
     inbound_count = int(context.get("sales_reply_count") or 0)
     outbound_count = int(context.get("sales_outreach_sent_count") or 0)
+    unanswered_outbound_count = int(context.get("consecutive_unanswered_outbound_count") or 0)
     likely_preferred_mode = str(context.get("likely_preferred_mode") or "").strip().lower()
     primary_activity_type = str(context.get("primary_activity_type") or "").strip().lower()
+
+    if is_recent_order_acknowledgement_context(context):
+        return build_recent_order_acknowledgement_email(
+            context,
+            recommended_contact_name=recommended_contact_name,
+        )["email_body"]
 
     if (
         latest_reply_signal
@@ -563,11 +601,10 @@ def build_text_tone_email_body(context, recommended_contact_name="", is_stale=Fa
             "Is there anything from our last visit that still needs sorting?",
             "If so, send me the details and I can confirm the next step.",
         ]
-    elif outbound_count >= 3 and inbound_count == 0 and recent_signals:
+    elif unanswered_outbound_count >= 3 and recent_signals:
         paragraphs = [
-            "We have tried a few times, so I’ll keep this brief.",
-            "Do you have any damaged mats building up that need repair?",
-            "If not, I’ll leave it there for now.",
+            "I’ve sent a few notes since we last heard from you, so I’ll keep this brief.",
+            "Are you still the right person to contact about mat repairs?",
         ]
     elif has_recent_sales_activity and latest_sales_signal and latest_sales_days is not None and latest_sales_days <= RECENT_OUTREACH_ANCHOR_DAYS:
         paragraphs = [
@@ -854,6 +891,7 @@ def build_outreach_prep_fallback(context):
     if context.get("customer_services_present"):
         rationale_bullets.append("Customer service traffic exists, but it has been excluded from the sales recommendation.")
 
+    recent_order_acknowledgement = is_recent_order_acknowledgement_context(context)
     email_subject = "Any mats for repair?"
     is_stale = has_stale_logistics_signal(context) or (latest_sales_days is not None and latest_sales_days > 90)
     email_body = build_text_tone_email_body(
@@ -861,6 +899,15 @@ def build_outreach_prep_fallback(context):
         recommended_contact_name=recommended_contact_name,
         is_stale=is_stale,
     )
+    if recent_order_acknowledgement:
+        acknowledgement = build_recent_order_acknowledgement_email(
+            context,
+            recommended_contact_name=recommended_contact_name,
+        )
+        email_subject = acknowledgement["email_subject"]
+        email_body = acknowledgement["email_body"]
+        tone = "Warm, appreciative, and concise"
+        rationale_bullets.insert(0, "A repair order was received very recently, so this should be a thank-you rather than another request for mats.")
     call_objective = (
         "Confirm whether there is a genuine operational reason for the reorder gap and agree the next follow-up step."
     )
@@ -871,6 +918,13 @@ def build_outreach_prep_fallback(context):
         "Ask whether anything has changed operationally or whether new damaged mats may be building up.",
         "Offer a simple next step: quote review, timing check, or quick visit if useful.",
     ]
+    if recent_order_acknowledgement:
+        call_objective = "Thank the customer for the recent repair order without asking for additional mats."
+        call_talking_points = [
+            "Thank the customer for the recent repair order.",
+            "Acknowledge the ongoing relationship.",
+            "Do not ask for more mats or another repair order so soon.",
+        ]
     voicemail_draft = (
         f"Hi, this is from Numat. I was just checking in to see whether there is anything upcoming we can help with on the repair side. "
         f"Please call me back when convenient."
@@ -882,6 +936,12 @@ def build_outreach_prep_fallback(context):
         "Just wanted to see whether you have any damaged mats or upcoming repair needs we should plan around. "
         "Happy to keep it brief if that’s easier."
     )
+    if recent_order_acknowledgement:
+        suggested_text_message = (
+            f"Hi {text_greeting_name}, thank you for the recent repair order. "
+            if text_greeting_name else
+            "Hi, thank you for the recent repair order. "
+        ) + "We appreciate your continued business."
     targeting_note = (
         f"Start with {recommended_contact_name or 'the most active contact'}"
         + (f" at {recommended_contact_email}" if recommended_contact_email else "")
@@ -935,6 +995,9 @@ def generate_outreach_prep(context):
         return result
 
     fallback = build_outreach_prep_fallback(context)
+    if is_recent_order_acknowledgement_context(context):
+        cache_outreach_prep(cache_key, fallback)
+        return fallback
     business_context = load_outreach_business_context()
     cold_outreach_context = load_cold_outreach_context() if context.get("is_cold_outreach") else ""
 
@@ -950,6 +1013,7 @@ def generate_outreach_prep(context):
                     "content": (
                         "You are a practical B2B sales assistant. Recommend an outreach mode, tone, and draft using only the provided data. "
                         "Treat customer service traffic as supporting context, not the main sales signal. "
+                        "If days_since_last_order is 0 to 7, the customer has just placed an order. Write a brief thank-you that acknowledges the recent order. Do not ask for more mats, another order, current repair needs, quantities, a visit, or any further commercial action so soon. A question is not required for this thank-you exception. "
                         "Use the supplied business context to correctly interpret what Numat does, what damaged mats usually mean, and how repair-service outreach differs from complaint handling. "
                         "Use this strict subject hierarchy: answer a current inbound reply first; otherwise continue a meaningful outbound thread from the last 30 days; otherwise use an older unresolved repair signal or blocker; use order age only as the final fallback. If the most recent sales outreach is a visit note, meeting summary, or post-visit follow-up, use that as the primary anchor unless a newer reply clearly changes the situation. "
                         "Use the inferred contact signals to decide who the most appropriate target is, and tune the tone for their likely role and influence. "
@@ -1078,6 +1142,11 @@ def generate_outreach_prep(context):
 def generate_action_plan_email_draft(context):
     """Generate only the two fields needed by the Action Plan focus view."""
     fallback = build_outreach_prep_fallback(context)
+    if is_recent_order_acknowledgement_context(context):
+        return {
+            "email_subject": fallback["email_subject"],
+            "email_body": fallback["email_body"],
+        }
     prepared_sales_context = redact_expired_scheduling_notes(context.get("recent_sales_context"))
     prepared_sales_context = redact_intent_resolved_by_later_order(prepared_sales_context)
     primary_fact = select_primary_outreach_fact(prepared_sales_context)
@@ -1101,6 +1170,7 @@ def generate_action_plan_email_draft(context):
         "order_count",
         "sales_outreach_sent_count",
         "sales_reply_count",
+        "consecutive_unanswered_outbound_count",
         "days_since_latest_sales_outreach",
         "days_since_latest_replied_outreach",
         "primary_activity_type",
@@ -1136,6 +1206,7 @@ def generate_action_plan_email_draft(context):
                     "content": (
                         "Write one short customer email for NuMat, which repairs damaged mats for industrial laundry and mat-service customers. "
                         "Return strict JSON with only email_subject and email_body. Use only supplied facts. "
+                        "If days_since_last_order is 0 to 7, write only a brief thank-you that acknowledges the recent order. Do not ask for more mats, another order, current repair needs, quantities, a visit, or any further commercial action so soon. This thank-you exception does not need a question. "
                         "Read recent_sales_context as a conversation: inbound is the customer's wording to respond to; outbound shows the salesperson's natural voice. "
                         "Use primary_outreach_fact as the subject of the email. It was selected before drafting with this strict hierarchy: first answer a current inbound reply; second continue a meaningful outbound thread from the last 30 days; third use an older unresolved repair signal or blocker; use order age only when none of those exists. Do not replace a recent specific thread with a generic dormant-account email. For a recent outbound message with no reply, follow up on the same purpose and wording rather than creating a new pitch. If the target contact differs from the previous recipient, briefly state that the team was contacted and ask whether this person is responsible. Preserve both speaker and speech act: direction Inbound means the customer wrote it; direction Outbound means the NuMat salesperson wrote it. speech_act salesperson_question means the salesperson asked or conditionally offered something—it is not evidence that the customer had those mats. Never convert 'if you have any damaged or wavy mats' into 'you mentioned', 'we discussed', 'I noted some mats', or a claim that mats existed. Ask the question directly instead. Use 'we discussed' only when the records clearly show a two-way discussion. "
                         "Treat analysis_date as today. Every CRM item's date and age_days determine when its wording was true. Relative phrases inside an old item—such as 'tomorrow', 'this week', 'next week', 'later this month', or 'next month'—are relative to that item's date, not analysis_date. "
@@ -1144,7 +1215,7 @@ def generate_action_plan_email_draft(context):
                         "Do not invent a new visit date, travel plan, meeting, or availability. You may ask whether the customer would like to arrange a new time, but only state specific new timing when the supplied current context explicitly supports it. "
                         "Sound simple, purposeful, sincere, familiar, and plainspoken—not polished sales copy. Match usable outbound style without copying errors. "
                         "Choose one purpose: answer a live update; address a recorded blocker; continue an agreed action; close the loop after unanswered attempts; re-open a responsive relationship; identify the right contact; or check for a current repair need. "
-                        "If outbound attempts are 3 or more with no replies, do not ask about damaged-mat volume or pitch benefits; ask whether this is still the right contact or close the loop. "
+                        "If consecutive_unanswered_outbound_count is 3 or more, newer unanswered outreach overrides any older repair note or order detail. Do not ask about damaged-mat volume or revive the old repair detail; briefly ask whether this is still the right contact or close the loop. "
                         "If an older reply records a blocker, ask only whether it changed or who owns the decision; do not list speculative causes. "
                         "For dormant existing customers, write as an existing supplier and usually use 45 to 85 body words. Do not reintroduce NuMat or stack generic benefits. "
                         "Give the email enough substance to be worth sending. When evidence allows, include: one natural reference to the specific history or relationship; one practical reason it matters now; and one easy next step. Do not pad the email when the history is sparse. "
@@ -1278,6 +1349,33 @@ def redact_expired_scheduling_notes(items):
 
 def select_primary_outreach_fact(items):
     """Rank usable CRM facts before drafting so order age is only a fallback."""
+    consecutive_unanswered = 0
+    latest_outbound = None
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("direction") or "").strip().lower()
+        if direction == "inbound":
+            break
+        if direction == "outbound":
+            consecutive_unanswered += 1
+            if latest_outbound is None:
+                latest_outbound = item
+    if consecutive_unanswered >= 3 and latest_outbound:
+        return {
+            "type": "unanswered_outreach",
+            "reason": "Several newer outbound attempts have not received a reply",
+            "date": latest_outbound.get("date"),
+            "age_days": latest_outbound.get("age_days"),
+            "direction": latest_outbound.get("direction"),
+            "sender_email": latest_outbound.get("sender_email"),
+            "recipient": latest_outbound.get("recipient"),
+            "speech_act": "close_loop",
+            "subject": latest_outbound.get("subject"),
+            "preview": latest_outbound.get("preview"),
+            "unanswered_count": consecutive_unanswered,
+        }
+
     ranked = []
     repair_terms = (
         "wavy mat", "edge repair", "mats for repair", "mats ready", "setting aside",
@@ -1353,11 +1451,21 @@ def select_primary_outreach_fact(items):
 
 def build_primary_fact_fallback_email(context, primary_fact):
     fact_type = str(primary_fact.get("type") or "")
-    if fact_type not in {"unresolved_repair_signal", "recent_outbound_thread", "recent_inbound_thread"}:
+    if fact_type not in {"unanswered_outreach", "unresolved_repair_signal", "recent_outbound_thread", "recent_inbound_thread"}:
         return None
     primary_contact = context.get("primary_contact") or {}
     first_name = get_contact_first_name(primary_contact.get("name"))
     greeting = f"Hi {first_name}," if first_name else "Hi,"
+    if fact_type == "unanswered_outreach":
+        return {
+            "email_subject": "Right contact for mat repairs?",
+            "email_body": (
+                f"{greeting}\n\n"
+                "I’ve sent a few notes since we last heard from you, so I’ll keep this brief. "
+                "Are you still the right person to contact about mat repairs?\n\n"
+                "Thanks,"
+            ),
+        }
     text = " ".join(str(primary_fact.get(key) or "") for key in ("subject", "preview")).lower()
     if fact_type in {"recent_outbound_thread", "recent_inbound_thread"}:
         target_email = str(primary_contact.get("email") or "").strip().lower()

@@ -39,6 +39,7 @@ from ai import generate_meeting_actions_from_audio
 from ai import generate_meeting_actions_from_transcript
 from ai import transcribe_meeting_audio
 from ai import generate_outreach_prep
+from ai import is_recent_order_acknowledgement_context
 from analysis import (
     analyze_order_cycle,
     calculate_average_gap,
@@ -173,6 +174,7 @@ from management_checks import (
     list_report_history,
     save_report,
 )
+from mat_data import read_filemaker_mat_counts_cache
 from strategic_contacts_report import build_strategic_contacts_pdf
 from pdl import (
     check_pdl_connection,
@@ -237,6 +239,7 @@ _CUSTOMER_SUMMARIES_CACHE = {
     "expires_at": 0,
     "result": None,
 }
+_CUSTOMER_SUMMARIES_CACHE_LOCK = Lock()
 
 _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK = Lock()
 _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE = {
@@ -260,8 +263,8 @@ _STRATEGIC_CONTACT_WORKSPACE_CACHE = {
     "activity_map": {},
 }
 
-HOME_QUEUE_SUMMARIES_CACHE_VERSION = "2026-05-13-contact-policy-2"
-HOME_ACTION_PLAN_CACHE_VERSION = "2026-10-26-workflow-1"
+HOME_QUEUE_SUMMARIES_CACHE_VERSION = "2026-11-06-no-hold-mode-1"
+HOME_ACTION_PLAN_CACHE_VERSION = "2026-11-06-contact-date-top-10-all-options-3"
 CUSTOMER_SUMMARIES_CACHE_VERSION = "2026-10-26-v7-shared-contacts"
 CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_VERSION = "2026-10-26-v1"
 
@@ -274,6 +277,8 @@ APOLLO_BRANCH_RESULTS_CACHE = {
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ACTION_PLAN_DISMISSALS_PATH = BASE_DIR / "data" / "action_plan_dismissals.json"
+DEFAULT_ACTION_PLAN_FOLLOW_UPS_PATH = BASE_DIR / "data" / "action_plan_follow_ups.json"
+DEFAULT_OUTREACH_DRAFTS_PATH = BASE_DIR / "data" / "outreach_drafts.json"
 DEFAULT_APP_USERS_PATH = BASE_DIR / "data" / "app_users.json"
 DEFAULT_RECENT_SENT_EMAILS_PATH = BASE_DIR / "data" / "recent_sent_emails.json"
 DEFAULT_STRATEGIC_CONTACTS_PATH = BASE_DIR / "data" / "strategic_contacts.json"
@@ -291,6 +296,7 @@ LOGIN_MFA_CHALLENGES_LOCK = Lock()
 AUDIT_LOG_LOCK = Lock()
 WEEKLY_KPI_TODOS_LOCK = Lock()
 WEEKLY_KPI_MEETINGS_LOCK = Lock()
+OUTREACH_DRAFTS_LOCK = Lock()
 CURRENT_SESSION_USER = ContextVar("CURRENT_SESSION_USER", default=None)
 
 
@@ -12057,6 +12063,12 @@ def post_action_plan_draft(draft_token: str = Form("")):
         return JSONResponse({"status": "invalid_draft_context"}, status_code=400)
 
     result = generate_action_plan_email_draft(context)
+    save_outreach_draft(
+        current_user.get("username"),
+        context.get("customer"),
+        result.get("email_subject"),
+        result.get("email_body"),
+    )
     return {
         "status": "ok",
         "email_subject": str(result.get("email_subject") or "").strip(),
@@ -12191,6 +12203,7 @@ def read_api_root():
         "production_analysis": "/api/production-analysis",
         "production_analysis_view": "/production-analysis-view",
         "customers_view": "/customers-view",
+        "freight_analysis_view": "/freight-analysis-view",
         "sample_data": "/sample-data",
         "customers_needing_attention_json": "/customers-needing-attention",
         "customers_needing_attention_view": "/customers-needing-attention-view",
@@ -12449,6 +12462,22 @@ def post_action_plan_restore(
     return RedirectResponse(url=return_to or "/action-plan-view#action-plan", status_code=303)
 
 
+@app.post("/action-plan-schedule")
+def post_action_plan_schedule(
+    customer: str = Form(...),
+    follow_up_date: str = Form(""),
+    return_to: str = Form("/action-plan-view#home-queue"),
+):
+    normalized_date = set_action_plan_follow_up(customer, follow_up_date)
+    details = (
+        f"Next follow-up scheduled for {normalized_date}."
+        if normalized_date else
+        "Custom follow-up date cleared; the four-week rule applies."
+    )
+    record_audit_event("action-plan-schedule", target=customer, details=details, area="action-plan")
+    return RedirectResponse(url=return_to or "/action-plan-view#home-queue", status_code=303)
+
+
 def render_home_page(selected_customer="", view="focus", group="all", territory="all", dismiss_customer="", message="", error=""):
     home_started_at = time.perf_counter()
 
@@ -12546,7 +12575,7 @@ def build_customer_lookup_entries(grouped_orders, master_data_result=None):
     master_data_result = master_data_result or {}
     entries_by_key = {}
 
-    def add_entry(customer_name="", customer_primary_key="", location_label="", orders=None, state_hint=""):
+    def add_entry(customer_name="", customer_primary_key="", location_label="", orders=None, state_hint="", prefer_location=False):
         customer_text = str(customer_name or "").strip()
         if not customer_text:
             return
@@ -12581,11 +12610,11 @@ def build_customer_lookup_entries(grouped_orders, master_data_result=None):
             existing["order_count"] = candidate["order_count"]
         if not existing.get("customer_primary_key") and candidate["customer_primary_key"]:
             existing["customer_primary_key"] = candidate["customer_primary_key"]
-        if not existing.get("location") and candidate["location"]:
+        if candidate["location"] and (prefer_location or not existing.get("location")):
             existing["location"] = candidate["location"]
-        if not existing.get("city") and candidate["city"]:
+        if candidate["city"] and (prefer_location or not existing.get("city")):
             existing["city"] = candidate["city"]
-        if not existing.get("state") and candidate["state"]:
+        if candidate["state"] and (prefer_location or not existing.get("state")):
             existing["state"] = candidate["state"]
 
     for customer_name, orders in grouped_orders.items():
@@ -12608,9 +12637,14 @@ def build_customer_lookup_entries(grouped_orders, master_data_result=None):
         add_entry(
             customer_name=customer_name,
             customer_primary_key=customer_key,
-            location_label=extract_customer_location_label(customer_name, []),
+            location_label=extract_customer_location_label(
+                customer_name,
+                grouped_orders.get(customer_name, []),
+                customer_record=customer_record,
+            ),
             orders=grouped_orders.get(customer_name, []),
             state_hint=(customer_record or {}).get("state", ""),
+            prefer_location=True,
         )
 
     return sorted(
@@ -13455,9 +13489,11 @@ def get_outreach_prep(customer: str, return_to: str = ""):
     outreach_context = build_outreach_context(customer, customer_orders, attention, crm_result)
     outreach_result = generate_outreach_prep(outreach_context)
     outreach_result = apply_test_customer_outreach_mode_overrides(outreach_result, customer)
+    if str(outreach_result.get("suggested_mode") or "").strip().lower() == "hold":
+        outreach_result["suggested_mode"] = "Email"
     if (
         is_email_first_corporate_customer(customer)
-        and str(outreach_result.get("suggested_mode") or "").strip().lower() not in {"", "hold"}
+        and str(outreach_result.get("suggested_mode") or "").strip()
     ):
         outreach_result["suggested_mode"] = "Email"
     body = render_outreach_prep_page(
@@ -13602,6 +13638,7 @@ def post_filemaker_record_call(
     subject: str = Form(""),
     body: str = Form(""),
     crm_category: str = Form(""),
+    follow_up_date: str = Form(""),
 ):
     current_user = get_current_session_user()
     if not current_user:
@@ -13611,6 +13648,20 @@ def post_filemaker_record_call(
     recipient = str(to or "").strip()
     subject_text = str(subject or "").strip()
     body_text = str(body or "").strip()
+    # FastAPI supplies a string for requests; direct unit calls may leave the
+    # Form metadata object in place when this new optional field is omitted.
+    follow_up_date_text = str(follow_up_date or "").strip() if isinstance(follow_up_date, str) else ""
+    if follow_up_date_text:
+        try:
+            datetime.strptime(follow_up_date_text, "%Y-%m-%d")
+        except ValueError:
+            return RedirectResponse(
+                url=append_message_to_url(
+                    return_to or "/action-plan-view",
+                    error="Next follow-up date is invalid.",
+                ),
+                status_code=303,
+            )
     connection_state = get_m365_connection_state(current_user)
     sender_email = str(
         connection_state.get("mailbox")
@@ -13666,10 +13717,17 @@ def post_filemaker_record_call(
             status_code=303,
         )
 
+    normalized_follow_up_date = ""
+    if follow_up_date_text:
+        normalized_follow_up_date = set_action_plan_follow_up(customer_name, follow_up_date_text)
+
     record_audit_event(
         "record-call",
         target=customer_name,
-        details=f"Telephone Call recorded for {recipient} • FileMaker record {write_result.get('record_id') or 'created'}",
+        details=(
+            f"Telephone Call recorded for {recipient} • FileMaker record {write_result.get('record_id') or 'created'}"
+            + (f" • next follow-up {normalized_follow_up_date}" if normalized_follow_up_date else "")
+        ),
         area="customer-call",
         status="success",
     )
@@ -13679,7 +13737,11 @@ def post_filemaker_record_call(
     return RedirectResponse(
         url=append_message_to_url(
             clear_home_selection_from_url(return_to or "/action-plan-view"),
-            message="Telephone call recorded in FileMaker.",
+            message=(
+                f"Telephone call recorded. Next follow-up scheduled for {normalized_follow_up_date}."
+                if normalized_follow_up_date else
+                "Telephone call recorded in FileMaker."
+            ),
         ),
         status_code=303,
     )
@@ -13948,6 +14010,871 @@ def get_orders_view(
     """
 
     return render_page(title="Orders", body=body)
+
+
+def filter_freight_orders(order_result, customers_by_key, customer="", city="", state="", start="", end=""):
+    customer_query = str(customer or "").strip().casefold()
+    city_query = str(city or "").strip().casefold()
+    state_query = str(state or "").strip().upper()
+    start_date = parse_iso_date(start)
+    end_date = parse_iso_date(end)
+    filtered_orders = []
+    for order in order_result.get("orders", []):
+        customer_name = str(order.get("customer") or "")
+        customer_record = customers_by_key.get(str(get_order_primary_key(order) or "").strip(), {})
+        if customer_query and customer_query not in customer_name.casefold():
+            continue
+        if city_query and city_query not in str(customer_record.get("city") or "").strip().casefold():
+            continue
+        effective_state = str(customer_record.get("state") or get_order_state(order) or "").strip().upper()
+        if state_query and effective_state != state_query:
+            continue
+        order_date = parse_iso_date(order.get("order_date"))
+        if start_date and (not order_date or order_date < start_date):
+            continue
+        if end_date and (not order_date or order_date > end_date):
+            continue
+        filtered_orders.append(order)
+    return filtered_orders
+
+
+def build_mat_size_freight_analysis(orders, mat_cache, freight_analysis):
+    sizes = {}
+    cached_orders = (mat_cache or {}).get("orders", {})
+    for order in orders or []:
+        extra = order.get("extra") or {}
+        order_number = str(extra.get("Orders::Order No") or extra.get("Order No") or "").strip()
+        cached_order = cached_orders.get(order_number, {})
+        cached_sizes = cached_order.get("sizes") or {}
+        for size, values in cached_sizes.items():
+            row = sizes.setdefault(str(size), {
+                "size": str(size),
+                "mats": 0,
+                "repairs": 0,
+                "repair_value": 0.0,
+                "repair_value_records": 0,
+                "square_feet": 0.0,
+                "square_feet_records": 0,
+            })
+            for field in ("mats", "repairs", "repair_value_records", "square_feet_records"):
+                row[field] += int(values.get(field) or 0)
+            row["repair_value"] += float(values.get("repair_value") or 0)
+            row["square_feet"] += float(values.get("square_feet") or 0)
+        unclassified_repairs = max(
+            0,
+            int(cached_order.get("repairs") or 0)
+            - sum(int(values.get("repairs") or 0) for values in cached_sizes.values()),
+        )
+        if unclassified_repairs:
+            row = sizes.setdefault("Unspecified", {
+                "size": "Unspecified",
+                "mats": 0,
+                "repairs": 0,
+                "repair_value": 0.0,
+                "repair_value_records": 0,
+                "square_feet": 0.0,
+                "square_feet_records": 0,
+            })
+            row["mats"] += unclassified_repairs
+            row["repairs"] += unclassified_repairs
+
+    freight_cost_per_mat = freight_analysis.get("average_freight_cost_per_mat")
+    rows = []
+    for row in sizes.values():
+        if not row["repairs"]:
+            continue
+        average_repair_cost = (
+            row["repair_value"] / row["repair_value_records"]
+            if row["repair_value_records"] else None
+        )
+        average_square_feet = (
+            row["square_feet"] / row["square_feet_records"]
+            if row["square_feet_records"] else None
+        )
+        rows.append({
+            **row,
+            "average_repair_cost": average_repair_cost,
+            "average_square_feet": average_square_feet,
+            "freight_cost_per_mat": freight_cost_per_mat,
+            "freight_inclusive_repair_cost": (
+                average_repair_cost + freight_cost_per_mat
+                if average_repair_cost is not None and freight_cost_per_mat is not None else None
+            ),
+        })
+    rows.sort(key=lambda row: row["size"].casefold())
+    return rows
+
+
+def normalize_mat_size_key(value):
+    return re.sub(r"\s+", "", str(value or "").strip().lower().replace("×", "x"))
+
+
+@app.get("/freight-analysis-view", response_class=HTMLResponse)
+def get_freight_analysis_view(
+    customer: str = "",
+    city: str = "",
+    state: str = "",
+    start: str = "",
+    end: str = "",
+):
+    order_result = get_orders_for_analysis()
+    master_data_result = fetch_filemaker_customer_data()
+    order_result = filter_order_result_to_customer_type(order_result, master_data_result)
+
+    if order_result.get("status") != "ok":
+        return render_page(
+            title="Freight Analysis",
+            body=f"<p class='status error'>Could not load order data: {escape(str(order_result.get('status') or 'unknown'))}</p>",
+        )
+
+    customers_by_key = master_data_result.get("customers_by_key", {})
+    state_query = str(state or "").strip().upper()
+    available_states = sorted({
+        str(record.get("state") or "").strip().upper()
+        for record in customers_by_key.values()
+        if str(record.get("state") or "").strip()
+    })
+    state_options = '<option value="">All states</option>' + "".join(
+        f'<option value="{escape(option)}"{" selected" if option == state_query else ""}>{escape(option)}</option>'
+        for option in available_states
+    )
+    filtered_orders = filter_freight_orders(
+        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end
+    )
+    freight_orders = [order for order in filtered_orders if order_has_freight_data(order)]
+
+    mat_cache = read_filemaker_mat_counts_cache()
+    analysis = build_freight_analysis(
+        filtered_orders,
+        customer_records=customers_by_key,
+        mat_counts_by_order=mat_cache.get("orders", {}),
+    )
+    mat_size_analysis = build_mat_size_freight_analysis(freight_orders, mat_cache, analysis)
+    export_query = urlencode({
+        key: value for key, value in {
+            "customer": customer,
+            "city": city,
+            "state": state,
+            "start": start,
+            "end": end,
+        }.items() if str(value or "").strip()
+    })
+    table_columns = [
+        ("Customer", "text"), ("Orders", "number"), ("Mats", "number"),
+        ("Repairs", "number"), ("Rejects", "number"), ("Location", "text"),
+        ("Repair revenue", "number"), ("Total revenue", "number"),
+        ("Freight revenue", "number"), ("Freight cost", "number"),
+        ("Incoming revenue", "number"), ("Incoming cost", "number"),
+        ("Outgoing revenue", "number"), ("Outgoing cost", "number"),
+        ("Contribution", "number"), ("Incoming gross", "number"),
+        ("Incoming net", "number"), ("Outgoing gross", "number"),
+        ("Outgoing net", "number"), ("Gross variance", "number"),
+        ("Net variance", "number"), ("Avg revenue / cost per order", "number"),
+        ("Avg revenue / cost per mat", "number"),
+        ("Approx miles / cost per mile", "number"),
+    ]
+    table_headers = "".join(
+        f'<th data-sort-type="{sort_type}" aria-sort="none"><button type="button" class="freight-sort-button">{escape(label)}<span aria-hidden="true">↕</span></button></th>'
+        for label, sort_type in table_columns
+    )
+    standard_size_order = {size: index for index, size in enumerate(("3x4", "3x5", "3x10", "4x6"))}
+    standard_mat_sizes = sorted(
+        (row for row in mat_size_analysis if normalize_mat_size_key(row["size"]) in standard_size_order),
+        key=lambda row: standard_size_order[normalize_mat_size_key(row["size"])],
+    )
+    other_mat_sizes = [
+        row for row in mat_size_analysis if normalize_mat_size_key(row["size"]) not in standard_size_order
+    ]
+
+    def render_mat_size_rows(size_rows, empty_message):
+        return "".join(
+            f"""
+            <tr data-square-feet="{row['average_square_feet'] if row['average_square_feet'] is not None else ''}"
+                data-inclusive-repair="{row['freight_inclusive_repair_cost'] if row['freight_inclusive_repair_cost'] is not None else ''}">
+                <td><strong>{escape(row['size'])}</strong></td>
+                <td>{row['repairs']:,}</td>
+                <td>{f"{row['average_square_feet']:,.2f}" if row['average_square_feet'] is not None else '—'}</td>
+                <td>{format_currency(row['average_repair_cost'])}</td>
+                <td>{format_currency(row['freight_cost_per_mat'])}</td>
+                <td><strong>{format_currency(row['freight_inclusive_repair_cost'])}</strong></td>
+                <td class="mat-buy-new-cost">Enter price / sq ft</td>
+                <td class="mat-saving">—</td>
+                <td class="mat-repair-percent">—</td>
+            </tr>
+            """
+            for row in size_rows
+        ) or f"<tr><td colspan='9' class='empty'>{escape(empty_message)}</td></tr>"
+
+    standard_mat_size_rows = render_mat_size_rows(
+        standard_mat_sizes,
+        "No repaired mats in the standard sizes match the current filters.",
+    )
+    other_mat_size_rows = render_mat_size_rows(
+        other_mat_sizes,
+        "No other repaired mat sizes match the current filters.",
+    )
+
+    def weight(value):
+        return f"{float(value or 0):,.0f} lb"
+
+    rows = "".join(
+        f"""
+        <tr>
+            <td><a href="/customer-view?customer={quote(str(row['customer']))}"><strong>{escape(str(row['customer']))}</strong></a></td>
+            <td>{row['orders']}</td>
+            <td>{int(row['mats']) if row['mats'] else '—'}</td>
+            <td>{row['repairs'] if row['mats'] else '—'}</td>
+            <td>{row['rejects'] if row['mats'] else '—'}</td>
+            <td>{escape(', '.join(part for part in (row['city'], row['state']) if part) or '—')}</td>
+            <td>{format_currency(row['repair_revenue'])}</td>
+            <td>{format_currency(row['total_revenue'])}</td>
+            <td>{format_currency(row['freight_charged'])}</td>
+            <td>{format_currency(row['freight_cost'])}</td>
+            <td>{format_currency(row['incoming_charged'])}</td>
+            <td>{format_currency(row['incoming_cost'])}</td>
+            <td>{format_currency(row['outgoing_charged'])}</td>
+            <td>{format_currency(row['outgoing_cost'])}</td>
+            <td>{format_currency(row['freight_margin'])}</td>
+            <td>{weight(row['incoming_gross_weight'])}</td>
+            <td>{weight(row['incoming_net_weight'])}</td>
+            <td>{weight(row['outgoing_gross_weight'])}</td>
+            <td>{weight(row['outgoing_net_weight'])}</td>
+            <td>{weight(row['gross_weight_variance'])}</td>
+            <td>{weight(row['net_weight_variance'])}</td>
+            <td>{format_currency(row['average_freight_income_per_order'])} revenue<br><small>{format_currency(row['average_freight_cost_per_order'])} cost</small></td>
+            <td>{format_currency(row['average_freight_income_per_mat']) if row['average_freight_income_per_mat'] is not None else '—'} revenue<br><small>{format_currency(row['average_freight_cost_per_mat']) if row['average_freight_cost_per_mat'] is not None else '—'} cost</small></td>
+            <td class="freight-mileage" data-zip="{escape(row['zip_code'])}" data-city="{escape(row['city'])}" data-state="{escape(row['state'])}" data-cost="{row['freight_cost']}" data-legs="{row['freight_legs']}">Calculating…</td>
+        </tr>
+        """
+        for row in analysis["rows"]
+    ) or "<tr><td colspan='24' class='empty'>No freight data matches the current filters. Sync customer data after adding the new FileMaker fields.</td></tr>"
+
+    body = f"""
+        <style>
+            .freight-analysis-main > h1 {{ margin-bottom: 9px; font-size: 1.55rem; line-height: 1.1; }}
+            .freight-analysis-controls {{ padding: 7px 12px 8px; }}
+            .freight-analysis-controls .panel-head {{ margin-bottom: 1px; }}
+            .freight-analysis-controls h2 {{ margin: 0; font-size: .96rem; }}
+            .freight-analysis-controls .home-focus-inline-kicker {{ font-size: .58rem; }}
+            .freight-analysis-intro {{ margin: 1px 0 5px; font-size: .7rem; line-height: 1.2; }}
+            .freight-filter-controls {{
+                display: grid;
+                grid-template-columns: repeat(7, minmax(0, 1fr));
+                gap: 6px;
+                align-items: end;
+                padding: 0;
+                border: 0;
+                background: transparent;
+            }}
+            .freight-filter-controls > * {{ min-width: 0; }}
+            .freight-filter-controls label {{ gap: 3px; }}
+            .freight-filter-controls label span {{ font-size: .68rem; }}
+            .freight-filter-controls input,
+            .freight-filter-controls select,
+            .freight-filter-controls button,
+            .freight-filter-controls .button {{
+                box-sizing: border-box;
+                width: 100%;
+                height: 28px;
+                min-height: 28px;
+            }}
+            .freight-filter-controls input,
+            .freight-filter-controls select {{ padding: 4px 7px; font-size: .74rem; }}
+            .freight-filter-controls button,
+            .freight-filter-controls .button {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                align-self: end;
+                margin: 0;
+                padding: 5px 8px;
+                font-size: .74rem;
+                white-space: nowrap;
+            }}
+            .freight-summary-groups {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+                margin: 8px 0;
+            }}
+            .freight-summary-group {{
+                min-width: 0;
+                padding: 9px;
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                background: rgba(255, 255, 255, .5);
+            }}
+            .freight-summary-group.wide {{ grid-column: 1 / -1; }}
+            .freight-summary-group h3 {{
+                margin: 0 0 7px;
+                color: var(--text);
+                font-size: .74rem;
+                letter-spacing: .03em;
+                text-transform: uppercase;
+            }}
+            .freight-summary-grid {{
+                display: grid;
+                grid-template-columns: repeat(var(--summary-columns), minmax(0, 1fr));
+                gap: 6px;
+                margin: 0;
+            }}
+            .freight-summary-grid > div {{
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
+                min-width: 0;
+                position: relative;
+                overflow: hidden;
+                min-height: 88px;
+                padding: 10px 11px 9px;
+                border-top: 3px solid var(--blue);
+            }}
+            .freight-summary-grid .label {{ align-self: flex-start; font-size: .7rem; line-height: 1.18; }}
+            .freight-summary-grid strong {{
+                display: block;
+                align-self: flex-start;
+                max-width: 100%;
+                margin-top: 5px;
+                font-size: 1rem;
+                line-height: 1;
+                letter-spacing: -.015em;
+                white-space: nowrap;
+            }}
+            .freight-inline-notes {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 5px 16px;
+                margin: 8px 2px 0;
+            }}
+            .freight-inline-note {{
+                margin: 0;
+                padding: 0;
+                color: var(--muted);
+                background: transparent;
+                border: 0;
+                box-shadow: none;
+                font-size: .68rem;
+                line-height: 1.3;
+            }}
+            .freight-inline-note.warning-note {{ color: #8a5a00; }}
+            .freight-tabs {{
+                display: flex;
+                gap: 4px;
+                margin: 8px 0 6px;
+                padding: 3px;
+                width: fit-content;
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                background: rgba(255, 255, 255, .72);
+            }}
+            .freight-tab {{
+                min-height: 29px;
+                padding: 5px 13px;
+                border: 0;
+                border-radius: 7px;
+                background: transparent;
+                color: var(--muted);
+                font-size: .7rem;
+                font-weight: 700;
+                box-shadow: none;
+            }}
+            .freight-tab:hover {{ background: rgba(42, 91, 255, .08); color: var(--blue); }}
+            .freight-tab[aria-selected="true"] {{ background: var(--blue); color: #fff; }}
+            .freight-tab-panel[hidden] {{ display: none !important; }}
+            main.freight-analysis-main {{
+                box-sizing: border-box;
+                width: calc(100% - 32px);
+                max-width: 1440px;
+                margin-left: auto;
+                margin-right: auto;
+                padding-left: 16px;
+                padding-right: 16px;
+            }}
+            .freight-breakdown-panel {{ padding: 10px 12px; }}
+            .freight-breakdown-panel h2 {{ margin: 0; font-size: 1.05rem; }}
+            .freight-breakdown-panel > p {{ margin: 3px 0 7px; font-size: .69rem; line-height: 1.2; }}
+            .freight-breakdown-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
+            .freight-export-button {{
+                display: inline-flex;
+                flex: 0 0 auto;
+                width: auto !important;
+                min-height: 28px;
+                padding: 5px 9px;
+                font-size: .68rem;
+                line-height: 1;
+                white-space: nowrap;
+            }}
+            .freight-breakdown-table {{ font-size: .68rem; }}
+            .freight-breakdown-table th {{
+                padding: 7px 6px;
+                font-size: .61rem;
+                line-height: 1.12;
+                text-align: center;
+                white-space: normal;
+            }}
+            .freight-sort-button {{
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                width: 100%;
+                padding: 0;
+                border: 0;
+                background: transparent;
+                color: inherit;
+                font: inherit;
+                font-weight: inherit;
+                line-height: inherit;
+                justify-content: center;
+                text-align: center;
+                box-shadow: none;
+                cursor: pointer;
+            }}
+            .freight-sort-button span {{ color: #7890a9; font-size: .68rem; }}
+            .freight-breakdown-table th[aria-sort="ascending"] .freight-sort-button span::before {{ content: "↑"; font-size: .68rem; }}
+            .freight-breakdown-table th[aria-sort="descending"] .freight-sort-button span::before {{ content: "↓"; font-size: .68rem; }}
+            .freight-breakdown-table th[aria-sort]:not([aria-sort="none"]) .freight-sort-button span {{ font-size: 0; }}
+            .freight-breakdown-table td {{
+                padding: 7px 6px;
+                line-height: 1.18;
+                text-align: center;
+                white-space: nowrap;
+            }}
+            .freight-breakdown-table th:first-child,
+            .freight-breakdown-table td:first-child {{ text-align: left; }}
+            .freight-breakdown-table th:first-child .freight-sort-button {{ justify-content: flex-start; text-align: left; }}
+            .freight-breakdown-table td:first-child {{ min-width: 105px; white-space: normal; }}
+            .mat-breakdown-panel {{ padding: 12px 14px; }}
+            .mat-breakdown-heading {{ display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 10px; }}
+            .mat-breakdown-heading h2 {{ margin: 0 0 3px; font-size: 1.05rem; }}
+            .mat-breakdown-heading p {{ margin: 0; font-size: .7rem; line-height: 1.25; }}
+            .mat-new-price-control {{ display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }}
+            .mat-new-price-control label {{ font-size: .7rem; font-weight: 700; color: var(--muted); }}
+            .mat-new-price-control input {{ width: 110px; height: 30px; padding: 5px 8px; font-size: .78rem; }}
+            .mat-breakdown-table {{ width: 100%; font-size: .74rem; }}
+            .mat-breakdown-table th {{ padding: 8px; text-align: center; font-size: .65rem; line-height: 1.15; }}
+            .mat-breakdown-table td {{ padding: 9px 8px; text-align: center; white-space: nowrap; }}
+            .mat-breakdown-table th:first-child,
+            .mat-breakdown-table td:first-child {{ text-align: left; }}
+            .mat-size-section-title {{ margin: 12px 0 6px; font-size: .86rem; color: var(--text); }}
+            .mat-size-section-title:first-of-type {{ margin-top: 0; }}
+            .mat-saving.positive {{ color: #087a46; font-weight: 700; }}
+            .mat-saving.negative {{ color: #b42318; font-weight: 700; }}
+            @media (max-width: 1100px) {{
+                .freight-filter-controls {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+                .freight-summary-groups {{ grid-template-columns: 1fr; }}
+                .freight-summary-group.wide {{ grid-column: auto; }}
+            }}
+            @media (max-width: 680px) {{
+                .freight-filter-controls {{ grid-template-columns: 1fr 1fr; }}
+                .freight-summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+            }}
+        </style>
+        {render_data_availability_banner(order_result, master_data_result)}
+        <section class="panel freight-analysis-controls">
+            <div class="panel-head">
+                <div>
+                    <span class="home-focus-inline-kicker">Current position</span>
+                    <h2>Freight revenue and cost analysis</h2>
+                </div>
+            </div>
+            <p class="muted freight-analysis-intro">Compare repair revenue, freight revenue and actual freight cost. Mileage is an approximate one-way road estimate from Roanoke, Alabama.</p>
+            <form class="controls freight-filter-controls" method="get" action="/freight-analysis-view">
+                <label><span>Customer</span><input type="search" name="customer" value="{escape(customer)}" placeholder="All customers"></label>
+                <label><span>City</span><input type="search" name="city" value="{escape(city)}" placeholder="All cities"></label>
+                <label><span>State</span><select name="state">{state_options}</select></label>
+                <label><span>From</span><input type="date" name="start" value="{escape(start)}"></label>
+                <label><span>To</span><input type="date" name="end" value="{escape(end)}"></label>
+                <button type="submit">Apply filters</button>
+                <a class="button secondary" href="/freight-analysis-view">Reset</a>
+            </form>
+        </section>
+
+        <div class="freight-tabs" role="tablist" aria-label="Freight analysis sections">
+            <button class="freight-tab" id="freight-overview-tab" type="button" role="tab" aria-selected="true" aria-controls="freight-overview">Overview</button>
+            <button class="freight-tab" id="freight-breakdown-tab" type="button" role="tab" aria-selected="false" aria-controls="freight-breakdown">Customer breakdown</button>
+            <button class="freight-tab" id="mat-breakdown-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-breakdown">Mat breakdown</button>
+        </div>
+
+        <div class="freight-tab-panel" id="freight-overview" role="tabpanel" aria-labelledby="freight-overview-tab">
+          <div class="freight-summary-groups">
+            <section class="freight-summary-group">
+              <h3>Activity</h3>
+              <div class="summary customer-summary freight-summary-grid" style="--summary-columns: 5">
+                {render_simple_summary_item("Customers", analysis['customer_count'])}
+                {render_simple_summary_item("Orders with freight", analysis['order_count'])}
+                {render_simple_summary_item("Mats", f"{int(analysis['mats']):,}" if analysis['mats'] else '—')}
+                {render_simple_summary_item("Repaired mats", f"{analysis['repairs']:,}" if analysis['mats'] else '—')}
+                {render_simple_summary_item("Rejected mats", f"{analysis['rejects']:,}" if analysis['mats'] else '—')}
+              </div>
+            </section>
+            <section class="freight-summary-group">
+              <h3>Revenue and freight recovery</h3>
+              <div class="summary customer-summary freight-summary-grid" style="--summary-columns: 5">
+                {render_simple_summary_item("Repair revenue", format_currency(analysis['repair_revenue']))}
+                {render_simple_summary_item("Total billed revenue", format_currency(analysis['total_revenue']))}
+                {render_simple_summary_item("Freight revenue", format_currency(analysis['freight_charged']))}
+                {render_simple_summary_item("Freight cost", format_currency(analysis['freight_cost']))}
+                {render_simple_summary_item("Freight contribution", format_currency(analysis['freight_margin']))}
+              </div>
+            </section>
+            <section class="freight-summary-group">
+              <h3>Incoming and outgoing freight</h3>
+              <div class="summary customer-summary freight-summary-grid" style="--summary-columns: 4">
+                {render_simple_summary_item("Incoming revenue", format_currency(analysis['incoming_charged']))}
+                {render_simple_summary_item("Incoming cost", format_currency(analysis['incoming_cost']))}
+                {render_simple_summary_item("Outgoing revenue", format_currency(analysis['outgoing_charged']))}
+                {render_simple_summary_item("Outgoing cost", format_currency(analysis['outgoing_cost']))}
+              </div>
+            </section>
+            <section class="freight-summary-group">
+              <h3>Unit economics and mileage</h3>
+              <div class="summary customer-summary freight-summary-grid" style="--summary-columns: 6">
+                {render_simple_summary_item("Avg freight revenue / order", format_currency(analysis['average_freight_income_per_order']))}
+                {render_simple_summary_item("Avg freight cost / order", format_currency(analysis['average_freight_cost_per_order']))}
+                {render_simple_summary_item("Avg freight revenue / mat", format_currency(analysis['average_freight_income_per_mat']) if analysis['average_freight_income_per_mat'] is not None else '—')}
+                {render_simple_summary_item("Avg freight cost / mat", format_currency(analysis['average_freight_cost_per_mat']) if analysis['average_freight_cost_per_mat'] is not None else '—')}
+                <div><span class="label">Approx freight miles</span><strong id="freight-total-miles">Calculating…</strong></div>
+                <div><span class="label">Avg freight cost / mile</span><strong id="freight-cost-per-mile">Calculating…</strong></div>
+              </div>
+            </section>
+            <section class="freight-summary-group wide">
+              <h3>Weight movement</h3>
+              <div class="summary customer-summary freight-summary-grid" style="--summary-columns: 6">
+                {render_simple_summary_item("Incoming gross weight", weight(analysis['incoming_gross_weight']))}
+                {render_simple_summary_item("Incoming net weight", weight(analysis['incoming_net_weight']))}
+                {render_simple_summary_item("Outgoing gross weight", weight(analysis['outgoing_gross_weight']))}
+                {render_simple_summary_item("Outgoing net weight", weight(analysis['outgoing_net_weight']))}
+                {render_simple_summary_item("Gross weight variance", weight(analysis['gross_weight_variance']))}
+                {render_simple_summary_item("Net weight variance", weight(analysis['net_weight_variance']))}
+              </div>
+            </section>
+          </div>
+
+          <div class="freight-inline-notes">
+            {f'<p class="freight-inline-note warning-note">{analysis["invalid_values"]} freight value(s) could not be read and were excluded. Review these in FileMaker.</p>' if analysis['invalid_values'] else ''}
+            {f'<p class="freight-inline-note warning-note">Mat counts have not been cached yet. Run the overnight customer/order refresh to enable mat, repair, reject and per-mat figures.</p>' if mat_cache.get('status') != 'ok' else f'<p class="freight-inline-note">Mat counts refreshed {escape(str(mat_cache.get("updated_at") or "unknown"))} from {int(mat_cache.get("record_count") or 0):,} mat records.</p>'}
+          </div>
+        </div>
+
+        <section class="panel freight-breakdown-panel freight-tab-panel" id="freight-breakdown" role="tabpanel" aria-labelledby="freight-breakdown-tab" hidden>
+            <div class="freight-breakdown-heading">
+                <h2>Customer freight breakdown</h2>
+                <a class="button freight-export-button" href="/freight-analysis-export.xlsx{f'?{export_query}' if export_query else ''}">Export to Excel</a>
+            </div>
+            <p class="muted">Mileage and cost-per-mile populate after location lookup; estimates use straight-line distance with a 1.18 road-distance factor.</p>
+            <div class="table-wrap tall-table">
+                <table class="freight-breakdown-table">
+                    <thead><tr>{table_headers}</tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel mat-breakdown-panel freight-tab-panel" id="mat-breakdown" role="tabpanel" aria-labelledby="mat-breakdown-tab" hidden>
+            <div class="mat-breakdown-heading">
+                <div>
+                    <h2>Mat price comparison</h2>
+                    <p class="muted">The freight-inclusive repair price adds the filtered average freight cost per mat to the current average repair price for each size.</p>
+                </div>
+                <div class="mat-new-price-control">
+                    <label for="mat-new-price-per-square-foot">Buy-new price</label>
+                    <input id="mat-new-price-per-square-foot" type="number" min="0" step="0.01" inputmode="decimal" placeholder="$ / sq ft" aria-label="Buy-new price per square foot">
+                </div>
+            </div>
+            <h3 class="mat-size-section-title">Standard sizes</h3>
+            <div class="table-wrap">
+                <table class="mat-breakdown-table">
+                    <thead><tr><th>Mat size</th><th>Repaired mats</th><th>Avg sq ft</th><th>Avg repair price</th><th>Avg freight / mat</th><th>Freight-inclusive repair price</th><th>Estimated buy-new cost</th><th>Saving vs new</th><th>Repair price % of new</th></tr></thead>
+                    <tbody>{standard_mat_size_rows}</tbody>
+                </table>
+            </div>
+            <h3 class="mat-size-section-title">Other sizes</h3>
+            <div class="table-wrap">
+                <table class="mat-breakdown-table">
+                    <thead><tr><th>Mat size</th><th>Repaired mats</th><th>Avg sq ft</th><th>Avg repair price</th><th>Avg freight / mat</th><th>Freight-inclusive repair price</th><th>Estimated buy-new cost</th><th>Saving vs new</th><th>Repair price % of new</th></tr></thead>
+                    <tbody>{other_mat_size_rows}</tbody>
+                </table>
+            </div>
+        </section>
+        <script>
+            (() => {{
+                const tabs = [...document.querySelectorAll('.freight-tab')];
+                const tabPanels = [...document.querySelectorAll('.freight-tab-panel')];
+                const selectTab = tab => {{
+                    const panelId = tab.getAttribute('aria-controls');
+                    tabs.forEach(item => item.setAttribute('aria-selected', String(item === tab)));
+                    tabPanels.forEach(panel => {{ panel.hidden = panel.id !== panelId; }});
+                    const hashes = {{
+                        'freight-overview': '#overview',
+                        'freight-breakdown': '#breakdown',
+                        'mat-breakdown': '#mat-breakdown',
+                    }};
+                    history.replaceState(null, '', hashes[panelId] || '#overview');
+                }};
+                tabs.forEach(tab => tab.addEventListener('click', () => selectTab(tab)));
+                if (location.hash === '#breakdown') selectTab(document.getElementById('freight-breakdown-tab'));
+                if (location.hash === '#mat-breakdown') selectTab(document.getElementById('mat-breakdown-tab'));
+
+                const summaryValues = [...document.querySelectorAll('.freight-summary-grid strong')];
+                const fitSummaryValues = () => {{
+                    summaryValues.forEach(value => {{
+                        value.style.fontSize = '1rem';
+                        let size = parseFloat(getComputedStyle(value).fontSize);
+                        while (value.scrollWidth > value.clientWidth + 1 && size > 11) {{
+                            size -= 0.5;
+                            value.style.fontSize = `${{size}}px`;
+                        }}
+                    }});
+                }};
+                requestAnimationFrame(fitSummaryValues);
+                if ('ResizeObserver' in window) {{
+                    const summaryResizeObserver = new ResizeObserver(() => requestAnimationFrame(fitSummaryValues));
+                    document.querySelectorAll('.freight-summary-group').forEach(group => summaryResizeObserver.observe(group));
+                }} else {{
+                    window.addEventListener('resize', fitSummaryValues);
+                }}
+
+                const matPriceInput = document.getElementById('mat-new-price-per-square-foot');
+                const matRows = [...document.querySelectorAll('.mat-breakdown-table tbody tr[data-square-feet]')];
+                const formatMoney = value => new Intl.NumberFormat('en-US', {{ style: 'currency', currency: 'USD' }}).format(value);
+                const updateMatComparison = () => {{
+                    const pricePerSquareFoot = Number(matPriceInput.value || 0);
+                    matRows.forEach(row => {{
+                        const squareFeet = Number(row.dataset.squareFeet || 0);
+                        const inclusiveRepair = Number(row.dataset.inclusiveRepair || 0);
+                        const buyNewCell = row.querySelector('.mat-buy-new-cost');
+                        const savingCell = row.querySelector('.mat-saving');
+                        const percentCell = row.querySelector('.mat-repair-percent');
+                        savingCell.classList.remove('positive', 'negative');
+                        if (!(pricePerSquareFoot > 0) || !(squareFeet > 0) || !(inclusiveRepair >= 0)) {{
+                            buyNewCell.textContent = squareFeet > 0 ? 'Enter price / sq ft' : 'Square footage unavailable';
+                            savingCell.textContent = '—';
+                            percentCell.textContent = '—';
+                            return;
+                        }}
+                        const buyNewCost = squareFeet * pricePerSquareFoot;
+                        const saving = buyNewCost - inclusiveRepair;
+                        buyNewCell.textContent = formatMoney(buyNewCost);
+                        savingCell.textContent = formatMoney(saving);
+                        savingCell.classList.add(saving >= 0 ? 'positive' : 'negative');
+                        percentCell.textContent = buyNewCost ? `${{(inclusiveRepair / buyNewCost * 100).toFixed(1)}}%` : '—';
+                    }});
+                    if (pricePerSquareFoot > 0) localStorage.setItem('freight-buy-new-price-per-square-foot', String(pricePerSquareFoot));
+                    else localStorage.removeItem('freight-buy-new-price-per-square-foot');
+                }};
+                matPriceInput.value = localStorage.getItem('freight-buy-new-price-per-square-foot') || '';
+                matPriceInput.addEventListener('input', updateMatComparison);
+                updateMatComparison();
+
+                const freightTable = document.querySelector('.freight-breakdown-table');
+                const sortableHeaders = [...freightTable.querySelectorAll('thead th')];
+                sortableHeaders.forEach((header, columnIndex) => {{
+                    header.querySelector('button').addEventListener('click', () => {{
+                        const descending = header.getAttribute('aria-sort') === 'ascending';
+                        sortableHeaders.forEach(item => item.setAttribute('aria-sort', 'none'));
+                        header.setAttribute('aria-sort', descending ? 'descending' : 'ascending');
+                        const sortType = header.dataset.sortType;
+                        const rows = [...freightTable.tBodies[0].rows];
+                        rows.sort((left, right) => {{
+                            const leftText = left.cells[columnIndex]?.textContent.trim() || '';
+                            const rightText = right.cells[columnIndex]?.textContent.trim() || '';
+                            let comparison;
+                            if (sortType === 'number') {{
+                                const parseNumber = text => {{
+                                    const match = text.replace(/[$,]/g, '').match(/-?\\d+(?:\\.\\d+)?/);
+                                    return match ? Number(match[0]) : Number.NEGATIVE_INFINITY;
+                                }};
+                                comparison = parseNumber(leftText) - parseNumber(rightText);
+                            }} else {{
+                                comparison = leftText.localeCompare(rightText, undefined, {{ numeric: true, sensitivity: 'base' }});
+                            }}
+                            return descending ? -comparison : comparison;
+                        }});
+                        rows.forEach(row => freightTable.tBodies[0].appendChild(row));
+                    }});
+                }});
+
+                const origin = {{ lat: 33.1518, lng: -85.3722 }};
+                const cells = [...document.querySelectorAll('.freight-mileage')];
+                const cacheKey = 'freight-postal-geo-v2';
+                let cache = {{}};
+                try {{ cache = JSON.parse(localStorage.getItem(cacheKey) || '{{}}'); }} catch (_error) {{ cache = {{}}; }}
+                const radians = value => value * Math.PI / 180;
+                const distance = (a, b) => {{
+                    const earthMiles = 3958.8;
+                    const dLat = radians(b.lat - a.lat);
+                    const dLng = radians(b.lng - a.lng);
+                    const h = Math.sin(dLat / 2) ** 2 + Math.cos(radians(a.lat)) * Math.cos(radians(b.lat)) * Math.sin(dLng / 2) ** 2;
+                    return earthMiles * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h)) * 1.18;
+                }};
+                const lookup = async cell => {{
+                    const rawPostalCode = (cell.dataset.zip || '').trim().toUpperCase().replace(/\\s+/g, '');
+                    let country;
+                    let postalCode;
+                    if (/^\\d{{5}}(?:-\\d{{4}})?$/.test(rawPostalCode)) {{
+                        country = 'us';
+                        postalCode = rawPostalCode.slice(0, 5);
+                    }} else if (/^[A-Z]\\d[A-Z]/.test(rawPostalCode)) {{
+                        country = 'ca';
+                        // Canadian coordinates are available for the first three
+                        // postal-code characters (the forward sortation area).
+                        postalCode = rawPostalCode.slice(0, 3);
+                    }} else {{
+                        return null;
+                    }}
+                    const postalCacheKey = `${{country}}:${{postalCode}}`;
+                    if (cache[postalCacheKey]) return cache[postalCacheKey];
+                    const response = await fetch(`https://api.zippopotam.us/${{country}}/${{encodeURIComponent(postalCode)}}`);
+                    if (!response.ok) return null;
+                    const payload = await response.json();
+                    const place = (payload.places || [])[0];
+                    if (!place) return null;
+                    cache[postalCacheKey] = {{ lat: Number(place.latitude), lng: Number(place.longitude) }};
+                    localStorage.setItem(cacheKey, JSON.stringify(cache));
+                    return cache[postalCacheKey];
+                }};
+                Promise.all(cells.map(async cell => {{
+                    try {{
+                        const point = await lookup(cell);
+                        if (!point) {{ cell.textContent = 'Mileage unavailable'; return {{ miles: 0, cost: 0 }}; }}
+                        const oneWay = distance(origin, point);
+                        const legs = Number(cell.dataset.legs || 0);
+                        const cost = Number(cell.dataset.cost || 0);
+                        const freightMiles = oneWay * legs;
+                        const perMile = freightMiles ? cost / freightMiles : 0;
+                        cell.innerHTML = `${{Math.round(oneWay).toLocaleString()}} mi one way<br><small>${{freightMiles.toLocaleString(undefined, {{maximumFractionDigits: 0}})}} freight mi · $${{perMile.toFixed(2)}} / mi</small>`;
+                        return {{ miles: freightMiles, cost }};
+                    }} catch (_error) {{ cell.textContent = 'Mileage unavailable'; return {{ miles: 0, cost: 0 }}; }}
+                }})).then(results => {{
+                    const miles = results.reduce((sum, item) => sum + item.miles, 0);
+                    const cost = results.reduce((sum, item) => sum + item.cost, 0);
+                    document.getElementById('freight-total-miles').textContent = miles ? Math.round(miles).toLocaleString() : 'Unavailable';
+                    document.getElementById('freight-cost-per-mile').textContent = miles ? `$${{(cost / miles).toFixed(2)}}` : 'Unavailable';
+                }});
+            }})();
+        </script>
+    """
+    return render_page(title="Freight Analysis", body=body, main_class="freight-analysis-main")
+
+
+def build_freight_analysis_workbook(analysis, filters=None):
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    filters = filters or {}
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Customer breakdown"
+    sheet["A1"] = "Freight Analysis — Customer Breakdown"
+    sheet["A1"].font = Font(size=16, bold=True, color="1F2937")
+    sheet.merge_cells("A1:AA1")
+    active_filters = ", ".join(
+        f"{label}: {filters.get(key)}"
+        for key, label in (("customer", "Customer"), ("city", "City"), ("state", "State"), ("start", "From"), ("end", "To"))
+        if str(filters.get(key) or "").strip()
+    ) or "No filters applied"
+    sheet["A2"] = active_filters
+    sheet["A2"].font = Font(size=10, italic=True, color="52657A")
+    sheet.merge_cells("A2:AA2")
+
+    headers = [
+        "Customer", "Orders", "Mats", "Repairs", "Rejects", "City", "State", "ZIP",
+        "Repair Revenue", "Total Revenue", "Freight Revenue", "Freight Cost",
+        "Incoming Revenue", "Incoming Cost", "Outgoing Revenue", "Outgoing Cost",
+        "Freight Contribution", "Incoming Gross Weight (lb)", "Incoming Net Weight (lb)",
+        "Outgoing Gross Weight (lb)", "Outgoing Net Weight (lb)", "Gross Weight Variance (lb)",
+        "Net Weight Variance (lb)", "Avg Freight Revenue / Order", "Avg Freight Cost / Order",
+        "Avg Freight Revenue / Mat", "Avg Freight Cost / Mat",
+    ]
+    header_row = 4
+    sheet.append([])
+    sheet.append(headers)
+    for row in analysis.get("rows", []):
+        sheet.append([
+            row["customer"], row["orders"], row["mats"], row["repairs"], row["rejects"],
+            row["city"], row["state"], row["zip_code"], row["repair_revenue"], row["total_revenue"],
+            row["freight_charged"], row["freight_cost"], row["incoming_charged"], row["incoming_cost"],
+            row["outgoing_charged"], row["outgoing_cost"], row["freight_margin"],
+            row["incoming_gross_weight"], row["incoming_net_weight"], row["outgoing_gross_weight"],
+            row["outgoing_net_weight"], row["gross_weight_variance"], row["net_weight_variance"],
+            row["average_freight_income_per_order"], row["average_freight_cost_per_order"],
+            row["average_freight_income_per_mat"], row["average_freight_cost_per_mat"],
+        ])
+
+    for cell in sheet[header_row]:
+        cell.fill = PatternFill("solid", fgColor="245CFF")
+        cell.font = Font(bold=True, color="FFFFFF", size=9)
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    sheet.row_dimensions[header_row].height = 32
+    sheet.freeze_panes = "A5"
+    sheet.auto_filter.ref = f"A{header_row}:AA{sheet.max_row}"
+    if sheet.max_row >= header_row + 1:
+        table = Table(displayName="FreightCustomerBreakdown", ref=f"A{header_row}:AA{sheet.max_row}")
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
+            showRowStripes=True, showColumnStripes=False,
+        )
+        sheet.add_table(table)
+
+    currency_columns = range(9, 18)
+    average_currency_columns = range(24, 28)
+    for row_number in range(header_row + 1, sheet.max_row + 1):
+        for column in currency_columns:
+            sheet.cell(row_number, column).number_format = '$#,##0.00;[Red]-$#,##0.00'
+        for column in average_currency_columns:
+            sheet.cell(row_number, column).number_format = '$#,##0.00;[Red]-$#,##0.00'
+        for column in range(18, 24):
+            sheet.cell(row_number, column).number_format = '#,##0.00'
+
+    widths = {"A": 34, "B": 10, "C": 12, "D": 12, "E": 12, "F": 16, "G": 9, "H": 11}
+    for column_letter in ["I", "J", "K", "L", "M", "N", "O", "P", "Q"]:
+        widths[column_letter] = 16
+    for column_letter in ["R", "S", "T", "U", "V", "W"]:
+        widths[column_letter] = 20
+    for column_letter in ["X", "Y", "Z", "AA"]:
+        widths[column_letter] = 20
+    for column_letter, width in widths.items():
+        sheet.column_dimensions[column_letter].width = width
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+@app.get("/freight-analysis-export.xlsx")
+def export_freight_analysis_workbook(
+    customer: str = "",
+    city: str = "",
+    state: str = "",
+    start: str = "",
+    end: str = "",
+):
+    order_result = get_orders_for_analysis()
+    master_data_result = fetch_filemaker_customer_data()
+    order_result = filter_order_result_to_customer_type(order_result, master_data_result)
+    if order_result.get("status") != "ok":
+        return PlainTextResponse("Freight data is currently unavailable.", status_code=503)
+    customers_by_key = master_data_result.get("customers_by_key", {})
+    filtered_orders = filter_freight_orders(
+        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end
+    )
+    mat_cache = read_filemaker_mat_counts_cache()
+    analysis = build_freight_analysis(
+        filtered_orders,
+        customer_records=customers_by_key,
+        mat_counts_by_order=mat_cache.get("orders", {}),
+    )
+    content = build_freight_analysis_workbook(analysis, {
+        "customer": customer, "city": city, "state": state, "start": start, "end": end,
+    })
+    filename = f"freight-analysis-{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def render_customer_map_page(rows):
@@ -14951,8 +15878,8 @@ def get_dismissed_customers_view():
 
 @app.post("/customers-view/sync")
 def post_customers_view_sync(
-    customer: str = Form(""),
-    state: str = Form(""),
+    group: str = Form("all"),
+    territory: str = Form("all"),
     sort: str = Form("last_order"),
     direction: str = Form("desc"),
     page: int = Form(1),
@@ -15002,8 +15929,8 @@ def post_customers_view_sync(
         error = f"Could not sync {' and '.join(failures)}."
 
     query = urlencode({
-        "customer": customer,
-        "state": state,
+        "group": normalize_action_plan_group_filter(group),
+        "territory": normalize_action_plan_territory_filter(territory),
         "sort": sort,
         "direction": direction,
         "page": max(1, page),
@@ -15017,6 +15944,8 @@ def post_customers_view_sync(
 def get_customers_view(
     customer: str = "",
     state: str = "",
+    group: str = "all",
+    territory: str = "all",
     sort: str = "last_order",
     direction: str = "desc",
     page: int = 1,
@@ -15025,8 +15954,17 @@ def get_customers_view(
 ):
     view_started_at = time.perf_counter()
     stage_started_at = time.perf_counter()
-    order_result = get_orders_for_analysis()
-    log_perf_metric("customers.get_orders_for_analysis", stage_started_at)
+    # These sources are independent and normally resolve from their persistent
+    # caches. Loading them together keeps a cold Customers request from paying
+    # each cache-read cost one after another.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        order_future = executor.submit(get_orders_for_analysis)
+        crm_future = executor.submit(fetch_crm_activities)
+        master_data_future = executor.submit(fetch_filemaker_customer_data)
+        order_result = order_future.result()
+        crm_result = crm_future.result()
+        master_data_result = master_data_future.result()
+    log_perf_metric("customers.fetch_sources", stage_started_at)
 
     if order_result["status"] != "ok":
         return render_page(
@@ -15038,27 +15976,16 @@ def get_customers_view(
             )
         )
 
-    stage_started_at = time.perf_counter()
-    crm_result = fetch_crm_activities()
-    log_perf_metric("customers.fetch_crm_activities", stage_started_at)
-    stage_started_at = time.perf_counter()
-    master_data_result = fetch_filemaker_customer_data()
-    log_perf_metric("customers.fetch_filemaker_customer_data", stage_started_at)
-    stage_started_at = time.perf_counter()
-    attention_result = build_customers_needing_attention_response(
-        order_result=order_result,
-        crm_result=crm_result,
-    )
-    attention_by_customer = {
-        item["customer"]: item
-        for item in attention_result["late_customers"]
-    }
-    log_perf_metric("customers.build_attention_response", stage_started_at)
+    order_result = filter_order_result_to_customer_type(order_result, master_data_result)
+    master_data_result = filter_master_data_to_customer_type(master_data_result)
     stage_started_at = time.perf_counter()
     summaries = build_cached_customer_summaries(
         order_result=order_result,
         crm_result=crm_result,
-        attention_result=attention_result,
+        # Attention calculations belong to the action-plan views. The customer
+        # directory no longer displays them, so avoid rebuilding that sizeable
+        # index just to render this table.
+        attention_result={"status": "ok", "late_customers": []},
         master_data_result=master_data_result,
     )
     log_perf_metric("customers.build_cached_customer_summaries", stage_started_at)
@@ -15066,7 +15993,9 @@ def get_customers_view(
     filtered_summaries = filter_customer_summaries(
         summaries,
         customer=customer,
-        state=state
+        state=state,
+        group=group,
+        territory=territory,
     )
     sorted_summaries = sort_customer_summaries(
         filtered_summaries,
@@ -15080,8 +16009,15 @@ def get_customers_view(
     page = max(1, min(page, total_pages))
     start_index = (page - 1) * page_size
     paged_summaries = sorted_summaries[start_index:start_index + page_size]
+    customers_return_to = build_customers_view_href(
+        group=group,
+        territory=territory,
+        sort=sort,
+        direction=direction,
+        page=page,
+    )
     rows = "".join(
-        render_customer_summary_row(summary)
+        render_customer_summary_row(summary, return_to=customers_return_to)
         for summary in paged_summaries
     )
 
@@ -15102,50 +16038,35 @@ def get_customers_view(
         {status_markup}
         {render_data_availability_banner(order_result, crm_result, master_data_result)}
 
-        <div class="summary customer-summary customers-page-summary">
-            <div>
-                <span class="label">Source</span>
-                <strong>{escape(order_result["source"])}</strong>
-            </div>
-            <div>
-                <span class="label">Customers</span>
-                <strong>{len(summaries)}</strong>
-            </div>
-            <div>
-                <span class="label">Showing</span>
-                <strong>{total_filtered}</strong>
-            </div>
-            <div>
-                <span class="label">Need Attention</span>
-                <strong>{len(attention_by_customer)}</strong>
-            </div>
-        </div>
-
-        {render_customers_filter_form(customer, state, sort, direction)}
+        {render_customers_filter_toolbar(group, territory, sort, direction)}
 
         <div class="table-wrap customers-table-wrap">
         <table class="customers-table">
             <thead>
                 <tr>
-                    {render_customer_sort_header("Customer", "customer", customer, state, sort, direction)}
-                    {render_customer_sort_header("Orders", "order_count", customer, state, sort, direction)}
-                    {render_customer_sort_header("CRM", "crm_count", customer, state, sort, direction)}
-                    {render_customer_sort_header("State", "state", customer, state, sort, direction)}
-                    {render_customer_sort_header("Last Order", "last_order", customer, state, sort, direction)}
-                    {render_customer_sort_header("Avg Cycle", "avg_cycle", customer, state, sort, direction)}
-                    {render_customer_sort_header("Total Value", "total_value", customer, state, sort, direction)}
-                    {render_customer_sort_header("Avg Value / Order", "avg_value", customer, state, sort, direction)}
-                    {render_customer_sort_header("Last Activity", "last_activity", customer, state, sort, direction)}
+                    {render_customer_sort_header("Customer", "customer", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("Orders", "order_count", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("CRM", "crm_count", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("State", "state", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("Last Order", "last_order", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("Avg Cycle", "avg_cycle", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("Total Value", "total_value", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("Avg Value / Order", "avg_value", customer, state, sort, direction, group, territory)}
+                    {render_customer_sort_header("Last Activity", "last_activity", customer, state, sort, direction, group, territory)}
                 </tr>
             </thead>
             <tbody>{rows}</tbody>
         </table>
         </div>
-        {render_customers_pagination(customer, state, sort, direction, page, total_pages, total_filtered, start_index, len(paged_summaries))}
+        {render_customers_pagination(customer, state, sort, direction, page, total_pages, total_filtered, start_index, len(paged_summaries), group, territory)}
     """
 
     log_perf_metric("customers.total", view_started_at)
-    return render_page(title="Customers", body=body)
+    return render_page(
+        title="Customers",
+        body=body,
+        page_actions=render_customers_sync_form(group, territory, sort, direction),
+    )
 
 
 @app.get("/contacts-view", response_class=HTMLResponse)
@@ -15693,6 +16614,7 @@ def get_apollo_health_view():
 @app.get("/customer-view", response_class=HTMLResponse)
 def get_customer_view(
     customer: str,
+    return_to: str = "",
     sort: str = "order_date",
     direction: str = "desc",
     crm_limit: int = 12,
@@ -15713,6 +16635,7 @@ def get_customer_view(
     log_perf_metric("customer_detail.load_data_sources_parallel", stage_started_at)
     crm_limit = max(12, min(crm_limit, 120))
     crm_page = max(1, crm_page)
+    customers_return_to = normalize_customer_detail_return_to(return_to)
 
     if result["status"] != "ok":
         return render_page(
@@ -15774,12 +16697,6 @@ def get_customer_view(
         latest_sales_crm_activity.get("date_created", "")
     ) if latest_sales_crm_activity else None
     display_last_activity = latest_sales_crm_activity_date
-    enrichment_href = build_customer_enrichment_href(
-        customer,
-        customer_orders,
-        crm_activities=crm_activities,
-        customer_primary_key=customer_primary_key,
-    )
     attention_result = build_customers_needing_attention_response(
         order_result=result,
         crm_result=crm_result,
@@ -15788,12 +16705,42 @@ def get_customer_view(
         item["customer"]: item
         for item in attention_result["late_customers"]
     }
+    customer_return_to = (
+        f"/customer-view?{urlencode({
+            'customer': customer,
+            'sort': sort,
+            'direction': direction,
+            'crm_limit': crm_limit,
+            'crm_page': crm_page,
+            'crm_direction': crm_direction,
+            'crm_category': crm_category,
+            'return_to': customers_return_to,
+        }, quote_via=quote)}#contact-ready"
+    )
+    outreach_preview = build_customer_detail_outreach_preview(
+        customer=customer,
+        customer_orders=customer_orders,
+        customer_primary_key=customer_primary_key,
+        attention=attention_by_customer.get(customer),
+        crm_result=crm_result,
+        crm_activities=crm_activities,
+    )
+    outreach_actions = (
+        render_home_focus_work_panel(
+            outreach_preview,
+            build_outreach_prep_href(customer, customer_return_to),
+            customer_return_to,
+            include_overview=False,
+            schedule_button_label="Schedule follow-up",
+        )
+        if outreach_preview else ""
+    )
     log_perf_metric("customer_detail.build_payload", stage_started_at)
 
     if customer_orders:
         rows = "".join(render_customer_order_row(order) for order in sorted_orders)
         order_history_html = f"""
-            {render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category)}
+            {render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category, customers_return_to)}
             <div class="table-wrap tall-table">
             <table>
                 <thead><tr><th>Record</th><th>Customer</th><th>Order Date</th><th>Amount</th><th>Order No</th><th>Status</th><th>Price List</th><th>State</th><th>Territory</th></tr></thead>
@@ -15870,6 +16817,7 @@ def get_customer_view(
             last_order=last_order,
             average_gap=average_gap,
             last_activity=last_activity,
+            actions_html=outreach_actions,
         )}
 
         {render_customer_crm_timeline(
@@ -15881,25 +16829,25 @@ def get_customer_view(
             crm_category,
             sort,
             direction,
+            customers_return_to,
         )}
 
         {order_history_html}
         </div>
     """
 
-    top_right = (
-        f'<a class="button secondary small-button" href="{escape(enrichment_href)}">'
-        '<svg viewBox="0 0 24 24" aria-hidden="true">'
-        '<path d="M12 3v18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>'
-        '<path d="M3 12h18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>'
-        '<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/>'
-        '</svg>'
-        '<span>Enrich</span>'
-        '</a>'
-    )
-
     log_perf_metric("customer_detail.total", view_started_at)
-    return render_page(title=f"Customer: {customer}", body=body, top_right=top_right)
+    return_path = urlsplit(customers_return_to).path if customers_return_to else ""
+    back_label = "Back to Action Plan" if return_path == "/action-plan-view" else "Back to customers"
+    back_action = (
+        f'<a class="button secondary small-button" href="{escape(customers_return_to)}">{back_label}</a>'
+        if customers_return_to else ""
+    )
+    return render_page(
+        title=f"Customer: {customer}",
+        body=body,
+        page_actions=back_action,
+    )
 
 
 def build_late_customers_response():
@@ -16017,6 +16965,44 @@ def build_attention_cache_key(order_result, crm_result):
     )
 
 
+def filter_order_result_to_customer_type(order_result, master_data_result):
+    """Limit FileMaker sales views to active records whose Type is Customer."""
+    if order_result.get("source") != "filemaker" or master_data_result.get("status") != "ok":
+        return order_result
+
+    customer_types_by_key = {
+        str(record.get("primary_key") or "").strip(): str(record.get("type") or "").strip().casefold()
+        for record in master_data_result.get("companies", [])
+        if str(record.get("primary_key") or "").strip()
+    }
+    if not customer_types_by_key:
+        return order_result
+
+    filtered_result = dict(order_result)
+    filtered_result["orders"] = [
+        order for order in order_result.get("orders", [])
+        if customer_types_by_key.get(str(get_order_primary_key(order) or "").strip()) == "customer"
+    ]
+    return filtered_result
+
+
+def filter_master_data_to_customer_type(master_data_result):
+    if master_data_result.get("status") != "ok":
+        return master_data_result
+
+    filtered_result = dict(master_data_result)
+    filtered_result["companies"] = [
+        record for record in master_data_result.get("companies", [])
+        if str(record.get("type") or "").strip().casefold() == "customer"
+    ]
+    filtered_result["customers_by_key"] = {
+        key: record
+        for key, record in master_data_result.get("customers_by_key", {}).items()
+        if str(record.get("type") or "").strip().casefold() == "customer"
+    }
+    return filtered_result
+
+
 def clear_attention_response_cache():
     _ATTENTION_RESPONSE_CACHE["key"] = None
     _ATTENTION_RESPONSE_CACHE["expires_at"] = 0
@@ -16037,9 +17023,10 @@ def clear_home_action_plan_cache():
 
 
 def clear_customer_summaries_cache():
-    _CUSTOMER_SUMMARIES_CACHE["key"] = None
-    _CUSTOMER_SUMMARIES_CACHE["expires_at"] = 0
-    _CUSTOMER_SUMMARIES_CACHE["result"] = None
+    with _CUSTOMER_SUMMARIES_CACHE_LOCK:
+        _CUSTOMER_SUMMARIES_CACHE["key"] = None
+        _CUSTOMER_SUMMARIES_CACHE["expires_at"] = 0
+        _CUSTOMER_SUMMARIES_CACHE["result"] = None
     clear_customer_contextual_activity_cache()
 
 
@@ -16059,8 +17046,31 @@ def should_enable_startup_prewarm():
 
 def prewarm_app_caches():
     try:
-        order_result = get_orders_for_analysis()
-        crm_result = fetch_crm_activities()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            order_future = executor.submit(get_orders_for_analysis)
+            crm_future = executor.submit(fetch_crm_activities)
+            customer_data_future = executor.submit(fetch_filemaker_customer_data)
+            order_result = order_future.result()
+            crm_result = crm_future.result()
+            customer_data_result = customer_data_future.result()
+
+        # Warm the exact filtered summary key used by /customers-view so the
+        # first visitor after a restart receives the already-built directory.
+        if order_result.get("status") == "ok" and crm_result.get("status") == "ok":
+            customer_order_result = filter_order_result_to_customer_type(
+                order_result,
+                customer_data_result,
+            )
+            filtered_customer_data = filter_master_data_to_customer_type(
+                customer_data_result,
+            )
+            build_cached_customer_summaries(
+                order_result=customer_order_result,
+                crm_result=crm_result,
+                attention_result={"status": "ok", "late_customers": []},
+                master_data_result=filtered_customer_data,
+            )
+
         master_data_result = fetch_filemaker_master_data()
 
         build_strategic_contact_workspace_maps(
@@ -16069,18 +17079,6 @@ def prewarm_app_caches():
             crm_result=crm_result,
         )
 
-        if order_result.get("status") == "ok":
-            attention_result = build_customers_needing_attention_response(
-                order_result=order_result,
-                crm_result=crm_result,
-            )
-            if crm_result.get("status") == "ok":
-                build_cached_customer_summaries(
-                    order_result=order_result,
-                    crm_result=crm_result,
-                    attention_result=attention_result,
-                    master_data_result=master_data_result,
-                )
     except Exception as error:
         print(f"Startup prewarm skipped after error: {error.__class__.__name__}")
 
@@ -16109,6 +17107,12 @@ def build_attention_explanation(customer):
 
 def build_customers_needing_attention_response(order_result=None, crm_result=None):
     order_result = order_result or get_orders_for_analysis()
+
+    if order_result.get("source") == "filemaker":
+        order_result = filter_order_result_to_customer_type(
+            order_result,
+            fetch_filemaker_customer_data(),
+        )
 
     if order_result["status"] != "ok":
         return {
@@ -16287,12 +17291,11 @@ def render_order_row(order):
 def render_customer_order_row(order):
     extra = order.get("extra", {})
     customer_name = str(order.get("customer", ""))
-    customer_url = f"/customer-view?customer={quote(customer_name)}"
 
     return f"""
         <tr>
             <td>{escape(str(order.get("filemaker_record_id", "")))}</td>
-            <td><a href="{customer_url}"><strong>{escape(customer_name)}</strong></a></td>
+            <td>{escape(customer_name)}</td>
             <td>{escape(str(order.get("order_date", "")))}</td>
             <td>{escape(str(order.get("amount", "")))}</td>
             <td>{escape(str(extra.get("Orders::Order No", "")))}</td>
@@ -16489,6 +17492,12 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
                 if latest_sales_crm_activity else ""
             ),
             "attention": attention,
+            "group_code": infer_customer_group_code(
+                customer_name,
+                customer_orders=customer_orders,
+                customer_record=customer_record,
+            ),
+            "territory": get_customer_territory(customer_orders),
         })
 
     return summaries
@@ -16693,47 +17702,84 @@ def build_cached_customer_summaries(order_result, crm_result, attention_result=N
         len(attention_by_customer),
     )
 
-    if (
-        cache_seconds
-        and _CUSTOMER_SUMMARIES_CACHE["key"] == cache_key
-        and _CUSTOMER_SUMMARIES_CACHE["result"] is not None
-        and _CUSTOMER_SUMMARIES_CACHE["expires_at"] > now
-    ):
-        return _CUSTOMER_SUMMARIES_CACHE["result"]
+    with _CUSTOMER_SUMMARIES_CACHE_LOCK:
+        if (
+            cache_seconds
+            and _CUSTOMER_SUMMARIES_CACHE["key"] == cache_key
+            and _CUSTOMER_SUMMARIES_CACHE["result"] is not None
+            and _CUSTOMER_SUMMARIES_CACHE["expires_at"] > now
+        ):
+            return _CUSTOMER_SUMMARIES_CACHE["result"]
 
-    summaries = build_customer_summaries(
-        order_result.get("orders", []),
-        attention_by_customer,
-        (
-            crm_result.get("activity_map", {})
-            if crm_result.get("status") == "ok"
-            else {}
-        ),
-        master_data_result,
-        crm_result.get("activities", []) if crm_result.get("status") == "ok" else [],
-    )
+        summaries = build_customer_summaries(
+            order_result.get("orders", []),
+            attention_by_customer,
+            (
+                crm_result.get("activity_map", {})
+                if crm_result.get("status") == "ok"
+                else {}
+            ),
+            master_data_result,
+            crm_result.get("activities", []) if crm_result.get("status") == "ok" else [],
+        )
 
-    log_perf_metric(
-        f"customers.build_summaries_inner customers={len(summaries)}",
-        started_at,
-    )
+        log_perf_metric(
+            f"customers.build_summaries_inner customers={len(summaries)}",
+            started_at,
+        )
 
-    if cache_seconds:
-        _CUSTOMER_SUMMARIES_CACHE["key"] = cache_key
-        # Filtering, sorting and pagination should reuse the completed customer
-        # index. Sync and data-update paths explicitly clear this cache.
-        _CUSTOMER_SUMMARIES_CACHE["expires_at"] = float("inf")
-        _CUSTOMER_SUMMARIES_CACHE["result"] = summaries
+        if cache_seconds:
+            _CUSTOMER_SUMMARIES_CACHE["key"] = cache_key
+            # Filtering, sorting and pagination should reuse the completed customer
+            # index. Sync and data-update paths explicitly clear this cache.
+            _CUSTOMER_SUMMARIES_CACHE["expires_at"] = float("inf")
+            _CUSTOMER_SUMMARIES_CACHE["result"] = summaries
 
     return summaries
 
 
-def render_customer_summary_row(summary):
+def normalize_customers_return_to(return_to):
+    value = str(return_to or "").strip()
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    if parts.scheme or parts.netloc or parts.path != "/customers-view":
+        return ""
+    return urlunsplit(("", "", parts.path, parts.query, parts.fragment))
+
+
+def normalize_customer_detail_return_to(return_to):
+    value = str(return_to or "").strip()
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    if parts.scheme or parts.netloc or parts.path not in {"/customers-view", "/action-plan-view"}:
+        return ""
+    return urlunsplit(("", "", parts.path, parts.query, parts.fragment))
+
+
+def render_customer_summary_row(summary, return_to=""):
     customer_name = str(summary["customer"])
-    customer_markup = f'<a href="/customer-view?customer={quote(customer_name)}"><strong>{escape(customer_name)}</strong></a>'
+    row_id = "customer-" + (
+        re.sub(r"[^a-z0-9]+", "-", customer_name.casefold()).strip("-")
+        or "record"
+    )
+    customer_query = {"customer": customer_name}
+    normalized_return_to = normalize_customers_return_to(return_to)
+    if normalized_return_to:
+        return_parts = urlsplit(normalized_return_to)
+        customer_query["return_to"] = urlunsplit((
+            "",
+            "",
+            return_parts.path,
+            return_parts.query,
+            row_id,
+        ))
+    customer_href = f"/customer-view?{urlencode(customer_query, quote_via=quote)}"
+    customer_markup = f'<a class="customer-name-link" href="{escape(customer_href)}">{escape(customer_name)}</a>'
 
     return f"""
-        <tr>
+        <tr id="{escape(row_id)}">
             <td>{customer_markup}</td>
             <td>{summary["order_count"]}</td>
             <td>{summary["crm_count"]}</td>
@@ -16862,7 +17908,7 @@ def render_contact_master_row(contact, existing_lookup=None, current_filters=Non
     """
 
 
-def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_direction, crm_category, sort, direction):
+def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_direction, crm_category, sort, direction, return_to=""):
     total_pages = max(1, (len(activities) + crm_limit - 1) // crm_limit)
     crm_page = max(1, min(crm_page, total_pages))
     start_index = (crm_page - 1) * crm_limit
@@ -16896,13 +17942,14 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
         crm_category=crm_category,
         sort=sort,
         direction=direction,
+        return_to=return_to,
     )
 
     return f"""
         <section class="panel" id="crm-timeline">
             <h2>CRM Timeline</h2>
             {summary_html}
-            {render_customer_crm_timeline_controls(customer, crm_direction, crm_category, crm_limit, sort, direction)}
+            {render_customer_crm_timeline_controls(customer, crm_direction, crm_category, crm_limit, sort, direction, return_to)}
             <div class="table-wrap tall-table crm-timeline-wrap">
             <table class="crm-timeline-table">
                 <thead>
@@ -16959,7 +18006,7 @@ def render_customer_crm_timeline_summary(activities, crm_direction, crm_category
     )
 
 
-def render_customer_crm_timeline_controls(customer, crm_direction, crm_category, crm_limit, sort, direction):
+def render_customer_crm_timeline_controls(customer, crm_direction, crm_category, crm_limit, sort, direction, return_to=""):
     direction_options = {
         "": "All",
         "inbound": "Inbound",
@@ -16983,6 +18030,7 @@ def render_customer_crm_timeline_controls(customer, crm_direction, crm_category,
             <input type="hidden" name="sort" value="{escape(sort)}">
             <input type="hidden" name="direction" value="{escape(direction)}">
             <input type="hidden" name="crm_page" value="1">
+            {f'<input type="hidden" name="return_to" value="{escape(normalize_customer_detail_return_to(return_to))}">' if normalize_customer_detail_return_to(return_to) else ''}
 
             <label>
                 <span>CRM Direction</span>
@@ -17012,12 +18060,13 @@ def render_customer_crm_timeline_controls(customer, crm_direction, crm_category,
                 'direction': direction,
                 'crm_limit': crm_limit,
                 'crm_page': 1,
+                'return_to': normalize_customer_detail_return_to(return_to),
             })}#crm-timeline">Reset</a>
         </form>
     """
 
 
-def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, crm_direction, crm_category, sort, direction):
+def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, crm_direction, crm_category, sort, direction, return_to=""):
     if total_pages <= 1:
         return ""
 
@@ -17029,6 +18078,9 @@ def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, c
         f"&crm_limit={crm_limit}&crm_direction={quote(crm_direction)}"
         f"&crm_category={quote(crm_category)}"
     )
+    normalized_return_to = normalize_customer_detail_return_to(return_to)
+    if normalized_return_to:
+        base_query += f"&return_to={quote(normalized_return_to)}"
 
     if crm_page > 1:
         previous_link = (
@@ -17115,6 +18167,7 @@ def render_contact_ready_panel(
     last_order,
     average_gap,
     last_activity,
+    actions_html="",
 ):
     recommendation = build_contact_recommendation(
         customer=customer,
@@ -17147,6 +18200,7 @@ def render_contact_ready_panel(
             </div>
             <p class="contact-guidance">{escape(recommendation["guidance"])}</p>
             <p class="contact-guidance subtle">{escape(recommendation["draft_prompt"])}</p>
+            {f'<div class="contact-ready-actions">{actions_html}</div>' if actions_html else ''}
         </section>
     """
 
@@ -17676,9 +18730,11 @@ def get_customer_crm_activities(activities, customer_primary_key):
     )
 
 
-def filter_customer_summaries(summaries, customer="", state=""):
+def filter_customer_summaries(summaries, customer="", state="", group="all", territory="all"):
     customer_filter = customer.strip().lower()
     state_filter = state.strip().lower()
+    group_filter = normalize_action_plan_group_filter(group)
+    territory_filter = normalize_action_plan_territory_filter(territory)
     filtered_summaries = []
 
     for summary in summaries:
@@ -17689,6 +18745,15 @@ def filter_customer_summaries(summaries, customer="", state=""):
             continue
 
         if state_filter and state_filter != str(summary["state"]).lower():
+            continue
+
+        if group_filter != "all" and group_filter != str(summary.get("group_code") or ""):
+            continue
+
+        if (
+            territory_filter != "all"
+            and territory_filter != normalize_customer_territory(summary.get("territory"))
+        ):
             continue
 
         filtered_summaries.append(summary)
@@ -18293,6 +19358,182 @@ def format_currency(value):
     return f"${numeric_value:,.2f}"
 
 
+FREIGHT_FIELDS = (
+    "Incoming Freight",
+    "Incoming Cost",
+    "Outgoing Freight",
+    "Outgoing Cost",
+)
+
+FREIGHT_WEIGHT_FIELDS = (
+    "Act Arrival_Gross Weight",
+    "Act Arrival_Nett Weight",
+    "Despatch_Gross Wright",
+    "Despatch_Nett Weight",
+)
+
+
+def order_has_freight_data(order):
+    extra = (order or {}).get("extra") or {}
+    return any(parse_freight_value(extra.get(field)) is not None for field in FREIGHT_FIELDS)
+
+
+def parse_freight_value(value):
+    if value in {None, ""}:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1].strip()
+    text = text.replace("$", "").replace(",", "").strip()
+    if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return None
+    number = float(text)
+    return -number if negative else number
+
+
+def build_freight_analysis(orders, customer_records=None, mat_counts_by_order=None):
+    customer_records = customer_records or {}
+    mat_counts_by_order = mat_counts_by_order or {}
+    customer_rows = {}
+    invalid_values = 0
+
+    for order in orders or []:
+        customer = str(order.get("customer") or "Unknown customer").strip() or "Unknown customer"
+        extra = order.get("extra") or {}
+        customer_key = str(get_order_primary_key(order) or "").strip()
+        customer_record = customer_records.get(customer_key, {})
+        values = {field: parse_freight_value(extra.get(field)) for field in FREIGHT_FIELDS}
+        weights = {field: parse_freight_value(extra.get(field)) for field in FREIGHT_WEIGHT_FIELDS}
+        invalid_values += sum(
+            1 for field in FREIGHT_FIELDS
+            if extra.get(field) not in {None, ""} and values[field] is None
+        )
+        charged_values = [values["Incoming Freight"], values["Outgoing Freight"]]
+        cost_values = [values["Incoming Cost"], values["Outgoing Cost"]]
+        has_freight = any(value is not None for value in charged_values + cost_values)
+        if not has_freight:
+            continue
+
+        row = customer_rows.setdefault(customer, {
+            "customer": customer,
+            "customer_primary_key": customer_key,
+            "city": str(customer_record.get("city") or "").strip(),
+            "state": str(customer_record.get("state") or get_order_state(order) or "").strip().upper(),
+            "zip_code": str(customer_record.get("zip_code") or extra.get("ai_Zip") or "").strip(),
+            "orders": 0,
+            "mats": 0.0,
+            "repairs": 0,
+            "rejects": 0,
+            "repair_actions": 0,
+            "orders_with_mats": 0,
+            "freight_legs": 0,
+            "repair_revenue": 0.0,
+            "freight_charged": 0.0,
+            "freight_cost": 0.0,
+            "incoming_charged": 0.0,
+            "incoming_cost": 0.0,
+            "outgoing_charged": 0.0,
+            "outgoing_cost": 0.0,
+            "incoming_gross_weight": 0.0,
+            "incoming_net_weight": 0.0,
+            "outgoing_gross_weight": 0.0,
+            "outgoing_net_weight": 0.0,
+            "orders_with_cost": 0,
+            "invalid_values": 0,
+        })
+        row["orders"] += 1
+        order_number = str(extra.get("Orders::Order No") or extra.get("Order No") or "").strip()
+        mat_counts = mat_counts_by_order.get(order_number, {})
+        mats = int(mat_counts.get("mats") or 0)
+        if mats:
+            row["mats"] += mats
+            row["repairs"] += int(mat_counts.get("repairs") or 0)
+            row["rejects"] += int(mat_counts.get("rejects") or 0)
+            row["repair_actions"] += int(mat_counts.get("repair_actions") or 0)
+            row["orders_with_mats"] += 1
+        row["repair_revenue"] += parse_freight_value(order.get("amount")) or 0.0
+        row["freight_charged"] += sum(value or 0.0 for value in charged_values)
+        row["freight_cost"] += sum(value or 0.0 for value in cost_values)
+        row["incoming_charged"] += values["Incoming Freight"] or 0.0
+        row["incoming_cost"] += values["Incoming Cost"] or 0.0
+        row["outgoing_charged"] += values["Outgoing Freight"] or 0.0
+        row["outgoing_cost"] += values["Outgoing Cost"] or 0.0
+        row["incoming_gross_weight"] += weights["Act Arrival_Gross Weight"] or 0.0
+        row["incoming_net_weight"] += weights["Act Arrival_Nett Weight"] or 0.0
+        row["outgoing_gross_weight"] += weights["Despatch_Gross Wright"] or 0.0
+        row["outgoing_net_weight"] += weights["Despatch_Nett Weight"] or 0.0
+        row["freight_legs"] += int(values["Incoming Freight"] is not None or values["Incoming Cost"] is not None)
+        row["freight_legs"] += int(values["Outgoing Freight"] is not None or values["Outgoing Cost"] is not None)
+        if any(value is not None for value in cost_values):
+            row["orders_with_cost"] += 1
+        row["invalid_values"] += sum(
+            1 for field in FREIGHT_FIELDS
+            if extra.get(field) not in {None, ""} and values[field] is None
+        )
+
+    rows = []
+    for row in customer_rows.values():
+        charged = row["freight_charged"]
+        cost = row["freight_cost"]
+        margin = charged - cost
+        coverage = row["orders_with_cost"] / row["orders"] if row["orders"] else 0.0
+        rows.append({
+            **row,
+            "gross_weight_variance": row["incoming_gross_weight"] - row["outgoing_gross_weight"],
+            "net_weight_variance": row["incoming_net_weight"] - row["outgoing_net_weight"],
+            "total_revenue": row["repair_revenue"] + charged,
+            "freight_margin": margin,
+            "recovery_percent": (charged / cost * 100.0) if cost else None,
+            "freight_percent_of_repair": (charged / row["repair_revenue"] * 100.0) if row["repair_revenue"] else None,
+            "cost_coverage": coverage,
+            "average_freight_income_per_order": charged / row["orders"] if row["orders"] else None,
+            "average_freight_cost_per_order": cost / row["orders"] if row["orders"] else None,
+            "average_freight_income_per_mat": charged / row["mats"] if row["mats"] else None,
+            "average_freight_cost_per_mat": cost / row["mats"] if row["mats"] else None,
+            "mat_coverage": row["orders_with_mats"] / row["orders"] if row["orders"] else 0.0,
+        })
+
+    rows.sort(key=lambda item: (-item["freight_cost"], item["customer"].casefold()))
+    total_mats = sum(row["mats"] for row in rows)
+    total_repairs = sum(row["repairs"] for row in rows)
+    total_rejects = sum(row["rejects"] for row in rows)
+    total_orders = sum(row["orders"] for row in rows)
+    freight_charged = sum(row["freight_charged"] for row in rows)
+    freight_cost = sum(row["freight_cost"] for row in rows)
+    repair_revenue = sum(row["repair_revenue"] for row in rows)
+    return {
+        "rows": rows,
+        "customer_count": len(rows),
+        "order_count": total_orders,
+        "mats": total_mats,
+        "repairs": total_repairs,
+        "rejects": total_rejects,
+        "repair_revenue": repair_revenue,
+        "total_revenue": repair_revenue + freight_charged,
+        "freight_charged": freight_charged,
+        "freight_cost": freight_cost,
+        "incoming_charged": sum(row["incoming_charged"] for row in rows),
+        "incoming_cost": sum(row["incoming_cost"] for row in rows),
+        "outgoing_charged": sum(row["outgoing_charged"] for row in rows),
+        "outgoing_cost": sum(row["outgoing_cost"] for row in rows),
+        "incoming_gross_weight": sum(row["incoming_gross_weight"] for row in rows),
+        "incoming_net_weight": sum(row["incoming_net_weight"] for row in rows),
+        "outgoing_gross_weight": sum(row["outgoing_gross_weight"] for row in rows),
+        "outgoing_net_weight": sum(row["outgoing_net_weight"] for row in rows),
+        "gross_weight_variance": sum(row["gross_weight_variance"] for row in rows),
+        "net_weight_variance": sum(row["net_weight_variance"] for row in rows),
+        "freight_margin": sum(row["freight_margin"] for row in rows),
+        "average_freight_income_per_order": freight_charged / total_orders if total_orders else None,
+        "average_freight_cost_per_order": freight_cost / total_orders if total_orders else None,
+        "average_freight_income_per_mat": freight_charged / total_mats if total_mats else None,
+        "average_freight_cost_per_mat": freight_cost / total_mats if total_mats else None,
+        "invalid_values": invalid_values,
+    }
+
+
 def truncate_text(value, limit=240):
     value = str(value or "").strip()
 
@@ -18505,6 +19746,11 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         if master_data_result.get("status") == "ok"
         else []
     )
+    customers_by_key = (
+        master_data_result.get("customers_by_key", {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
     crm_activities = (
         crm_result.get("activity_map", {}).get(customer_primary_key, [])
         if crm_result.get("status") == "ok" else []
@@ -18523,6 +19769,13 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         activity for activity in sales_activities
         if str(activity.get("direction") or "").strip().lower() == "inbound"
     ]
+    consecutive_unanswered_outbound_count = 0
+    for activity in sort_sales_activities_by_date(sales_activities):
+        direction = str(activity.get("direction") or "").strip().lower()
+        if direction == "inbound":
+            break
+        if direction == "outbound":
+            consecutive_unanswered_outbound_count += 1
     replied_sales_context = []
     latest_replied_outreach = inbound_sales[0] if inbound_sales else None
     recent_sales_context = []
@@ -18697,6 +19950,7 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
         "customer_primary_key": customer_primary_key,
         "sales_outreach_sent_count": len(outbound_sales),
         "sales_reply_count": len(inbound_sales),
+        "consecutive_unanswered_outbound_count": consecutive_unanswered_outbound_count,
         "approx_response_rate": f"{approx_response_rate}%" if outbound_sales else "n/a",
         "last_reply_date": last_reply_date,
         "days_since_latest_replied_outreach": days_since_last_reply,
@@ -18770,6 +20024,8 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
             if part
         ) or "Not available"
     suggested_mode = str(result.get("suggested_mode", "") or "Email").strip() or "Email"
+    if suggested_mode.lower() == "hold":
+        suggested_mode = "Email"
     order_rhythm = str(context.get("order_cycle_pattern") or "Not enough orders")
     last_order_display = format_optional_date(context.get("last_order_date", ""))
     last_sales_outreach_display = format_optional_date(context.get("latest_sales_outreach", ""))
@@ -18821,15 +20077,6 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
                 <path fill="currentColor" d="M12 2.8a6.2 6.2 0 0 1 6.2 6.2c0 4.4-4.8 10.2-5.4 10.9a1 1 0 0 1-1.6 0C10.6 19.2 5.8 13.4 5.8 9A6.2 6.2 0 0 1 12 2.8Zm0 8.6A2.4 2.4 0 1 0 12 6.6a2.4 2.4 0 0 0 0 4.8Z"/>
             </svg>
         """
-    elif mode_lower == "hold":
-        cta_label = "Review Context"
-        cta_href = "#why-now-card"
-        cta_icon = """
-            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path fill="currentColor" d="M12 2.8A9.2 9.2 0 1 1 2.8 12 9.2 9.2 0 0 1 12 2.8Zm0 1.5A7.7 7.7 0 1 0 19.7 12 7.7 7.7 0 0 0 12 4.3Zm-2 3.4c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Zm4 0c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Z"/>
-            </svg>
-        """
-
     email_draft_markup = f"""
                 <div class="outreach-draft-form">
                     <div class="outreach-draft-row">
@@ -19407,6 +20654,11 @@ def infer_contact_role_signal(contact):
 def build_outreach_contact_signals(sales_activities, contacts_by_email=None, customer_contacts=None, excluded_emails=None):
     contacts_by_email = contacts_by_email or {}
     customer_contacts = customer_contacts or []
+    customer_contact_emails = {
+        str(contact.get("email") or "").strip().lower()
+        for contact in customer_contacts
+        if str(contact.get("email") or "").strip()
+    }
     excluded_emails = {
         str(email or "").strip().lower()
         for email in (excluded_emails or [])
@@ -19499,6 +20751,12 @@ def build_outreach_contact_signals(sales_activities, contacts_by_email=None, cus
                 continue
 
             master_contact = contacts_by_email.get(email, {})
+            # If FileMaker knows this email as an active contact, only surface it
+            # for customer locations where an active contact record is linked.
+            # This prevents a moved contact's current branch record from making
+            # them appear against an old inactive branch association.
+            if master_contact and email not in customer_contact_emails:
+                continue
             contact = seed_contact(email=email, master_contact=master_contact)
 
             if direction == "inbound":
@@ -20342,6 +21600,112 @@ def render_top_attention_row(customer):
     """
 
 
+def build_contact_date_action_plan_customers(grouped_orders, crm_activity_map, today=None, follow_ups=None):
+    """Return customers due by a scheduled date or four weeks after last contact.
+
+    A scheduled date takes precedence over the rolling four-week date. Customers
+    with no recorded sales contact are immediately due and sort before contacted
+    customers.
+    """
+    today = today or get_analysis_today()
+    today_date = today.date() if isinstance(today, datetime) else today
+    follow_ups = follow_ups if follow_ups is not None else read_action_plan_follow_ups()
+    dismissals = read_action_plan_dismissals()
+    active_customers = []
+    dismissed_customers = []
+
+    for customer_name, customer_orders in grouped_orders.items():
+        customer_primary_key = get_customer_primary_key(customer_orders)
+        crm_activities = crm_activity_map.get(customer_primary_key, [])
+        crm_activities = merge_recent_sent_emails_with_crm(customer_name, crm_activities)
+        sales_activities = get_sales_outreach_activities(crm_activities)
+        dated_sales = [
+            (parse_crm_datetime(activity.get("date_created", "")), activity)
+            for activity in sales_activities
+        ]
+        dated_sales = [(date_value, activity) for date_value, activity in dated_sales if date_value]
+        latest_contact_dt, latest_contact = max(dated_sales, default=(None, None), key=lambda item: item[0] or datetime.min)
+        last_contact_date = latest_contact_dt.date() if latest_contact_dt else None
+        days_since_contact = (today_date - last_contact_date).days if last_contact_date else None
+
+        scheduled_text = str((follow_ups.get(customer_name) or {}).get("follow_up_date") or "").strip()
+        try:
+            scheduled_date = datetime.strptime(scheduled_text, "%Y-%m-%d").date() if scheduled_text else None
+        except ValueError:
+            scheduled_date = None
+            scheduled_text = ""
+
+        default_due_date = last_contact_date + timedelta(days=29) if last_contact_date else today_date
+        due_date = scheduled_date or default_due_date
+        if due_date > today_date:
+            continue
+
+        last_order = max(
+            (str(order.get("order_date") or "") for order in customer_orders),
+            default="",
+        )
+        overdue_days = max((today_date - due_date).days, 0)
+        # The score is now solely a contact-recency ordering key. Never-contacted
+        # customers deliberately sort first, then oldest contact first.
+        priority_score = 100000 + overdue_days if last_contact_date is None else max(days_since_contact or 0, 0)
+        customer = {
+            "customer": customer_name,
+            "priority_score": priority_score,
+            "days_since_last_activity": days_since_contact,
+            "last_activity_date": last_contact_date.isoformat() if last_contact_date else None,
+            "last_contact_date": last_contact_date.isoformat() if last_contact_date else "",
+            "days_since_last_contact": days_since_contact,
+            "follow_up_date": scheduled_text,
+            "due_date": due_date.isoformat(),
+            "due_source": "scheduled" if scheduled_date else "four_week_rule",
+            "action": "Follow up now",
+            "last_order": last_order,
+            "days_since_last": 0,
+            "avg_gap": None,
+            "status": "needs_attention",
+            "display_last_contact": build_last_contact_display(
+                "", latest_contact, crm_activities=crm_activities
+            )[0],
+        }
+        dismissal = get_action_plan_dismissal(customer_name, last_order, dismissals=dismissals)
+        if dismissal:
+            customer["dismiss_reason"] = dismissal.get("reason", "")
+            customer["dismissed_at"] = dismissal.get("dismissed_at", "")
+            dismissed_customers.append(customer)
+        else:
+            active_customers.append(customer)
+
+    active_customers.sort(
+        key=lambda item: (
+            item.get("last_contact_date") != "",
+            item.get("last_contact_date") or "",
+            str(item.get("customer") or "").casefold(),
+        )
+    )
+    dismissed_customers.sort(key=lambda item: str(item.get("customer") or "").casefold())
+    return active_customers, dismissed_customers
+
+
+def include_master_customers_in_action_plan(grouped_orders, master_data_result):
+    """Add customer master records that have no loaded order history."""
+    grouped_orders = dict(grouped_orders or {})
+    for customer_key, customer_record in (master_data_result or {}).get("customers_by_key", {}).items():
+        customer_type = str(customer_record.get("type") or "").strip().casefold()
+        if customer_type != "customer":
+            continue
+        customer_name = str(customer_record.get("company") or "").strip()
+        if not customer_name or customer_name in grouped_orders:
+            continue
+        grouped_orders[customer_name] = [{
+            "customer": customer_name,
+            "customer_primary_key": str(customer_key or "").strip(),
+            "order_date": "",
+            "amount": 0,
+            "extra": {},
+        }]
+    return grouped_orders
+
+
 def build_home_action_plan(
     attention_customers,
     grouped_orders,
@@ -20380,12 +21744,6 @@ def build_home_action_plan(
 
         crm_activities = crm_activity_map.get(customer_primary_key, [])
         crm_activities = merge_recent_sent_emails_with_crm(customer_name, crm_activities)
-        sales_activities = get_sales_outreach_activities(crm_activities)
-        outbound_sales = [
-            activity for activity in sales_activities
-            if str(activity.get("direction") or "").strip().lower() == "outbound"
-        ]
-        contact_policy = build_action_plan_contact_policy(outbound_sales, customer_name=customer_name)
         enriched_customer = dict(customer)
         enriched_customer["territory"] = territory.title() if territory else "Unassigned"
         enriched_customer["last_order"] = (
@@ -20393,24 +21751,16 @@ def build_home_action_plan(
             if customer_orders else ""
         )
 
-        if contact_policy.get("exclude_from_action_plan"):
-            continue
+        due_today_customers.append(enriched_customer)
 
-        if has_recent_activity(enriched_customer.get("days_since_last_activity")):
-            continue
-
-        if float(enriched_customer.get("priority_score") or 0) >= 1.5:
-            due_today_customers.append(enriched_customer)
-
-    due_today_customers = sort_late_customers(
+    due_today_customers = sorted(
         due_today_customers,
-        sort_key="priority_score",
-        direction="desc",
+        key=lambda item: (
+            item.get("last_contact_date") != "",
+            item.get("last_contact_date") or "",
+            str(item.get("customer") or "").casefold(),
+        ),
     )[:10]
-    dismissed_customers = [
-        customer for customer in dismissed_customers
-        if float(customer.get("priority_score") or 0) >= 1.5
-    ]
 
     return {
         "due_today": due_today_customers,
@@ -20454,44 +21804,45 @@ def build_cached_home_action_plan_workflow(
         if any(existing_key[:2] != cache_key[:2] for existing_key in entries):
             entries.clear()
 
-        attention_result = build_customers_needing_attention_response(
-            order_result=order_result,
-            crm_result=crm_result,
+        master_data_result = fetch_filemaker_master_data()
+        customers_by_key = (
+            master_data_result.get("customers_by_key", {})
+            if master_data_result.get("status") == "ok"
+            else {}
         )
-        attention_customers = attention_result["late_customers"]
-        grouped_orders = group_by_customer(order_result["orders"])
+        # The Action Plan is customer-only. Recheck order-backed companies
+        # against the FileMaker company Type so historical orders cannot pull
+        # suppliers, prospects or "Other" records into the queue.
+        customer_order_result = filter_order_result_to_customer_type(
+            order_result,
+            master_data_result,
+        )
+        grouped_orders = group_by_customer(customer_order_result["orders"])
         crm_activity_map = (
             crm_result.get("activity_map", {})
             if crm_result.get("status") == "ok"
             else {}
         )
-
-        master_data_result = None
-        customers_by_key = {}
-        if normalized_group != "all":
-            master_data_result = fetch_filemaker_master_data()
-            customers_by_key = (
-                master_data_result.get("customers_by_key", {})
-                if master_data_result.get("status") == "ok"
-                else {}
-            )
+        grouped_orders = include_master_customers_in_action_plan(grouped_orders, master_data_result)
+        attention_customers, dismissed_customers = build_contact_date_action_plan_customers(
+            grouped_orders,
+            crm_activity_map,
+        )
 
         action_plan = build_home_action_plan(
             attention_customers,
             grouped_orders,
             crm_activity_map,
-            attention_result.get("dismissed_customers", []),
+            dismissed_customers,
             group_filter=normalized_group,
             territory_filter=normalized_territory,
             customers_by_key=customers_by_key,
         )
+        # Manual focus can target any FileMaker company whose Type is Customer,
+        # not only the ten accounts currently due in the live queue.
         customer_options = sorted(
-            (
-                str(customer.get("customer", "")).strip()
-                for customer in action_plan.get("due_today", [])
-                if str(customer.get("customer", "")).strip()
-            ),
-            key=lambda item: str(item or "").lower(),
+            (str(customer_name or "").strip() for customer_name in grouped_orders),
+            key=lambda item: item.casefold(),
         )
         queue_summaries = build_home_queue_summaries(
             action_plan.get("due_today", []),
@@ -20535,6 +21886,105 @@ def get_action_plan_dismissals_path():
         return Path(raw_path).expanduser()
 
     return DEFAULT_ACTION_PLAN_DISMISSALS_PATH
+
+
+def get_action_plan_follow_ups_path():
+    raw_path = os.getenv("ACTION_PLAN_FOLLOW_UPS_PATH", "").strip()
+    return Path(raw_path).expanduser() if raw_path else DEFAULT_ACTION_PLAN_FOLLOW_UPS_PATH
+
+
+def get_outreach_drafts_path():
+    raw_path = os.getenv("OUTREACH_DRAFTS_PATH", "").strip()
+    return Path(raw_path).expanduser() if raw_path else DEFAULT_OUTREACH_DRAFTS_PATH
+
+
+def read_outreach_drafts():
+    path = get_outreach_drafts_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def get_saved_outreach_draft(username, customer):
+    username_key = str(username or "").strip().casefold()
+    customer_key = str(customer or "").strip().casefold()
+    if not username_key or not customer_key:
+        return {}
+    item = (read_outreach_drafts().get(username_key) or {}).get(customer_key) or {}
+    return item if isinstance(item, dict) else {}
+
+
+def save_outreach_draft(username, customer, subject, body):
+    username_key = str(username or "").strip().casefold()
+    customer_key = str(customer or "").strip().casefold()
+    if not username_key or not customer_key:
+        return
+    with OUTREACH_DRAFTS_LOCK:
+        drafts = read_outreach_drafts()
+        user_drafts = drafts.setdefault(username_key, {})
+        user_drafts[customer_key] = {
+            "customer": str(customer or "").strip(),
+            "email_subject": str(subject or "").strip(),
+            "email_body": str(body or "").strip(),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        path = get_outreach_drafts_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        temporary_path.write_text(json.dumps(drafts, indent=2), encoding="utf-8")
+        temporary_path.replace(path)
+
+
+def read_action_plan_follow_ups():
+    follow_ups_path = get_action_plan_follow_ups_path()
+    try:
+        if not follow_ups_path.exists():
+            return {}
+        payload = json.loads(follow_ups_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(customer): {
+            "follow_up_date": str(item.get("follow_up_date") or "").strip(),
+            "updated_at": str(item.get("updated_at") or "").strip(),
+        }
+        for customer, item in payload.items()
+        if isinstance(item, dict) and str(item.get("follow_up_date") or "").strip()
+    }
+
+
+def write_action_plan_follow_ups(follow_ups):
+    follow_ups_path = get_action_plan_follow_ups_path()
+    follow_ups_path.parent.mkdir(parents=True, exist_ok=True)
+    follow_ups_path.write_text(json.dumps(follow_ups, indent=2), encoding="utf-8")
+
+
+def set_action_plan_follow_up(customer_name, follow_up_date):
+    customer_name = str(customer_name or "").strip()
+    follow_up_date = str(follow_up_date or "").strip()
+    if not customer_name:
+        raise ValueError("Customer is required")
+    if follow_up_date:
+        try:
+            datetime.strptime(follow_up_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("Follow-up date must use YYYY-MM-DD") from error
+
+    follow_ups = read_action_plan_follow_ups()
+    if follow_up_date:
+        follow_ups[customer_name] = {
+            "follow_up_date": follow_up_date,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    else:
+        follow_ups.pop(customer_name, None)
+    write_action_plan_follow_ups(follow_ups)
+    clear_home_queue_summaries_cache()
+    return follow_up_date
 
 
 def read_action_plan_dismissals():
@@ -20676,7 +22126,12 @@ def build_order_history_coverage_note(order_result):
 
 def get_order_primary_key(order):
     extra = order.get("extra", {})
-    return extra.get("Companies 4::PrimaryKey") or extra.get("Customer Ref") or ""
+    return (
+        extra.get("Companies 4::PrimaryKey")
+        or extra.get("Customer Ref")
+        or order.get("customer_primary_key")
+        or ""
+    )
 
 
 def get_crm_days_since_latest_activity(latest_crm_activity):
@@ -20814,11 +22269,9 @@ def build_action_plan_contact_policy(outbound_sales, customer_name=""):
         why_override = "Testing override enabled for this customer • recent contact hold ignored"
     elif direct_touch_cooloff_hold:
         hold_reason = "Recent email and direct follow-up already logged"
-        mode_override = "Hold"
         why_override = "Email and call/text already logged • wait until 30 days since the latest direct follow-up"
     elif recent_contact_hold:
         hold_reason = f"Recent contact already logged in the last {recent_contact_days} days"
-        mode_override = "Hold"
         why_override = f"Recent contact logged {latest_contact_days} days ago • avoid duplicate follow-up"
     elif email_follow_up_window:
         if email_first_customer:
@@ -20996,12 +22449,14 @@ def render_home_workflow_layout(action_plan, queue_summaries, selected_preview, 
     return f"""
         <section class="home-workspace">
             <div class="home-workspace-topbar">
-                <div class="home-topbar-filters">
+                <div class="home-topbar-primary">
                     {render_action_plan_territory_toggle(home_view=home_view, group_filter=group_filter, territory_filter=territory_filter)}
                     {render_action_plan_group_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view=home_view, group_filter=group_filter, territory_filter=territory_filter)}
-                    {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view, group_filter=group_filter, territory_filter=territory_filter)}
                 </div>
-                {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view, group_filter=group_filter, territory_filter=territory_filter)}
+                <div class="home-topbar-secondary">
+                    {render_home_view_toggle(selected_preview.get("customer", "") if selected_preview else "", home_view, group_filter=group_filter, territory_filter=territory_filter)}
+                    {render_home_add_customer_form(customer_options, selected_customer=(selected_preview.get("customer", "") if selected_preview else ""), home_view=home_view, group_filter=group_filter, territory_filter=territory_filter)}
+                </div>
             </div>
             {render_home_focus_preview(selected_preview, group_filter=group_filter, territory_filter=territory_filter, dismiss_open=str(dismiss_customer or "").strip().lower() == str((selected_preview or {}).get("customer", "")).strip().lower()) if home_view == "focus" else ""}
 
@@ -21171,11 +22626,17 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
         if master_data_result.get("status") == "ok"
         else []
     )
+    customers_by_key = (
+        master_data_result.get("customers_by_key", {})
+        if master_data_result.get("status") == "ok"
+        else {}
+    )
 
     for customer in queue_customers:
         customer_name = str(customer.get("customer", ""))
         customer_orders = grouped_orders.get(customer_name, [])
         customer_primary_key = get_customer_primary_key(customer_orders)
+        customer_record = customers_by_key.get(customer_primary_key, {})
         crm_activities = crm_activity_map.get(customer_primary_key, [])
         crm_activities = merge_recent_sent_emails_with_crm(customer_name, crm_activities)
         sales_activities = get_sales_outreach_activities(crm_activities)
@@ -21203,12 +22664,21 @@ def build_home_queue_summaries(queue_customers, grouped_orders, crm_activity_map
         )
         summaries.append({
             "customer": customer_name,
-            "location": extract_customer_location_label(customer_name, customer_orders),
+            "location": extract_customer_location_label(
+                customer_name,
+                customer_orders,
+                customer_record=customer_record,
+            ),
             "priority_score": customer.get("priority_score"),
             "days_since_last": customer.get("days_since_last"),
             "avg_gap": customer.get("avg_gap"),
             "last_order": customer.get("last_order"),
             "last_activity_date": customer.get("last_activity_date"),
+            "last_contact_date": customer.get("last_contact_date"),
+            "days_since_last_contact": customer.get("days_since_last_contact"),
+            "follow_up_date": customer.get("follow_up_date"),
+            "due_date": customer.get("due_date"),
+            "due_source": customer.get("due_source"),
             "action": customer.get("action"),
             "suggested_mode": suggested_mode,
             "next_action_label": get_home_next_action_label(suggested_mode),
@@ -21241,8 +22711,6 @@ def determine_home_queue_mode(customer, outbound_count=0, inbound_count=0, conta
     if str(contact_policy.get("mode_override") or "").strip():
         return str(contact_policy.get("mode_override") or "").strip()
 
-    if has_recent_activity(customer.get("days_since_last_activity")):
-        return "Hold"
     if is_email_first_corporate_customer(customer.get("customer", "")):
         return "Email"
     if outbound_count >= 3 and inbound_count == 0:
@@ -21257,14 +22725,19 @@ def get_home_next_action_label(suggested_mode):
         return "Prepare Call"
     if normalized == "visit":
         return "Prepare Visit"
-    if normalized == "hold":
-        return "Review Context"
     return "Prepare Email"
 
 
 def build_home_why_now(customer, outbound_count=0, inbound_count=0, contact_policy=None):
     days_since_last = customer.get("days_since_last")
     contact_policy = contact_policy or {}
+
+    if customer.get("due_source") == "scheduled":
+        return f"Scheduled follow-up due {customer.get('due_date')}"
+    if customer.get("last_contact_date"):
+        return f"{customer.get('days_since_last_contact')} days since last contact"
+    if "last_contact_date" in customer:
+        return "No previous sales contact recorded"
 
     if str(contact_policy.get("why_override") or "").strip():
         return str(contact_policy.get("why_override") or "").strip()
@@ -21282,15 +22755,24 @@ def build_home_why_now(customer, outbound_count=0, inbound_count=0, contact_poli
     return f"Beyond usual cycle • {days_since_last} days since last order"
 
 
-def extract_customer_location_label(customer_name, customer_orders=None):
+def extract_customer_location_label(customer_name, customer_orders=None, customer_record=None):
     customer_name = str(customer_name or "").strip()
+    customer_record = customer_record or {}
+    city = str(customer_record.get("city") or "").strip()
+    state = str(customer_record.get("state") or "").strip()
+
+    if city and state:
+        return f"{city}, {state}"
+    if city:
+        return city
+
     match = re.search(r"\(([^()]+)\)\s*$", customer_name)
 
     if match:
         return match.group(1).strip()
 
     customer_orders = customer_orders or []
-    state = get_order_state(customer_orders[-1]) if customer_orders else ""
+    state = state or (get_order_state(customer_orders[-1]) if customer_orders else "")
     territory = get_customer_territory(customer_orders) if customer_orders else ""
 
     if state and territory:
@@ -21585,6 +23067,13 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
     # page is interactive so model latency never blocks navigation.
     result = build_outreach_prep_fallback(context)
     current_user = get_current_session_user() or {}
+    saved_draft = get_saved_outreach_draft(current_user.get("username"), selected_customer)
+    if (
+        not is_recent_order_acknowledgement_context(context)
+        and int(context.get("consecutive_unanswered_outbound_count") or 0) < 3
+    ):
+        result["email_subject"] = str(saved_draft.get("email_subject") or "").strip()
+        result["email_body"] = str(saved_draft.get("email_body") or "").strip()
     draft_token = itsdangerous.URLSafeTimedSerializer(
         os.getenv("APP_SESSION_SECRET", "change-this-session-secret"),
         salt="action-plan-draft",
@@ -21593,6 +23082,11 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         "context": context,
     })
     result = apply_test_customer_outreach_mode_overrides(result, selected_customer)
+    if str(result.get("suggested_mode") or "").strip().lower() == "hold":
+        queue_mode = str(queue_summary.get("suggested_mode") or "").strip()
+        result["suggested_mode"] = (
+            queue_mode if queue_mode.lower() in {"email", "call"} else "Email"
+        )
     target_contact_name = str(result.get("recommended_contact_name") or "").strip()
     target_contact_email = str(result.get("recommended_contact_email") or "").strip()
     primary_contact = context.get("primary_contact") or {}
@@ -21618,7 +23112,8 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         "queue_summary": queue_summary,
         "context": context,
         "result": result,
-        "draft_async": True,
+        "draft_async": False,
+        "draft_saved": bool(result["email_subject"] or result["email_body"]),
         "draft_token": draft_token,
         "target_name": target_contact_name,
         "target_email": target_contact_email,
@@ -21636,6 +23131,71 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         started_at,
     )
     return payload
+
+
+def build_customer_detail_outreach_preview(
+    customer,
+    customer_orders,
+    customer_primary_key,
+    attention,
+    crm_result,
+    crm_activities,
+):
+    customer_name = str(customer or "").strip()
+    if not customer_name:
+        return None
+
+    working_orders = list(customer_orders or [])
+    if not working_orders:
+        working_orders = [{
+            "customer": customer_name,
+            "customer_primary_key": str(customer_primary_key or "").strip(),
+            "order_date": "",
+            "amount": 0,
+            "extra": {},
+        }]
+
+    action_customer = dict(attention or {})
+    if not action_customer:
+        action_customer = build_manual_action_plan_customer(
+            customer_name,
+            working_orders,
+            crm_matches=crm_activities,
+        ) or {
+            "customer": customer_name,
+            "avg_gap": None,
+            "days_since_last": None,
+            "priority_score": 1.1,
+            "action": "Review account",
+            "last_order": "",
+            "last_activity_date": (
+                str(crm_activities[0].get("date_created") or "")[:10]
+                if crm_activities else ""
+            ),
+        }
+    action_customer["customer"] = customer_name
+    action_customer["follow_up_date"] = str(
+        (read_action_plan_follow_ups().get(customer_name) or {}).get("follow_up_date") or ""
+    )
+
+    grouped_orders = {customer_name: working_orders}
+    activity_map = dict(crm_result.get("activity_map", {}) or {})
+    activity_map[str(customer_primary_key or "").strip()] = list(crm_activities or [])
+    preview_crm_result = dict(crm_result)
+    preview_crm_result["status"] = "ok"
+    preview_crm_result["activity_map"] = activity_map
+    queue_summaries = build_home_queue_summaries(
+        [action_customer],
+        grouped_orders,
+        activity_map,
+    )
+    return build_home_preview_payload(
+        customer_name,
+        queue_summaries,
+        grouped_orders,
+        [action_customer],
+        preview_crm_result,
+    )
 
 
 def build_home_message_points(context, result, customer_name):
@@ -21820,12 +23380,19 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
     return options
 
 
-def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
+def render_home_focus_work_panel(
+    preview,
+    outreach_prep_href,
+    return_to,
+    include_overview=True,
+    schedule_button_label="Schedule & next customer",
+):
     customer_name = str(preview.get("customer") or "").strip()
     context = preview.get("context") or {}
     result = preview.get("result") or {}
     queue_summary = preview.get("queue_summary") or {}
     draft_async = bool(preview.get("draft_async"))
+    draft_saved = bool(preview.get("draft_saved"))
     primary_contact = context.get("primary_contact") or {}
     target_name = str(preview.get("target_name") or "Best known contact").strip()
     target_email = str(preview.get("target_email") or "").strip()
@@ -21834,6 +23401,8 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     target_phone = str(primary_contact.get("phone") or "").strip()
     target_cell = str(primary_contact.get("cell") or "").strip()
     mode = str(preview.get("mode") or "Email").strip() or "Email"
+    if mode.lower() == "hold":
+        mode = "Email"
     mode_lower = mode.lower()
     current_user = get_current_session_user()
     m365_state = get_m365_connection_state(current_user)
@@ -21854,9 +23423,10 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     confirm_body_id = f"home-focus-confirm-body-{slug}"
     overview_text = build_home_focus_account_overview(context, queue_summary)
     evidence_strength = condense_evidence_strength(result.get("evidence_strength") or "Not available")
-    email_subject = "" if draft_async else (str(result.get("email_subject") or "").strip() or "Not available")
-    email_body = "" if draft_async else (str(result.get("email_body") or "").strip() or "Not available")
+    email_subject = str(result.get("email_subject") or "").strip()
+    email_body = str(result.get("email_body") or "").strip()
     draft_status_id = f"home-focus-draft-status-{slug}"
+    generate_draft_button_id = f"home-focus-generate-draft-{slug}"
     draft_token_json = json.dumps(str(preview.get("draft_token") or ""))
     suggested_text_message = str(result.get("suggested_text_message") or "").strip() or "Not available"
     recipient_options = build_home_focus_recipient_options(
@@ -21874,6 +23444,18 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
     call_phone_card_id = f"home-focus-call-phone-card-{slug}"
     call_cell_card_id = f"home-focus-call-cell-card-{slug}"
     call_to_id = f"home-focus-call-to-{slug}"
+    schedule_return_to = clear_home_selection_from_url(return_to or "/action-plan-view#focus-preview")
+    schedule_form = f"""
+        <form method="post" action="/action-plan-schedule" class="home-focus-schedule-form">
+            <input type="hidden" name="customer" value="{escape(customer_name)}">
+            <input type="hidden" name="return_to" value="{escape(schedule_return_to)}">
+            <label for="home-focus-follow-up-{slug}"><span class="label">Schedule next follow-up</span></label>
+            <div class="home-focus-schedule-row">
+                <input id="home-focus-follow-up-{slug}" type="date" name="follow_up_date" value="{escape(str(queue_summary.get('follow_up_date') or ''))}" required>
+                <button type="submit" class="button secondary">{escape(schedule_button_label)}</button>
+            </div>
+        </form>
+    """
     latest_outreach_subject = str(context.get("latest_sales_outreach_subject") or "").strip()
     latest_outreach_preview = str(context.get("latest_sales_outreach_preview") or "").strip()
     latest_outreach_date = format_optional_datetime(context.get("latest_sales_outreach") or "")
@@ -21914,6 +23496,11 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
         f'{escape(item["label"] or item["email"])}{" — " if item["label"] else ""}{escape(item["email"])}</option>'
         for item in recipient_options
     )
+    customer_detail_query = {"customer": customer_name}
+    normalized_overview_return_to = normalize_customer_detail_return_to(return_to)
+    if normalized_overview_return_to:
+        customer_detail_query["return_to"] = normalized_overview_return_to
+    customer_detail_href = f"/customer-view?{urlencode(customer_detail_query, quote_via=quote)}"
 
     latest_history_markup = ""
     if latest_outreach_subject or latest_outreach_preview:
@@ -21939,7 +23526,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
             <div class="home-focus-overview-head">
                 <div>
                     <span class="home-focus-inline-kicker">Account overview</span>
-                    <h3>{escape(customer_name)}</h3>
+                    <h3><a class="home-focus-customer-link" href="{escape(customer_detail_href)}">{escape(customer_name)}</a></h3>
                     <p class="home-focus-inline-location">{escape(str(preview.get("location") or "Location not recorded"))}</p>
                 </div>
                 <span class="home-focus-inline-mode">{escape(mode)}</span>
@@ -22045,7 +23632,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
         return f"""
             <section class="home-focus-work-card">
                 <div class="home-focus-work-head">
-                    <div>
+                    <div class="home-focus-work-heading-main">
                         <span class="home-focus-inline-kicker">Next action</span>
                         <h3 id="{mode_title_id}">{'Email outreach' if initial_mode == 'email' else 'Call follow-up'}</h3>
                         {mode_switch_markup}
@@ -22065,7 +23652,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             <input id="{recommended_to_id}" type="hidden" name="recommended_to" value="{escape(target_email)}">
                             <input id="{recommended_subject_id}" type="hidden" name="recommended_subject" value="{escape(email_subject)}">
                             <input id="{recommended_body_id}" type="hidden" name="recommended_body" value="{escape(email_body)}">
-                            {f'<p class="outreach-edit-note" id="{draft_status_id}">Writing a tailored draft from the conversation history…</p>' if draft_async else ''}
+                            <p class="outreach-edit-note" id="{draft_status_id}" hidden></p>
                             <div class="outreach-draft-row">
                                 <label class="label" for="{to_input_id}">To</label>
                                 <div class="home-focus-recipient-row">
@@ -22083,11 +23670,14 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             </div>
                             <div class="outreach-draft-row">
                                 <label class="label" for="{subject_input_id}">Subject</label>
-                                <input id="{subject_input_id}" class="outreach-draft-input" type="text" name="subject" value="{escape(email_subject)}" placeholder="{'Writing tailored subject…' if draft_async else 'Enter subject'}" autocomplete="off" />
+                                <input id="{subject_input_id}" class="outreach-draft-input" type="text" name="subject" value="{escape(email_subject)}" placeholder="Enter subject or generate AI outreach" autocomplete="off" />
                             </div>
                             <div class="outreach-draft-row outreach-draft-row-body">
                                 <label class="label" for="{body_input_id}">Body</label>
-                                <textarea id="{body_input_id}" class="outreach-draft-textarea home-focus-draft-textarea" name="body" rows="9" placeholder="{'Writing tailored draft…' if draft_async else 'Enter email draft'}">{escape(email_body)}</textarea>
+                                <textarea id="{body_input_id}" class="outreach-draft-textarea home-focus-draft-textarea" name="body" rows="9" placeholder="Enter an email or generate AI outreach">{escape(email_body)}</textarea>
+                            </div>
+                            <div class="home-focus-generate-draft-row">
+                                <button id="{generate_draft_button_id}" type="button" class="home-focus-generate-draft-link" onclick="loadHomeFocusDraft('{slug}')">Generate AI outreach</button>
                             </div>
                             <div class="outreach-draft-actions home-focus-draft-actions">
                                 {primary_action}
@@ -22109,6 +23699,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                                 </div>
                             </div>
                         </form>
+                        {schedule_form}
                     </div>
                     <div
                         class="home-focus-mode-panel"
@@ -22170,6 +23761,10 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                                 <label>
                                     <span class="label">Call notes</span>
                                     <textarea name="body" rows="4" placeholder="Record who you spoke to, what was discussed and the agreed next step." required></textarea>
+                                </label>
+                                <label>
+                                    <span class="label">Next follow-up date (optional)</span>
+                                    <input type="date" name="follow_up_date">
                                 </label>
                                 <button type="submit" class="button home-focus-record-call-button">Record call in FileMaker</button>
                             </form>
@@ -22276,6 +23871,12 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         const recommendedSubject = document.getElementById(`home-focus-recommended-subject-${{slug}}`);
                         const recommendedBody = document.getElementById(`home-focus-recommended-body-${{slug}}`);
                         const sendButton = form?.querySelector('.home-focus-send-button');
+                        const generateButton = document.getElementById(`home-focus-generate-draft-${{slug}}`);
+                        if (status) {{
+                            status.hidden = false;
+                            status.textContent = 'Generating and saving AI outreach…';
+                        }}
+                        if (generateButton) generateButton.disabled = true;
                         if (sendButton?.tagName === 'BUTTON') sendButton.disabled = true;
                         try {{
                             const draftData = new URLSearchParams();
@@ -22293,12 +23894,18 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                             if (body) body.value = payload.email_body;
                             if (recommendedSubject) recommendedSubject.value = payload.email_subject || '';
                             if (recommendedBody) recommendedBody.value = payload.email_body;
-                            if (status) status.hidden = true;
-                            if (sendButton?.tagName === 'BUTTON') sendButton.disabled = false;
-                        }} catch (error) {{
                             if (status) {{
                                 status.hidden = false;
-                                status.textContent = 'The tailored draft could not be loaded. Open the full prep page to retry.';
+                                status.textContent = 'AI outreach generated and saved. It will be reused until you generate it again.';
+                            }}
+                            if (generateButton) generateButton.disabled = false;
+                            if (sendButton?.tagName === 'BUTTON') sendButton.disabled = false;
+                        }} catch (error) {{
+                            if (generateButton) generateButton.disabled = false;
+                            if (sendButton?.tagName === 'BUTTON') sendButton.disabled = false;
+                            if (status) {{
+                                status.hidden = false;
+                                status.textContent = 'The AI outreach could not be generated. Please try again.';
                             }}
                         }}
                     }}
@@ -22306,11 +23913,10 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
                         hideHomeFocusM365SendConfirm('{slug}');
                         setHomeFocusMode('{slug}', '{initial_mode}');
                         syncHomeFocusCallContact('{slug}');
-                        {'loadHomeFocusDraft(' + json.dumps(slug) + ');' if draft_async else ''}
                     }});
                 </script>
             </section>
-            {overview_panel}
+            {overview_panel if include_overview else ''}
         """
 
     return f"""
@@ -22324,7 +23930,7 @@ def render_home_focus_work_panel(preview, outreach_prep_href, return_to):
             </div>
             <p class="home-focus-call-note">{escape(str(queue_summary.get("why_now") or "Review the full prep page for the recommended next step."))}</p>
         </section>
-        {overview_panel}
+        {overview_panel if include_overview else ''}
     """
 
 
@@ -22432,6 +24038,8 @@ def render_home_queue_row(summary, group_filter="all", territory_filter="all", i
     customer_href = f"/customer-view?customer={quote(customer_name)}"
     selected_class = " class=\"queue-selected\"" if is_selected else ""
     mode_label = str(summary.get("suggested_mode") or "Email")
+    if mode_label.strip().lower() == "hold":
+        mode_label = "Email"
     mode_class = f"mode-chip mode-{mode_label.strip().lower()}"
     mode_markup = render_queue_mode_chip(mode_label)
 
@@ -22482,13 +24090,6 @@ def render_queue_mode_chip(mode_label):
             '<path fill="currentColor" d="M12 2.8a6.2 6.2 0 0 1 6.2 6.2c0 4.4-4.8 10.2-5.4 10.9a1 1 0 0 1-1.6 0C10.6 19.2 5.8 13.4 5.8 9A6.2 6.2 0 0 1 12 2.8Zm0 8.6A2.4 2.4 0 1 0 12 6.6a2.4 2.4 0 0 0 0 4.8Z"/>'
             '</svg>'
         )
-    if normalized == "hold":
-        return (
-            '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
-            '<path fill="currentColor" d="M12 2.8A9.2 9.2 0 1 1 2.8 12 9.2 9.2 0 0 1 12 2.8Zm0 1.5A7.7 7.7 0 1 0 19.7 12 7.7 7.7 0 0 0 12 4.3Zm-2 3.4c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Zm4 0c.4 0 .8.3.8.8v7a.8.8 0 0 1-1.6 0v-7c0-.5.4-.8.8-.8Z"/>'
-            '</svg>'
-        )
-
     return escape(mode_label)
 
 
@@ -23395,44 +24996,63 @@ def render_late_customers_filter_form(customer, action, sort, direction):
     """
 
 
-def render_customers_filter_form(customer, state, sort, direction):
+def build_customers_view_href(group="all", territory="all", sort="last_order", direction="desc", page=1):
+    query = urlencode({
+        "group": normalize_action_plan_group_filter(group),
+        "territory": normalize_action_plan_territory_filter(territory),
+        "sort": sort,
+        "direction": direction,
+        "page": max(1, int(page or 1)),
+    })
+    return f"/customers-view?{query}"
+
+
+def render_customers_filter_toolbar(group, territory, sort, direction):
+    normalized_group = normalize_action_plan_group_filter(group)
+    normalized_territory = normalize_action_plan_territory_filter(territory)
+    territory_chips = []
+    for territory_key, meta in ACTION_PLAN_TERRITORY_FILTERS.items():
+        class_name = "toggle-chip active" if territory_key == normalized_territory else "toggle-chip"
+        href = build_customers_view_href(normalized_group, territory_key, sort, direction)
+        territory_chips.append(
+            f'<a class="{class_name}" href="{escape(href)}">{escape(str(meta["label"]))}</a>'
+        )
+
+    group_chips = []
+    for group_key, meta in ACTION_PLAN_GROUP_FILTERS.items():
+        class_name = "toggle-chip active" if group_key == normalized_group else "toggle-chip"
+        href = build_customers_view_href(group_key, normalized_territory, sort, direction)
+        group_chips.append(
+            f'<a class="{class_name}" href="{escape(href)}">{escape(str(meta["label"]))}</a>'
+        )
+
     return f"""
-        <form class="controls customers-controls" method="get" action="/customers-view">
+        <section class="home-workspace-topbar customers-filter-toolbar" aria-label="Customer filters">
+            <div class="home-topbar-primary customers-filter-row">
+                <div class="home-view-toggle customers-territory-toggle" aria-label="Territory">
+                    {''.join(territory_chips)}
+                </div>
+                <div class="home-view-toggle home-group-toggle customers-group-toggle" aria-label="Customer group">
+                    {''.join(group_chips)}
+                </div>
+            </div>
+        </section>
+    """
+
+
+def render_customers_sync_form(group, territory, sort, direction):
+    return f"""
+        <form class="customers-sync-form" method="post" action="/customers-view/sync">
+            <input type="hidden" name="group" value="{escape(normalize_action_plan_group_filter(group))}">
+            <input type="hidden" name="territory" value="{escape(normalize_action_plan_territory_filter(territory))}">
             <input type="hidden" name="sort" value="{escape(sort)}">
             <input type="hidden" name="direction" value="{escape(direction)}">
-            <label>
-                <span>Customer</span>
-                <input
-                    type="search"
-                    name="customer"
-                    value="{escape(customer)}"
-                    placeholder="Search customer"
-                >
-            </label>
-
-            <label>
-                <span>State</span>
-                <input
-                    type="search"
-                    name="state"
-                    value="{escape(state)}"
-                    placeholder="OH"
-                >
-            </label>
-
-            <button type="submit">Apply</button>
-            <a class="button secondary" href="/customers-view">Reset</a>
-            <button
-                type="submit"
-                class="button secondary"
-                formmethod="post"
-                formaction="/customers-view/sync"
-            >Sync customer data</button>
+            <button type="submit" class="button secondary small-button customers-sync-button">Sync customer data</button>
         </form>
     """
 
 
-def render_customer_sort_header(label, sort_key, customer, state, current_sort, current_direction):
+def render_customer_sort_header(label, sort_key, customer, state, current_sort, current_direction, group="all", territory="all"):
     next_direction = "asc" if current_sort != sort_key or current_direction == "desc" else "desc"
     indicator = ""
     aria_sort = "none"
@@ -23444,6 +25064,8 @@ def render_customer_sort_header(label, sort_key, customer, state, current_sort, 
         "state": state,
         "sort": sort_key,
         "direction": next_direction,
+        "group": normalize_action_plan_group_filter(group),
+        "territory": normalize_action_plan_territory_filter(territory),
         "page": 1,
     })
     return (
@@ -23452,12 +25074,14 @@ def render_customer_sort_header(label, sort_key, customer, state, current_sort, 
     )
 
 
-def render_customers_pagination(customer, state, sort, direction, page, total_pages, total_filtered, start_index, shown_count):
+def render_customers_pagination(customer, state, sort, direction, page, total_pages, total_filtered, start_index, shown_count, group="all", territory="all"):
     base_query = urlencode({
         "customer": customer,
         "state": state,
         "sort": sort,
         "direction": direction,
+        "group": normalize_action_plan_group_filter(group),
+        "territory": normalize_action_plan_territory_filter(territory),
     })
     previous_link = (
         f'<a class="button secondary pager-button" href="/customers-view?{base_query}&page={page - 1}">Previous</a>'
@@ -26481,7 +28105,7 @@ def extract_apollo_phone(person):
     return str(first_phone)
 
 
-def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category):
+def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category, return_to=""):
     sort_options = {
         "order_date": "Order Date",
         "amount": "Amount",
@@ -26503,6 +28127,7 @@ def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, cr
             <input type="hidden" name="crm_page" value="{crm_page}">
             <input type="hidden" name="crm_direction" value="{escape(crm_direction)}">
             <input type="hidden" name="crm_category" value="{escape(crm_category)}">
+            {f'<input type="hidden" name="return_to" value="{escape(normalize_customer_detail_return_to(return_to))}">' if normalize_customer_detail_return_to(return_to) else ''}
 
             <label>
                 <span>Sort</span>
@@ -26566,6 +28191,7 @@ def render_global_nav(title):
         ("analysis", "Analysis", [
             ("Insights", "/insights-view"),
             ("Orders", "/orders-view"),
+            ("Freight Analysis", "/freight-analysis-view"),
             ("AI Analysis", "/ai-analysis-view"),
             ("Ask The Data", "/ask-data-view"),
         ]),
@@ -26579,7 +28205,7 @@ def render_global_nav(title):
     module_title_aliases = {
         "sales": {"Home", "Action Plan", "Calendar", "CRM Activities", "Outreach Prep"},
         "customers": {"Customers", "Contacts", "Customer Map", "Strategic Contacts", "Organisation View", "Dismissed Customers"},
-        "analysis": {"Insights", "Orders", "AI Analysis", "Ask The Data"},
+        "analysis": {"Insights", "Orders", "Freight Analysis", "AI Analysis", "Ask The Data"},
         "management": {"Weekly KPI Dashboard", "Production Analysis", "Plant Productivity Calculation", "Overbooked Operator Days", "Meeting History", "Meeting Record", "Action History", "Promised Orders", "Priority 1 Customers"},
     }
     active_module = ""
@@ -26671,16 +28297,20 @@ def render_global_nav(title):
     )
 
 
-def render_page(title, body, top_right="", show_title=True, show_nav=True, main_class=""):
+def render_page(title, body, top_right="", show_title=True, show_nav=True, main_class="", page_actions=""):
     title_class = "page-title"
 
     if title == "Numat AI Sales Assistant":
         title_class += " home-page-title"
 
-    page_title_html = (
-        f"<h1 class=\"{title_class}\">{escape(title)}</h1>"
-        if show_title else ""
-    )
+    page_title_html = ""
+    if show_title:
+        page_title_html = (
+            '<div class="page-heading-row">'
+            f'<h1 class="{title_class}">{escape(title)}</h1>'
+            f'{page_actions}'
+            '</div>'
+        )
 
     app_header_html = (
         f"""
@@ -26768,6 +28398,18 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         letter-spacing: 0;
                     }}
 
+                    .page-heading-row {{
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 16px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .page-heading-row h1 {{
+                        margin-bottom: 0;
+                    }}
+
                     h2, h3 {{
                         color: var(--blue);
                     }}
@@ -26791,12 +28433,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .app-header {{
-                        position: relative;
+                        position: sticky;
+                        top: 0;
                         z-index: 50;
                         width: 100%;
                         background: #ffffff;
                         border-bottom: 1px solid var(--border);
-                        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.035);
+                        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.06);
                     }}
 
                     .app-header-inner {{
@@ -27177,34 +28820,52 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .home-workspace {{
                         display: grid;
-                        gap: 16px;
+                        gap: 10px;
                     }}
 
                     .home-workspace-topbar {{
-                        display: flex;
-                        flex-wrap: wrap;
-                        align-items: center;
-                        justify-content: space-between;
-                        gap: 12px;
+                        display: grid;
+                        grid-template-columns: 1fr;
+                        align-items: start;
+                        justify-items: start;
+                        gap: 8px;
                     }}
 
-                    .home-topbar-filters {{
+                    .home-topbar-primary,
+                    .home-topbar-secondary {{
                         display: flex;
                         flex-wrap: wrap;
                         align-items: center;
-                        gap: 10px;
+                        justify-content: flex-start;
+                        gap: 8px 12px;
+                        width: 100%;
+                    }}
+
+                    .home-topbar-secondary .home-add-customer-form {{
+                        flex: 0 1 520px;
+                    }}
+
+                    .home-topbar-secondary {{
+                        justify-content: space-between;
+                    }}
+
+                    .home-topbar-primary {{
+                        justify-content: space-between;
                     }}
 
                     .home-view-toggle {{
                         display: inline-flex;
                         align-items: center;
                         gap: 8px;
-                        padding: 4px;
+                        height: 40px;
+                        min-height: 40px;
+                        box-sizing: border-box;
+                        padding: 3px;
                         border: 1px solid var(--border);
                         border-radius: 10px;
                         background: rgba(255, 255, 255, 0.78);
                         box-shadow: var(--shadow-soft);
-                        margin-bottom: 4px;
+                        margin-bottom: 0;
                         width: fit-content;
                     }}
 
@@ -27212,13 +28873,17 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         display: flex;
                         align-items: center;
                         gap: 8px;
-                        margin-bottom: 4px;
+                        margin-bottom: 0;
+                        min-width: 0;
                     }}
 
                     .home-add-customer-input {{
-                        width: min(360px, 100%);
+                        width: min(420px, 100%);
                         min-width: 220px;
-                        min-height: 38px;
+                        height: 40px;
+                        min-height: 40px;
+                        box-sizing: border-box;
+                        flex: 1 1 320px;
                         padding: 0 12px;
                         border: 1px solid var(--border);
                         border-radius: 10px;
@@ -27228,15 +28893,21 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .home-add-customer-button {{
-                        min-height: 38px;
-                        padding: 0 14px;
+                        width: 64px !important;
+                        min-width: 64px;
+                        max-width: 64px;
+                        height: 40px;
+                        min-height: 40px;
+                        flex: 0 0 auto;
+                        padding: 0 12px;
                         font-size: 13px;
                     }}
 
                     .home-view-toggle .toggle-chip {{
-                        min-height: 38px;
-                        min-width: 86px;
-                        padding: 0 16px;
+                        height: 32px;
+                        min-height: 32px;
+                        min-width: 74px;
+                        padding: 0 12px;
                         border-radius: 8px;
                         border: 1px solid transparent;
                         color: var(--muted);
@@ -27258,7 +28929,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .home-focus-panel {{
-                        padding: 20px 22px 16px;
+                        padding: 13px 16px 12px;
                         box-shadow: 0 18px 42px rgba(15, 23, 42, 0.12);
                     }}
 
@@ -27267,13 +28938,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         justify-content: space-between;
                         align-items: start;
                         gap: 16px;
-                        margin-bottom: 18px;
+                        margin-bottom: 10px;
                     }}
 
                     .panel h2.home-focus-title {{
-                        margin: 0 0 6px;
+                        margin: 0 0 3px;
                         color: var(--text);
-                        font-size: 44px;
+                        font-size: 32px;
                         font-weight: 800;
                         line-height: 1.1;
                     }}
@@ -27281,7 +28952,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .home-focus-location {{
                         margin: 0;
                         color: var(--muted);
-                        font-size: 16px;
+                        font-size: 14px;
                     }}
 
                     .home-preview-dismiss-form {{
@@ -27380,14 +29051,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .home-focus-work-layout {{
                         display: grid;
                         grid-template-columns: minmax(0, 1.18fr) minmax(0, 0.82fr);
-                        gap: 20px;
+                        gap: 12px;
                         align-items: start;
-                        margin-bottom: 18px;
+                        margin-bottom: 8px;
                     }}
 
                     .home-focus-overview-card,
                     .home-focus-work-card {{
-                        padding: 16px 18px;
+                        padding: 12px 14px;
                         border: 1px solid var(--border);
                         border-radius: 12px;
                         background: var(--surface-card);
@@ -27400,7 +29071,28 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         align-items: start;
                         justify-content: space-between;
                         gap: 14px;
-                        margin-bottom: 12px;
+                        margin-bottom: 8px;
+                    }}
+
+                    .home-focus-work-heading-main {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        gap: 5px 10px;
+                        min-width: 0;
+                    }}
+
+                    .home-focus-work-heading-main .home-focus-inline-kicker {{
+                        margin: 0;
+                    }}
+
+                    .home-focus-work-heading-main .home-focus-mode-switch {{
+                        margin: 0;
+                    }}
+
+                    .home-focus-work-heading-main .home-focus-mode-note {{
+                        margin: 0;
+                        white-space: nowrap;
                     }}
 
                     .home-focus-inline-kicker {{
@@ -27416,8 +29108,18 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .home-focus-overview-head h3,
                     .home-focus-work-head h3 {{
                         margin: 0;
-                        font-size: 24px;
+                        font-size: 20px;
                         line-height: 1.15;
+                    }}
+
+                    .home-focus-customer-link {{
+                        color: var(--blue);
+                        text-decoration: none;
+                    }}
+
+                    .home-focus-customer-link:hover,
+                    .home-focus-customer-link:focus-visible {{
+                        text-decoration: underline;
                     }}
 
                     .home-focus-mode-switch {{
@@ -27476,16 +29178,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .home-focus-overview-text {{
-                        margin: 0 0 14px;
+                        margin: 0 0 8px;
                         color: #334e68;
                         font-size: 14px;
-                        line-height: 1.5;
+                        line-height: 1.35;
                     }}
 
                     .home-focus-inline-contact {{
                         display: grid;
                         gap: 4px;
-                        margin-bottom: 14px;
+                        margin-bottom: 8px;
                     }}
 
                     .home-focus-inline-contact strong {{
@@ -27534,7 +29236,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .home-focus-draft-form {{
-                        gap: 12px;
+                        gap: 4px;
                     }}
 
                     .home-focus-draft-form .outreach-draft-input {{
@@ -27588,7 +29290,43 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .home-focus-draft-textarea {{
-                        min-height: 240px;
+                        min-height: 150px;
+                    }}
+
+                    .home-focus-generate-draft-row {{
+                        display: flex;
+                        justify-content: flex-start;
+                        margin: -3px 0 -1px 74px;
+                    }}
+
+                    .home-focus-generate-draft-link {{
+                        appearance: none;
+                        width: auto;
+                        min-width: 0;
+                        min-height: 0;
+                        margin: 0;
+                        padding: 0;
+                        border: 0;
+                        border-radius: 0;
+                        background: transparent;
+                        color: var(--muted);
+                        box-shadow: none;
+                        font: inherit;
+                        font-size: 12px;
+                        font-weight: 400;
+                        line-height: 1.3;
+                        text-decoration: none;
+                        cursor: pointer;
+                    }}
+
+                    .home-focus-generate-draft-link:hover {{
+                        background: transparent;
+                        color: var(--text);
+                    }}
+
+                    .home-focus-generate-draft-link:disabled {{
+                        opacity: .55;
+                        cursor: wait;
                     }}
 
                     .home-focus-mode-panels {{
@@ -27610,8 +29348,39 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .home-focus-send-button {{
                         width: auto;
                         min-width: 220px;
-                        min-height: 46px;
+                        min-height: 40px;
                         justify-content: center;
+                    }}
+
+                    .home-focus-schedule-form {{
+                        display: grid;
+                        gap: 5px;
+                        margin-top: 5px;
+                        padding-top: 5px;
+                        border-top: 1px solid var(--border);
+                    }}
+
+                    .home-focus-schedule-row {{
+                        display: grid;
+                        grid-template-columns: minmax(150px, 0.7fr) minmax(190px, 1fr);
+                        gap: 8px;
+                    }}
+
+                    .home-focus-schedule-row input {{
+                        width: 100%;
+                        min-height: 38px;
+                        box-sizing: border-box;
+                        padding: 7px 10px;
+                        border: 1px solid #c7d8e8;
+                        border-radius: 9px;
+                        background: #fff;
+                        color: var(--text);
+                        font: inherit;
+                    }}
+
+                    .home-focus-schedule-row .button {{
+                        min-height: 38px;
+                        padding-inline: 12px;
                     }}
 
                     .home-focus-call-note {{
@@ -29630,12 +31399,12 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .home-focus-history-stack {{
                         display: grid;
-                        gap: 12px;
-                        margin-top: 14px;
+                        gap: 8px;
+                        margin-top: 8px;
                     }}
 
                     .home-focus-history-card {{
-                        padding: 12px 14px;
+                        padding: 9px 11px;
                         border: 1px solid var(--border);
                         border-radius: 10px;
                         background: #fbfdff;
@@ -32521,38 +34290,23 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         grid-template-columns: repeat(auto-fit, minmax(180px, 240px));
                     }}
 
-                    .customers-page-summary {{
-                        grid-template-columns: repeat(4, minmax(0, 1fr));
-                        gap: 8px;
-                        margin-bottom: 8px;
-                    }}
-
-                    .customers-page-summary div {{
-                        padding: 8px 10px;
-                    }}
-
-                    .customers-controls {{
-                        grid-template-columns: repeat(2, minmax(180px, 1fr)) repeat(3, minmax(130px, .75fr));
-                        gap: 8px;
+                    .customers-filter-toolbar {{
                         margin-bottom: 10px;
-                        padding: 10px;
                     }}
 
-                    .customers-controls label {{
-                        gap: 4px;
+                    .customers-filter-row {{
+                        width: 100%;
                     }}
 
-                    .customers-controls input,
-                    .customers-controls select,
-                    .customers-controls button,
-                    .customers-controls .button {{
-                        height: 38px;
-                        min-height: 38px;
+                    .customers-sync-form {{
+                        margin: 0;
                     }}
 
-                    .controls.customers-controls button,
-                    .controls.customers-controls .button {{
-                        align-self: end;
+                    .customers-sync-button {{
+                        height: 34px;
+                        min-height: 34px;
+                        padding: 0 14px;
+                        white-space: nowrap;
                     }}
 
                     .controls.crm-timeline-controls button {{
@@ -32575,6 +34329,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .table-sort-link:hover {{
                         color: var(--blue);
                         text-decoration: underline;
+                    }}
+
+                    .customer-name-link {{
+                        font-weight: 400;
                     }}
 
                     .apollo-controls {{
@@ -32977,38 +34735,38 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .crm-timeline-table th:nth-child(1),
                     .crm-timeline-table td:nth-child(1) {{
-                        width: 14%;
-                        min-width: 120px;
+                        width: 11%;
+                        min-width: 96px;
                         white-space: normal;
                     }}
 
                     .crm-timeline-table th:nth-child(2),
                     .crm-timeline-table td:nth-child(2) {{
-                        width: 10%;
-                        min-width: 100px;
+                        width: 9%;
+                        min-width: 88px;
                         white-space: normal;
                     }}
 
                     .crm-timeline-table th:nth-child(3),
                     .crm-timeline-table td:nth-child(3) {{
-                        width: 26%;
-                        min-width: 220px;
+                        width: 18%;
+                        min-width: 150px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
 
                     .crm-timeline-table th:nth-child(4),
                     .crm-timeline-table td:nth-child(4) {{
-                        width: 27%;
-                        min-width: 240px;
+                        width: 23%;
+                        min-width: 190px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
 
                     .crm-timeline-table th:nth-child(5),
                     .crm-timeline-table td:nth-child(5) {{
-                        width: 23%;
-                        min-width: 220px;
+                        width: 39%;
+                        min-width: 300px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
@@ -33801,6 +35559,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .customer-detail-page .contact-guidance.subtle {{
                         font-size: 12px;
+                    }}
+
+                    .contact-ready-actions {{
+                        margin-top: 14px;
+                        padding-top: 14px;
+                        border-top: 1px solid var(--border);
+                    }}
+
+                    .contact-ready-actions .home-focus-work-card {{
+                        box-shadow: none;
                     }}
 
                     .customer-detail-page .filter-summary {{
@@ -35190,11 +36958,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .home-workspace-topbar {{
+                            grid-template-columns: 1fr;
                             align-items: stretch;
                             gap: 8px;
                         }}
 
                         .home-topbar-filters {{
+                            display: flex;
+                            flex-wrap: wrap;
                             width: 100%;
                             gap: 8px;
                         }}
@@ -35311,7 +37082,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .home-focus-draft-textarea {{
-                            min-height: 180px;
+                            min-height: 150px;
+                        }}
+
+                        .home-focus-schedule-row {{
+                            grid-template-columns: 1fr;
                         }}
 
                         .home-focus-call-number-grid {{
@@ -35470,9 +37245,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             grid-template-columns: 1fr;
                         }}
 
-                        .customers-page-summary,
-                        .customers-controls {{
-                            grid-template-columns: 1fr;
+                        .page-heading-row {{
+                            align-items: flex-start;
+                            flex-wrap: wrap;
                         }}
 
                         .crm-filter-grid {{

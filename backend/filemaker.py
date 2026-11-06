@@ -119,6 +119,19 @@ def get_extra_fields():
     if activity_content_field and activity_content_field not in fields:
         fields.append(activity_content_field)
 
+    for freight_field in (
+        "Incoming Freight",
+        "Incoming Cost",
+        "Outgoing Freight",
+        "Outgoing Cost",
+        "Act Arrival_Gross Weight",
+        "Act Arrival_Nett Weight",
+        "Despatch_Gross Wright",
+        "Despatch_Nett Weight",
+    ):
+        if freight_field not in fields:
+            fields.append(freight_field)
+
     return fields
 
 
@@ -661,8 +674,8 @@ def get_filemaker_response_message(response):
     return str(response.text or "").strip()
 
 
-def fetch_all_layout_records(layout, batch_size=500, sort_fields=None, max_records=None):
-    offset = 1
+def fetch_all_layout_records(layout, batch_size=500, sort_fields=None, max_records=None, start_offset=1):
+    offset = max(1, int(start_offset or 1))
     records = []
 
     while True:
@@ -1240,10 +1253,12 @@ def get_request_error_status(error):
 
 def fetch_order_records(limit=100, offset=1):
     config = get_filemaker_config()
-    result = fetch_layout_records(
+    batch_size = max(1, get_int_env("FILEMAKER_ORDER_BATCH_SIZE", 1000))
+    result = fetch_all_layout_records(
         config["orders_layout"],
-        limit=limit,
-        offset=offset
+        batch_size=min(batch_size, max(1, int(limit))),
+        max_records=max(1, int(limit)),
+        start_offset=max(1, int(offset)),
     )
 
     if result["status"] != "ok":

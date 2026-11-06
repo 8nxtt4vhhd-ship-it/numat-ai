@@ -25,6 +25,7 @@ _FILEMAKER_ORDER_CACHE = {
     "key": None,
     "expires_at": 0,
     "result": None,
+    "disk_mtime": None,
 }
 _FILEMAKER_ORDER_CACHE_LOCK = Lock()
 
@@ -112,6 +113,7 @@ def clear_filemaker_orders_cache(clear_persisted=False):
         _FILEMAKER_ORDER_CACHE["key"] = None
         _FILEMAKER_ORDER_CACHE["expires_at"] = 0
         _FILEMAKER_ORDER_CACHE["result"] = None
+        _FILEMAKER_ORDER_CACHE["disk_mtime"] = None
     if clear_persisted:
         cache_path = get_filemaker_orders_cache_path()
         try:
@@ -125,12 +127,18 @@ def fetch_cached_filemaker_orders():
     cache_seconds = get_filemaker_cache_seconds()
     cache_key = build_filemaker_cache_key(limit)
     now = time.time()
+    cache_path = get_filemaker_orders_cache_path()
+    try:
+        disk_mtime = cache_path.stat().st_mtime_ns
+    except FileNotFoundError:
+        disk_mtime = None
 
     if (
         cache_seconds
         and _FILEMAKER_ORDER_CACHE["key"] == cache_key
         and _FILEMAKER_ORDER_CACHE["result"] is not None
         and _FILEMAKER_ORDER_CACHE["expires_at"] > now
+        and _FILEMAKER_ORDER_CACHE["disk_mtime"] == disk_mtime
     ):
         return _FILEMAKER_ORDER_CACHE["result"]
 
@@ -150,6 +158,7 @@ def fetch_cached_filemaker_orders():
             _FILEMAKER_ORDER_CACHE["key"] = cache_key
             _FILEMAKER_ORDER_CACHE["expires_at"] = float("inf")
             _FILEMAKER_ORDER_CACHE["result"] = cached_result
+            _FILEMAKER_ORDER_CACHE["disk_mtime"] = disk_mtime
         return cached_result
 
     with _FILEMAKER_ORDER_CACHE_LOCK:
@@ -160,6 +169,7 @@ def fetch_cached_filemaker_orders():
             and _FILEMAKER_ORDER_CACHE["key"] == cache_key
             and _FILEMAKER_ORDER_CACHE["result"] is not None
             and _FILEMAKER_ORDER_CACHE["expires_at"] > now
+            and _FILEMAKER_ORDER_CACHE["disk_mtime"] == disk_mtime
         ):
             return _FILEMAKER_ORDER_CACHE["result"]
 
@@ -175,6 +185,10 @@ def fetch_cached_filemaker_orders():
             # FileMaker simply because a short timer elapsed.
             _FILEMAKER_ORDER_CACHE["expires_at"] = float("inf")
             _FILEMAKER_ORDER_CACHE["result"] = result
+            try:
+                _FILEMAKER_ORDER_CACHE["disk_mtime"] = get_filemaker_orders_cache_path().stat().st_mtime_ns
+            except FileNotFoundError:
+                _FILEMAKER_ORDER_CACHE["disk_mtime"] = None
             return result
 
         cached_snapshot = read_filemaker_orders_cache()

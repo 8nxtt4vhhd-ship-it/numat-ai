@@ -482,6 +482,7 @@ def compare_company_rows(source_rows, companies, price_list_by_key=None, custome
             "matched_zip": str(company.get("zip_code") or ""),
             "price_list": price_list,
             "is_price_list_d": bool(best and match_status == "Matched" and price_list == "D"),
+            "is_price_list_e": bool(best and match_status == "Matched" and price_list == "E"),
             "order_count": int(metrics.get("order_count") or 0) if best else 0,
             "total_spend": round(float(metrics.get("total_spend") or 0), 2) if best else 0,
             "confidence": best[0] if best else 0,
@@ -498,6 +499,7 @@ def summarize_results(results):
         "possible": sum(row["match_status"] == "Possible match" for row in results),
         "unmatched": sum(row["match_status"] == "No match" for row in results),
         "price_list_d": sum(bool(row.get("is_price_list_d")) for row in results),
+        "price_list_e": sum(bool(row.get("is_price_list_e")) for row in results),
     }
 
 
@@ -547,12 +549,12 @@ def build_results_workbook(payload):
     worksheet.append(["Analysis request", payload.get("analysis_request", "")])
     worksheet.append(["Order-history coverage", payload.get("coverage_note", "")])
     worksheet.append([])
-    worksheet.append(["Uploaded", "Matched", "Possible matches", "No match", "Confirmed Price List D"])
-    worksheet.append([summary["uploaded"], summary["matched"], summary["possible"], summary["unmatched"], summary["price_list_d"]])
+    worksheet.append(["Uploaded", "Matched", "Possible matches", "No match", "Confirmed Price List D", "Confirmed Price List E"])
+    worksheet.append([summary["uploaded"], summary["matched"], summary["possible"], summary["unmatched"], summary["price_list_d"], summary["price_list_e"]])
     headers = [
         "Source row", "Uploaded company", "Uploaded city", "Uploaded state", "Uploaded postcode",
         "Match status", "Matched company", "Customer key", "Matched city", "Matched state",
-        "Matched postcode", "Price list", "Price List D", "Order count", "Total spend", "Confidence", "Reason",
+        "Matched postcode", "Price list", "Price List D", "Price List E", "Order count", "Total spend", "Confidence", "Reason",
     ]
     worksheet.append(headers)
     for row in payload.get("results") or []:
@@ -561,6 +563,7 @@ def build_results_workbook(payload):
             row.get("source_zip"), row.get("match_status"), row.get("matched_company"),
             row.get("customer_primary_key"), row.get("matched_city"), row.get("matched_state"),
             row.get("matched_zip"), row.get("price_list"), "Yes" if row.get("is_price_list_d") else "No",
+            "Yes" if row.get("is_price_list_e") else "No",
             row.get("order_count"), row.get("total_spend"), row.get("confidence"), row.get("reason"),
         ]
         worksheet.append([safe_excel_value(value) for value in values])
@@ -577,15 +580,15 @@ def build_results_workbook(payload):
         cell.font = Font(bold=True, color=navy)
         cell.alignment = Alignment(wrap_text=True, vertical="top")
     if worksheet.max_row >= 10:
-        table = Table(displayName="CompanyComparison", ref=f"A9:Q{worksheet.max_row}")
+        table = Table(displayName="CompanyComparison", ref=f"A9:R{worksheet.max_row}")
         table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showColumnStripes=False)
         worksheet.add_table(table)
-    widths = [12, 30, 18, 16, 18, 18, 30, 18, 18, 16, 18, 12, 13, 13, 16, 12, 34]
+    widths = [12, 30, 18, 16, 18, 18, 30, 18, 18, 16, 18, 12, 13, 13, 13, 16, 12, 34]
     for index, width in enumerate(widths, start=1):
         worksheet.column_dimensions[chr(64 + index)].width = width
     worksheet.freeze_panes = "A10"
     worksheet.auto_filter.ref = f"A9:Q{worksheet.max_row}"
-    for cell in worksheet["O"][9:]:
+    for cell in worksheet["P"][9:]:
         cell.number_format = '"$"#,##0.00'
     worksheet.sheet_view.showGridLines = False
 

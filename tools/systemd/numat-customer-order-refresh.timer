@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh NuMat customer, contact and order caches overnight
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 America/Chicago
+Persistent=true
+Unit=numat-customer-order-refresh.service
+
+[Install]
+WantedBy=timers.target

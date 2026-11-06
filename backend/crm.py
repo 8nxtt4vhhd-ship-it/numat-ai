@@ -505,7 +505,8 @@ def build_shared_contact_activity_map(activities, master_data):
     for contact in (master_data or {}).get("all_contacts") or []:
         email = str(contact.get("email") or "").strip().lower()
         customer_key = str(contact.get("customer_ref") or "").strip()
-        if not email or customer_key not in customers_by_key:
+        active = str(contact.get("active") or "").strip().lower()
+        if not email or customer_key not in customers_by_key or active != "active":
             continue
         customer_keys_by_email.setdefault(email, set()).add(customer_key)
 

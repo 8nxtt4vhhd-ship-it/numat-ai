@@ -63,6 +63,8 @@ class NavigationTests(unittest.TestCase):
         self.assertIn('!menu.contains(event.target)', html)
         self.assertIn('event.key === "Escape"', html)
         self.assertIn('<header class="app-header">', html)
+        self.assertIn('.app-header {\n                        position: sticky;', html)
+        self.assertIn('top: 0;', html)
         self.assertLess(html.index('<header class="app-header">'), html.index('<main class="">'))
 
     def test_home_uses_workspace_banner_without_ask_data_panel(self):

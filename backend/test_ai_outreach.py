@@ -1,7 +1,9 @@
 import unittest
 
 from ai import (
+    build_outreach_prep_fallback,
     build_primary_fact_fallback_email,
+    build_recent_order_acknowledgement_email,
     build_text_tone_email_body,
     draft_violates_outreach_style,
     redact_expired_scheduling_notes,
@@ -10,6 +12,37 @@ from ai import (
 
 
 class OutreachStyleTests(unittest.TestCase):
+    def test_recent_order_becomes_thank_you_without_another_ask(self):
+        fallback = build_outreach_prep_fallback({
+            "customer": "Ace Imagewear",
+            "days_since_last_order": 1,
+            "sales_outreach_sent_count": 0,
+            "sales_reply_count": 0,
+            "primary_contact": {"name": "Kelly Bainbridge", "email": "kelly@example.com"},
+        })
+
+        self.assertEqual(fallback["email_subject"], "Thank you for your recent order")
+        self.assertIn("repair order you sent yesterday", fallback["email_body"])
+        self.assertIn("continued business", fallback["email_body"])
+        self.assertNotIn("?", fallback["email_body"])
+        self.assertNotIn("more mats", fallback["email_body"].lower())
+        self.assertNotIn("repair needs", fallback["email_body"].lower())
+
+    def test_recent_order_acknowledgement_window_ends_after_seven_days(self):
+        seven_days = build_recent_order_acknowledgement_email(
+            {"days_since_last_order": 7},
+            recommended_contact_name="Kelly Bainbridge",
+        )
+        normal_body = build_text_tone_email_body({
+            "customer": "Ace Imagewear",
+            "days_since_last_order": 8,
+            "sales_outreach_sent_count": 0,
+            "sales_reply_count": 0,
+        })
+
+        self.assertIn("recently", seven_days["email_body"])
+        self.assertIn("Do you have any repair work coming up?", normal_body)
+
     def test_vague_location_and_sales_language_are_rejected(self):
         self.assertTrue(draft_violates_outreach_style("I was in your area last week."))
         self.assertTrue(draft_violates_outreach_style("We have an exciting opportunity to partner with you."))
@@ -78,6 +111,26 @@ class OutreachStyleTests(unittest.TestCase):
             {"primary_contact": {"name": "Greg Smith"}}, fact
         )
         self.assertIn("You previously mentioned collecting wavy mats for edge repair", fallback["email_body"])
+
+    def test_newer_unanswered_streak_outranks_old_repair_note(self):
+        items = [
+            {"date": "02/23/2026", "direction": "Outbound", "subject": "left a message", "preview": "Called and left a message."},
+            {"date": "02/19/2026", "direction": "Outbound", "subject": "Convention", "preview": "Hope to see you at CSC."},
+            {"date": "02/02/2026", "direction": "Outbound", "subject": "WTSA follow up", "preview": "Following up after WTSA."},
+            {"date": "12/18/2025", "direction": "Outbound", "subject": "thank you", "preview": "Thank you for the opportunity."},
+            {"date": "10/30/2025", "direction": "Inbound", "subject": "Advanced Linen", "preview": "We may have mats for repair."},
+        ]
+
+        fact = select_primary_outreach_fact(items)
+        fallback = build_primary_fact_fallback_email(
+            {"primary_contact": {"name": "Gordon Smith"}}, fact
+        )
+
+        self.assertEqual(fact["type"], "unanswered_outreach")
+        self.assertIn("sent a few notes since we last heard from you", fallback["email_body"])
+        self.assertIn("still the right person", fallback["email_body"])
+        self.assertNotIn("possible mats", fallback["email_body"].lower())
+        self.assertNotIn("still seeing those", fallback["email_body"].lower())
 
     def test_salesperson_conditional_question_does_not_become_a_customer_fact(self):
         fact = select_primary_outreach_fact([

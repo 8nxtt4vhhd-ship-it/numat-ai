@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh NuMat customer, contact and order caches from FileMaker
+After=network-online.target numat-ai.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=numatadmin
+WorkingDirectory=/srv/numat-ai/backend
+EnvironmentFile=/srv/numat-ai/backend/.env
+ExecStart=/srv/numat-ai/backend/venv/bin/python /srv/numat-ai/backend/customer_order_refresh.py

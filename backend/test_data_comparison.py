@@ -100,6 +100,25 @@ class DataComparisonTests(unittest.TestCase):
         self.assertEqual(result["order_count"], 4)
         self.assertEqual(result["total_spend"], 1234.5)
 
+    def test_price_list_e_is_reported_for_matched_company(self):
+        rows = [{"source_company": "Alsco Portland", "source_city": "", "source_state": "", "source_zip": ""}]
+        companies = [{"primary_key": "E1", "company": "Alsco Portland", "parent_org": "", "price_list": "E"}]
+
+        result = compare_company_rows(rows, companies)[0]
+        summary = summarize_results([result])
+
+        self.assertEqual(result["price_list"], "E")
+        self.assertTrue(result["is_price_list_e"])
+        self.assertEqual(summary["price_list_e"], 1)
+
+        workbook = load_workbook(BytesIO(build_results_workbook({
+            "filename": "alsco.csv",
+            "company_column": "Company",
+            "results": [result],
+            "summary": summary,
+        })), data_only=True)
+        self.assertEqual(workbook["Comparison"]["N10"].value, "Yes")
+
     def test_plain_language_request_recognizes_price_list_and_spend(self):
         request = interpret_analysis_request(
             "Identify the customer and associated price list, and include how much they have spent with us all time."
