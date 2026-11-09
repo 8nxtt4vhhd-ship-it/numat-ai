@@ -9,6 +9,7 @@ from openpyxl import load_workbook
 
 class FreightAnalysisTests(unittest.TestCase):
     def test_freight_fields_are_always_requested_from_filemaker(self):
+        self.assertIn("Orders::Status", filemaker.get_extra_fields())
         for field in main.FREIGHT_FIELDS + main.FREIGHT_WEIGHT_FIELDS:
             self.assertIn(field, filemaker.get_extra_fields())
 
@@ -20,6 +21,39 @@ class FreightAnalysisTests(unittest.TestCase):
     def test_freight_population_excludes_orders_without_freight_values(self):
         self.assertTrue(main.order_has_freight_data({"extra": {"Incoming Cost": 25}}))
         self.assertFalse(main.order_has_freight_data({"extra": {"Incoming Cost": ""}}))
+
+    def test_freight_filter_only_keeps_complete_orders_and_preserves_incomplete_values(self):
+        order_result = {"orders": [{
+            "customer": "Complete Customer",
+            "order_date": "2026-10-01",
+            "extra": {
+                "Orders::Status": " Complete ",
+                "Incoming Freight": 100,
+                "Incoming Cost": "",
+            },
+        }, {
+            "customer": "Open Customer",
+            "order_date": "2026-10-01",
+            "extra": {
+                "Orders::Status": "Open",
+                "Incoming Freight": 100,
+                "Incoming Cost": 90,
+            },
+        }, {
+            "customer": "Blank Status Customer",
+            "order_date": "2026-10-01",
+            "extra": {
+                "Incoming Freight": 100,
+                "Incoming Cost": 90,
+            },
+        }]}
+
+        filtered = main.filter_freight_orders(order_result, {})
+
+        self.assertEqual([order["customer"] for order in filtered], ["Complete Customer"])
+        self.assertTrue(main.is_complete_freight_order(order_result["orders"][0]))
+        self.assertFalse(main.is_complete_freight_order(order_result["orders"][1]))
+        self.assertEqual(filtered[0]["extra"]["Incoming Cost"], "")
 
     def test_analysis_calculates_current_revenue_and_unit_averages(self):
         orders = [{
@@ -85,11 +119,23 @@ class FreightAnalysisTests(unittest.TestCase):
                 "order_date": "2026-10-01",
                 "extra": {
                     "Customer Ref": "customer-key",
+                    "Orders::Status": "Complete",
                     "Orders::Order No": 1234,
                     "Incoming Freight": 150,
                     "Incoming Cost": 100,
                     "Outgoing Freight": 150,
                     "Outgoing Cost": 100,
+                },
+            }, {
+                "customer": "Open Customer",
+                "amount": 500,
+                "order_date": "2026-10-01",
+                "extra": {
+                    "Customer Ref": "customer-key",
+                    "Orders::Status": "Open",
+                    "Orders::Order No": 1235,
+                    "Incoming Freight": 75,
+                    "Incoming Cost": 60,
                 },
             }],
         }
@@ -132,6 +178,7 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertIn("Customer summary Excel", html)
         self.assertIn("Job detail Excel", html)
         self.assertIn("/freight-job-detail-export.xlsx", html)
+        self.assertIn("1 non-complete job(s) with freight data were excluded", html)
         self.assertIn("data-sort-type", html)
         self.assertIn("country = 'ca'", html)
         self.assertIn("rawPostalCode.slice(0, 3)", html)

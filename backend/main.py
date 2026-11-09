@@ -14012,7 +14012,21 @@ def get_orders_view(
     return render_page(title="Orders", body=body)
 
 
-def filter_freight_orders(order_result, customers_by_key, customer="", city="", state="", start="", end=""):
+def is_complete_freight_order(order):
+    extra = (order or {}).get("extra") or {}
+    return str(extra.get("Orders::Status") or "").strip().casefold() == "complete"
+
+
+def filter_freight_orders(
+    order_result,
+    customers_by_key,
+    customer="",
+    city="",
+    state="",
+    start="",
+    end="",
+    complete_only=True,
+):
     customer_query = str(customer or "").strip().casefold()
     city_query = str(city or "").strip().casefold()
     state_query = str(state or "").strip().upper()
@@ -14020,6 +14034,8 @@ def filter_freight_orders(order_result, customers_by_key, customer="", city="", 
     end_date = parse_iso_date(end)
     filtered_orders = []
     for order in order_result.get("orders", []):
+        if complete_only and not is_complete_freight_order(order):
+            continue
         customer_name = str(order.get("customer") or "")
         customer_record = customers_by_key.get(str(get_order_primary_key(order) or "").strip(), {})
         if customer_query and customer_query not in customer_name.casefold():
@@ -14137,6 +14153,20 @@ def get_freight_analysis_view(
     state_options = '<option value="">All states</option>' + "".join(
         f'<option value="{escape(option)}"{" selected" if option == state_query else ""}>{escape(option)}</option>'
         for option in available_states
+    )
+    scoped_orders = filter_freight_orders(
+        order_result,
+        customers_by_key,
+        customer=customer,
+        city=city,
+        state=state,
+        start=start,
+        end=end,
+        complete_only=False,
+    )
+    excluded_non_complete_freight_orders = sum(
+        1 for order in scoped_orders
+        if order_has_freight_data(order) and not is_complete_freight_order(order)
     )
     filtered_orders = filter_freight_orders(
         order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end
@@ -14552,6 +14582,7 @@ def get_freight_analysis_view(
           </div>
 
           <div class="freight-inline-notes">
+            {f'<p class="freight-inline-note warning-note">{excluded_non_complete_freight_orders:,} non-complete job(s) with freight data were excluded. Only orders with a status of Complete contribute to this analysis and its exports.</p>' if excluded_non_complete_freight_orders else '<p class="freight-inline-note">Only orders with a status of Complete contribute to this analysis and its exports.</p>'}
             {f'<p class="freight-inline-note warning-note">{analysis["invalid_values"]} freight value(s) could not be read and were excluded. Review these in FileMaker.</p>' if analysis['invalid_values'] else ''}
             {f'<p class="freight-inline-note warning-note">Mat counts have not been cached yet. Run the overnight customer/order refresh to enable mat, repair, reject and per-mat figures.</p>' if mat_cache.get('status') != 'ok' else f'<p class="freight-inline-note">Mat counts refreshed {escape(str(mat_cache.get("updated_at") or "unknown"))} from {int(mat_cache.get("record_count") or 0):,} mat records.</p>'}
           </div>

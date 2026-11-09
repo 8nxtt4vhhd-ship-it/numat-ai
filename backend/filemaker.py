@@ -120,6 +120,7 @@ def get_extra_fields():
         fields.append(activity_content_field)
 
     for freight_field in (
+        "Orders::Status",
         "Incoming Freight",
         "Incoming Cost",
         "Outgoing Freight",
