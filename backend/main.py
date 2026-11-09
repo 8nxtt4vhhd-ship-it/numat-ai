@@ -8082,36 +8082,30 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
     monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
     cached_trend_months = {str(item.get("month") or "") for item in monthly_labour_trend}
     if detail_available and force_refresh:
-        if not expected_trend_months.issubset(cached_trend_months):
-            if period_start == trend_start and period_end == trend_end:
-                trend_detail = productivity_detail
+        current_month = trend_end[:7]
+        months_to_refresh = sorted(expected_trend_months - cached_trend_months)
+        if current_month not in months_to_refresh:
+            months_to_refresh.append(current_month)
+        refreshed_rows = []
+        for month_key in months_to_refresh:
+            month_start = f"{month_key}-01"
+            year, month = (int(value) for value in month_key.split("-"))
+            month_last_day = calendar_module.monthrange(year, month)[1]
+            month_end = min(f"{month_key}-{month_last_day:02d}", trend_end)
+            if period_start == month_start and period_end == month_end:
+                month_detail = productivity_detail
             else:
-                trend_detail = fetch_productivity_detail(
+                month_detail = fetch_productivity_detail(
                     force_refresh=True,
-                    period_start=trend_start,
-                    period_end=trend_end,
+                    period_start=month_start,
+                    period_end=month_end,
                     remember_range=False,
                 )
-            refreshed_rows = build_monthly_labour_trend(
-                trend_detail,
-                production_result.get("production_rows", []),
-            )
-        else:
-            current_month_start = f"{trend_end[:7]}-01"
-            if period_start == current_month_start and period_end == trend_end:
-                current_month_detail = productivity_detail
-            else:
-                current_month_detail = fetch_productivity_detail(
-                    force_refresh=True,
-                    period_start=current_month_start,
-                    period_end=trend_end,
-                    remember_range=False,
-                )
-            refreshed_rows = build_monthly_labour_trend(
-                current_month_detail,
+            refreshed_rows.extend(build_monthly_labour_trend(
+                month_detail,
                 production_result.get("production_rows", []),
                 limit=1,
-            )
+            ))
         save_monthly_labour_trend(refreshed_rows)
         monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
     elif detail_available and not monthly_labour_trend:

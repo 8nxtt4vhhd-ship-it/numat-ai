@@ -182,6 +182,7 @@ def get_cached_monthly_labour_trend(period_start, period_end):
         dict(_MONTHLY_LABOUR_TREND_CACHE[key])
         for key in sorted(_MONTHLY_LABOUR_TREND_CACHE)
         if start_key <= key <= end_key
+        and _MONTHLY_LABOUR_TREND_CACHE[key].get("source_complete") is True
     ]
 
 
@@ -191,7 +192,10 @@ def save_monthly_labour_trend(rows):
     for row in rows or []:
         key = str(row.get("month") or "")
         if re.fullmatch(r"\d{4}-\d{2}", key):
-            _MONTHLY_LABOUR_TREND_CACHE[key] = dict(row)
+            if row.get("source_complete") is True:
+                _MONTHLY_LABOUR_TREND_CACHE[key] = dict(row)
+            else:
+                _MONTHLY_LABOUR_TREND_CACHE.pop(key, None)
     _save_production_disk_cache()
 
 
@@ -402,6 +406,7 @@ def build_monthly_labour_trend(productivity_detail, production_rows=None, limit=
             buckets[date_key]["press_repair_value"] += float(item.get("repair_value") or 0)
 
     cycle_status = str(productivity_detail.get("cycle_status") or "").strip().lower()
+    clocking_status = str(productivity_detail.get("clocking_status") or "").strip().lower()
     fallback_values = defaultdict(float)
     for item in production_rows or []:
         item_date = str(item.get("date") or "")[:10]
@@ -419,6 +424,12 @@ def build_monthly_labour_trend(productivity_detail, production_rows=None, limit=
             if fallback_value > 0:
                 press_value = fallback_value
                 value_source = "completed_day_summary"
+        source_complete = (
+            clocking_status in {"", "ok"}
+            and (cycle_status in {"", "ok"} or value_source == "completed_day_summary")
+            and bucket["clocked_hours"] > 0
+            and press_value > 0
+        )
         insurance_cost = prorated_monthly_cost(
             bucket["period_start"], bucket["period_end"], insurance_rate
         )
@@ -429,6 +440,7 @@ def build_monthly_labour_trend(productivity_detail, production_rows=None, limit=
             "labour_cost": labour_cost,
             "press_repair_value": press_value,
             "press_repair_value_source": value_source,
+            "source_complete": source_complete,
             "labour_percentage": labour_cost / press_value * 100 if press_value > 0 else None,
         })
     return rows[-max(1, int(limit)):]

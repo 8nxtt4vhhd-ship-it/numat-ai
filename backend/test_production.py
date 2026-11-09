@@ -23,6 +23,7 @@ class ProductionKpiTests(unittest.TestCase):
             "period_start": "2026-09-01",
             "period_end": "2026-10-15",
             "cycle_status": "ok",
+            "clocking_status": "ok",
             "clockings": [
                 {"date": "2026-09-10", "clocked_hours": 100, "excluded": False},
                 {"date": "2026-09-10", "clocked_hours": 20, "excluded": True},
@@ -42,12 +43,14 @@ class ProductionKpiTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["labour_cost"], 8250)
         self.assertAlmostEqual(rows[0]["labour_percentage"], 41.25)
         self.assertAlmostEqual(rows[1]["labour_cost"], 1800 + (6000 * 15 / 31))
+        self.assertTrue(rows[0]["source_complete"])
 
     def test_monthly_labour_trend_uses_completed_day_value_when_cycles_timeout(self):
         detail = {
             "period_start": "2026-10-01",
             "period_end": "2026-10-31",
             "cycle_status": "timeout",
+            "clocking_status": "ok",
             "clockings": [{"date": "2026-10-10", "clocked_hours": 100, "excluded": False}],
             "cycles": [],
         }
@@ -60,6 +63,20 @@ class ProductionKpiTests(unittest.TestCase):
         self.assertEqual(rows[0]["press_repair_value"], 15000)
         self.assertEqual(rows[0]["press_repair_value_source"], "completed_day_summary")
         self.assertAlmostEqual(rows[0]["labour_percentage"], 55.0)
+        self.assertTrue(rows[0]["source_complete"])
+
+    def test_monthly_labour_trend_rejects_insurance_only_timeout_result(self):
+        rows = build_monthly_labour_trend({
+            "period_start": "2026-09-01",
+            "period_end": "2026-09-30",
+            "clocking_status": "timeout",
+            "cycle_status": "timeout",
+            "clockings": [],
+            "cycles": [],
+        })
+
+        self.assertEqual(rows[0]["labour_cost"], 6000)
+        self.assertFalse(rows[0]["source_complete"])
 
     def test_labour_percentage_uses_completed_day_value_when_cycles_timeout(self):
         detail = {
@@ -118,7 +135,8 @@ class ProductionKpiTests(unittest.TestCase):
                     production._LAST_PRODUCTIVITY_DETAIL_RANGE = ("2026-10-01", "2026-10-06")
                     production._MONTHLY_LABOUR_TREND_CACHE.clear()
                     production._MONTHLY_LABOUR_TREND_CACHE["2026-09"] = {
-                        "month": "2026-09", "labour_cost": 12000, "labour_percentage": 28.5,
+                        "month": "2026-09", "labour_cost": 12000,
+                        "labour_percentage": 28.5, "source_complete": True,
                     }
                     production._PRODUCTION_DISK_CACHE_LOADED = True
                     production._save_production_disk_cache()
