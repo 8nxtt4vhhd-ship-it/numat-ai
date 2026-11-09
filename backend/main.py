@@ -145,10 +145,12 @@ from m365 import (
 )
 from production import (
     apply_press_value_fallback,
+    build_monthly_labour_trend,
     build_production_kpi_payload,
     clear_productivity_detail_cache,
     fetch_production_analysis_data,
     fetch_productivity_detail,
+    get_cached_productivity_detail,
     get_last_productivity_detail_range,
     get_time_bookings_layout,
     operator_key,
@@ -8017,6 +8019,17 @@ def resolve_production_date_range(start="", end="", fallback_days=90):
     return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
 
+def resolve_monthly_labour_trend_range(period_end, months=6):
+    end_date = datetime.strptime(str(period_end), "%Y-%m-%d")
+    start_month = end_date.replace(day=1)
+    for _ in range(max(1, int(months)) - 1):
+        start_month = (
+            start_month.replace(year=start_month.year - 1, month=12)
+            if start_month.month == 1 else start_month.replace(month=start_month.month - 1)
+        )
+    return start_month.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+
+
 @app.get("/production-analysis-view", response_class=HTMLResponse)
 def production_analysis_view(days: int = 90, start: str = "", end: str = "", refresh: str = ""):
     force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -8049,6 +8062,24 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
     detail_available = productivity_detail.get("status") == "ok" and bool(productivity_detail.get("clocking_count"))
     plant_productivity = detail_summary.get("plant_productivity") if detail_available else summary.get("plant_productivity")
     labour_percentage = detail_summary.get("labour_percentage") if detail_available else None
+    trend_start, trend_end = resolve_monthly_labour_trend_range(period_end)
+    if force_refresh:
+        trend_detail = fetch_productivity_detail(
+            force_refresh=True,
+            period_start=trend_start,
+            period_end=trend_end,
+            remember_range=False,
+        )
+        trend_detail = apply_press_value_fallback(
+            trend_detail,
+            production_result.get("production_rows", []),
+        )
+    else:
+        trend_detail = get_cached_productivity_detail(trend_start, trend_end) or productivity_detail
+    monthly_labour_trend = build_monthly_labour_trend(
+        trend_detail,
+        production_result.get("production_rows", []),
+    ) if detail_available else []
     latest_date = format_optional_datetime(latest.get("date")) if latest else "No data"
     body = f"""
         <section class="production-analysis-toolbar">
@@ -8080,6 +8111,7 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
         </div>
         <div class="production-analysis-grid">
             {render_productivity_attention(productivity_detail) if detail_available else ''}
+            {render_monthly_labour_trend(monthly_labour_trend, period_start, period_end) if detail_available else ''}
             {render_department_productivity(productivity_detail.get('department_rows', []), detail_summary) if detail_available else ''}
             <section class="panel production-span-2">
                 <div class="panel-head"><div><span class="home-focus-inline-kicker">Weekly flow trend</span><h2>Department throughput</h2></div></div>
@@ -8745,9 +8777,33 @@ def render_productivity_attention(detail):
         )
         content = f'<ul class="production-attention-list">{content}</ul>'
     return f'''
-        <section class="panel production-span-full production-attention-panel">
+        <section class="panel production-span-2 production-attention-panel">
             <div class="panel-head"><div><span class="home-focus-inline-kicker">Start here</span><h2>Attention required</h2></div><span class="small muted">Booking gaps and available-capacity signals</span></div>
             {content}
+        </section>
+    '''
+
+
+def render_monthly_labour_trend(rows, period_start="", period_end=""):
+    if not rows:
+        body = '<p class="empty-action">No monthly labour history is available for this period.</p>'
+    else:
+        table_rows = "".join(f'''<tr>
+            <td><strong>{escape(str(item.get('label') or ''))}</strong>{'<small>Partial month</small>' if item.get('partial') else ''}</td>
+            <td>{format_production_number(item.get('labour_cost'), currency=True, decimals=0)}</td>
+            <td>{format_production_number(item.get('labour_percentage'), '%', decimals=1)}</td>
+        </tr>''' for item in reversed(rows))
+        body = f'''<div class="production-labour-history-wrap"><table class="production-labour-history-table">
+            <thead><tr><th>Month</th><th>Labour $</th><th>Labour %</th></tr></thead>
+            <tbody>{table_rows}</tbody>
+        </table></div>'''
+    detail_url = f"/production-analysis/productivity-detail?{urlencode({'start': period_start, 'end': period_end})}#labour-calculation"
+    return f'''
+        <section class="panel production-labour-history-panel">
+            <div class="panel-head"><div><span class="home-focus-inline-kicker">Labour trend</span><h2>Monthly labour</h2></div></div>
+            <p class="small muted">Clocked labour plus insurance, using the selected period.</p>
+            {body}
+            <a class="small production-labour-history-link" href="{escape(detail_url)}">View calculation</a>
         </section>
     '''
 
@@ -14188,6 +14244,11 @@ def get_freight_analysis_view(
         customer_records=customers_by_key,
         mat_counts_by_order=mat_cache.get("orders", {}),
     )
+    order_breakdown_rows = build_freight_job_rows(
+        filtered_orders,
+        customer_records=customers_by_key,
+        mat_counts_by_order=mat_cache.get("orders", {}),
+    )
     mat_size_analysis = build_mat_size_freight_analysis(freight_orders, mat_cache, analysis)
     export_query = urlencode({
         key: value for key, value in {
@@ -14215,6 +14276,19 @@ def get_freight_analysis_view(
     table_headers = "".join(
         f'<th data-sort-type="{sort_type}" aria-sort="none"><button type="button" class="freight-sort-button">{escape(label)}<span aria-hidden="true">↕</span></button></th>'
         for label, sort_type in table_columns
+    )
+    order_table_columns = [
+        ("Order", "text"), ("Date", "text"), ("Customer", "text"), ("Location", "text"),
+        ("Repair revenue", "number"), ("Mats", "number"), ("Repairs", "number"), ("Rejects", "number"),
+        ("Incoming revenue", "number"), ("Incoming cost", "number"), ("Incoming variance", "number"),
+        ("Outgoing revenue", "number"), ("Outgoing cost", "number"), ("Outgoing variance", "number"),
+        ("Freight revenue", "number"), ("Freight cost", "number"), ("Contribution", "number"),
+        ("Recovery", "number"), ("Incoming gross", "number"), ("Incoming net", "number"),
+        ("Outgoing gross", "number"), ("Outgoing net", "number"),
+    ]
+    order_table_headers = "".join(
+        f'<th data-sort-type="{sort_type}" aria-sort="none"><button type="button" class="freight-sort-button">{escape(label)}<span aria-hidden="true">↕</span></button></th>'
+        for label, sort_type in order_table_columns
     )
     standard_size_order = {size: index for index, size in enumerate(("3x4", "3x5", "3x10", "4x6"))}
     standard_mat_sizes = sorted(
@@ -14287,6 +14361,36 @@ def get_freight_analysis_view(
         """
         for row in analysis["rows"]
     ) or "<tr><td colspan='24' class='empty'>No freight data matches the current filters. Sync customer data after adding the new FileMaker fields.</td></tr>"
+
+    order_rows = "".join(
+        f"""
+        <tr>
+            <td>{escape(row['order_number'] or '—')}</td>
+            <td>{escape(row['order_date'] or '—')}</td>
+            <td>{escape(row['customer'])}</td>
+            <td>{escape(', '.join(part for part in (row['city'], row['state']) if part) or '—')}</td>
+            <td>{format_currency(row['repair_revenue'])}</td>
+            <td>{row['mats']:,}</td>
+            <td>{row['repairs']:,}</td>
+            <td>{row['rejects']:,}</td>
+            <td>{format_currency(row['incoming_charge'])}</td>
+            <td>{format_currency(row['incoming_cost'])}</td>
+            <td>{format_currency(row['incoming_variance'])}</td>
+            <td>{format_currency(row['outgoing_charge'])}</td>
+            <td>{format_currency(row['outgoing_cost'])}</td>
+            <td>{format_currency(row['outgoing_variance'])}</td>
+            <td>{format_currency(row['total_freight_charge'])}</td>
+            <td>{format_currency(row['total_freight_cost'])}</td>
+            <td>{format_currency(row['freight_variance'])}</td>
+            <td>{f"{row['recovery_percent'] * 100:,.1f}%" if row['recovery_percent'] is not None else '—'}</td>
+            <td>{weight(row['incoming_gross_weight'])}</td>
+            <td>{weight(row['incoming_net_weight'])}</td>
+            <td>{weight(row['outgoing_gross_weight'])}</td>
+            <td>{weight(row['outgoing_net_weight'])}</td>
+        </tr>
+        """
+        for row in order_breakdown_rows
+    ) or "<tr><td colspan='22' class='empty'>No individual orders match the current filters.</td></tr>"
 
     body = f"""
         <style>
@@ -14532,6 +14636,7 @@ def get_freight_analysis_view(
         <div class="freight-tabs" role="tablist" aria-label="Freight analysis sections">
             <button class="freight-tab" id="freight-overview-tab" type="button" role="tab" aria-selected="true" aria-controls="freight-overview">Overview</button>
             <button class="freight-tab" id="freight-breakdown-tab" type="button" role="tab" aria-selected="false" aria-controls="freight-breakdown">Customer breakdown</button>
+            <button class="freight-tab" id="order-breakdown-tab" type="button" role="tab" aria-selected="false" aria-controls="order-breakdown">Order breakdown</button>
             <button class="freight-tab" id="mat-breakdown-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-breakdown">Mat breakdown</button>
         </div>
 
@@ -14616,6 +14721,20 @@ def get_freight_analysis_view(
             </div>
         </section>
 
+        <section class="panel freight-breakdown-panel freight-tab-panel" id="order-breakdown" role="tabpanel" aria-labelledby="order-breakdown-tab" hidden>
+            <div class="freight-breakdown-heading">
+                <h2>Individual order freight breakdown</h2>
+                <a class="button freight-export-button" href="/freight-job-detail-export.xlsx{f'?{export_query}' if export_query else ''}">Order detail Excel</a>
+            </div>
+            <p class="muted">Each completed order with valid freight data matching the filters is shown below.</p>
+            <div class="table-wrap tall-table">
+                <table class="freight-breakdown-table order-breakdown-table">
+                    <thead><tr>{order_table_headers}</tr></thead>
+                    <tbody>{order_rows}</tbody>
+                </table>
+            </div>
+        </section>
+
         <section class="panel mat-breakdown-panel freight-tab-panel" id="mat-breakdown" role="tabpanel" aria-labelledby="mat-breakdown-tab" hidden>
             <div class="mat-breakdown-heading">
                 <div>
@@ -14653,12 +14772,14 @@ def get_freight_analysis_view(
                     const hashes = {{
                         'freight-overview': '#overview',
                         'freight-breakdown': '#breakdown',
+                        'order-breakdown': '#order-breakdown',
                         'mat-breakdown': '#mat-breakdown',
                     }};
                     history.replaceState(null, '', hashes[panelId] || '#overview');
                 }};
                 tabs.forEach(tab => tab.addEventListener('click', () => selectTab(tab)));
                 if (location.hash === '#breakdown') selectTab(document.getElementById('freight-breakdown-tab'));
+                if (location.hash === '#order-breakdown') selectTab(document.getElementById('order-breakdown-tab'));
                 if (location.hash === '#mat-breakdown') selectTab(document.getElementById('mat-breakdown-tab'));
 
                 const summaryValues = [...document.querySelectorAll('.freight-summary-grid strong')];
@@ -14712,31 +14833,32 @@ def get_freight_analysis_view(
                 matPriceInput.addEventListener('input', updateMatComparison);
                 updateMatComparison();
 
-                const freightTable = document.querySelector('.freight-breakdown-table');
-                const sortableHeaders = [...freightTable.querySelectorAll('thead th')];
-                sortableHeaders.forEach((header, columnIndex) => {{
-                    header.querySelector('button').addEventListener('click', () => {{
-                        const descending = header.getAttribute('aria-sort') === 'ascending';
-                        sortableHeaders.forEach(item => item.setAttribute('aria-sort', 'none'));
-                        header.setAttribute('aria-sort', descending ? 'descending' : 'ascending');
-                        const sortType = header.dataset.sortType;
-                        const rows = [...freightTable.tBodies[0].rows];
-                        rows.sort((left, right) => {{
-                            const leftText = left.cells[columnIndex]?.textContent.trim() || '';
-                            const rightText = right.cells[columnIndex]?.textContent.trim() || '';
-                            let comparison;
-                            if (sortType === 'number') {{
-                                const parseNumber = text => {{
-                                    const match = text.replace(/[$,]/g, '').match(/-?\\d+(?:\\.\\d+)?/);
-                                    return match ? Number(match[0]) : Number.NEGATIVE_INFINITY;
-                                }};
-                                comparison = parseNumber(leftText) - parseNumber(rightText);
-                            }} else {{
-                                comparison = leftText.localeCompare(rightText, undefined, {{ numeric: true, sensitivity: 'base' }});
-                            }}
-                            return descending ? -comparison : comparison;
+                document.querySelectorAll('.freight-breakdown-table').forEach(freightTable => {{
+                    const sortableHeaders = [...freightTable.querySelectorAll('thead th')];
+                    sortableHeaders.forEach((header, columnIndex) => {{
+                        header.querySelector('button').addEventListener('click', () => {{
+                            const descending = header.getAttribute('aria-sort') === 'ascending';
+                            sortableHeaders.forEach(item => item.setAttribute('aria-sort', 'none'));
+                            header.setAttribute('aria-sort', descending ? 'descending' : 'ascending');
+                            const sortType = header.dataset.sortType;
+                            const rows = [...freightTable.tBodies[0].rows];
+                            rows.sort((left, right) => {{
+                                const leftText = left.cells[columnIndex]?.textContent.trim() || '';
+                                const rightText = right.cells[columnIndex]?.textContent.trim() || '';
+                                let comparison;
+                                if (sortType === 'number') {{
+                                    const parseNumber = text => {{
+                                        const match = text.replace(/[$,]/g, '').match(/-?\\d+(?:\\.\\d+)?/);
+                                        return match ? Number(match[0]) : Number.NEGATIVE_INFINITY;
+                                    }};
+                                    comparison = parseNumber(leftText) - parseNumber(rightText);
+                                }} else {{
+                                    comparison = leftText.localeCompare(rightText, undefined, {{ numeric: true, sensitivity: 'base' }});
+                                }}
+                                return descending ? -comparison : comparison;
+                            }});
+                            rows.forEach(row => freightTable.tBodies[0].appendChild(row));
                         }});
-                        rows.forEach(row => freightTable.tBodies[0].appendChild(row));
                     }});
                 }});
 
@@ -17441,7 +17563,10 @@ def build_customers_needing_attention_response(order_result=None, crm_result=Non
         if str(forced_customer_name).strip().lower() in late_customer_names:
             continue
         forced_customer_primary_key = get_customer_primary_key(forced_customer_orders)
-        forced_crm_matches = crm_activity_map.get(forced_customer_primary_key, [])
+        forced_crm_matches = merge_recent_sent_emails_with_crm(
+            forced_customer_name,
+            crm_activity_map.get(forced_customer_primary_key, []),
+        )
         forced_customer = build_forced_action_plan_customer(
             forced_customer_name,
             forced_customer_orders,
@@ -17461,7 +17586,10 @@ def build_customers_needing_attention_response(order_result=None, crm_result=Non
             if customer_orders else ""
         )
         customer_primary_key = get_customer_primary_key(customer_orders)
-        crm_matches = crm_activity_map.get(customer_primary_key, [])
+        crm_matches = merge_recent_sent_emails_with_crm(
+            customer["customer"],
+            crm_activity_map.get(customer_primary_key, []),
+        )
         sales_crm_matches = get_sales_outreach_activities(crm_matches)
         latest_crm_activity = crm_matches[0] if crm_matches else None
         latest_sales_crm_activity = sales_crm_matches[0] if sales_crm_matches else None
@@ -17755,7 +17883,10 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
             if get_order_state(order)
         )
         attention = attention_by_customer.get(customer_name)
-        crm_activities = crm_activity_map.get(customer_primary_key, [])
+        crm_activities = merge_recent_sent_emails_with_crm(
+            customer_name,
+            crm_activity_map.get(customer_primary_key, []),
+        )
         sales_crm_activities = get_sales_outreach_activities(crm_activities)
         latest_sales_crm_activity = sales_crm_activities[0] if sales_crm_activities else None
         latest_sales_crm_activity_date = parse_crm_datetime(
@@ -31599,11 +31730,22 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .production-recook-axis {{ display: flex; justify-content: space-between; margin-top: 6px; color: var(--muted); font-size: 10px; }}
 
                     .production-attention-panel {{ border-left: 4px solid #f59e0b; }}
-                    .production-attention-list {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }}
+                    .production-attention-list {{ display: grid; grid-template-columns: 1fr; gap: 10px; max-height: 315px; margin: 0; padding: 0 6px 0 0; overflow-y: auto; list-style: none; }}
                     .production-attention-list li {{ padding: 12px 14px; border: 1px solid #f4dfb7; border-radius: 11px; background: #fffaf0; }}
                     .production-attention-list strong,
                     .production-attention-list span {{ display: block; }}
                     .production-attention-list span {{ margin-top: 3px; color: var(--muted); font-size: 12px; }}
+                    .production-labour-history-panel {{ border-left: 4px solid #2e829f; }}
+                    .production-labour-history-panel > p {{ margin: -8px 0 10px; }}
+                    .production-labour-history-wrap {{ max-height: 276px; overflow-y: auto; }}
+                    .production-labour-history-table {{ width: 100%; border-collapse: collapse; }}
+                    .production-labour-history-table th,
+                    .production-labour-history-table td {{ padding: 10px 8px; border-bottom: 1px solid var(--border); text-align: right; }}
+                    .production-labour-history-table th {{ color: #3f5870; background: #edf4fa; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }}
+                    .production-labour-history-table th:first-child,
+                    .production-labour-history-table td:first-child {{ text-align: left; }}
+                    .production-labour-history-table td small {{ display: block; margin-top: 2px; color: var(--muted); font-size: 9px; }}
+                    .production-labour-history-link {{ display: inline-block; margin-top: 10px; font-weight: 700; }}
 
                     .production-department-table {{ width: 100%; border-collapse: collapse; }}
                     .production-department-table th,
@@ -36976,6 +37118,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .production-attention-list {{
                             grid-template-columns: 1fr;
+                        }}
+
+                        .production-attention-panel,
+                        .production-labour-history-panel {{
+                            grid-column: 1 / -1;
                         }}
 
                         .production-productivity-equation {{

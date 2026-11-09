@@ -159,6 +159,13 @@ def get_last_productivity_detail_range():
     return None
 
 
+def get_cached_productivity_detail(period_start, period_end):
+    """Return a persisted productivity range without contacting FileMaker."""
+    _load_production_disk_cache()
+    cached = _PRODUCTIVITY_DETAIL_CACHE.get((str(period_start), str(period_end)))
+    return cached.get("result") if isinstance(cached, dict) else None
+
+
 def number(value):
     if value is None or isinstance(value, bool):
         return None
@@ -322,6 +329,82 @@ def prorated_monthly_cost(period_start, period_end, monthly_cost):
     return total
 
 
+def build_monthly_labour_trend(productivity_detail, production_rows=None, limit=6):
+    """Summarize the dashboard labour calculation by calendar month."""
+    period_start = str(productivity_detail.get("period_start") or "")[:10]
+    period_end = str(productivity_detail.get("period_end") or "")[:10]
+    try:
+        range_start = datetime.strptime(period_start, "%Y-%m-%d").date()
+        range_end = datetime.strptime(period_end, "%Y-%m-%d").date()
+    except ValueError:
+        return []
+
+    buckets = {}
+    current = range_start.replace(day=1)
+    while current <= range_end:
+        month_end = current.replace(day=calendar.monthrange(current.year, current.month)[1])
+        covered_start = max(range_start, current)
+        covered_end = min(range_end, month_end)
+        key = current.strftime("%Y-%m")
+        buckets[key] = {
+            "month": key,
+            "label": current.strftime("%b %Y"),
+            "period_start": covered_start.strftime("%Y-%m-%d"),
+            "period_end": covered_end.strftime("%Y-%m-%d"),
+            "partial": covered_start != current or covered_end != month_end,
+            "clocked_hours": 0.0,
+            "press_repair_value": 0.0,
+        }
+        current = (
+            current.replace(year=current.year + 1, month=1)
+            if current.month == 12 else current.replace(month=current.month + 1)
+        )
+
+    for item in productivity_detail.get("clockings", []):
+        if item.get("excluded"):
+            continue
+        date_key = str(item.get("date") or "")[:7]
+        if date_key in buckets:
+            buckets[date_key]["clocked_hours"] += float(item.get("clocked_hours") or 0)
+
+    for item in productivity_detail.get("cycles", []):
+        date_key = str(item.get("date") or "")[:7]
+        if date_key in buckets:
+            buckets[date_key]["press_repair_value"] += float(item.get("repair_value") or 0)
+
+    cycle_status = str(productivity_detail.get("cycle_status") or "").strip().lower()
+    fallback_values = defaultdict(float)
+    for item in production_rows or []:
+        item_date = str(item.get("date") or "")[:10]
+        if period_start <= item_date <= period_end:
+            fallback_values[item_date[:7]] += float(item.get("production_revenue_today") or 0)
+
+    hourly_rate = get_average_labour_rate()
+    insurance_rate = get_monthly_insurance_cost()
+    rows = []
+    for bucket in buckets.values():
+        press_value = bucket["press_repair_value"]
+        value_source = "cycles"
+        if (cycle_status and cycle_status != "ok") or press_value <= 0:
+            fallback_value = fallback_values.get(bucket["month"], 0.0)
+            if fallback_value > 0:
+                press_value = fallback_value
+                value_source = "completed_day_summary"
+        insurance_cost = prorated_monthly_cost(
+            bucket["period_start"], bucket["period_end"], insurance_rate
+        )
+        labour_cost = bucket["clocked_hours"] * hourly_rate + insurance_cost
+        rows.append({
+            **bucket,
+            "insurance_cost": insurance_cost,
+            "labour_cost": labour_cost,
+            "press_repair_value": press_value,
+            "press_repair_value_source": value_source,
+            "labour_percentage": labour_cost / press_value * 100 if press_value > 0 else None,
+        })
+    return rows[-max(1, int(limit)):]
+
+
 def _find_all_records(layout, query, batch_size=500, max_records=20000):
     records = []
     offset = 1
@@ -446,7 +529,14 @@ def build_productivity_detail(time_bookings, clockings):
     }
 
 
-def fetch_productivity_detail(days=90, force_refresh=False, today=None, period_start=None, period_end=None):
+def fetch_productivity_detail(
+    days=90,
+    force_refresh=False,
+    today=None,
+    period_start=None,
+    period_end=None,
+    remember_range=True,
+):
     global _LAST_PRODUCTIVITY_DETAIL_RANGE
     today = today or datetime.now()
     end = (
@@ -524,7 +614,8 @@ def fetch_productivity_detail(days=90, force_refresh=False, today=None, period_s
     if result.get("status") == "ok" and result.get("cycle_status") == "ok":
         cache_seconds = get_production_cache_seconds()
         _PRODUCTIVITY_DETAIL_CACHE[cache_key] = {"expires_at": now + cache_seconds, "result": result}
-        _LAST_PRODUCTIVITY_DETAIL_RANGE = cache_key
+        if remember_range:
+            _LAST_PRODUCTIVITY_DETAIL_RANGE = cache_key
         _save_production_disk_cache()
     return result
 

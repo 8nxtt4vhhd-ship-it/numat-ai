@@ -8,6 +8,7 @@ import production
 
 from production import (
     apply_press_value_fallback,
+    build_monthly_labour_trend,
     build_productivity_detail,
     build_production_kpi_payload,
     canonical_department,
@@ -17,6 +18,49 @@ from production import (
 
 
 class ProductionKpiTests(unittest.TestCase):
+    def test_monthly_labour_trend_uses_clocked_cost_insurance_and_cycle_value(self):
+        detail = {
+            "period_start": "2026-09-01",
+            "period_end": "2026-10-15",
+            "cycle_status": "ok",
+            "clockings": [
+                {"date": "2026-09-10", "clocked_hours": 100, "excluded": False},
+                {"date": "2026-09-10", "clocked_hours": 20, "excluded": True},
+                {"date": "2026-10-10", "clocked_hours": 80, "excluded": False},
+            ],
+            "cycles": [
+                {"date": "2026-09-10", "repair_value": 20000},
+                {"date": "2026-10-10", "repair_value": 12000},
+            ],
+        }
+
+        rows = build_monthly_labour_trend(detail)
+
+        self.assertEqual([item["label"] for item in rows], ["Sep 2026", "Oct 2026"])
+        self.assertFalse(rows[0]["partial"])
+        self.assertTrue(rows[1]["partial"])
+        self.assertAlmostEqual(rows[0]["labour_cost"], 8250)
+        self.assertAlmostEqual(rows[0]["labour_percentage"], 41.25)
+        self.assertAlmostEqual(rows[1]["labour_cost"], 1800 + (6000 * 15 / 31))
+
+    def test_monthly_labour_trend_uses_completed_day_value_when_cycles_timeout(self):
+        detail = {
+            "period_start": "2026-10-01",
+            "period_end": "2026-10-31",
+            "cycle_status": "timeout",
+            "clockings": [{"date": "2026-10-10", "clocked_hours": 100, "excluded": False}],
+            "cycles": [],
+        }
+
+        rows = build_monthly_labour_trend(
+            detail,
+            [{"date": "2026-10-10", "production_revenue_today": 15000}],
+        )
+
+        self.assertEqual(rows[0]["press_repair_value"], 15000)
+        self.assertEqual(rows[0]["press_repair_value_source"], "completed_day_summary")
+        self.assertAlmostEqual(rows[0]["labour_percentage"], 55.0)
+
     def test_labour_percentage_uses_completed_day_value_when_cycles_timeout(self):
         detail = {
             "period_start": "2026-10-15", "period_end": "2026-10-15",

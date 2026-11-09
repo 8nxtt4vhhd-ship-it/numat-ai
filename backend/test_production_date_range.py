@@ -5,7 +5,11 @@ from unittest.mock import patch
 from openpyxl import load_workbook
 
 import main
-from main import render_production_date_control, resolve_production_date_range
+from main import (
+    render_production_date_control,
+    resolve_monthly_labour_trend_range,
+    resolve_production_date_range,
+)
 from production import build_production_kpi_payload
 
 
@@ -38,6 +42,12 @@ class ProductionDateRangeTests(unittest.TestCase):
 
         self.assertEqual(start, "2026-10-01")
         self.assertEqual(end, "2026-10-06")
+
+    def test_labour_trend_range_includes_current_and_previous_five_months(self):
+        start, end = resolve_monthly_labour_trend_range("2026-11-08")
+
+        self.assertEqual(start, "2026-06-01")
+        self.assertEqual(end, "2026-11-08")
 
     def test_control_displays_us_formatted_dates(self):
         html = render_production_date_control("2026-10-01", "2026-10-06")
@@ -73,6 +83,24 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertEqual(detail_fetch.call_args.kwargs["period_end"], "2026-10-07")
         self.assertIn("Export press analysis", html)
         self.assertIn("/production-analysis/export-press-analysis?start=2026-10-01&end=2026-10-07", html)
+
+    def test_labour_history_panel_shows_cost_percentage_and_partial_month(self):
+        html = main.render_monthly_labour_trend(
+            [{
+                "label": "Oct 2026",
+                "labour_cost": 7720,
+                "labour_percentage": 32.4,
+                "partial": True,
+            }],
+            "2026-10-01",
+            "2026-10-15",
+        )
+
+        self.assertIn("Monthly labour", html)
+        self.assertIn("Labour $", html)
+        self.assertIn("$7,720", html)
+        self.assertIn("32.4%", html)
+        self.assertIn("Partial month", html)
 
     def test_productivity_detail_page_shows_exact_calculation(self):
         detail = {

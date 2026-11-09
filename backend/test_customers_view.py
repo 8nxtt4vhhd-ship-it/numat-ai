@@ -185,6 +185,77 @@ class CustomersViewTests(unittest.TestCase):
 
         self.assertEqual(summary["display_last_activity"], datetime(2026, 10, 20, 9, 0))
 
+    def test_customer_summary_uses_recent_sales_focus_email_before_crm_sync(self):
+        master_data = {
+            "status": "ok",
+            "customers_by_key": {
+                "customer-1": {"company": "Example Customer", "state": "TX"}
+            },
+        }
+        recent_send = {
+            "customer": "Example Customer",
+            "sender_email": "sales@numatsystems.com",
+            "recipient": "buyer@example.com",
+            "subject": "Checking in",
+            "body_preview": "A recent Sales Focus email.",
+            "sent_at": "2026-11-09 10:15:00",
+            "mode": "email",
+        }
+
+        with patch.object(main, "read_recent_sent_emails", return_value=[recent_send]):
+            summary = main.build_customer_summaries([], {}, {}, master_data)[0]
+
+        self.assertEqual(summary["display_last_activity"], datetime(2026, 11, 9, 10, 15))
+        self.assertEqual(summary["crm_count"], 1)
+
+    def test_action_plan_uses_recent_sales_focus_email_before_crm_sync(self):
+        order = {
+            "customer": "Example Customer",
+            "order_date": "2025-01-01",
+            "extra": {"Customer Ref": "customer-1"},
+        }
+        order_result = {"source": "cache", "status": "ok", "orders": [order]}
+        crm_result = {
+            "source": "filemaker_sync_cache",
+            "status": "ok",
+            "activities": [],
+            "activity_map": {},
+            "counts": {},
+        }
+        recent_send = {
+            "customer": "Example Customer",
+            "sender_email": "sales@numatsystems.com",
+            "recipient": "buyer@example.com",
+            "subject": "Checking in",
+            "body_preview": "A recent Sales Focus email.",
+            "sent_at": "2026-11-09 10:15:00",
+            "mode": "email",
+        }
+        late_customer = {
+            "customer": "Example Customer",
+            "avg_gap": 30,
+            "days_since_last": 600,
+            "priority_score": 80,
+            "action": "Reach out",
+            "days_since_last_activity": None,
+            "last_activity_content": "",
+        }
+        main.clear_attention_response_cache()
+        with (
+            patch.object(main, "find_late_customers", return_value=[late_customer]),
+            patch.object(main, "read_recent_sent_emails", return_value=[recent_send]),
+            patch.object(main, "read_action_plan_dismissals", return_value={}),
+            patch.object(main, "get_forced_action_plan_customers", return_value=[]),
+            patch.object(main, "should_add_ai_explanations", return_value=False),
+            patch.object(main, "get_analysis_today", return_value=datetime(2026, 11, 9, 12, 0)),
+        ):
+            result = main.build_customers_needing_attention_response(order_result, crm_result)
+
+        customer = result["late_customers"][0]
+        self.assertEqual(customer["days_since_last_activity"], 0)
+        self.assertEqual(customer["last_activity_date"], "2026-11-09")
+        self.assertIn("A recent Sales Focus email", customer["display_last_contact"])
+
     def test_branch_context_recovers_activity_mapped_to_sibling_customer(self):
         activity = {
             "date_created": "2026-03-30 16:00:06",
