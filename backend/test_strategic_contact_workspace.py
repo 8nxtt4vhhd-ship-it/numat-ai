@@ -12,15 +12,14 @@ from strategic_contacts_report import _activity_contacts, _activity_text, build_
 
 
 class StrategicContactWorkspaceTests(unittest.TestCase):
-    def test_layer_colours_override_contact_recency_colours(self):
+    def test_all_hierarchy_layers_use_the_same_neutral_contact_card_style(self):
         html = main.render_page(title="Test", body="")
 
         self.assertIn(".hierarchy-section-lead-zone > .hierarchy-contact-card.contact-recent", html)
         self.assertIn(".hierarchy-intermediate-group > .hierarchy-contact-card.contact-recent", html)
-        self.assertIn("background: #f1edff", html)
-        self.assertIn("background: #e8f2ff", html)
-        self.assertIn("background: #edf8f1", html)
-        self.assertIn("background: #fff9ec", html)
+        self.assertIn(".hierarchy-child-stack .hierarchy-contact-card", html)
+        self.assertGreaterEqual(html.count("border-color: #c9d6e5"), 4)
+        self.assertGreaterEqual(html.count("background: #ffffff"), 4)
 
     def test_prudential_has_its_own_chart_group_and_default_structure(self):
         self.assertEqual(main.get_org_chart_group_key("Prudential Financial"), "prudential")
@@ -716,6 +715,12 @@ This older quoted message should not appear.
         self.assertNotIn('action="/strategic-contacts/sync-filemaker"', html)
         self.assertIn("Last contact", html)
         self.assertIn("01/10/2026 14:30", html)
+        details_index = html.index('<details class="org-chart-contact-details">')
+        self.assertLess(html.index("Taylor Smith"), details_index)
+        self.assertLess(html.index("Director"), details_index)
+        self.assertGreater(html.index("In FileMaker"), details_index)
+        self.assertGreater(html.index("Shared / Unassigned"), details_index)
+        self.assertGreater(html.index("01/10/2026 14:30"), details_index)
         self.assertNotIn("Plant review", html)
         self.assertNotIn("We confirmed the next review meeting.", html)
         self.assertIn("org-chart-contact-card contact-recent", html)

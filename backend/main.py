@@ -2882,11 +2882,7 @@ def render_hierarchy_contact_card(
     recent_contact_date = str(recent_contact.get("date_label") or "").strip()
     contact_history_class = get_strategic_contact_recency_class(recent_contact)
     filemaker_presence = (filemaker_presence_map or {}).get(item_id) or {}
-    presence_badge = (
-        "<span class='status-pill warning'>In FileMaker</span>"
-        if filemaker_presence.get("exists")
-        else "<span class='status-pill'>Not in FileMaker</span>"
-    )
+    presence_label = "In FileMaker" if filemaker_presence.get("exists") else "Not in FileMaker"
     actions = ""
     if can_manage_strategic_contacts(get_current_session_user()):
         actions = f"""
@@ -2916,20 +2912,16 @@ def render_hierarchy_contact_card(
             data-contact-id="{escape(item_id)}">
             <div class="org-chart-contact-node">
                 <div class="org-chart-contact-title-row">
-                    <h4 data-contact-field="name">{escape(name)}</h4>{presence_badge}
+                    <h4 data-contact-field="name">{escape(name)}</h4>
                 </div>
                 <p class="org-chart-contact-preview-role" data-contact-field="position">{escape(position)}</p>
-                <p class="small muted hierarchy-card-meta" data-contact-field="region">{escape(region or 'Region not set')}</p>
-                <div class="org-chart-recent-contact hierarchy-recent-contact">
-                    <div class="org-chart-recent-contact-head">
-                        <span>Last contact</span>
-                        <strong>{escape(recent_contact_date or 'No contact recorded')}</strong>
-                    </div>
-                </div>
             </div>
             <details class="org-chart-contact-details">
                 <summary>Details</summary>
                 <div class="org-chart-contact-detail-body">
+                    <p><strong>FileMaker:</strong> {escape(presence_label)}</p>
+                    <p><strong>Location:</strong> <span data-contact-field="region">{escape(region or 'Not set')}</span></p>
+                    <p><strong>Last contact:</strong> {escape(recent_contact_date or 'No contact recorded')}</p>
                     <p><strong>Email:</strong> <span data-contact-field="email">{escape(str(item.get('email') or 'Not set'))}</span></p>
                     <p><strong>Function:</strong> <span data-contact-field="function">{escape(str(item.get('function') or 'Not set'))}</span></p>
                     {actions}
@@ -36097,12 +36089,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .hierarchy-intermediate-group > .hierarchy-contact-card {{
                         width: min(240px, 100%);
                         min-width: 0;
-                        height: 210px;
+                        height: auto;
+                        min-height: 108px;
                         margin: 0 auto;
-                        padding: 10px;
+                        padding: 12px 14px;
                         box-sizing: border-box;
-                        border-color: #76a4e8;
-                        background: #e8f2ff;
+                        border-color: #c9d6e5;
+                        background: #ffffff;
                     }}
 
                     .hierarchy-nested-management-zone {{
@@ -36141,11 +36134,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .hierarchy-section-lead-zone > .hierarchy-contact-card {{
                         width: 100%;
-                        height: 210px;
-                        min-height: 210px;
+                        height: auto;
+                        min-height: 108px;
                         box-sizing: border-box;
-                        border-color: #76a4e8;
-                        background: #f1edff;
+                        border-color: #c9d6e5;
+                        background: #ffffff;
                     }}
 
                     .hierarchy-section-lead-zone > .hierarchy-contact-card:has(.org-chart-contact-details[open]) {{
@@ -36255,15 +36248,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .hierarchy-contact-card {{
                         height: auto;
                         min-height: 0;
-                        padding: 10px;
+                        padding: 12px 14px;
                         cursor: grab;
                     }}
 
                     .hierarchy-c-suite-zone > .hierarchy-contact-card,
                     .hierarchy-manager-group > .hierarchy-contact-card {{
                         width: 100%;
-                        height: 210px;
-                        min-height: 210px;
+                        height: auto;
+                        min-height: 108px;
                         box-sizing: border-box;
                     }}
 
@@ -36451,25 +36444,25 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .hierarchy-manager-group > .hierarchy-contact-card,
                     .hierarchy-manager-group > .hierarchy-contact-card.contact-recent,
                     .hierarchy-manager-group > .hierarchy-contact-card.contact-older {{
-                        border-color: #a9d7bd;
-                        background: #edf8f1;
-                        box-shadow: 0 8px 20px rgba(31, 122, 69, 0.07);
+                        border-color: #c9d6e5;
+                        background: #ffffff;
+                        box-shadow: 0 8px 20px rgba(31, 52, 79, 0.06);
                     }}
 
                     .hierarchy-section-lead-zone > .hierarchy-contact-card,
                     .hierarchy-section-lead-zone > .hierarchy-contact-card.contact-recent,
                     .hierarchy-section-lead-zone > .hierarchy-contact-card.contact-older {{
-                        border-color: #b8a8e8;
-                        background: #f1edff;
-                        box-shadow: 0 8px 20px rgba(103, 80, 164, 0.07);
+                        border-color: #c9d6e5;
+                        background: #ffffff;
+                        box-shadow: 0 8px 20px rgba(31, 52, 79, 0.06);
                     }}
 
                     .hierarchy-intermediate-group > .hierarchy-contact-card,
                     .hierarchy-intermediate-group > .hierarchy-contact-card.contact-recent,
                     .hierarchy-intermediate-group > .hierarchy-contact-card.contact-older {{
-                        border-color: #76a4e8;
-                        background: #e8f2ff;
-                        box-shadow: 0 8px 20px rgba(50, 108, 190, 0.07);
+                        border-color: #c9d6e5;
+                        background: #ffffff;
+                        box-shadow: 0 8px 20px rgba(31, 52, 79, 0.06);
                     }}
 
                     .hierarchy-contact-card .hierarchy-recent-contact {{
@@ -36493,7 +36486,27 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .hierarchy-contact-card .org-chart-contact-preview-role {{
                         min-height: 0;
-                        margin-top: 2px;
+                        margin: 5px 0 2px;
+                        color: #607086;
+                        font-size: 12px;
+                        line-height: 1.3;
+                    }}
+
+                    .hierarchy-contact-card .org-chart-contact-title-row h4 {{
+                        font-size: 15px;
+                        line-height: 1.2;
+                    }}
+
+                    .hierarchy-contact-card .org-chart-contact-details {{
+                        margin-top: 8px;
+                    }}
+
+                    .hierarchy-contact-card .org-chart-contact-detail-body {{
+                        padding-top: 7px;
+                    }}
+
+                    .hierarchy-contact-card .org-chart-contact-detail-body p {{
+                        margin: 4px 0;
                     }}
 
                     .hierarchy-recent-contact {{
@@ -36590,15 +36603,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .hierarchy-child-stack .hierarchy-contact-card {{
-                        box-shadow: none;
-                        border-color: #ead9b8;
-                        background: #fff9ec;
+                        border-color: #c9d6e5;
+                        background: #ffffff;
+                        box-shadow: 0 8px 20px rgba(31, 52, 79, 0.06);
                     }}
 
                     .hierarchy-nested-management-zone .hierarchy-manager-group > .hierarchy-contact-card {{
                         height: auto;
-                        min-height: 188px;
-                        padding: 9px;
+                        min-height: 98px;
+                        padding: 11px 12px;
                     }}
 
                     .hierarchy-nested-management-zone .org-chart-contact-title-row,
