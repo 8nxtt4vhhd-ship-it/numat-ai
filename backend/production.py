@@ -18,6 +18,7 @@ from filemaker import (
 
 _PRODUCTION_CACHE = {"expires_at": 0, "result": None}
 _PRODUCTIVITY_DETAIL_CACHE = {}
+_MONTHLY_LABOUR_TREND_CACHE = {}
 _LAST_PRODUCTIVITY_DETAIL_RANGE = None
 _PRODUCTION_CACHE_LOCK = Lock()
 _PRODUCTION_DISK_CACHE_LOADED = False
@@ -119,6 +120,11 @@ def _load_production_disk_cache():
                     continue
                 start, end = key.split("|", 1)
                 _PRODUCTIVITY_DETAIL_CACHE[(start, end)] = {"expires_at": 0, "result": result}
+        monthly_labour = payload.get("monthly_labour_trend")
+        if isinstance(monthly_labour, dict):
+            for key, row in monthly_labour.items():
+                if re.fullmatch(r"\d{4}-\d{2}", str(key)) and isinstance(row, dict):
+                    _MONTHLY_LABOUR_TREND_CACHE[str(key)] = row
         last_range = payload.get("last_productivity_detail_range")
         if isinstance(last_range, list) and len(last_range) == 2:
             candidate = (str(last_range[0]), str(last_range[1]))
@@ -141,6 +147,7 @@ def _save_production_disk_cache():
                 for (start, end), cached in _PRODUCTIVITY_DETAIL_CACHE.items()
                 if isinstance(cached, dict) and isinstance(cached.get("result"), dict)
             },
+            "monthly_labour_trend": _MONTHLY_LABOUR_TREND_CACHE,
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,6 +171,28 @@ def get_cached_productivity_detail(period_start, period_end):
     _load_production_disk_cache()
     cached = _PRODUCTIVITY_DETAIL_CACHE.get((str(period_start), str(period_end)))
     return cached.get("result") if isinstance(cached, dict) else None
+
+
+def get_cached_monthly_labour_trend(period_start, period_end):
+    """Return saved monthly labour rows within a date range, oldest first."""
+    _load_production_disk_cache()
+    start_key = str(period_start)[:7]
+    end_key = str(period_end)[:7]
+    return [
+        dict(_MONTHLY_LABOUR_TREND_CACHE[key])
+        for key in sorted(_MONTHLY_LABOUR_TREND_CACHE)
+        if start_key <= key <= end_key
+    ]
+
+
+def save_monthly_labour_trend(rows):
+    """Persist calculated monthly labour snapshots alongside the dashboard cache."""
+    _load_production_disk_cache()
+    for row in rows or []:
+        key = str(row.get("month") or "")
+        if re.fullmatch(r"\d{4}-\d{2}", key):
+            _MONTHLY_LABOUR_TREND_CACHE[key] = dict(row)
+    _save_production_disk_cache()
 
 
 def number(value):

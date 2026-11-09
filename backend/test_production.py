@@ -102,6 +102,7 @@ class ProductionKpiTests(unittest.TestCase):
     def test_production_cache_survives_application_restart(self):
         previous_production = dict(production._PRODUCTION_CACHE)
         previous_details = dict(production._PRODUCTIVITY_DETAIL_CACHE)
+        previous_monthly_labour = dict(production._MONTHLY_LABOUR_TREND_CACHE)
         previous_loaded = production._PRODUCTION_DISK_CACHE_LOADED
         previous_last_range = production._LAST_PRODUCTIVITY_DETAIL_RANGE
         try:
@@ -115,12 +116,17 @@ class ProductionKpiTests(unittest.TestCase):
                         "result": {"status": "ok", "booked_hours": 237.1},
                     }
                     production._LAST_PRODUCTIVITY_DETAIL_RANGE = ("2026-10-01", "2026-10-06")
+                    production._MONTHLY_LABOUR_TREND_CACHE.clear()
+                    production._MONTHLY_LABOUR_TREND_CACHE["2026-09"] = {
+                        "month": "2026-09", "labour_cost": 12000, "labour_percentage": 28.5,
+                    }
                     production._PRODUCTION_DISK_CACHE_LOADED = True
                     production._save_production_disk_cache()
 
                     production._PRODUCTION_CACHE.update({"expires_at": 0, "result": None})
                     production._PRODUCTIVITY_DETAIL_CACHE.clear()
                     production._LAST_PRODUCTIVITY_DETAIL_RANGE = None
+                    production._MONTHLY_LABOUR_TREND_CACHE.clear()
                     production._PRODUCTION_DISK_CACHE_LOADED = False
                     production._load_production_disk_cache()
 
@@ -128,12 +134,18 @@ class ProductionKpiTests(unittest.TestCase):
                     restored = production._PRODUCTIVITY_DETAIL_CACHE[("2026-10-01", "2026-10-06")]["result"]
                     self.assertEqual(restored["booked_hours"], 237.1)
                     self.assertEqual(production.get_last_productivity_detail_range(), ("2026-10-01", "2026-10-06"))
+                    self.assertEqual(
+                        production.get_cached_monthly_labour_trend("2026-09-01", "2026-10-31")[0]["labour_cost"],
+                        12000,
+                    )
                     self.assertEqual(oct(os.stat(cache_path).st_mode & 0o777), "0o600")
         finally:
             production._PRODUCTION_CACHE.clear()
             production._PRODUCTION_CACHE.update(previous_production)
             production._PRODUCTIVITY_DETAIL_CACHE.clear()
             production._PRODUCTIVITY_DETAIL_CACHE.update(previous_details)
+            production._MONTHLY_LABOUR_TREND_CACHE.clear()
+            production._MONTHLY_LABOUR_TREND_CACHE.update(previous_monthly_labour)
             production._PRODUCTION_DISK_CACHE_LOADED = previous_loaded
             production._LAST_PRODUCTIVITY_DETAIL_RANGE = previous_last_range
 

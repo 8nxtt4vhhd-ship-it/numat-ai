@@ -150,10 +150,12 @@ from production import (
     clear_productivity_detail_cache,
     fetch_production_analysis_data,
     fetch_productivity_detail,
+    get_cached_monthly_labour_trend,
     get_cached_productivity_detail,
     get_last_productivity_detail_range,
     get_time_bookings_layout,
     operator_key,
+    save_monthly_labour_trend,
 )
 from production_reports import (
     build_ai_analysis_docx,
@@ -8030,6 +8032,19 @@ def resolve_monthly_labour_trend_range(period_end, months=6):
     return start_month.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
 
+def monthly_keys_in_range(period_start, period_end):
+    start = datetime.strptime(str(period_start), "%Y-%m-%d").replace(day=1)
+    end = datetime.strptime(str(period_end), "%Y-%m-%d").replace(day=1)
+    keys = []
+    while start <= end:
+        keys.append(start.strftime("%Y-%m"))
+        start = (
+            start.replace(year=start.year + 1, month=1)
+            if start.month == 12 else start.replace(month=start.month + 1)
+        )
+    return keys
+
+
 @app.get("/production-analysis-view", response_class=HTMLResponse)
 def production_analysis_view(days: int = 90, start: str = "", end: str = "", refresh: str = ""):
     force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -8063,23 +8078,47 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
     plant_productivity = detail_summary.get("plant_productivity") if detail_available else summary.get("plant_productivity")
     labour_percentage = detail_summary.get("labour_percentage") if detail_available else None
     trend_start, trend_end = resolve_monthly_labour_trend_range(period_end)
-    if force_refresh:
-        trend_detail = fetch_productivity_detail(
-            force_refresh=True,
-            period_start=trend_start,
-            period_end=trend_end,
-            remember_range=False,
-        )
-        trend_detail = apply_press_value_fallback(
-            trend_detail,
+    expected_trend_months = set(monthly_keys_in_range(trend_start, trend_end))
+    monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
+    cached_trend_months = {str(item.get("month") or "") for item in monthly_labour_trend}
+    if detail_available and force_refresh:
+        if not expected_trend_months.issubset(cached_trend_months):
+            if period_start == trend_start and period_end == trend_end:
+                trend_detail = productivity_detail
+            else:
+                trend_detail = fetch_productivity_detail(
+                    force_refresh=True,
+                    period_start=trend_start,
+                    period_end=trend_end,
+                    remember_range=False,
+                )
+            refreshed_rows = build_monthly_labour_trend(
+                trend_detail,
+                production_result.get("production_rows", []),
+            )
+        else:
+            current_month_start = f"{trend_end[:7]}-01"
+            if period_start == current_month_start and period_end == trend_end:
+                current_month_detail = productivity_detail
+            else:
+                current_month_detail = fetch_productivity_detail(
+                    force_refresh=True,
+                    period_start=current_month_start,
+                    period_end=trend_end,
+                    remember_range=False,
+                )
+            refreshed_rows = build_monthly_labour_trend(
+                current_month_detail,
+                production_result.get("production_rows", []),
+                limit=1,
+            )
+        save_monthly_labour_trend(refreshed_rows)
+        monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
+    elif detail_available and not monthly_labour_trend:
+        monthly_labour_trend = build_monthly_labour_trend(
+            get_cached_productivity_detail(trend_start, trend_end) or productivity_detail,
             production_result.get("production_rows", []),
         )
-    else:
-        trend_detail = get_cached_productivity_detail(trend_start, trend_end) or productivity_detail
-    monthly_labour_trend = build_monthly_labour_trend(
-        trend_detail,
-        production_result.get("production_rows", []),
-    ) if detail_available else []
     latest_date = format_optional_datetime(latest.get("date")) if latest else "No data"
     body = f"""
         <section class="production-analysis-toolbar">
