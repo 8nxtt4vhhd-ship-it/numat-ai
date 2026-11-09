@@ -259,6 +259,7 @@ _STRATEGIC_DISCOVERY_RESULTS_CACHE = {
 }
 
 _STRATEGIC_CONTACT_WORKSPACE_CACHE_LOCK = Lock()
+_MONTHLY_LABOUR_HISTORY_REFRESH_LOCK = Lock()
 _STRATEGIC_CONTACT_WORKSPACE_CACHE = {
     "key": None,
     "contact_signature": None,
@@ -8045,6 +8046,38 @@ def monthly_keys_in_range(period_start, period_end):
     return keys
 
 
+def start_monthly_labour_history_refresh(month_keys, trend_end, production_rows):
+    """Populate missing completed months without blocking the web request."""
+    months = [key for key in sorted(set(month_keys)) if key != str(trend_end)[:7]]
+    if not months or not _MONTHLY_LABOUR_HISTORY_REFRESH_LOCK.acquire(blocking=False):
+        return False
+
+    def worker():
+        try:
+            for month_key in months:
+                month_start = f"{month_key}-01"
+                year, month = (int(value) for value in month_key.split("-"))
+                month_last_day = calendar_module.monthrange(year, month)[1]
+                month_end = f"{month_key}-{month_last_day:02d}"
+                month_detail = fetch_productivity_detail(
+                    force_refresh=True,
+                    period_start=month_start,
+                    period_end=month_end,
+                    remember_range=False,
+                )
+                rows = build_monthly_labour_trend(
+                    month_detail,
+                    production_rows,
+                    limit=1,
+                )
+                save_monthly_labour_trend(rows)
+        finally:
+            _MONTHLY_LABOUR_HISTORY_REFRESH_LOCK.release()
+
+    Thread(target=worker, daemon=True).start()
+    return True
+
+
 @app.get("/production-analysis-view", response_class=HTMLResponse)
 def production_analysis_view(days: int = 90, start: str = "", end: str = "", refresh: str = ""):
     force_refresh = str(refresh or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -8082,32 +8115,18 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
     monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
     cached_trend_months = {str(item.get("month") or "") for item in monthly_labour_trend}
     if detail_available and force_refresh:
-        current_month = trend_end[:7]
-        months_to_refresh = sorted(expected_trend_months - cached_trend_months)
-        if current_month not in months_to_refresh:
-            months_to_refresh.append(current_month)
-        refreshed_rows = []
-        for month_key in months_to_refresh:
-            month_start = f"{month_key}-01"
-            year, month = (int(value) for value in month_key.split("-"))
-            month_last_day = calendar_module.monthrange(year, month)[1]
-            month_end = min(f"{month_key}-{month_last_day:02d}", trend_end)
-            if period_start == month_start and period_end == month_end:
-                month_detail = productivity_detail
-            else:
-                month_detail = fetch_productivity_detail(
-                    force_refresh=True,
-                    period_start=month_start,
-                    period_end=month_end,
-                    remember_range=False,
-                )
-            refreshed_rows.extend(build_monthly_labour_trend(
-                month_detail,
-                production_result.get("production_rows", []),
-                limit=1,
-            ))
-        save_monthly_labour_trend(refreshed_rows)
+        selected_rows = build_monthly_labour_trend(
+            productivity_detail,
+            production_result.get("production_rows", []),
+        )
+        save_monthly_labour_trend(selected_rows)
         monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
+        cached_trend_months = {str(item.get("month") or "") for item in monthly_labour_trend}
+        start_monthly_labour_history_refresh(
+            expected_trend_months - cached_trend_months,
+            trend_end,
+            production_result.get("production_rows", []),
+        )
     elif detail_available and not monthly_labour_trend:
         monthly_labour_trend = build_monthly_labour_trend(
             get_cached_productivity_detail(trend_start, trend_end) or productivity_detail,

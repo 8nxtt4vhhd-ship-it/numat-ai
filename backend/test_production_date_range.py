@@ -14,6 +14,41 @@ from production import build_production_kpi_payload
 
 
 class ProductionDateRangeTests(unittest.TestCase):
+    def test_missing_labour_months_refresh_in_background_and_skip_current_month(self):
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        detail = {
+            "period_start": "2026-09-01",
+            "period_end": "2026-09-30",
+            "clocking_status": "ok",
+            "cycle_status": "ok",
+            "clockings": [{"date": "2026-09-10", "clocked_hours": 10}],
+            "cycles": [{"date": "2026-09-10", "repair_value": 1000}],
+        }
+        with (
+            patch.object(main, "Thread", ImmediateThread),
+            patch.object(main, "fetch_productivity_detail", return_value=detail) as fetch,
+            patch.object(main, "save_monthly_labour_trend") as save,
+        ):
+            started = main.start_monthly_labour_history_refresh(
+                {"2026-09", "2026-10", "2026-11"},
+                "2026-11-08",
+                [],
+            )
+
+        self.assertTrue(started)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["period_start"] for call in fetch.call_args_list],
+            ["2026-09-01", "2026-10-01"],
+        )
+        self.assertEqual(save.call_count, 2)
+
     def test_cycle_detail_replaces_saved_daily_press_total(self):
         result = {
             "status": "ok",
