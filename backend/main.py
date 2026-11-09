@@ -8111,9 +8111,7 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
     plant_productivity = detail_summary.get("plant_productivity") if detail_available else summary.get("plant_productivity")
     labour_percentage = detail_summary.get("labour_percentage") if detail_available else None
     trend_start, trend_end = resolve_monthly_labour_trend_range(period_end)
-    expected_trend_months = set(monthly_keys_in_range(trend_start, trend_end))
     monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
-    cached_trend_months = {str(item.get("month") or "") for item in monthly_labour_trend}
     if detail_available and force_refresh:
         selected_rows = build_monthly_labour_trend(
             productivity_detail,
@@ -8121,12 +8119,6 @@ def production_analysis_view(days: int = 90, start: str = "", end: str = "", ref
         )
         save_monthly_labour_trend(selected_rows)
         monthly_labour_trend = get_cached_monthly_labour_trend(trend_start, trend_end)
-        cached_trend_months = {str(item.get("month") or "") for item in monthly_labour_trend}
-        start_monthly_labour_history_refresh(
-            expected_trend_months - cached_trend_months,
-            trend_end,
-            production_result.get("production_rows", []),
-        )
     elif detail_available and not monthly_labour_trend:
         monthly_labour_trend = build_monthly_labour_trend(
             get_cached_productivity_detail(trend_start, trend_end) or productivity_detail,
