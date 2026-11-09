@@ -129,7 +129,9 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertIn('id="mat-breakdown-tab"', html)
         self.assertIn("Buy-new price", html)
         self.assertIn('id="freight-breakdown"', html)
-        self.assertIn("Export to Excel", html)
+        self.assertIn("Customer summary Excel", html)
+        self.assertIn("Job detail Excel", html)
+        self.assertIn("/freight-job-detail-export.xlsx", html)
         self.assertIn("data-sort-type", html)
         self.assertIn("country = 'ca'", html)
         self.assertIn("rawPostalCode.slice(0, 3)", html)
@@ -157,6 +159,67 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertEqual(sheet["L5"].value, 200)
         self.assertEqual(sheet.max_column, 27)
         self.assertNotIn("Cost Coverage", [cell.value for cell in sheet[4]])
+        self.assertEqual(sheet.freeze_panes, "A5")
+
+    def test_job_detail_export_itemises_cost_charge_and_variance(self):
+        orders = [{
+            "customer": "Variance Customer",
+            "order_date": "2026-10-15",
+            "amount": 1250,
+            "filemaker_record_id": "987",
+            "extra": {
+                "Customer Ref": "customer-key",
+                "Orders::Order No": "JOB-1001",
+                "Incoming Freight": 80,
+                "Incoming Cost": 100,
+                "Outgoing Freight": 150,
+                "Outgoing Cost": 120,
+                "Act Arrival_Gross Weight": 500,
+                "Despatch_Gross Wright": 450,
+            },
+        }, {
+            "customer": "Variance Customer",
+            "order_date": "2026-10-14",
+            "amount": 800,
+            "extra": {
+                "Customer Ref": "customer-key",
+                "Orders::Order No": "JOB-1000",
+                "Incoming Freight": 90,
+                "Incoming Cost": "",
+            },
+        }]
+        customer_records = {
+            "customer-key": {"city": "Patterson", "state": "CA"},
+        }
+        rows = main.build_freight_job_rows(
+            orders,
+            customer_records=customer_records,
+            mat_counts_by_order={"JOB-1001": {"mats": 12, "repairs": 10, "rejects": 2}},
+        )
+
+        self.assertEqual(rows[0]["order_number"], "JOB-1001")
+        self.assertEqual(rows[0]["incoming_variance"], -20)
+        self.assertEqual(rows[0]["outgoing_variance"], 30)
+        self.assertEqual(rows[0]["freight_variance"], 10)
+        self.assertEqual(rows[0]["recovery_percent"], 230 / 220)
+        self.assertEqual(rows[0]["status"], "Charge exceeds cost")
+        self.assertEqual(rows[0]["mats"], 12)
+        self.assertEqual(rows[1]["status"], "Incomplete incoming data")
+
+        workbook = load_workbook(BytesIO(main.build_freight_job_detail_workbook(
+            rows, {"state": "CA"}
+        )))
+        sheet = workbook["Job freight detail"]
+        headers = [cell.value for cell in sheet[4]]
+        self.assertIn("Incoming Charge", headers)
+        self.assertIn("Incoming Cost", headers)
+        self.assertIn("Freight Variance", headers)
+        self.assertEqual(sheet["A5"].value, "JOB-1001")
+        self.assertEqual(sheet["B5"].value.strftime("%m/%d/%Y"), "10/15/2026")
+        self.assertEqual(sheet["K5"].value, 80)
+        self.assertEqual(sheet["L5"].value, 100)
+        self.assertEqual(sheet["S5"].value, 10)
+        self.assertEqual(sheet["U5"].value, "Charge exceeds cost")
         self.assertEqual(sheet.freeze_panes, "A5")
 
     def test_mat_size_analysis_adds_average_freight_to_repair_price(self):
