@@ -54,6 +54,11 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertTrue(main.is_complete_freight_order(order_result["orders"][0]))
         self.assertFalse(main.is_complete_freight_order(order_result["orders"][1]))
         self.assertEqual(filtered[0]["extra"]["Incoming Cost"], "")
+        self.assertTrue(main.has_incomplete_freight_data(filtered[0]))
+        self.assertEqual(
+            main.filter_freight_orders(order_result, {}, complete_freight_data_only=True),
+            [],
+        )
 
     def test_analysis_calculates_current_revenue_and_unit_averages(self):
         orders = [{
@@ -137,6 +142,19 @@ class FreightAnalysisTests(unittest.TestCase):
                     "Incoming Freight": 75,
                     "Incoming Cost": 60,
                 },
+            }, {
+                "customer": "Missing Data Customer",
+                "amount": 750,
+                "order_date": "2026-10-01",
+                "extra": {
+                    "Customer Ref": "customer-key",
+                    "Orders::Status": "Complete",
+                    "Orders::Order No": 1236,
+                    "Incoming Freight": 90,
+                    "Incoming Cost": "",
+                    "Outgoing Freight": 80,
+                    "Outgoing Cost": 70,
+                },
             }],
         }
         master_data = {
@@ -178,7 +196,11 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertIn("Customer summary Excel", html)
         self.assertIn("Job detail Excel", html)
         self.assertIn("/freight-job-detail-export.xlsx", html)
+        self.assertIn("/freight-missing-data-export.xlsx", html)
+        self.assertIn("Missing data Excel", html)
         self.assertIn("1 non-complete job(s) with freight data were excluded", html)
+        self.assertIn("1 completed job(s) with missing or invalid freight data were excluded", html)
+        self.assertNotIn("Missing Data Customer</td>", html)
         self.assertIn("data-sort-type", html)
         self.assertIn("country = 'ca'", html)
         self.assertIn("rawPostalCode.slice(0, 3)", html)
@@ -252,6 +274,7 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "Charge exceeds cost")
         self.assertEqual(rows[0]["mats"], 12)
         self.assertEqual(rows[1]["status"], "Incomplete incoming data")
+        self.assertEqual(rows[1]["missing_fields"], "Incoming Cost, Outgoing Freight, Outgoing Cost")
 
         workbook = load_workbook(BytesIO(main.build_freight_job_detail_workbook(
             rows, {"state": "CA"}
@@ -268,6 +291,17 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertEqual(sheet["S5"].value, 10)
         self.assertEqual(sheet["U5"].value, "Charge exceeds cost")
         self.assertEqual(sheet.freeze_panes, "A5")
+
+        missing_workbook = load_workbook(BytesIO(main.build_freight_job_detail_workbook(
+            [rows[1]],
+            {"state": "CA"},
+            report_title="Freight Analysis — Missing Data Jobs",
+            sheet_title="Missing freight data",
+            table_name="FreightMissingData",
+        )))
+        missing_sheet = missing_workbook["Missing freight data"]
+        self.assertEqual(missing_sheet["A1"].value, "Freight Analysis — Missing Data Jobs")
+        self.assertEqual(missing_sheet["W5"].value, "Incoming Cost, Outgoing Freight, Outgoing Cost")
 
     def test_mat_size_analysis_adds_average_freight_to_repair_price(self):
         orders = [{"extra": {"Orders::Order No": "1016"}}]

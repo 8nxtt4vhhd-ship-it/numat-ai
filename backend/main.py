@@ -14017,6 +14017,15 @@ def is_complete_freight_order(order):
     return str(extra.get("Orders::Status") or "").strip().casefold() == "complete"
 
 
+def has_complete_freight_data(order):
+    extra = (order or {}).get("extra") or {}
+    return all(parse_freight_value(extra.get(field)) is not None for field in FREIGHT_FIELDS)
+
+
+def has_incomplete_freight_data(order):
+    return order_has_freight_data(order) and not has_complete_freight_data(order)
+
+
 def filter_freight_orders(
     order_result,
     customers_by_key,
@@ -14026,6 +14035,7 @@ def filter_freight_orders(
     start="",
     end="",
     complete_only=True,
+    complete_freight_data_only=False,
 ):
     customer_query = str(customer or "").strip().casefold()
     city_query = str(city or "").strip().casefold()
@@ -14035,6 +14045,8 @@ def filter_freight_orders(
     filtered_orders = []
     for order in order_result.get("orders", []):
         if complete_only and not is_complete_freight_order(order):
+            continue
+        if complete_freight_data_only and not has_complete_freight_data(order):
             continue
         customer_name = str(order.get("customer") or "")
         customer_record = customers_by_key.get(str(get_order_primary_key(order) or "").strip(), {})
@@ -14168,8 +14180,13 @@ def get_freight_analysis_view(
         1 for order in scoped_orders
         if order_has_freight_data(order) and not is_complete_freight_order(order)
     )
+    excluded_incomplete_freight_orders = sum(
+        1 for order in scoped_orders
+        if is_complete_freight_order(order) and has_incomplete_freight_data(order)
+    )
     filtered_orders = filter_freight_orders(
-        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end
+        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end,
+        complete_freight_data_only=True,
     )
     freight_orders = [order for order in filtered_orders if order_has_freight_data(order)]
 
@@ -14583,6 +14600,7 @@ def get_freight_analysis_view(
 
           <div class="freight-inline-notes">
             {f'<p class="freight-inline-note warning-note">{excluded_non_complete_freight_orders:,} non-complete job(s) with freight data were excluded. Only orders with a status of Complete contribute to this analysis and its exports.</p>' if excluded_non_complete_freight_orders else '<p class="freight-inline-note">Only orders with a status of Complete contribute to this analysis and its exports.</p>'}
+            {f'<p class="freight-inline-note warning-note">{excluded_incomplete_freight_orders:,} completed job(s) with missing or invalid freight data were excluded from the dashboard and standard exports. Download Missing data Excel to review them.</p>' if excluded_incomplete_freight_orders else '<p class="freight-inline-note">No completed jobs with missing freight data were excluded.</p>'}
             {f'<p class="freight-inline-note warning-note">{analysis["invalid_values"]} freight value(s) could not be read and were excluded. Review these in FileMaker.</p>' if analysis['invalid_values'] else ''}
             {f'<p class="freight-inline-note warning-note">Mat counts have not been cached yet. Run the overnight customer/order refresh to enable mat, repair, reject and per-mat figures.</p>' if mat_cache.get('status') != 'ok' else f'<p class="freight-inline-note">Mat counts refreshed {escape(str(mat_cache.get("updated_at") or "unknown"))} from {int(mat_cache.get("record_count") or 0):,} mat records.</p>'}
           </div>
@@ -14594,6 +14612,7 @@ def get_freight_analysis_view(
                 <div class="freight-export-actions">
                     <a class="button secondary freight-export-button" href="/freight-analysis-export.xlsx{f'?{export_query}' if export_query else ''}">Customer summary Excel</a>
                     <a class="button freight-export-button" href="/freight-job-detail-export.xlsx{f'?{export_query}' if export_query else ''}">Job detail Excel</a>
+                    <a class="button secondary freight-export-button" href="/freight-missing-data-export.xlsx{f'?{export_query}' if export_query else ''}">Missing data Excel</a>
                 </div>
             </div>
             <p class="muted">Mileage and cost-per-mile populate after location lookup; estimates use straight-line distance with a 1.18 road-distance factor.</p>
@@ -14896,6 +14915,7 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
             field for field in FREIGHT_FIELDS
             if extra.get(field) not in {None, ""} and values[field] is None
         ]
+        missing_fields = [field for field in FREIGHT_FIELDS if values[field] is None]
         incoming_present = values["Incoming Freight"] is not None or values["Incoming Cost"] is not None
         outgoing_present = values["Outgoing Freight"] is not None or values["Outgoing Cost"] is not None
         incomplete_legs = []
@@ -14912,8 +14932,11 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
         variance = total_charge - total_cost
         if invalid_fields:
             status = "Invalid freight value"
-        elif incomplete_legs:
-            status = f"Incomplete {' & '.join(incomplete_legs)} data"
+        elif missing_fields:
+            status = (
+                f"Incomplete {' & '.join(incomplete_legs)} data"
+                if incomplete_legs else "Incomplete freight data"
+            )
         elif variance < -0.005:
             status = "Undercharged"
         elif variance > 0.005:
@@ -14944,6 +14967,7 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
             "recovery_percent": (total_charge / total_cost) if total_cost else None,
             "status": status,
             "invalid_fields": ", ".join(invalid_fields),
+            "missing_fields": ", ".join(missing_fields),
             "incoming_gross_weight": weights["Act Arrival_Gross Weight"],
             "incoming_net_weight": weights["Act Arrival_Nett Weight"],
             "outgoing_gross_weight": weights["Despatch_Gross Wright"],
@@ -14953,7 +14977,13 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
     return rows
 
 
-def build_freight_job_detail_workbook(rows, filters=None):
+def build_freight_job_detail_workbook(
+    rows,
+    filters=None,
+    report_title="Freight Analysis — Individual Job Detail",
+    sheet_title="Job freight detail",
+    table_name="FreightJobDetail",
+):
     from io import BytesIO
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -14963,10 +14993,10 @@ def build_freight_job_detail_workbook(rows, filters=None):
     filters = filters or {}
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "Job freight detail"
-    sheet["A1"] = "Freight Analysis — Individual Job Detail"
+    sheet.title = sheet_title
+    sheet["A1"] = report_title
     sheet["A1"].font = Font(size=16, bold=True, color="1F2937")
-    sheet.merge_cells("A1:Z1")
+    sheet.merge_cells("A1:AA1")
     active_filters = ", ".join(
         f"{label}: {filters.get(key)}"
         for key, label in (("customer", "Customer"), ("city", "City"), ("state", "State"), ("start", "From"), ("end", "To"))
@@ -14974,14 +15004,14 @@ def build_freight_job_detail_workbook(rows, filters=None):
     ) or "No filters applied"
     sheet["A2"] = active_filters
     sheet["A2"].font = Font(size=10, italic=True, color="52657A")
-    sheet.merge_cells("A2:Z2")
+    sheet.merge_cells("A2:AA2")
     headers = [
         "Job No", "Order Date", "Customer", "City", "State", "FileMaker Record ID",
         "Repair Revenue", "Mats", "Repairs", "Rejects",
         "Incoming Charge", "Incoming Cost", "Incoming Variance",
         "Outgoing Charge", "Outgoing Cost", "Outgoing Variance",
         "Total Freight Charge", "Total Freight Cost", "Freight Variance", "Recovery %",
-        "Review Status", "Invalid Fields", "Incoming Gross Weight (lb)", "Incoming Net Weight (lb)",
+        "Review Status", "Invalid Fields", "Missing Fields", "Incoming Gross Weight (lb)", "Incoming Net Weight (lb)",
         "Outgoing Gross Weight (lb)", "Outgoing Net Weight (lb)",
     ]
     sheet.append([])
@@ -14995,7 +15025,7 @@ def build_freight_job_detail_workbook(rows, filters=None):
             item["incoming_charge"], item["incoming_cost"], item["incoming_variance"],
             item["outgoing_charge"], item["outgoing_cost"], item["outgoing_variance"],
             item["total_freight_charge"], item["total_freight_cost"], item["freight_variance"],
-            item["recovery_percent"], item["status"], item["invalid_fields"],
+            item["recovery_percent"], item["status"], item["invalid_fields"], item["missing_fields"],
             item["incoming_gross_weight"], item["incoming_net_weight"],
             item["outgoing_gross_weight"], item["outgoing_net_weight"],
         ])
@@ -15005,9 +15035,9 @@ def build_freight_job_detail_workbook(rows, filters=None):
         cell.alignment = Alignment(wrap_text=True, vertical="center")
     sheet.row_dimensions[header_row].height = 34
     sheet.freeze_panes = "A5"
-    sheet.auto_filter.ref = f"A{header_row}:Z{sheet.max_row}"
+    sheet.auto_filter.ref = f"A{header_row}:AA{sheet.max_row}"
     if rows:
-        table = Table(displayName="FreightJobDetail", ref=f"A{header_row}:Z{sheet.max_row}")
+        table = Table(displayName=table_name, ref=f"A{header_row}:AA{sheet.max_row}")
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
             showRowStripes=True, showColumnStripes=False,
@@ -15019,7 +15049,7 @@ def build_freight_job_detail_workbook(rows, filters=None):
         for column in currency_columns:
             sheet.cell(row_number, column).number_format = '$#,##0.00;[Red]-$#,##0.00'
         sheet.cell(row_number, 20).number_format = "0.0%"
-        for column in range(23, 27):
+        for column in range(24, 28):
             sheet.cell(row_number, column).number_format = '#,##0.00'
         status_cell = sheet.cell(row_number, 21)
         if status_cell.value == "Undercharged":
@@ -15028,7 +15058,7 @@ def build_freight_job_detail_workbook(rows, filters=None):
         elif str(status_cell.value or "").startswith(("Incomplete", "Invalid")):
             status_cell.fill = PatternFill("solid", fgColor="FFF4CC")
             status_cell.font = Font(color="8A5A00", bold=True)
-    widths = [14, 13, 34, 16, 9, 18, 16, 10, 10, 10, 16, 16, 17, 16, 16, 17, 19, 18, 17, 13, 22, 24, 22, 21, 22, 21]
+    widths = [14, 13, 34, 16, 9, 18, 16, 10, 10, 10, 16, 16, 17, 16, 16, 17, 19, 18, 17, 13, 22, 24, 34, 22, 21, 22, 21]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     output = BytesIO()
@@ -15051,7 +15081,8 @@ def export_freight_analysis_workbook(
         return PlainTextResponse("Freight data is currently unavailable.", status_code=503)
     customers_by_key = master_data_result.get("customers_by_key", {})
     filtered_orders = filter_freight_orders(
-        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end
+        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end,
+        complete_freight_data_only=True,
     )
     mat_cache = read_filemaker_mat_counts_cache()
     analysis = build_freight_analysis(
@@ -15085,7 +15116,8 @@ def export_freight_job_detail_workbook(
         return PlainTextResponse("Freight data is currently unavailable.", status_code=503)
     customers_by_key = master_data_result.get("customers_by_key", {})
     filtered_orders = filter_freight_orders(
-        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end
+        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end,
+        complete_freight_data_only=True,
     )
     mat_cache = read_filemaker_mat_counts_cache()
     rows = build_freight_job_rows(
@@ -15097,6 +15129,45 @@ def export_freight_job_detail_workbook(
         "customer": customer, "city": city, "state": state, "start": start, "end": end,
     })
     filename = f"freight-job-detail-{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/freight-missing-data-export.xlsx")
+def export_freight_missing_data_workbook(
+    customer: str = "",
+    city: str = "",
+    state: str = "",
+    start: str = "",
+    end: str = "",
+):
+    order_result = get_orders_for_analysis()
+    master_data_result = fetch_filemaker_customer_data()
+    order_result = filter_order_result_to_customer_type(order_result, master_data_result)
+    if order_result.get("status") != "ok":
+        return PlainTextResponse("Freight data is currently unavailable.", status_code=503)
+    customers_by_key = master_data_result.get("customers_by_key", {})
+    filtered_orders = filter_freight_orders(
+        order_result, customers_by_key, customer=customer, city=city, state=state, start=start, end=end
+    )
+    missing_data_orders = [order for order in filtered_orders if has_incomplete_freight_data(order)]
+    mat_cache = read_filemaker_mat_counts_cache()
+    rows = build_freight_job_rows(
+        missing_data_orders,
+        customer_records=customers_by_key,
+        mat_counts_by_order=mat_cache.get("orders", {}),
+    )
+    content = build_freight_job_detail_workbook(
+        rows,
+        {"customer": customer, "city": city, "state": state, "start": start, "end": end},
+        report_title="Freight Analysis — Missing Data Jobs",
+        sheet_title="Missing freight data",
+        table_name="FreightMissingData",
+    )
+    filename = f"freight-missing-data-{datetime.now().strftime('%Y-%m-%d')}.xlsx"
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
