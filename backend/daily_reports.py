@@ -122,10 +122,20 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
         if str(item.get("date") or "") == report_day_hint
     ]
     productivity_detail = dict(productivity_detail)
-    productivity_detail["day_summary"] = build_productivity_detail(
+    day_summary = build_productivity_detail(
         day_bookings,
         day_clockings,
     ).get("summary", {})
+    day_manager_clocked_hours = sum(
+        float(item.get("clocked_hours") or 0)
+        for item in day_clockings
+        if item.get("manager") and not item.get("excluded")
+    )
+    day_summary["manager_clocked_hours"] = day_manager_clocked_hours
+    day_summary["labour_clocked_hours"] = (
+        float(day_summary.get("clocked_hours") or 0) + day_manager_clocked_hours
+    )
+    productivity_detail["day_summary"] = day_summary
     fresh_orders_result = fetch_order_records(limit=get_filemaker_order_limit())
     if fresh_orders_result.get("status") == "ok":
         write_filemaker_orders_cache(fresh_orders_result)

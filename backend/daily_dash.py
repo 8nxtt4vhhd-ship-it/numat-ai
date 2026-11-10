@@ -139,6 +139,14 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
         (productivity_detail.get("summary") or {}).get("plant_productivity")
         if raw_productivity_available else productivity(month_operators)
     )
+    labour_hours_today = (
+        (productivity_detail.get("day_summary") or {}).get("labour_clocked_hours")
+        if raw_productivity_available else sum(item.get("clocked_hours") or 0 for item in day_operators)
+    )
+    labour_hours_mtd = (
+        (productivity_detail.get("summary") or {}).get("labour_clocked_hours")
+        if raw_productivity_available else sum(item.get("clocked_hours") or 0 for item in month_operators)
+    )
     return {
         "report_date": report_date,
         "generated_at": datetime.now().astimezone().isoformat(timespec="minutes"),
@@ -156,8 +164,8 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
         "mats_mtd": sum(sum(item.get(f"ff{number}_mats") or 0 for number in (1, 2, 3)) for item in month_rows),
         "cycles_today": sum(item.get("cycles") or 0 for item in presses),
         "cycles_mtd": sum(sum(item.get(f"ff{number}_cycles") or 0 for number in (1, 2, 3)) for item in month_rows),
-        "labour_hours_today": sum(item.get("clocked_hours") or 0 for item in day_operators),
-        "labour_hours_mtd": sum(item.get("clocked_hours") or 0 for item in month_operators),
+        "labour_hours_today": labour_hours_today,
+        "labour_hours_mtd": labour_hours_mtd,
         "labour_pct_today": latest.get("labour_percentage"),
         "labour_pct_mtd": labour_pct_mtd,
         "productivity_today": productivity_today,
