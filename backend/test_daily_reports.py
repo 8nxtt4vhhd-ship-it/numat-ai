@@ -67,8 +67,8 @@ class DailyDashTests(unittest.TestCase):
         productivity_detail = {
             "status": "ok",
             "clocking_count": 10,
-            "summary": {"plant_productivity": 95.4, "labour_clocked_hours": 291.5},
-            "day_summary": {"plant_productivity": 91.2, "labour_clocked_hours": 96.0},
+            "summary": {"plant_productivity": 95.4, "clocked_hours": 260.2, "labour_clocked_hours": 291.5},
+            "day_summary": {"plant_productivity": 91.2, "clocked_hours": 85.75, "labour_clocked_hours": 96.0},
             "cycle_status": "ok",
             "cycles": [],
         }
@@ -82,10 +82,10 @@ class DailyDashTests(unittest.TestCase):
 
         self.assertEqual(payload["productivity_today"], 91.2)
         self.assertEqual(payload["productivity_mtd"], 95.4)
-        self.assertEqual(payload["labour_hours_today"], 96.0)
-        self.assertEqual(payload["labour_hours_mtd"], 291.5)
+        self.assertEqual(payload["labour_hours_today"], 85.75)
+        self.assertEqual(payload["labour_hours_mtd"], 260.2)
 
-    def test_daily_report_labour_hours_include_manager_clockings(self):
+    def test_daily_report_visible_labour_hours_exclude_manager_clockings(self):
         detail = {
             "status": "ok",
             "clocking_count": 2,
@@ -96,7 +96,7 @@ class DailyDashTests(unittest.TestCase):
             ],
             "cycles": [],
             "cycle_status": "ok",
-            "summary": {"plant_productivity": 90, "labour_clocked_hours": 10},
+            "summary": {"plant_productivity": 90, "clocked_hours": 8, "labour_clocked_hours": 10},
         }
         with (
             patch.object(daily_reports, "fetch_production_analysis_data", return_value=sample_production_result()),
@@ -110,10 +110,10 @@ class DailyDashTests(unittest.TestCase):
                 {"status": "ok", "orders": []},
                 {"status": "ok"},
                 requested_day=date(2026, 8, 18),
-                productivity_detail={**detail, "day_summary": {"plant_productivity": 0, "labour_clocked_hours": 10}},
+                productivity_detail={**detail, "day_summary": {"plant_productivity": 0, "clocked_hours": 8, "labour_clocked_hours": 10}},
             )
 
-        self.assertEqual(report["payload"]["labour_hours_today"], 10)
+        self.assertEqual(report["payload"]["labour_hours_today"], 8)
 
     def test_pdf_is_valid(self):
         payload = build_daily_dash_payload(sample_production_result(), {"status": "ok", "orders": []}, daily_invoice_target=8000)
