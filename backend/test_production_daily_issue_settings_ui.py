@@ -43,6 +43,57 @@ class ProductionDailyIssueSettingsUiTests(unittest.TestCase):
         self.assertIn("Preview selected date", html)
         self.assertIn("Send selected date now", html)
         self.assertIn("All enabled reports", html)
+        self.assertIn("Production labour history cache", html)
+        self.assertIn("Load selected month", html)
+        self.assertIn("the production dashboard never loads historical months automatically", html)
+
+    def test_admin_can_cache_one_complete_labour_month(self):
+        detail = {
+            "period_start": "2026-10-01",
+            "period_end": "2026-10-31",
+            "status": "ok",
+            "clocking_status": "ok",
+            "cycle_status": "ok",
+            "clockings": [{"date": "2026-10-10", "clocked_hours": 100, "excluded": False}],
+            "cycles": [{"date": "2026-10-10", "repair_value": 20000}],
+        }
+        with (
+            patch.object(main, "get_current_session_user", return_value={"username": "admin", "role": "admin"}),
+            patch.object(main, "fetch_productivity_detail", return_value=detail) as fetch,
+            patch.object(main, "fetch_production_analysis_data", return_value={"production_rows": []}),
+            patch.object(main, "save_monthly_labour_trend") as save,
+            patch.object(main, "record_audit_event"),
+        ):
+            response = main.post_admin_production_labour_cache("2026-10")
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("cached%20successfully", response.headers["location"])
+        self.assertEqual(fetch.call_args.kwargs["period_start"], "2026-10-01")
+        self.assertEqual(fetch.call_args.kwargs["period_end"], "2026-10-31")
+        self.assertTrue(save.call_args.args[0][0]["source_complete"])
+
+    def test_incomplete_labour_month_is_rejected(self):
+        detail = {
+            "period_start": "2026-10-01",
+            "period_end": "2026-10-31",
+            "status": "partial",
+            "clocking_status": "timeout",
+            "cycle_status": "timeout",
+            "clockings": [],
+            "cycles": [],
+        }
+        with (
+            patch.object(main, "get_current_session_user", return_value={"username": "admin", "role": "admin"}),
+            patch.object(main, "fetch_productivity_detail", return_value=detail),
+            patch.object(main, "fetch_production_analysis_data", return_value={"production_rows": []}),
+            patch.object(main, "save_monthly_labour_trend") as save,
+            patch.object(main, "record_audit_event"),
+        ):
+            response = main.post_admin_production_labour_cache("2026-10")
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("was%20not%20cached", response.headers["location"])
+        save.assert_not_called()
 
     def test_admin_menu_links_directly_to_production_email_settings(self):
         with patch.object(main, "get_current_session_user", return_value={"username": "admin", "role": "admin"}):

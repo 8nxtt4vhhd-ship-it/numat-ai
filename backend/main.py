@@ -259,7 +259,6 @@ _STRATEGIC_DISCOVERY_RESULTS_CACHE = {
 }
 
 _STRATEGIC_CONTACT_WORKSPACE_CACHE_LOCK = Lock()
-_MONTHLY_LABOUR_HISTORY_REFRESH_LOCK = Lock()
 _STRATEGIC_CONTACT_WORKSPACE_CACHE = {
     "key": None,
     "contact_signature": None,
@@ -6493,6 +6492,32 @@ def get_admin_settings_page(message: str = "", error: str = ""):
     daily_issue_test_date = datetime.now().strftime("%Y-%m-%d")
     through_date = (datetime.now() - timedelta(days=1)).date()
     elapsed_target = calculate_elapsed_invoice_target(through_date, daily_target)
+    labour_cache_months = []
+    month_cursor = datetime.now().replace(day=1) - timedelta(days=1)
+    for _ in range(5):
+        month_key = month_cursor.strftime("%Y-%m")
+        month_start = f"{month_key}-01"
+        month_end = f"{month_key}-{calendar_module.monthrange(month_cursor.year, month_cursor.month)[1]:02d}"
+        cached_rows = get_cached_monthly_labour_trend(month_start, month_end)
+        cached_row = next((item for item in cached_rows if item.get("month") == month_key), None)
+        labour_cache_months.append({
+            "key": month_key,
+            "label": month_cursor.strftime("%B %Y"),
+            "cached": bool(cached_row),
+            "labour_cost": cached_row.get("labour_cost") if cached_row else None,
+            "labour_percentage": cached_row.get("labour_percentage") if cached_row else None,
+        })
+        month_cursor = month_cursor.replace(day=1) - timedelta(days=1)
+    labour_cache_options = "".join(
+        f'<option value="{item["key"]}">{escape(item["label"])} — {"cached" if item["cached"] else "not loaded"}</option>'
+        for item in labour_cache_months
+    )
+    labour_cache_rows = "".join(f'''<tr>
+        <td>{escape(item['label'])}</td>
+        <td>{'Cached' if item['cached'] else 'Not loaded'}</td>
+        <td>{format_production_number(item['labour_cost'], currency=True, decimals=0) if item['cached'] else '—'}</td>
+        <td>{format_production_number(item['labour_percentage'], '%', decimals=1) if item['cached'] else '—'}</td>
+    </tr>''' for item in labour_cache_months)
     status_markup = f"<p class='status ok'>{escape(message)}</p>" if message else f"<p class='status error'>{escape(error)}</p>" if error else ""
     body = f"""
         <section class="panel user-accounts-panel settings-compact">
@@ -6526,6 +6551,15 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                         <button class="button" type="submit">Refresh KPI dashboard data</button>
                     </form>
                 </div>
+            </div>
+            <div class="action-column" id="production-labour-cache" style="margin-top:18px;scroll-margin-top:18px">
+                <div class="panel-head"><div><h3>Production labour history cache</h3><p class="subtle">Load one completed month at a time. This runs only when an administrator presses the button; the production dashboard never loads historical months automatically.</p></div></div>
+                <div class="table-wrap"><table class="production-department-table"><thead><tr><th>Month</th><th>Status</th><th>Labour $</th><th>Labour %</th></tr></thead><tbody>{labour_cache_rows}</tbody></table></div>
+                <form method="post" action="/admin-settings/production-labour-cache" class="login-form" style="margin-top:12px">
+                    <label><span class="label">Completed month to load</span><select name="month" required>{labour_cache_options}</select></label>
+                    <p class="subtle">Wait for this request to finish before loading another month. Incomplete or timed-out FileMaker results are rejected and will not replace a valid cached month.</p>
+                    <button class="button secondary" type="submit">Load selected month</button>
+                </form>
             </div>
             <div class="action-column" id="production-daily-issues" style="margin-top:18px;scroll-margin-top:18px">
                 <div class="panel-head"><div><h3>Daily management checks emails</h3><p class="subtle">Three focused reports share one nightly schedule. Saturday and Sunday are excluded. Each reported issue includes a secure one-click comment link.</p></div><a class="button secondary small-button" href="/management-checks-history">View report history</a></div>
@@ -6566,6 +6600,71 @@ def get_admin_settings_page(message: str = "", error: str = ""):
         </section>
     """
     return render_page(title="System Settings", body=body)
+
+
+@app.post("/admin-settings/production-labour-cache")
+def post_admin_production_labour_cache(month: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(
+            url="/admin-settings?error=" + quote("You do not have permission to load production labour history."),
+            status_code=303,
+        )
+    month_key = str(month or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", month_key):
+        return RedirectResponse(
+            url="/admin-settings?error=" + quote("Select a valid completed month.") + "#production-labour-cache",
+            status_code=303,
+        )
+    try:
+        month_start_date = datetime.strptime(f"{month_key}-01", "%Y-%m-%d")
+    except ValueError:
+        return RedirectResponse(
+            url="/admin-settings?error=" + quote("Select a valid completed month.") + "#production-labour-cache",
+            status_code=303,
+        )
+    current_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if month_start_date >= current_month or month_start_date < current_month - timedelta(days=370):
+        return RedirectResponse(
+            url="/admin-settings?error=" + quote("Only a completed month from the past year can be loaded.") + "#production-labour-cache",
+            status_code=303,
+        )
+    month_end = f"{month_key}-{calendar_module.monthrange(month_start_date.year, month_start_date.month)[1]:02d}"
+    detail = fetch_productivity_detail(
+        force_refresh=True,
+        period_start=f"{month_key}-01",
+        period_end=month_end,
+        remember_range=False,
+    )
+    production_result = fetch_production_analysis_data()
+    rows = build_monthly_labour_trend(detail, production_result.get("production_rows", []), limit=1)
+    row = rows[0] if rows else None
+    if not row or row.get("source_complete") is not True:
+        status_detail = f"clockings: {detail.get('clocking_status') or 'unknown'}; cycles: {detail.get('cycle_status') or 'unknown'}"
+        record_audit_event(
+            "production-labour-cache",
+            target=month_key,
+            details=f"Rejected incomplete monthly result ({status_detail}).",
+            user=current_user,
+            area="system-settings",
+            status="failed",
+        )
+        return RedirectResponse(
+            url="/admin-settings?error=" + quote(f"{month_start_date.strftime('%B %Y')} was not cached because FileMaker did not return a complete result ({status_detail}).") + "#production-labour-cache",
+            status_code=303,
+        )
+    save_monthly_labour_trend([row])
+    record_audit_event(
+        "production-labour-cache",
+        target=month_key,
+        details=f"Cached labour cost ${row['labour_cost']:,.0f} and labour percentage {row['labour_percentage']:.1f}%.",
+        user=current_user,
+        area="system-settings",
+    )
+    return RedirectResponse(
+        url="/admin-settings?message=" + quote(f"{month_start_date.strftime('%B %Y')} labour history cached successfully.") + "#production-labour-cache",
+        status_code=303,
+    )
 
 
 @app.post("/admin-settings/invoice-target")
@@ -8031,51 +8130,6 @@ def resolve_monthly_labour_trend_range(period_end, months=6):
             if start_month.month == 1 else start_month.replace(month=start_month.month - 1)
         )
     return start_month.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-
-
-def monthly_keys_in_range(period_start, period_end):
-    start = datetime.strptime(str(period_start), "%Y-%m-%d").replace(day=1)
-    end = datetime.strptime(str(period_end), "%Y-%m-%d").replace(day=1)
-    keys = []
-    while start <= end:
-        keys.append(start.strftime("%Y-%m"))
-        start = (
-            start.replace(year=start.year + 1, month=1)
-            if start.month == 12 else start.replace(month=start.month + 1)
-        )
-    return keys
-
-
-def start_monthly_labour_history_refresh(month_keys, trend_end, production_rows):
-    """Populate missing completed months without blocking the web request."""
-    months = [key for key in sorted(set(month_keys)) if key != str(trend_end)[:7]]
-    if not months or not _MONTHLY_LABOUR_HISTORY_REFRESH_LOCK.acquire(blocking=False):
-        return False
-
-    def worker():
-        try:
-            for month_key in months:
-                month_start = f"{month_key}-01"
-                year, month = (int(value) for value in month_key.split("-"))
-                month_last_day = calendar_module.monthrange(year, month)[1]
-                month_end = f"{month_key}-{month_last_day:02d}"
-                month_detail = fetch_productivity_detail(
-                    force_refresh=True,
-                    period_start=month_start,
-                    period_end=month_end,
-                    remember_range=False,
-                )
-                rows = build_monthly_labour_trend(
-                    month_detail,
-                    production_rows,
-                    limit=1,
-                )
-                save_monthly_labour_trend(rows)
-        finally:
-            _MONTHLY_LABOUR_HISTORY_REFRESH_LOCK.release()
-
-    Thread(target=worker, daemon=True).start()
-    return True
 
 
 @app.get("/production-analysis-view", response_class=HTMLResponse)
