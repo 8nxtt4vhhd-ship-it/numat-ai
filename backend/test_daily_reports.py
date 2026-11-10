@@ -37,6 +37,26 @@ def sample_production_result():
 
 
 class DailyDashTests(unittest.TestCase):
+    def test_newest_orders_uses_latest_orders_not_customer_first_orders(self):
+        orders = [
+            {"order_date": "2026-09-30", "order_created_at": "09/30/2026 10:00:00", "customer": "Older Customer", "extra": {"Orders::Order No": 3700}},
+            {"order_date": "2026-10-15", "order_created_at": "10/15/2026 09:00:00", "customer": "October Customer", "extra": {"Orders::Order No": 3750}},
+            {"order_date": "2026-10-20", "order_created_at": "10/20/2026 11:00:00", "customer": "Repeat Customer", "extra": {"Orders::Order No": 3760}},
+        ]
+        production = sample_production_result()
+        production["production_rows"][0]["date"] = "2026-10-31"
+
+        payload = build_daily_dash_payload(
+            production,
+            {"status": "ok", "orders": orders},
+            report_date="2026-10-31",
+            daily_invoice_target=8000,
+        )
+
+        self.assertEqual(
+            [item["extra"]["Orders::Order No"] for item in payload["newest_orders"]],
+            [3760, 3750, 3700],
+        )
     def test_order_mapping_accepts_filemaker_field_name_variations(self):
         record = {"recordId": "1", "fieldData": {
             "Orders::CreationTimestamp": "11/09/2026 09:37:25",
@@ -44,7 +64,6 @@ class DailyDashTests(unittest.TestCase):
             "Orders::ExpectedArrivalDate": "11/16/2026",
             "Orders::Expected Arrival No of Cages": 4,
             "Orders::ExpectedArrivalSkids": 2,
-            "Orders::Expected Arrival Gross Weight": 3104,
             "Orders::Order No": "3801",
             "Orders::Customer Name": "Wildman Business Group",
         }}
@@ -55,7 +74,6 @@ class DailyDashTests(unittest.TestCase):
         self.assertEqual(order["extra"]["Expected Arrival Date"], "11/16/2026")
         self.assertEqual(order["extra"]["Expected Arrival Cages"], 4)
         self.assertEqual(order["extra"]["Expected Arrival Skids"], 2)
-        self.assertEqual(order["extra"]["Expected Arrival Weight"], 3104)
     def test_payload_uses_all_plant_clockings(self):
         payload = build_daily_dash_payload(sample_production_result(), {"status": "ok", "orders": []}, daily_invoice_target=8000)
         self.assertEqual(payload["productivity_today"], 60)

@@ -39,17 +39,20 @@ def _active_orders(orders, report_date):
     )
 
 
-def _new_accounts(orders, report_date, limit=5):
-    first_by_customer = {}
-    for item in orders:
-        order_date = str(item.get("order_date") or "")
-        customer = str(item.get("customer") or "").strip()
-        if not customer or not order_date or order_date > report_date:
-            continue
-        current = first_by_customer.get(customer)
-        if current is None or order_date < str(current.get("order_date") or ""):
-            first_by_customer[customer] = item
-    return sorted(first_by_customer.values(), key=lambda item: str(item.get("order_date") or ""), reverse=True)[:limit]
+def _newest_orders(orders, report_date, limit=5):
+    eligible = [
+        item for item in orders
+        if str(item.get("order_date") or "")
+        and str(item.get("order_date") or "") <= report_date
+    ]
+    return sorted(
+        eligible,
+        key=lambda item: (
+            str(item.get("order_created_at") or item.get("order_date") or ""),
+            float(((item.get("extra") or {}).get("Orders::Order No") or 0)),
+        ),
+        reverse=True,
+    )[:limit]
 
 
 def _new_orders_today(orders, report_date):
@@ -175,7 +178,7 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
         "backlog": {name: latest.get(f"backlog_{name.casefold()}") for name in ("Sort", "Grind", "Press", "Trim")},
         "backlog_weeks": latest.get("backlog_weeks"),
         "incoming_skids": latest.get("incoming_skids"),
-        "new_accounts": _new_accounts(orders, report_date),
+        "newest_orders": _newest_orders(orders, report_date),
         "new_orders_today": _new_orders_today(orders, report_date),
         "oldest_orders": active_orders[:5],
         "aged_debt": {
@@ -295,14 +298,14 @@ def build_daily_dash_pdf(payload):
     story += [data_table(["Current","0-30","31-60","61-90","90+ days","Total outstanding","Average debtor days"],[[fmt(debt["current"],"money2"),fmt(debt["0_30"],"money2"),fmt(debt["31_60"],"money2"),fmt(debt["61_90"],"money2"),fmt(debt["90_plus"],"money2"),fmt(debt["total_outstanding"],"money2"),fmt(payload.get("average_debtor_days"),"decimal1")]],[36*mm]*7),Spacer(1,3*mm)]
 
     new_rows=[]
-    for item in payload["new_accounts"]:
+    for item in payload["newest_orders"]:
         extra=item.get("extra") or {}; new_rows.append([item.get("order_date") or "-",item.get("customer") or "-",extra.get("Orders::Order No") or "-",extra.get("ai_PriceList") or "-"])
-    if not new_rows: new_rows=[["-","No new-account orders available","-","-"]]
+    if not new_rows: new_rows=[["-","No orders available","-","-"]]
     old_rows=[]
     for item in payload["oldest_orders"]:
         extra=item.get("extra") or {}; old_rows.append([extra.get("Orders::Order No") or "-",item.get("customer") or "-",extra.get("Orders::Status") or "-",item.get("order_date") or "-"])
     if not old_rows: old_rows=[["-","No open orders available","-","-"]]
-    new_table=[Paragraph("Newest first-time customers",styles["Section"]),data_table(["Date","Customer","Order","Price list"],new_rows,[23*mm,70*mm,20*mm,18*mm])]
+    new_table=[Paragraph("Newest orders",styles["Section"]),data_table(["Date","Customer","Order","Price list"],new_rows,[23*mm,70*mm,20*mm,18*mm])]
     old_table=[Paragraph("Oldest orders in house",styles["Section"]),data_table(["Order","Customer","Stage","Received"],old_rows,[20*mm,65*mm,25*mm,23*mm])]
     story += [Table([[new_table,old_table]],colWidths=[doc.width/2,doc.width/2],style=[("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),4*mm)]),Spacer(1,4*mm),Paragraph("Supervisor comments",styles["Section"])]
     notes=payload.get("supervisor_notes") or "No supervisor comments were recorded in the production API record."
@@ -317,12 +320,11 @@ def build_daily_dash_pdf(payload):
             extra.get("CreatedBy") or "-",
             item.get("customer") or "-",
             extra.get("Expected Arrival Date") or "-",
-            fmt(extra.get("Expected Arrival Cages") or None),
-            fmt(extra.get("Expected Arrival Skids") or None),
-            fmt(extra.get("Expected Arrival Weight") or None),
+            fmt(extra.get("Expected Arrival Cages") or None, unavailable="-"),
+            fmt(extra.get("Expected Arrival Skids") or None, unavailable="-"),
         ])
     if not new_order_rows:
-        new_order_rows = [["-", "-", "-", "No new orders were created today", "-", "-", "-", "-"]]
+        new_order_rows = [["-", "-", "-", "No new orders were created today", "-", "-", "-"]]
     story += [notes_table, PageBreak()]
     story += [
         Table(
@@ -333,9 +335,9 @@ def build_daily_dash_pdf(payload):
         Paragraph("Orders created on the report date", styles["Small"]),
         Spacer(1, 2*mm),
         data_table(
-            ["Order", "Created", "Created by", "Customer", "Expected arrival", "Cages", "Skids", "Weight"],
+            ["Order", "Created", "Created by", "Customer", "Expected arrival", "Cages", "Skids"],
             new_order_rows,
-            [16*mm, 30*mm, 34*mm, 69*mm, 28*mm, 18*mm, 18*mm, 22*mm],
+            [18*mm, 32*mm, 38*mm, 78*mm, 31*mm, 20*mm, 20*mm],
             font_size=7,
         ),
     ]

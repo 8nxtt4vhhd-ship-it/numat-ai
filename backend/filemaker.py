@@ -727,7 +727,6 @@ def map_filemaker_record_to_order(record):
         "Expected Arrival Date",
         "Expected Arrival Cages",
         "Expected Arrival Skids",
-        "Expected Arrival Weight",
     )
     extra = {
         field_name: get_field_value(field_data, field_name)
@@ -738,7 +737,6 @@ def map_filemaker_record_to_order(record):
         "Expected Arrival Date": ("Expected Arrival Date", "ExpectedArrivalDate", "Orders::Expected Arrival Date"),
         "Expected Arrival Cages": ("Expected Arrival Cages", "ExpectedArrivalCages", "Expected Arrival No of Cages", "Orders::Expected Arrival Cages"),
         "Expected Arrival Skids": ("Expected Arrival Skids", "ExpectedArrivalSkids", "Expected Arrival No of Skids", "Orders::Expected Arrival Skids"),
-        "Expected Arrival Weight": ("Expected Arrival Weight", "ExpectedArrivalWeight", "Expected Arrival Gross Weight", "Orders::Expected Arrival Weight"),
     }
     for canonical_name, aliases in daily_dash_aliases.items():
         extra[canonical_name] = get_first_nonempty_field_value(field_data, *aliases)
