@@ -51,9 +51,13 @@ from analysis import (
 )
 from app_settings import (
     calculate_elapsed_invoice_target,
+    get_daily_crm_report_settings,
+    get_daily_dash_report_settings,
     get_daily_invoice_target,
     get_production_daily_issues_settings,
     set_daily_invoice_target,
+    set_daily_crm_report_settings,
+    set_daily_dash_report_settings,
     set_production_daily_issues_settings,
 )
 from data_sources import (
@@ -6479,6 +6483,8 @@ def get_admin_settings_page(message: str = "", error: str = ""):
         )
     daily_target = get_daily_invoice_target()
     daily_issue_settings = get_production_daily_issues_settings()
+    daily_crm_settings = get_daily_crm_report_settings()
+    daily_dash_settings = get_daily_dash_report_settings()
     daily_reports = daily_issue_settings.get("reports", {})
     production_report = daily_reports.get("production", {})
     sales_report = daily_reports.get("sales", {})
@@ -6489,6 +6495,10 @@ def get_admin_settings_page(message: str = "", error: str = ""):
     production_enabled = " checked" if production_report.get("enabled") else ""
     sales_enabled = " checked" if sales_report.get("enabled") else ""
     combined_enabled = " checked" if combined_report.get("enabled") else ""
+    daily_crm_recipients = "\n".join(daily_crm_settings.get("recipients", []))
+    daily_dash_recipients = "\n".join(daily_dash_settings.get("recipients", []))
+    daily_crm_enabled = " checked" if daily_crm_settings.get("enabled") else ""
+    daily_dash_enabled = " checked" if daily_dash_settings.get("enabled") else ""
     daily_issue_test_date = datetime.now().strftime("%Y-%m-%d")
     through_date = (datetime.now() - timedelta(days=1)).date()
     elapsed_target = calculate_elapsed_invoice_target(through_date, daily_target)
@@ -6597,9 +6607,119 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                     <script>document.addEventListener('change',function(event){{if(event.target.matches('input[name="report_date"]')){{document.querySelectorAll('[data-production-test-date-copy]').forEach(function(input){{input.value=event.target.value;}});}}}});</script>
                 </div>
             </div>
+            <div class="action-column" id="scheduled-daily-reports" style="margin-top:18px;scroll-margin-top:18px">
+                <div class="panel-head"><div><h3>Scheduled daily reports</h3><p class="subtle">Configure the weekday schedule and distribution list for the Daily CRM Summary and Daily Dash. Saturday and Sunday are excluded.</p></div></div>
+                <div class="action-columns settings-report-grid">
+                    <div class="action-column">
+                        <h4>Daily CRM Summary</h4>
+                        <p class="subtle">A concise AI summary of opportunities, follow-ups, concerns and meaningful customer updates. Activity counts remain in Management Checks.</p>
+                        <form method="post" action="/admin-settings/daily-crm-report" class="login-form">
+                            <label><span class="label">Distribution list</span><textarea name="recipients" rows="3">{escape(daily_crm_recipients)}</textarea></label>
+                            <label><span class="label">Weekday send time</span><input type="time" name="send_time" value="{escape(daily_crm_settings['send_time'])}" required /></label>
+                            <label class="checkbox-row"><input type="checkbox" name="enabled" value="1"{daily_crm_enabled}> Enable Daily CRM Summary</label>
+                            <button class="button" type="submit">Save CRM report settings</button>
+                        </form>
+                        <form method="get" action="/admin-settings/daily-crm-report-preview" class="login-form" style="margin-top:12px">
+                            <label><span class="label">Preview date</span><input type="date" name="report_date" value="{daily_issue_test_date}" required /></label>
+                            <button class="button secondary" type="submit">Preview CRM summary</button>
+                        </form>
+                        <form method="post" action="/admin-settings/daily-crm-report-test" class="login-form" style="margin-top:12px">
+                            <label><span class="label">Test report date</span><input type="date" name="report_date" value="{daily_issue_test_date}" required /></label>
+                            <button class="button secondary" type="submit">Send CRM summary test</button>
+                        </form>
+                    </div>
+                    <div class="action-column">
+                        <h4>Daily Dash</h4>
+                        <p class="subtle">The production, labour, press, backlog and commercial-control PDF. The configured list replaces the previous hard-coded recipient.</p>
+                        <form method="post" action="/admin-settings/daily-dash-report" class="login-form">
+                            <label><span class="label">Distribution list</span><textarea name="recipients" rows="3">{escape(daily_dash_recipients)}</textarea></label>
+                            <label><span class="label">Weekday send time</span><input type="time" name="send_time" value="{escape(daily_dash_settings['send_time'])}" required /></label>
+                            <label class="checkbox-row"><input type="checkbox" name="enabled" value="1"{daily_dash_enabled}> Enable Daily Dash</label>
+                            <button class="button" type="submit">Save Daily Dash settings</button>
+                        </form>
+                        <form method="post" action="/admin-settings/daily-dash-report-test" class="login-form" style="margin-top:12px">
+                            <label><span class="label">Test report date</span><input type="date" name="report_date" value="{daily_issue_test_date}" required /></label>
+                            <button class="button secondary" type="submit">Send Daily Dash test</button>
+                        </form>
+                    </div>
+                </div>
+                <p class="subtle">Enter one address per line, or separate addresses with commas.</p>
+            </div>
         </section>
     """
     return render_page(title="System Settings", body=body)
+
+
+@app.post("/admin-settings/daily-crm-report")
+def post_admin_daily_crm_report(enabled: str = Form(""), recipients: str = Form(""), send_time: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to manage scheduled reports."), status_code=303)
+    try:
+        set_daily_crm_report_settings(enabled=enabled == "1", recipients=recipients, send_time=send_time)
+    except ValueError as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#scheduled-daily-reports", status_code=303)
+    record_audit_event("daily-crm-report-settings", details=f"Daily CRM Summary {'enabled' if enabled == '1' else 'disabled'} at {send_time}.", user=current_user, area="system-settings")
+    return RedirectResponse(url="/admin-settings?message=" + quote("Daily CRM Summary settings saved.") + "#scheduled-daily-reports", status_code=303)
+
+
+@app.post("/admin-settings/daily-dash-report")
+def post_admin_daily_dash_report(enabled: str = Form(""), recipients: str = Form(""), send_time: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to manage scheduled reports."), status_code=303)
+    try:
+        set_daily_dash_report_settings(enabled=enabled == "1", recipients=recipients, send_time=send_time)
+    except ValueError as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#scheduled-daily-reports", status_code=303)
+    record_audit_event("daily-dash-report-settings", details=f"Daily Dash {'enabled' if enabled == '1' else 'disabled'} at {send_time}.", user=current_user, area="system-settings")
+    return RedirectResponse(url="/admin-settings?message=" + quote("Daily Dash settings saved.") + "#scheduled-daily-reports", status_code=303)
+
+
+@app.get("/admin-settings/daily-crm-report-preview", response_class=HTMLResponse)
+def get_admin_daily_crm_report_preview(report_date: str = ""):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return render_page(title="Daily CRM Summary Preview", body="<p class='status error'>You do not have permission to preview this report.</p>")
+    try:
+        from daily_crm_report import generate_report, parse_day
+        report = generate_report(parse_day(report_date))
+    except Exception as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#scheduled-daily-reports", status_code=303)
+    body = f'''<section class="panel"><div class="panel-head"><div><h2>{escape(report['subject'])}</h2><p class="subtle">Local preview only - no email was sent.</p></div><a class="button secondary small-button" href="/admin-settings#scheduled-daily-reports">Back to settings</a></div><div style="margin-top:18px">{report['body_html']}</div></section>'''
+    return render_page(title="Daily CRM Summary Preview", body=body)
+
+
+@app.post("/admin-settings/daily-crm-report-test")
+def post_admin_daily_crm_report_test(report_date: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to send this report."), status_code=303)
+    try:
+        from daily_crm_report import deliver, parse_day
+        selected_date = parse_day(report_date)
+        outcome = deliver(report_day=selected_date, force=True)
+    except Exception as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#scheduled-daily-reports", status_code=303)
+    if outcome.get("status") == "ok":
+        return RedirectResponse(url="/admin-settings?message=" + quote(f"Daily CRM Summary test for {selected_date.strftime('%m/%d/%Y')} sent.") + "#scheduled-daily-reports", status_code=303)
+    return RedirectResponse(url="/admin-settings?error=" + quote(f"Daily CRM Summary was not sent: {outcome.get('error') or outcome.get('status')}") + "#scheduled-daily-reports", status_code=303)
+
+
+@app.post("/admin-settings/daily-dash-report-test")
+def post_admin_daily_dash_report_test(report_date: str = Form("")):
+    current_user = get_current_session_user()
+    if not can_manage_user_accounts(current_user):
+        return RedirectResponse(url="/admin-settings?error=" + quote("You do not have permission to send this report."), status_code=303)
+    try:
+        from daily_reports import deliver, parse_day
+        selected_date = parse_day(report_date)
+        outcome = deliver(requested_day=selected_date, force=True)
+    except Exception as error:
+        return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#scheduled-daily-reports", status_code=303)
+    if outcome.get("status") == "ok":
+        return RedirectResponse(url="/admin-settings?message=" + quote(f"Daily Dash test for {selected_date.strftime('%m/%d/%Y')} sent.") + "#scheduled-daily-reports", status_code=303)
+    return RedirectResponse(url="/admin-settings?error=" + quote(f"Daily Dash was not sent: {outcome.get('error') or outcome.get('status')}") + "#scheduled-daily-reports", status_code=303)
 
 
 @app.post("/admin-settings/production-labour-cache")

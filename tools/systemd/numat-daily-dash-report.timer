@@ -1,8 +1,8 @@
 [Unit]
-Description=Send NuMat Daily Dash PDF each evening
+Description=Check the configured NuMat Daily Dash schedule
 
 [Timer]
-OnCalendar=*-*-* 18:00:00 America/Chicago
+OnCalendar=*-*-* *:0/15:00 America/Chicago
 Persistent=true
 Unit=numat-daily-dash-report.service
 

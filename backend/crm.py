@@ -437,6 +437,73 @@ def refresh_recent_crm_cache_in_background():
             _RECENT_CRM_REFRESH_RUNNING = False
 
 
+SHARED_CONTACT_DEPARTMENT_LOCAL_PARTS = {
+    "ap",
+    "apss",
+    "ar",
+    "accountspayable",
+    "accountsreceivable",
+    "accounts",
+    "billing",
+    "finance",
+    "invoice",
+    "invoices",
+    "payments",
+    "statements",
+    "customerservice",
+    "customerservices",
+}
+
+
+def is_departmental_contact_email(email, contacts=None):
+    """Return True for role mailboxes that must not link unrelated branches."""
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email or "@" not in normalized_email:
+        return False
+
+    configured = {
+        item.strip().lower()
+        for item in os.getenv("CRM_SHARED_CONTACT_EXCLUDED_EMAILS", "").split(",")
+        if item.strip()
+    }
+    if normalized_email in configured:
+        return True
+
+    local_part = normalized_email.split("@", 1)[0]
+    compact_local_part = re.sub(r"[^a-z0-9]", "", local_part)
+    if compact_local_part in SHARED_CONTACT_DEPARTMENT_LOCAL_PARTS:
+        return True
+
+    department_phrases = (
+        "account payable",
+        "accounts payable",
+        "account receivable",
+        "accounts receivable",
+        "billing department",
+        "finance department",
+        "invoice processing",
+    )
+    for contact in contacts or []:
+        if str(contact.get("email") or "").strip().lower() != normalized_email:
+            continue
+        descriptor = " ".join(
+            str(contact.get(field) or "").strip().casefold()
+            for field in ("name", "position")
+        )
+        if any(phrase in descriptor for phrase in department_phrases):
+            return True
+
+    return False
+
+
+def get_departmental_contact_emails(contacts):
+    return {
+        str(contact.get("email") or "").strip().lower()
+        for contact in contacts or []
+        if is_departmental_contact_email(contact.get("email"), [contact])
+    }
+
+
 def filter_inactive_filemaker_customer_activities(result, source):
     if source != "filemaker" or result.get("status") != "ok":
         return result
@@ -448,13 +515,16 @@ def filter_inactive_filemaker_customer_activities(result, source):
     inactive_customer_keys = set(master_data.get("inactive_customer_keys") or [])
     inactive_customer_names = set(master_data.get("inactive_customer_names") or [])
     customers_by_key = master_data.get("customers_by_key") or {}
+    all_contacts = master_data.get("all_contacts") or []
+    departmental_contact_emails = get_departmental_contact_emails(all_contacts)
     active_contact_emails = {
         str(contact.get("email") or "").strip().lower()
-        for contact in master_data.get("all_contacts") or []
+        for contact in all_contacts
         if (
             str(contact.get("email") or "").strip()
             and str(contact.get("customer_ref") or "").strip() in customers_by_key
             and str(contact.get("active") or "").strip().lower() == "active"
+            and str(contact.get("email") or "").strip().lower() not in departmental_contact_emails
         )
     }
 
@@ -500,13 +570,20 @@ def build_shared_contact_activity_map(activities, master_data):
     """Index activity against every active customer location sharing the contact."""
     activity_map = build_activity_map(activities)
     customers_by_key = (master_data or {}).get("customers_by_key") or {}
+    all_contacts = (master_data or {}).get("all_contacts") or []
+    departmental_contact_emails = get_departmental_contact_emails(all_contacts)
     customer_keys_by_email = {}
 
-    for contact in (master_data or {}).get("all_contacts") or []:
+    for contact in all_contacts:
         email = str(contact.get("email") or "").strip().lower()
         customer_key = str(contact.get("customer_ref") or "").strip()
         active = str(contact.get("active") or "").strip().lower()
-        if not email or customer_key not in customers_by_key or active != "active":
+        if (
+            not email
+            or customer_key not in customers_by_key
+            or active != "active"
+            or email in departmental_contact_emails
+        ):
             continue
         customer_keys_by_email.setdefault(email, set()).add(customer_key)
 

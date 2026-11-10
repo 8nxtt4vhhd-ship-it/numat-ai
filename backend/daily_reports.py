@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
+from app_settings import get_daily_dash_report_settings
 from daily_dash import build_daily_dash_payload, build_daily_dash_pdf
 from data_sources import get_filemaker_order_limit, get_orders_for_analysis, write_filemaker_orders_cache
 from filemaker import fetch_order_records
@@ -160,7 +161,7 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
     log = load_delivery_log()
     if not dry_run and not force and (log.get(key) or {}).get("status") == "sent":
         return {"status": "already_sent", "key": key}
-    recipients = recipients or all_active_user_recipients()
+    recipients = recipients or get_daily_dash_report_settings().get("recipients") or all_active_user_recipients()
     recipients = list(dict.fromkeys(str(email).strip().lower() for email in recipients if "@" in str(email)))
     if not recipients:
         return {"status": "missing_recipients", "key": key}
@@ -193,18 +194,39 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
     return {**send_result, "key": key, "recipients": recipients, "order_cache_refreshed": orders_refreshed}
 
 
+def schedule_is_due(now=None, settings=None):
+    settings = settings or get_daily_dash_report_settings()
+    if not settings.get("enabled"):
+        return False
+    current = (now or datetime.now(ALABAMA_TIMEZONE)).astimezone(ALABAMA_TIMEZONE)
+    if current.weekday() >= 5:
+        return False
+    hour, minute = (int(part) for part in settings["send_time"].split(":"))
+    scheduled = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return scheduled <= current < scheduled + timedelta(minutes=30)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate and send the NuMat Daily Dash PDF.")
     parser.add_argument("--date", type=parse_day, help="Completed production date as YYYY-MM-DD; defaults to the latest available day.")
     parser.add_argument("--today", action="store_true", help="Use today's Alabama calendar date.")
+    parser.add_argument("--weekdays-only", action="store_true", help="Skip scheduled delivery on Saturday and Sunday.")
     parser.add_argument("--recipient", action="append", dest="recipients", help="Send only to this email address; may be repeated.")
     parser.add_argument("--dry-run", action="store_true", help="Generate the PDF without sending email.")
     parser.add_argument("--output-dir")
     parser.add_argument("--force", action="store_true", help="Send even if this report date is already recorded as sent.")
+    parser.add_argument("--run-if-due", action="store_true", help="Exit without sending unless the configured weekday schedule is due.")
     args = parser.parse_args(argv)
     if args.date and args.today:
         parser.error("Use either --date or --today, not both.")
     requested_day = datetime.now(ALABAMA_TIMEZONE).date() if args.today else args.date
+    settings = get_daily_dash_report_settings()
+    if args.run_if_due and not schedule_is_due(settings=settings):
+        print(json.dumps({"status": "not_due", "enabled": settings.get("enabled"), "send_time": settings.get("send_time")}))
+        return 0
+    if args.weekdays_only and (requested_day or datetime.now(ALABAMA_TIMEZONE).date()).weekday() >= 5:
+        print(json.dumps({"status": "skipped_weekend", "date": str(requested_day or datetime.now(ALABAMA_TIMEZONE).date())}))
+        return 0
     outcome = deliver(
         requested_day=requested_day,
         dry_run=args.dry_run,
@@ -213,7 +235,7 @@ def main(argv=None):
         recipients=args.recipients,
     )
     print(json.dumps(outcome, default=str))
-    return 0 if outcome.get("status") in {"ok", "dry_run", "already_sent"} else 1
+    return 0 if outcome.get("status") in {"ok", "dry_run", "already_sent", "not_due"} else 1
 
 
 if __name__ == "__main__":

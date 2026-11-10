@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the configured NuMat Daily CRM Summary schedule
+
+[Timer]
+OnCalendar=*-*-* *:0/15:00 America/Chicago
+Persistent=true
+Unit=numat-daily-crm-report.service
+
+[Install]
+WantedBy=timers.target

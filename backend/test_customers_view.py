@@ -371,6 +371,53 @@ class CustomersViewTests(unittest.TestCase):
         self.assertEqual(activity_map["branch-a"], [activity])
         self.assertEqual(activity_map["branch-b"], [activity])
 
+    def test_departmental_accounts_payable_email_stays_on_original_location(self):
+        activity = {
+            "date_created": "2026-11-10 09:00:00",
+            "customer_primary_key": "vestis-birmingham",
+            "sender_email": "customerservice@numatsystems.com",
+            "to": "apss@vestis.com",
+            "subject": "Invoice 10950",
+            "activity_category": "customer_services",
+        }
+        master_data = {
+            "customers_by_key": {
+                "vestis-birmingham": {},
+                "vestis-charlotte": {},
+                "vestis-memphis": {},
+            },
+            "all_contacts": [
+                {
+                    "name": "Accounts Payable",
+                    "position": "Accounts Payable",
+                    "email": "apss@vestis.com",
+                    "customer_ref": customer_key,
+                    "active": "Active",
+                }
+                for customer_key in (
+                    "vestis-birmingham",
+                    "vestis-charlotte",
+                    "vestis-memphis",
+                )
+            ],
+        }
+
+        activity_map = crm.build_shared_contact_activity_map([activity], master_data)
+
+        self.assertEqual(activity_map["vestis-birmingham"], [activity])
+        self.assertNotIn("vestis-charlotte", activity_map)
+        self.assertNotIn("vestis-memphis", activity_map)
+
+    def test_contact_role_can_mark_nonstandard_departmental_mailbox(self):
+        contacts = [{
+            "name": "Accounts Payable Team",
+            "position": "Invoice Processing",
+            "email": "shared-box@customer.com",
+        }]
+
+        self.assertTrue(crm.is_departmental_contact_email("shared-box@customer.com", contacts))
+        self.assertFalse(crm.is_departmental_contact_email("pam.martin@vestis.com", contacts))
+
     def test_contact_activity_follows_directory_location_when_crm_uses_another_key(self):
         activity = {
             "date_created": "2026-10-01 20:42:24",

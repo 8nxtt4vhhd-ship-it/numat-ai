@@ -37,11 +37,13 @@ def sample_production_result():
 
 
 class DailyDashTests(unittest.TestCase):
-    def test_newest_orders_uses_latest_orders_not_customer_first_orders(self):
+    def test_new_and_returning_accounts_matches_weekly_kpi_rules(self):
         orders = [
-            {"order_date": "2026-09-30", "order_created_at": "09/30/2026 10:00:00", "customer": "Older Customer", "extra": {"Orders::Order No": 3700}},
-            {"order_date": "2026-10-15", "order_created_at": "10/15/2026 09:00:00", "customer": "October Customer", "extra": {"Orders::Order No": 3750}},
-            {"order_date": "2026-10-20", "order_created_at": "10/20/2026 11:00:00", "customer": "Repeat Customer", "extra": {"Orders::Order No": 3760}},
+            {"order_date": "2026-10-15", "customer": "Brand New Co", "customer_primary_key": "new-1"},
+            {"order_date": "2023-08-01", "customer": "Returning Co", "customer_primary_key": "return-1"},
+            {"order_date": "2026-10-20", "customer": "Returning Co", "customer_primary_key": "return-1"},
+            {"order_date": "2026-01-01", "customer": "Regular Co", "customer_primary_key": "regular-1"},
+            {"order_date": "2026-10-21", "customer": "Regular Co", "customer_primary_key": "regular-1"},
         ]
         production = sample_production_result()
         production["production_rows"][0]["date"] = "2026-10-31"
@@ -53,9 +55,28 @@ class DailyDashTests(unittest.TestCase):
             daily_invoice_target=8000,
         )
 
+        self.assertEqual([item["customer"] for item in payload["new_and_returning_accounts"]], ["Returning Co", "Brand New Co", "Regular Co"])
+        self.assertEqual(payload["new_and_returning_accounts"][0]["category"], "Lost & lapsed return")
+        self.assertEqual(payload["new_and_returning_accounts"][1]["category"], "New")
+
+    def test_new_and_returning_accounts_shows_five_most_recent_across_months(self):
+        orders = [
+            {"order_date": f"2026-{month:02d}-01", "customer": f"Customer {month}", "customer_primary_key": f"customer-{month}"}
+            for month in range(1, 7)
+        ]
+        production = sample_production_result()
+        production["production_rows"][0]["date"] = "2026-11-09"
+
+        payload = build_daily_dash_payload(
+            production,
+            {"status": "ok", "orders": orders},
+            report_date="2026-11-09",
+            daily_invoice_target=8000,
+        )
+
         self.assertEqual(
-            [item["extra"]["Orders::Order No"] for item in payload["newest_orders"]],
-            [3760, 3750, 3700],
+            [item["customer"] for item in payload["new_and_returning_accounts"]],
+            ["Customer 6", "Customer 5", "Customer 4", "Customer 3", "Customer 2"],
         )
     def test_order_mapping_accepts_filemaker_field_name_variations(self):
         record = {"recordId": "1", "fieldData": {

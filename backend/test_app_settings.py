@@ -84,6 +84,19 @@ class AppSettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app_settings.set_production_daily_issues_settings(enabled=False, recipients="manager@example.com", send_time="6:30 PM")
 
+    def test_daily_dash_and_crm_report_settings_are_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            with patch.object(app_settings, "get_settings_path", return_value=path):
+                dash = app_settings.set_daily_dash_report_settings(True, "plant@example.com", "18:00")
+                crm = app_settings.set_daily_crm_report_settings(True, "sales@example.com", "18:30")
+
+        self.assertEqual(dash["recipients"], ["plant@example.com"])
+        self.assertEqual(crm["recipients"], ["sales@example.com"])
+        self.assertEqual(dash["send_time"], "18:00")
+        self.assertEqual(crm["send_time"], "18:30")
+        self.assertTrue(dash["weekdays_only"])
+
 
 if __name__ == "__main__":
     unittest.main()

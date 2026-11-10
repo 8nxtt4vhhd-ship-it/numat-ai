@@ -39,20 +39,44 @@ def _active_orders(orders, report_date):
     )
 
 
-def _newest_orders(orders, report_date, limit=5):
-    eligible = [
-        item for item in orders
-        if str(item.get("order_date") or "")
-        and str(item.get("order_date") or "") <= report_date
-    ]
-    return sorted(
-        eligible,
-        key=lambda item: (
-            str(item.get("order_created_at") or item.get("order_date") or ""),
-            float(((item.get("extra") or {}).get("Orders::Order No") or 0)),
-        ),
-        reverse=True,
-    )[:limit]
+def _new_and_returning_accounts(orders, report_date, limit=5):
+    orders_by_customer = defaultdict(list)
+    for item in orders:
+        order_date = str(item.get("order_date") or "")
+        customer = str(item.get("customer") or "").strip()
+        customer_key = str(item.get("customer_primary_key") or "").strip()
+        identity = customer_key or customer.casefold()
+        if identity and customer and order_date and order_date <= report_date:
+            orders_by_customer[identity].append((order_date, item, customer))
+
+    results = []
+    for customer_orders in orders_by_customer.values():
+        customer_orders.sort(key=lambda row: row[0])
+        qualifying_events = []
+        for index, (order_date, item, customer) in enumerate(customer_orders):
+            if index == 0:
+                qualifying_events.append({
+                    "customer": customer,
+                    "order_date": order_date,
+                    "category": "New",
+                    "detail": "First-ever order",
+                })
+                continue
+            previous_date = datetime.strptime(customer_orders[index - 1][0], "%Y-%m-%d")
+            current_date = datetime.strptime(order_date, "%Y-%m-%d")
+            gap_days = (current_date - previous_date).days
+            if gap_days >= 730:
+                qualifying_events.append({
+                    "customer": customer,
+                    "order_date": order_date,
+                    "category": "Lost & lapsed return",
+                    "detail": f"First order in {gap_days / 365.25:.1f} years",
+                })
+        if qualifying_events:
+            results.append(qualifying_events[-1])
+
+    results.sort(key=lambda item: (item["order_date"], item["customer"].casefold()), reverse=True)
+    return results[:limit]
 
 
 def _new_orders_today(orders, report_date):
@@ -178,7 +202,7 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
         "backlog": {name: latest.get(f"backlog_{name.casefold()}") for name in ("Sort", "Grind", "Press", "Trim")},
         "backlog_weeks": latest.get("backlog_weeks"),
         "incoming_skids": latest.get("incoming_skids"),
-        "newest_orders": _newest_orders(orders, report_date),
+        "new_and_returning_accounts": _new_and_returning_accounts(orders, report_date),
         "new_orders_today": _new_orders_today(orders, report_date),
         "oldest_orders": active_orders[:5],
         "aged_debt": {
@@ -298,14 +322,14 @@ def build_daily_dash_pdf(payload):
     story += [data_table(["Current","0-30","31-60","61-90","90+ days","Total outstanding","Average debtor days"],[[fmt(debt["current"],"money2"),fmt(debt["0_30"],"money2"),fmt(debt["31_60"],"money2"),fmt(debt["61_90"],"money2"),fmt(debt["90_plus"],"money2"),fmt(debt["total_outstanding"],"money2"),fmt(payload.get("average_debtor_days"),"decimal1")]],[36*mm]*7),Spacer(1,3*mm)]
 
     new_rows=[]
-    for item in payload["newest_orders"]:
-        extra=item.get("extra") or {}; new_rows.append([item.get("order_date") or "-",item.get("customer") or "-",extra.get("Orders::Order No") or "-",extra.get("ai_PriceList") or "-"])
-    if not new_rows: new_rows=[["-","No orders available","-","-"]]
+    for item in payload["new_and_returning_accounts"]:
+        new_rows.append([item.get("order_date") or "-",item.get("customer") or "-",item.get("detail") or "-"])
+    if not new_rows: new_rows=[["-","No qualifying accounts available","-"]]
     old_rows=[]
     for item in payload["oldest_orders"]:
         extra=item.get("extra") or {}; old_rows.append([extra.get("Orders::Order No") or "-",item.get("customer") or "-",extra.get("Orders::Status") or "-",item.get("order_date") or "-"])
     if not old_rows: old_rows=[["-","No open orders available","-","-"]]
-    new_table=[Paragraph("Newest orders",styles["Section"]),data_table(["Date","Customer","Order","Price list"],new_rows,[23*mm,70*mm,20*mm,18*mm])]
+    new_table=[Paragraph("New and returning accounts",styles["Section"]),data_table(["Date","Customer","Detail"],new_rows,[23*mm,77*mm,43*mm])]
     old_table=[Paragraph("Oldest orders in house",styles["Section"]),data_table(["Order","Customer","Stage","Received"],old_rows,[20*mm,65*mm,25*mm,23*mm])]
     story += [Table([[new_table,old_table]],colWidths=[doc.width/2,doc.width/2],style=[("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),4*mm)]),Spacer(1,4*mm),Paragraph("Supervisor comments",styles["Section"])]
     notes=payload.get("supervisor_notes") or "No supervisor comments were recorded in the production API record."

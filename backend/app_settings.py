@@ -9,6 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SETTINGS_PATH = BASE_DIR / "data" / "app_settings.json"
 DEFAULT_DAILY_INVOICE_TARGET = 8000.0
 DEFAULT_PRODUCTION_ISSUES_SEND_TIME = "18:30"
+DEFAULT_DAILY_REPORT_SEND_TIME = "18:00"
 MANAGEMENT_CHECK_REPORT_TYPES = ("production", "sales", "combined")
 PRODUCTION_BREAK_CONTEXT_LINE = "Around 1 hour of unbooked paid time per operator per day is normal because paid breaks are not deducted. Allow up to and including 1.5 hours; only report an unbooked-time anomaly when the daily gap is more than 1.5 hours."
 DEFAULT_PRODUCTION_ISSUES_CONTEXT = """NuMat repairs rubber-backed carpeted mats; it is not a new-product manufacturing operation.
@@ -80,6 +81,59 @@ def normalize_email_recipients(value):
             recipients.append(email)
             seen.add(email)
     return recipients
+
+
+def get_scheduled_email_report_settings(report_key):
+    settings = load_app_settings().get(str(report_key or ""), {})
+    if not isinstance(settings, dict):
+        settings = {}
+    send_time = str(settings.get("send_time") or DEFAULT_DAILY_REPORT_SEND_TIME).strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", send_time):
+        send_time = DEFAULT_DAILY_REPORT_SEND_TIME
+    try:
+        recipients = normalize_email_recipients(settings.get("recipients", []))
+    except ValueError:
+        recipients = []
+    return {
+        "enabled": bool(settings.get("enabled", False)),
+        "recipients": recipients,
+        "send_time": send_time,
+        "timezone": "America/Chicago",
+        "weekdays_only": True,
+    }
+
+
+def set_scheduled_email_report_settings(report_key, enabled=False, recipients=None, send_time=""):
+    normalized_time = str(send_time or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized_time):
+        raise ValueError("Enter the nightly send time in 24-hour HH:MM format.")
+    normalized_recipients = normalize_email_recipients(recipients)
+    if enabled and not normalized_recipients:
+        raise ValueError("Add at least one recipient before enabling this report.")
+    payload = load_app_settings()
+    payload[str(report_key)] = {
+        "enabled": bool(enabled),
+        "recipients": normalized_recipients,
+        "send_time": normalized_time,
+    }
+    save_app_settings(payload)
+    return get_scheduled_email_report_settings(report_key)
+
+
+def get_daily_dash_report_settings():
+    return get_scheduled_email_report_settings("daily_dash_report")
+
+
+def set_daily_dash_report_settings(enabled=False, recipients=None, send_time=""):
+    return set_scheduled_email_report_settings("daily_dash_report", enabled, recipients, send_time)
+
+
+def get_daily_crm_report_settings():
+    return get_scheduled_email_report_settings("daily_crm_report")
+
+
+def set_daily_crm_report_settings(enabled=False, recipients=None, send_time=""):
+    return set_scheduled_email_report_settings("daily_crm_report", enabled, recipients, send_time)
 
 
 def get_production_daily_issues_settings():
