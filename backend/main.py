@@ -246,6 +246,7 @@ _CUSTOMER_SUMMARIES_CACHE = {
     "key": None,
     "expires_at": 0,
     "result": None,
+    "sources": None,
 }
 _CUSTOMER_SUMMARIES_CACHE_LOCK = Lock()
 
@@ -16584,42 +16585,48 @@ def get_customers_view(
     error: str = "",
 ):
     view_started_at = time.perf_counter()
-    stage_started_at = time.perf_counter()
-    # These sources are independent and normally resolve from their persistent
-    # caches. Loading them together keeps a cold Customers request from paying
-    # each cache-read cost one after another.
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        order_future = executor.submit(get_orders_for_analysis)
-        crm_future = executor.submit(fetch_crm_activities)
-        master_data_future = executor.submit(fetch_filemaker_customer_data)
-        order_result = order_future.result()
-        crm_result = crm_future.result()
-        master_data_result = master_data_future.result()
-    log_perf_metric("customers.fetch_sources", stage_started_at)
+    cached_directory = get_cached_customer_directory()
+    if cached_directory is not None:
+        summaries, cached_sources = cached_directory
+        order_result, crm_result, master_data_result = cached_sources
+        log_perf_metric("customers.cached_directory_hit", view_started_at)
+    else:
+        stage_started_at = time.perf_counter()
+        # These sources are independent and normally resolve from their persistent
+        # caches. Loading them together keeps a cold Customers request from paying
+        # each cache-read cost one after another.
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            order_future = executor.submit(get_orders_for_analysis)
+            crm_future = executor.submit(fetch_crm_activities)
+            master_data_future = executor.submit(fetch_filemaker_customer_data)
+            order_result = order_future.result()
+            crm_result = crm_future.result()
+            master_data_result = master_data_future.result()
+        log_perf_metric("customers.fetch_sources", stage_started_at)
 
-    if order_result["status"] != "ok":
-        return render_page(
-            title="Customers",
-            body=(
-                f"<p class='status error'>Could not load data from "
-                f"{escape(order_result['source'])}: "
-                f"{escape(order_result['status'])}</p>"
+        if order_result["status"] != "ok":
+            return render_page(
+                title="Customers",
+                body=(
+                    f"<p class='status error'>Could not load data from "
+                    f"{escape(order_result['source'])}: "
+                    f"{escape(order_result['status'])}</p>"
+                )
             )
-        )
 
-    order_result = filter_order_result_to_customer_type(order_result, master_data_result)
-    master_data_result = filter_master_data_to_customer_type(master_data_result)
-    stage_started_at = time.perf_counter()
-    summaries = build_cached_customer_summaries(
-        order_result=order_result,
-        crm_result=crm_result,
-        # Attention calculations belong to the action-plan views. The customer
-        # directory no longer displays them, so avoid rebuilding that sizeable
-        # index just to render this table.
-        attention_result={"status": "ok", "late_customers": []},
-        master_data_result=master_data_result,
-    )
-    log_perf_metric("customers.build_cached_customer_summaries", stage_started_at)
+        order_result = filter_order_result_to_customer_type(order_result, master_data_result)
+        master_data_result = filter_master_data_to_customer_type(master_data_result)
+        stage_started_at = time.perf_counter()
+        summaries = build_cached_customer_summaries(
+            order_result=order_result,
+            crm_result=crm_result,
+            # Attention calculations belong to the action-plan views. The customer
+            # directory no longer displays them, so avoid rebuilding that sizeable
+            # index just to render this table.
+            attention_result={"status": "ok", "late_customers": []},
+            master_data_result=master_data_result,
+        )
+        log_perf_metric("customers.build_cached_customer_summaries", stage_started_at)
     stage_started_at = time.perf_counter()
     filtered_summaries = filter_customer_summaries(
         summaries,
@@ -17659,6 +17666,7 @@ def clear_customer_summaries_cache():
         _CUSTOMER_SUMMARIES_CACHE["key"] = None
         _CUSTOMER_SUMMARIES_CACHE["expires_at"] = 0
         _CUSTOMER_SUMMARIES_CACHE["result"] = None
+        _CUSTOMER_SUMMARIES_CACHE["sources"] = None
     clear_customer_contextual_activity_cache()
 
 
@@ -18375,8 +18383,28 @@ def build_cached_customer_summaries(order_result, crm_result, attention_result=N
             # index. Sync and data-update paths explicitly clear this cache.
             _CUSTOMER_SUMMARIES_CACHE["expires_at"] = float("inf")
             _CUSTOMER_SUMMARIES_CACHE["result"] = summaries
+            _CUSTOMER_SUMMARIES_CACHE["sources"] = (
+                order_result,
+                crm_result,
+                master_data_result or {},
+            )
 
     return summaries
+
+
+def get_cached_customer_directory():
+    now = time.time()
+    with _CUSTOMER_SUMMARIES_CACHE_LOCK:
+        if (
+            _CUSTOMER_SUMMARIES_CACHE["result"] is not None
+            and _CUSTOMER_SUMMARIES_CACHE["sources"] is not None
+            and _CUSTOMER_SUMMARIES_CACHE["expires_at"] > now
+        ):
+            return (
+                _CUSTOMER_SUMMARIES_CACHE["result"],
+                _CUSTOMER_SUMMARIES_CACHE["sources"],
+            )
+    return None
 
 
 def normalize_customers_return_to(return_to):

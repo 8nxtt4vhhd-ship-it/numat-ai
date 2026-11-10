@@ -14,7 +14,29 @@ class CustomersViewTests(unittest.TestCase):
     def tearDown(self):
         filemaker.clear_filemaker_master_data_cache()
         data_sources.clear_filemaker_orders_cache()
+        main.clear_customer_summaries_cache()
         main.clear_customer_contextual_activity_cache()
+
+    def test_customer_search_reuses_built_directory_without_reloading_sources(self):
+        summaries = [{"customer": "Vestis Uniform Services", "state": "IL"}]
+        sources = (
+            {"status": "ok", "source": "filemaker", "orders": []},
+            {"status": "ok", "source": "filemaker_sync_cache", "activities": []},
+            {"status": "ok", "source": "filemaker", "customers_by_key": {}},
+        )
+        with (
+            patch.object(main, "get_cached_customer_directory", return_value=(summaries, sources)),
+            patch.object(main, "get_orders_for_analysis") as orders,
+            patch.object(main, "fetch_crm_activities") as crm_activities,
+            patch.object(main, "fetch_filemaker_customer_data") as customer_data,
+            patch.object(main, "render_customer_summary_row", return_value="<tr><td>Vestis Uniform Services</td></tr>"),
+        ):
+            html = main.get_customers_view(customer="Vestis")
+
+        self.assertIn("Vestis Uniform Services", html)
+        orders.assert_not_called()
+        crm_activities.assert_not_called()
+        customer_data.assert_not_called()
 
     def test_customers_page_skips_unused_attention_calculation(self):
         order_result = {
