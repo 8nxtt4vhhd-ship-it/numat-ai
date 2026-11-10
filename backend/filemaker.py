@@ -721,9 +721,16 @@ def fetch_all_layout_records(layout, batch_size=500, sort_fields=None, max_recor
 def map_filemaker_record_to_order(record):
     config = get_filemaker_config()
     field_data = record.get("fieldData", {})
+    required_daily_dash_fields = (
+        "CreatedBy",
+        "Expected Arrival Date",
+        "Expected Arrival Cages",
+        "Expected Arrival Skids",
+        "Expected Arrival Weight",
+    )
     extra = {
         field_name: get_field_value(field_data, field_name)
-        for field_name in config["extra_fields"]
+        for field_name in dict.fromkeys((*config["extra_fields"], *required_daily_dash_fields))
     }
 
     customer_primary_key = normalize_text_value(
@@ -735,6 +742,7 @@ def map_filemaker_record_to_order(record):
         "order_date": normalize_filemaker_date(
             get_field_value(field_data, config["order_date_field"])
         ),
+        "order_created_at": get_field_value(field_data, config["order_date_field"]),
         "amount": get_field_value(field_data, config["amount_field"]),
         "customer_primary_key": customer_primary_key,
         "extra": extra,

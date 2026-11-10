@@ -19,14 +19,16 @@ class ProductionDateRangeTests(unittest.TestCase):
             "status": "ok",
             "production_rows": [{
                 "date": "2026-10-15", "press_throughput": 2429,
+                "production_revenue_today": 1000,
                 "ff1_lf": 300, "ff2_lf": 1230, "ff3_lf": 899,
             }],
             "operator_rows": [], "plant_operator_rows": [],
         }
         cycles = [
-            {"date": "2026-10-15", "machine": "FF1", "linear_feet": 299, "ff1_lf": 299, "ff2_lf": None, "ff3_lf": None},
-            {"date": "2026-10-15", "machine": "FF2", "linear_feet": 1241, "ff1_lf": None, "ff2_lf": 1241, "ff3_lf": None},
-            {"date": "2026-10-15", "machine": "FF3", "linear_feet": 912, "ff1_lf": None, "ff2_lf": None, "ff3_lf": 912},
+            {"date": "2026-10-15", "machine": "FF1", "linear_feet": 299, "repair_value": 1000, "ff1_lf": 299, "ff2_lf": None, "ff3_lf": None},
+            {"date": "2026-10-15", "machine": "FF2", "linear_feet": 1241, "repair_value": 2000, "ff1_lf": None, "ff2_lf": 1241, "ff3_lf": None},
+            {"date": "2026-10-15", "machine": "FF3", "linear_feet": 912, "repair_value": 3000, "ff1_lf": None, "ff2_lf": None, "ff3_lf": 912},
+            {"date": "2026-10-15", "machine": "", "linear_feet": 0, "repair_value": 793, "ff1_lf": None, "ff2_lf": None, "ff3_lf": None},
         ]
 
         payload = build_production_kpi_payload(result, period_start="2026-10-15", period_end="2026-10-15", cycles=cycles)
@@ -36,6 +38,9 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertEqual(latest["press_throughput_daily_summary"], 2429)
         self.assertEqual((latest["ff1_lf"], latest["ff2_lf"], latest["ff3_lf"]), (299, 1241, 912))
         self.assertEqual(payload["summary"]["average_press_throughput"], 2452)
+        self.assertEqual(latest["production_revenue_today"], 6793)
+        self.assertEqual(latest["production_revenue_today_daily_summary"], 1000)
+        self.assertEqual(payload["summary"]["average_production_revenue"], 6793)
 
     def test_accepts_us_formatted_dates(self):
         start, end = resolve_production_date_range("10/01/2026", "10/06/2026")

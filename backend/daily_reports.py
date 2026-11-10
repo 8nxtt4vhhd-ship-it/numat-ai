@@ -12,11 +12,12 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 from daily_dash import build_daily_dash_payload, build_daily_dash_pdf
-from data_sources import get_orders_for_analysis
+from data_sources import get_filemaker_order_limit, get_orders_for_analysis, write_filemaker_orders_cache
+from filemaker import fetch_order_records
 from finance import fetch_aged_debt_summary
 from m365 import has_m365_reporting_config, send_m365_reporting_mail
 from monthly_reports import failure_recipients, load_users
-from production import fetch_production_analysis_data
+from production import fetch_cycle_records, fetch_production_analysis_data
 
 DEFAULT_DELIVERY_LOG_PATH = BASE_DIR / "data" / "daily_dash_deliveries.json"
 ALABAMA_TIMEZONE = ZoneInfo("America/Chicago")
@@ -73,12 +74,13 @@ def notify_failure(report_day, reason):
     )
 
 
-def build_report(production_result, orders_result, finance_result, requested_day=None):
+def build_report(production_result, orders_result, finance_result, requested_day=None, cycles_result=None):
     payload = build_daily_dash_payload(
         production_result,
         orders_result=orders_result,
         finance_result=finance_result,
         report_date=requested_day.isoformat() if requested_day else None,
+        cycles_result=cycles_result,
     )
     report_day = payload["report_date"]
     return {
@@ -97,10 +99,29 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
     production_result = fetch_production_analysis_data(force_refresh=True, include_today=True)
     if production_result.get("status") not in {"ok", "partial"}:
         return {"status": "production_data_error", "error": production_result.get("warning") or production_result.get("status")}
-    orders_result = get_orders_for_analysis()
+    report_day_hint = (
+        requested_day.isoformat()
+        if requested_day else max(
+            (str(item.get("date") or "") for item in production_result.get("production_rows", [])),
+            default=str(date.today() - timedelta(days=1)),
+        )
+    )
+    cycles_result = fetch_cycle_records(report_day_hint, report_day_hint)
+    fresh_orders_result = fetch_order_records(limit=get_filemaker_order_limit())
+    if fresh_orders_result.get("status") == "ok":
+        write_filemaker_orders_cache(fresh_orders_result)
+        orders_result = fresh_orders_result
+    else:
+        orders_result = get_orders_for_analysis()
     finance_result = fetch_aged_debt_summary(force_refresh=True)
     try:
-        report = build_report(production_result, orders_result, finance_result, requested_day=requested_day)
+        report = build_report(
+            production_result,
+            orders_result,
+            finance_result,
+            requested_day=requested_day,
+            cycles_result=cycles_result,
+        )
     except Exception as error:
         report_day = requested_day.isoformat() if requested_day else str(date.today() - timedelta(days=1))
         if not dry_run:

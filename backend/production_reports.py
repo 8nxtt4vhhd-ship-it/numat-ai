@@ -423,7 +423,7 @@ def build_press_analysis_workbook(period_start, period_end, production_rows, cyc
             parse_date(item.get("date")), item.get("ff1_lf"), item.get("ff2_lf"), item.get("ff3_lf"),
             f"=SUM(B{index}:D{index})", item.get("ff1_mats"), item.get("ff2_mats"), item.get("ff3_mats"),
             f"=SUM(F{index}:H{index})", item.get("ff1_cycles"), item.get("ff2_cycles"), item.get("ff3_cycles"),
-            f"=SUM(J{index}:L{index})", sum(item.get(f"ff{press}_revenue") or 0 for press in (1, 2, 3)),
+            f"=SUM(J{index}:L{index})", item.get("production_revenue_today"),
         ])
     headers(daily, 5, 14)
     body(daily, 6, len(production_rows) + 5, 14)

@@ -49,14 +49,46 @@ class DailyDashTests(unittest.TestCase):
         self.assertTrue(content.startswith(b"%PDF"))
         self.assertGreater(len(content), 1000)
 
+    def test_payload_uses_all_cycle_repair_value_and_lists_orders_created_that_day(self):
+        orders = [{
+            "order_date": "2026-08-18",
+            "order_created_at": "08/18/2026 09:37:25",
+            "customer": "Wildman Business Group",
+            "extra": {
+                "Orders::Order No": "3801",
+                "CreatedBy": "NuMat Systems Customer Service",
+                "Expected Arrival Date": "08/25/2026",
+                "Expected Arrival Cages": 4,
+                "Expected Arrival Skids": "",
+                "Expected Arrival Weight": 3104,
+            },
+        }]
+        cycles = {"status": "ok", "cycles": [
+            {"date": "2026-08-18", "machine": "FF1", "repair_value": 8571},
+            {"date": "2026-08-18", "machine": "", "operator": "Kenley Pike", "repair_value": 793},
+        ]}
+
+        payload = build_daily_dash_payload(
+            sample_production_result(),
+            {"status": "ok", "orders": orders},
+            daily_invoice_target=8000,
+            cycles_result=cycles,
+        )
+
+        self.assertEqual(payload["production_revenue_today"], 9364)
+        self.assertEqual(len(payload["new_orders_today"]), 1)
+        self.assertEqual(payload["new_orders_today"][0]["extra"]["Orders::Order No"], "3801")
+
     def test_dry_run_writes_pdf_and_does_not_send(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(daily_reports, "fetch_production_analysis_data", return_value=sample_production_result()):
-                with patch.object(daily_reports, "get_orders_for_analysis", return_value={"status": "ok", "orders": []}):
-                    with patch.object(daily_reports, "fetch_aged_debt_summary", return_value={"status": "ok"}):
-                        with patch.object(daily_reports, "all_active_user_recipients", return_value=["kelly@example.com"]):
-                            with patch.object(daily_reports, "send_m365_reporting_mail") as send:
-                                result = daily_reports.deliver(date(2026, 8, 18), dry_run=True, output_dir=directory)
+                with patch.object(daily_reports, "fetch_cycle_records", return_value={"status": "ok", "cycles": []}):
+                    with patch.object(daily_reports, "fetch_order_records", return_value={"status": "ok", "orders": []}):
+                        with patch.object(daily_reports, "write_filemaker_orders_cache"):
+                            with patch.object(daily_reports, "fetch_aged_debt_summary", return_value={"status": "ok"}):
+                                with patch.object(daily_reports, "all_active_user_recipients", return_value=["kelly@example.com"]):
+                                    with patch.object(daily_reports, "send_m365_reporting_mail") as send:
+                                        result = daily_reports.deliver(date(2026, 8, 18), dry_run=True, output_dir=directory)
             self.assertEqual(result["status"], "dry_run")
             self.assertTrue(Path(result["path"]).read_bytes().startswith(b"%PDF"))
             send.assert_not_called()

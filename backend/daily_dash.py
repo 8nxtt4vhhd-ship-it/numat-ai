@@ -52,7 +52,14 @@ def _new_accounts(orders, report_date, limit=5):
     return sorted(first_by_customer.values(), key=lambda item: str(item.get("order_date") or ""), reverse=True)[:limit]
 
 
-def build_daily_dash_payload(production_result, orders_result=None, finance_result=None, report_date=None, daily_invoice_target=None):
+def _new_orders_today(orders, report_date):
+    return sorted(
+        [item for item in orders if str(item.get("order_date") or "") == report_date],
+        key=lambda item: str(item.get("order_created_at") or item.get("order_date") or ""),
+    )
+
+
+def build_daily_dash_payload(production_result, orders_result=None, finance_result=None, report_date=None, daily_invoice_target=None, cycles_result=None):
     rows = sorted(production_result.get("production_rows", []), key=lambda item: str(item.get("date") or ""))
     if report_date:
         rows = [item for item in rows if str(item.get("date") or "") <= str(report_date)]
@@ -81,7 +88,15 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
     labour_pct_mtd = (labour_cost / invoiced * 100) if labour_cost is not None and invoiced and invoiced > 0 else 0.0
 
     press_lf = latest.get("press_throughput_reported") or latest.get("press_throughput")
-    press_revenue = latest.get("production_revenue_today")
+    cycles_result = cycles_result or {}
+    report_cycles = [
+        item for item in cycles_result.get("cycles", [])
+        if str(item.get("date") or "") == report_date
+    ] if cycles_result.get("status") == "ok" else []
+    press_revenue = (
+        sum(float(item.get("repair_value") or 0) for item in report_cycles)
+        if report_cycles else latest.get("production_revenue_today")
+    )
     average_revenue = (press_revenue / press_lf) if press_revenue is not None and press_lf else None
     production = []
     for label, key in (("Sort", "sort_throughput"), ("Grind", "grind_throughput"), ("Press", "press_throughput_reported"), ("Trim", "trim_throughput"), ("Re-cook", "recook_lf")):
@@ -133,6 +148,7 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
         "backlog_weeks": latest.get("backlog_weeks"),
         "incoming_skids": latest.get("incoming_skids"),
         "new_accounts": _new_accounts(orders, report_date),
+        "new_orders_today": _new_orders_today(orders, report_date),
         "oldest_orders": active_orders[:5],
         "aged_debt": {
             "current": finance_result.get("current"),
@@ -263,6 +279,36 @@ def build_daily_dash_pdf(payload):
     notes=payload.get("supervisor_notes") or "No supervisor comments were recorded in the production API record."
     notes_table=Table([[Paragraph(notes,styles["BodyCompact"])]],colWidths=[doc.width],rowHeights=[28*mm])
     notes_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#F8FAFD")),("BOX",(0,0),(-1,-1),0.6,colors.HexColor(BORDER)),("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),4*mm),("RIGHTPADDING",(0,0),(-1,-1),4*mm),("TOPPADDING",(0,0),(-1,-1),3*mm)]))
-    story += [notes_table]
+    new_order_rows = []
+    for item in payload.get("new_orders_today", []):
+        extra = item.get("extra") or {}
+        new_order_rows.append([
+            extra.get("Orders::Order No") or "-",
+            item.get("order_created_at") or item.get("order_date") or "-",
+            extra.get("CreatedBy") or "-",
+            item.get("customer") or "-",
+            extra.get("Expected Arrival Date") or "-",
+            fmt(extra.get("Expected Arrival Cages") or None),
+            fmt(extra.get("Expected Arrival Skids") or None),
+            fmt(extra.get("Expected Arrival Weight") or None),
+        ])
+    if not new_order_rows:
+        new_order_rows = [["-", "-", "-", "No new orders were created today", "-", "-", "-", "-"]]
+    story += [notes_table, PageBreak()]
+    story += [
+        Table(
+            [[Paragraph("NEW ORDERS PROCESSED TODAY", styles["DashTitle"]), Paragraph(date_label, styles["RightSmall"])]],
+            colWidths=[doc.width*0.7, doc.width*0.3],
+        ),
+        Spacer(1, 2*mm),
+        Paragraph("Orders created on the report date", styles["Small"]),
+        Spacer(1, 2*mm),
+        data_table(
+            ["Order", "Created", "Created by", "Customer", "Expected arrival", "Cages", "Skids", "Weight"],
+            new_order_rows,
+            [16*mm, 30*mm, 34*mm, 69*mm, 28*mm, 18*mm, 18*mm, 22*mm],
+            font_size=7,
+        ),
+    ]
     doc.build(story)
     return output.getvalue()

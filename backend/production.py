@@ -348,6 +348,18 @@ def normalize_cycle_record(record):
     }
 
 
+def fetch_cycle_records(period_start, period_end):
+    """Fetch only cycle detail for a report period without loading time data."""
+    start = datetime.strptime(str(period_start), "%Y-%m-%d")
+    end = datetime.strptime(str(period_end), "%Y-%m-%d")
+    filemaker_range = f'{start.strftime("%m/%d/%Y")}...{end.strftime("%m/%d/%Y")}'
+    result = _find_all_records(get_cycles_layout(), {"Start Time": filemaker_range})
+    return {
+        "status": result.get("status"),
+        "cycles": [normalize_cycle_record(item) for item in result.get("records", [])],
+    }
+
+
 def prorated_monthly_cost(period_start, period_end, monthly_cost):
     start = datetime.strptime(str(period_start), "%Y-%m-%d").date()
     end = datetime.strptime(str(period_end), "%Y-%m-%d").date()
@@ -910,6 +922,7 @@ def apply_cycle_press_totals(rows, cycles):
     """Use cycle-detail LF as the authoritative press total without mutating the cache."""
     cycle_days = defaultdict(lambda: {
         "press_throughput": 0.0,
+        "press_repair_value": 0.0,
         "cycle_count": 0,
         "press_counts": defaultdict(int),
         "press_lf": defaultdict(float),
@@ -921,6 +934,7 @@ def apply_cycle_press_totals(rows, cycles):
         linear_feet = float(cycle.get("linear_feet") or 0)
         values = cycle_days[date_key]
         values["press_throughput"] += linear_feet
+        values["press_repair_value"] += float(cycle.get("repair_value") or 0)
         values["cycle_count"] += 1
         allocated = False
         for press in (1, 2, 3):
@@ -944,6 +958,9 @@ def apply_cycle_press_totals(rows, cycles):
         if cycle_day and cycle_day["cycle_count"]:
             item["press_throughput_daily_summary"] = item.get("press_throughput")
             item["press_throughput"] = cycle_day["press_throughput"]
+            item["production_revenue_today_daily_summary"] = item.get("production_revenue_today")
+            item["production_revenue_today"] = cycle_day["press_repair_value"]
+            item["production_revenue_source"] = "cycles"
             item["press_total_source"] = "cycles"
             for press in (1, 2, 3):
                 if cycle_day["press_counts"].get(press):
