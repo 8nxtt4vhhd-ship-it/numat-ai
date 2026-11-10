@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -135,6 +136,31 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
 
             self.assertEqual(updated["approved_actions"][0]["owner"], "Kelly")
             self.assertTrue(updated["finalized_at"])
+
+    def test_batch_meeting_actions_accepts_generated_action_variants(self):
+        class Request:
+            async def json(self):
+                return {
+                    "meeting_id": "meeting-1",
+                    "actions": [
+                        "Call the customer",
+                        {"action": "Review press capacity", "assigned_to": "Lois"},
+                    ],
+                }
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            main, "get_weekly_kpi_todos_path", return_value=Path(temp_dir) / "todos.json"
+        ), patch.object(main, "update_weekly_kpi_meeting_actions") as update, patch.object(
+            main, "record_audit_event"
+        ):
+            result = asyncio.run(main.post_weekly_kpi_todos_batch(Request()))
+            saved = main.load_weekly_kpi_todos()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["created"], 2)
+        self.assertEqual([item["text"] for item in saved], ["Call the customer", "Review press capacity"])
+        self.assertEqual(saved[1]["owner"], "Lois")
+        update.assert_called_once()
 
     def test_admin_can_edit_saved_meeting_transcript(self):
         with TemporaryDirectory() as temp_dir, patch.object(

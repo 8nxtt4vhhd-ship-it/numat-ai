@@ -10283,16 +10283,33 @@ async def post_weekly_kpi_todos_batch(request: Request):
     created = 0
     approved_actions = []
     for action in proposed[:25]:
-        text = str((action or {}).get("text") or "").strip()
+        if isinstance(action, str):
+            text = action.strip()
+            owner = ""
+        elif isinstance(action, dict):
+            text = str(
+                action.get("text")
+                or action.get("action")
+                or action.get("task")
+                or ""
+            ).strip()
+            owner = str(action.get("owner") or action.get("assigned_to") or "").strip()
+        else:
+            continue
         if not text:
             continue
         items.append({
-            "id": secrets.token_urlsafe(10), "text": text[:500], "owner": str((action or {}).get("owner") or "").strip()[:120],
+            "id": secrets.token_urlsafe(10), "text": text[:500], "owner": owner[:120],
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed_at": "",
             "created_by": str(current_user.get("display_name") or current_user.get("username") or "").strip(), "source": "meeting-audio-ai",
         })
-        approved_actions.append({"text": text[:500], "owner": str((action or {}).get("owner") or "").strip()[:120]})
+        approved_actions.append({"text": text[:500], "owner": owner[:120]})
         created += 1
+    if not created:
+        return JSONResponse(
+            {"status": "no_actions", "created": 0, "meeting_id": meeting_id, "error_message": "No valid selected actions were received."},
+            status_code=400,
+        )
     save_weekly_kpi_todos(items)
     record_audit_event("meeting-actions-ai-create", target=f"{created} actions", area="weekly-kpi")
     if meeting_id:
@@ -10700,8 +10717,29 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                 status.textContent = 'Review the proposed actions.';
                 document.getElementById('meeting-actions-add')?.addEventListener('click', async () => {
                     const selected = actions.filter((_, index) => proposals.querySelector(`input[data-index="${index}"]`)?.checked);
-                    const saved = await fetch('/api/weekly-kpi/todos/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({actions:selected, meeting_id:data.meeting_id})});
-                    if (saved.ok) location.href = '/weekly-kpi-dashboard#weekly-actions';
+                    const button = document.getElementById('meeting-actions-add');
+                    if (!selected.length) {
+                        status.textContent = 'Select at least one action to add.';
+                        return;
+                    }
+                    button.disabled = true;
+                    status.textContent = `Adding ${selected.length} selected action${selected.length === 1 ? '' : 's'}…`;
+                    try {
+                        const saved = await fetch('/api/weekly-kpi/todos/batch', {
+                            method:'POST',
+                            headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({actions:selected, meeting_id:data.meeting_id}),
+                        });
+                        const result = await saved.json().catch(() => ({}));
+                        if (!saved.ok || result.status !== 'ok' || Number(result.created || 0) < 1) {
+                            throw new Error(result.error_message || 'The selected actions could not be saved.');
+                        }
+                        status.textContent = `${result.created} action${result.created === 1 ? '' : 's'} added.`;
+                        location.href = '/weekly-kpi-dashboard#weekly-actions';
+                    } catch (error) {
+                        status.textContent = error?.message || 'The selected actions could not be saved. Please try again.';
+                        button.disabled = false;
+                    }
                 });
             };
             const transcribeSavedRecording = async () => {
