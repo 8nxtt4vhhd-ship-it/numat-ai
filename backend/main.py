@@ -25670,11 +25670,43 @@ def render_customers_filter_toolbar(group, territory, sort, direction, customer=
 
     return f"""
         <style>
-            .customers-search-form {{ display:flex;align-items:end;gap:8px;flex-wrap:wrap;margin-bottom:12px; }}
-            .customers-search-form label {{ display:grid;gap:4px;min-width:min(360px,100%); }}
-            .customers-search-form input[type=search] {{ height:40px;min-width:280px; }}
-            .customers-search-form .button {{ height:40px;margin:0; }}
-            @media(max-width:620px) {{ .customers-search-form label,.customers-search-form input[type=search] {{ width:100%;min-width:0; }} }}
+            .customers-filter-toolbar .customers-search-form {{
+                display:grid;
+                grid-template-columns:minmax(220px,300px) auto auto;
+                align-items:center;
+                gap:6px;
+                width:auto;
+                margin:0 0 6px;
+            }}
+            .customers-filter-toolbar .customers-search-form label {{ display:block;min-width:0;margin:0; }}
+            .customers-filter-toolbar .customers-search-form .label {{
+                position:absolute;
+                width:1px;
+                height:1px;
+                padding:0;
+                margin:-1px;
+                overflow:hidden;
+                clip:rect(0,0,0,0);
+                white-space:nowrap;
+                border:0;
+            }}
+            .customers-filter-toolbar .customers-search-form input[type=search] {{
+                width:100%;
+                min-width:0;
+                height:34px;
+                padding:6px 10px;
+            }}
+            .customers-filter-toolbar .customers-search-form .button {{
+                width:auto;
+                min-width:76px;
+                height:34px;
+                padding:6px 12px;
+                margin:0;
+            }}
+            @media(max-width:620px) {{
+                .customers-filter-toolbar .customers-search-form {{ grid-template-columns:minmax(0,1fr) auto; width:100%; }}
+                .customers-filter-toolbar .customers-search-form .secondary {{ grid-column:2; }}
+            }}
         </style>
         <section class="home-workspace-topbar customers-filter-toolbar" aria-label="Customer filters">
             <form class="customers-search-form" method="get" action="/customers-view">
