@@ -161,7 +161,7 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
     log = load_delivery_log()
     if not dry_run and not force and (log.get(key) or {}).get("status") == "sent":
         return {"status": "already_sent", "key": key}
-    recipients = recipients or get_daily_dash_report_settings().get("recipients") or all_active_user_recipients()
+    recipients = recipients if recipients is not None else get_daily_dash_report_settings().get("recipients", [])
     recipients = list(dict.fromkeys(str(email).strip().lower() for email in recipients if "@" in str(email)))
     if not recipients:
         return {"status": "missing_recipients", "key": key}

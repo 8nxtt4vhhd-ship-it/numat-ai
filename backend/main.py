@@ -6639,6 +6639,7 @@ def get_admin_settings_page(message: str = "", error: str = ""):
                         </form>
                         <form method="post" action="/admin-settings/daily-dash-report-test" class="login-form" style="margin-top:12px">
                             <label><span class="label">Test report date</span><input type="date" name="report_date" value="{daily_issue_test_date}" required /></label>
+                            <p class="subtle">Save the distribution list above before sending a test. The test sends only to the saved list.</p>
                             <button class="button secondary" type="submit">Send Daily Dash test</button>
                         </form>
                     </div>

@@ -209,12 +209,30 @@ class DailyDashTests(unittest.TestCase):
                     with patch.object(daily_reports, "fetch_order_records", return_value={"status": "ok", "orders": []}):
                         with patch.object(daily_reports, "write_filemaker_orders_cache"):
                             with patch.object(daily_reports, "fetch_aged_debt_summary", return_value={"status": "ok"}):
-                                with patch.object(daily_reports, "all_active_user_recipients", return_value=["kelly@example.com"]):
+                                with patch.object(daily_reports, "get_daily_dash_report_settings", return_value={"recipients": ["kelly@example.com"]}):
                                     with patch.object(daily_reports, "send_m365_reporting_mail") as send:
                                         result = daily_reports.deliver(date(2026, 8, 18), dry_run=True, output_dir=directory)
             self.assertEqual(result["status"], "dry_run")
             self.assertTrue(Path(result["path"]).read_bytes().startswith(b"%PDF"))
             send.assert_not_called()
+
+    def test_empty_daily_dash_distribution_never_falls_back_to_all_users(self):
+        detail = {"status": "ok", "clocking_count": 0, "time_bookings": [], "clockings": [], "cycles": [], "cycle_status": "ok", "summary": {}}
+        with (
+            patch.object(daily_reports, "fetch_production_analysis_data", return_value=sample_production_result()),
+            patch.object(daily_reports, "fetch_productivity_detail", return_value=detail),
+            patch.object(daily_reports, "fetch_order_records", return_value={"status": "ok", "orders": []}),
+            patch.object(daily_reports, "write_filemaker_orders_cache"),
+            patch.object(daily_reports, "fetch_aged_debt_summary", return_value={"status": "ok"}),
+            patch.object(daily_reports, "get_daily_dash_report_settings", return_value={"recipients": []}),
+            patch.object(daily_reports, "all_active_user_recipients", return_value=["everyone@example.com"]) as fallback,
+            patch.object(daily_reports, "send_m365_reporting_mail") as send,
+        ):
+            result = daily_reports.deliver(date(2026, 8, 18), force=True)
+
+        self.assertEqual(result["status"], "missing_recipients")
+        fallback.assert_not_called()
+        send.assert_not_called()
 
 
 if __name__ == "__main__":
