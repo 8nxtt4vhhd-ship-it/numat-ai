@@ -16512,6 +16512,7 @@ def post_customers_view_sync(
     sort: str = Form("last_order"),
     direction: str = Form("desc"),
     page: int = Form(1),
+    customer: str = Form(""),
 ):
     # This is the explicit, potentially slower refresh path. Keep normal page
     # loads cache-only, but refresh the contact directory and a broad CRM
@@ -16563,6 +16564,7 @@ def post_customers_view_sync(
         "sort": sort,
         "direction": direction,
         "page": max(1, page),
+        "customer": str(customer or "").strip(),
         "message": message,
         "error": error,
     })
@@ -16639,6 +16641,7 @@ def get_customers_view(
     start_index = (page - 1) * page_size
     paged_summaries = sorted_summaries[start_index:start_index + page_size]
     customers_return_to = build_customers_view_href(
+        customer=customer,
         group=group,
         territory=territory,
         sort=sort,
@@ -16667,7 +16670,7 @@ def get_customers_view(
         {status_markup}
         {render_data_availability_banner(order_result, crm_result, master_data_result)}
 
-        {render_customers_filter_toolbar(group, territory, sort, direction)}
+        {render_customers_filter_toolbar(group, territory, sort, direction, customer=customer)}
 
         <div class="table-wrap customers-table-wrap">
         <table class="customers-table">
@@ -16694,7 +16697,7 @@ def get_customers_view(
     return render_page(
         title="Customers",
         body=body,
-        page_actions=render_customers_sync_form(group, territory, sort, direction),
+        page_actions=render_customers_sync_form(group, territory, sort, direction, customer),
     )
 
 
@@ -25634,8 +25637,9 @@ def render_late_customers_filter_form(customer, action, sort, direction):
     """
 
 
-def build_customers_view_href(group="all", territory="all", sort="last_order", direction="desc", page=1):
+def build_customers_view_href(group="all", territory="all", sort="last_order", direction="desc", page=1, customer=""):
     query = urlencode({
+        "customer": str(customer or "").strip(),
         "group": normalize_action_plan_group_filter(group),
         "territory": normalize_action_plan_territory_filter(territory),
         "sort": sort,
@@ -25645,13 +25649,13 @@ def build_customers_view_href(group="all", territory="all", sort="last_order", d
     return f"/customers-view?{query}"
 
 
-def render_customers_filter_toolbar(group, territory, sort, direction):
+def render_customers_filter_toolbar(group, territory, sort, direction, customer=""):
     normalized_group = normalize_action_plan_group_filter(group)
     normalized_territory = normalize_action_plan_territory_filter(territory)
     territory_chips = []
     for territory_key, meta in ACTION_PLAN_TERRITORY_FILTERS.items():
         class_name = "toggle-chip active" if territory_key == normalized_territory else "toggle-chip"
-        href = build_customers_view_href(normalized_group, territory_key, sort, direction)
+        href = build_customers_view_href(normalized_group, territory_key, sort, direction, customer=customer)
         territory_chips.append(
             f'<a class="{class_name}" href="{escape(href)}">{escape(str(meta["label"]))}</a>'
         )
@@ -25659,13 +25663,29 @@ def render_customers_filter_toolbar(group, territory, sort, direction):
     group_chips = []
     for group_key, meta in ACTION_PLAN_GROUP_FILTERS.items():
         class_name = "toggle-chip active" if group_key == normalized_group else "toggle-chip"
-        href = build_customers_view_href(group_key, normalized_territory, sort, direction)
+        href = build_customers_view_href(group_key, normalized_territory, sort, direction, customer=customer)
         group_chips.append(
             f'<a class="{class_name}" href="{escape(href)}">{escape(str(meta["label"]))}</a>'
         )
 
     return f"""
+        <style>
+            .customers-search-form {{ display:flex;align-items:end;gap:8px;flex-wrap:wrap;margin-bottom:12px; }}
+            .customers-search-form label {{ display:grid;gap:4px;min-width:min(360px,100%); }}
+            .customers-search-form input[type=search] {{ height:40px;min-width:280px; }}
+            .customers-search-form .button {{ height:40px;margin:0; }}
+            @media(max-width:620px) {{ .customers-search-form label,.customers-search-form input[type=search] {{ width:100%;min-width:0; }} }}
+        </style>
         <section class="home-workspace-topbar customers-filter-toolbar" aria-label="Customer filters">
+            <form class="customers-search-form" method="get" action="/customers-view">
+                <input type="hidden" name="group" value="{escape(normalized_group)}">
+                <input type="hidden" name="territory" value="{escape(normalized_territory)}">
+                <input type="hidden" name="sort" value="{escape(sort)}">
+                <input type="hidden" name="direction" value="{escape(direction)}">
+                <label><span class="label">Find a customer</span><input type="search" name="customer" value="{escape(str(customer or ''))}" placeholder="Customer name"></label>
+                <button type="submit" class="button small-button">Search</button>
+                {f'<a class="button secondary small-button" href="{escape(build_customers_view_href(normalized_group, normalized_territory, sort, direction))}">Clear</a>' if str(customer or '').strip() else ''}
+            </form>
             <div class="home-topbar-primary customers-filter-row">
                 <div class="home-view-toggle customers-territory-toggle" aria-label="Territory">
                     {''.join(territory_chips)}
@@ -25678,13 +25698,14 @@ def render_customers_filter_toolbar(group, territory, sort, direction):
     """
 
 
-def render_customers_sync_form(group, territory, sort, direction):
+def render_customers_sync_form(group, territory, sort, direction, customer=""):
     return f"""
         <form class="customers-sync-form" method="post" action="/customers-view/sync">
             <input type="hidden" name="group" value="{escape(normalize_action_plan_group_filter(group))}">
             <input type="hidden" name="territory" value="{escape(normalize_action_plan_territory_filter(territory))}">
             <input type="hidden" name="sort" value="{escape(sort)}">
             <input type="hidden" name="direction" value="{escape(direction)}">
+            <input type="hidden" name="customer" value="{escape(str(customer or ''))}">
             <button type="submit" class="button secondary small-button customers-sync-button">Sync customer data</button>
         </form>
     """

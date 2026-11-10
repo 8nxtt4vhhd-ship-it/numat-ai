@@ -1077,6 +1077,14 @@ def fetch_filemaker_customer_data(force_refresh=False):
         if cached_master is not None and _FILEMAKER_MASTER_DATA_CACHE["expires_at"] > now:
             return cached_master
 
+    if not force_refresh:
+        disk_result = read_filemaker_master_data_disk_cache(cache_key)
+        if disk_result is not None:
+            _FILEMAKER_CUSTOMER_DATA_CACHE["key"] = cache_key
+            _FILEMAKER_CUSTOMER_DATA_CACHE["expires_at"] = float("inf")
+            _FILEMAKER_CUSTOMER_DATA_CACHE["result"] = disk_result
+            return disk_result
+
     if not config["customers_layout"]:
         return build_empty_filemaker_master_data("missing_master_layout")
 

@@ -660,19 +660,38 @@ class CustomersViewTests(unittest.TestCase):
             territory="east",
             sort="customer",
             direction="asc",
+            customer="Vestis",
         )
 
         self.assertIn('aria-label="Territory"', toolbar)
         self.assertIn('aria-label="Customer group"', toolbar)
         self.assertIn('class="toggle-chip active"', toolbar)
         self.assertIn("Cintas / UniFirst / Prudential", toolbar)
-        self.assertNotIn("Search customer", toolbar)
-        self.assertNotIn(">Apply<", toolbar)
-        self.assertNotIn(">Reset<", toolbar)
+        self.assertIn("Find a customer", toolbar)
+        self.assertIn('value="Vestis"', toolbar)
+        self.assertIn(">Search<", toolbar)
+        self.assertIn(">Clear<", toolbar)
+        self.assertIn("customer=Vestis", toolbar)
 
         sync_form = main.render_customers_sync_form("C", "east", "customer", "asc")
         self.assertIn("Sync customer data", sync_form)
         self.assertIn("small-button", sync_form)
+
+    def test_customer_directory_uses_disk_cache_before_filemaker(self):
+        cache_key = ("server", "database", "customers", "contacts")
+        cached = {"status": "ok", "customers_by_key": {"cached": {"company": "Cached Co"}}}
+        filemaker._FILEMAKER_CUSTOMER_DATA_CACHE.update({"key": None, "expires_at": 0, "result": None})
+        filemaker._FILEMAKER_MASTER_DATA_CACHE.update({"key": None, "expires_at": 0, "result": None})
+        with (
+            patch.object(filemaker, "get_filemaker_config", return_value={"customers_layout": "Customers"}),
+            patch.object(filemaker, "build_filemaker_master_data_cache_key", return_value=cache_key),
+            patch.object(filemaker, "read_filemaker_master_data_disk_cache", return_value=cached),
+            patch.object(filemaker, "fetch_all_layout_records") as fetch,
+        ):
+            result = filemaker.fetch_filemaker_customer_data()
+
+        self.assertIs(result, cached)
+        fetch.assert_not_called()
 
     def test_customer_filters_match_group_and_territory(self):
         summaries = [
