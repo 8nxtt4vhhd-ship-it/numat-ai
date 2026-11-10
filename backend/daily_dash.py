@@ -59,7 +59,7 @@ def _new_orders_today(orders, report_date):
     )
 
 
-def build_daily_dash_payload(production_result, orders_result=None, finance_result=None, report_date=None, daily_invoice_target=None, cycles_result=None):
+def build_daily_dash_payload(production_result, orders_result=None, finance_result=None, report_date=None, daily_invoice_target=None, cycles_result=None, productivity_detail=None):
     rows = sorted(production_result.get("production_rows", []), key=lambda item: str(item.get("date") or ""))
     if report_date:
         rows = [item for item in rows if str(item.get("date") or "") <= str(report_date)]
@@ -88,6 +88,12 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
     labour_pct_mtd = (labour_cost / invoiced * 100) if labour_cost is not None and invoiced and invoiced > 0 else 0.0
 
     press_lf = latest.get("press_throughput_reported") or latest.get("press_throughput")
+    productivity_detail = productivity_detail or {}
+    if cycles_result is None:
+        cycles_result = {
+            "status": productivity_detail.get("cycle_status"),
+            "cycles": productivity_detail.get("cycles", []),
+        }
     cycles_result = cycles_result or {}
     report_cycles = [
         item for item in cycles_result.get("cycles", [])
@@ -121,6 +127,18 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
     active_orders = _active_orders(orders, report_date)
     finance_result = finance_result or {}
     finance_available = finance_result.get("status") == "ok"
+    raw_productivity_available = (
+        productivity_detail.get("status") == "ok"
+        and bool(productivity_detail.get("clocking_count"))
+    )
+    productivity_today = (
+        (productivity_detail.get("day_summary") or {}).get("plant_productivity")
+        if raw_productivity_available else productivity(day_operators)
+    )
+    productivity_mtd = (
+        (productivity_detail.get("summary") or {}).get("plant_productivity")
+        if raw_productivity_available else productivity(month_operators)
+    )
     return {
         "report_date": report_date,
         "generated_at": datetime.now().astimezone().isoformat(timespec="minutes"),
@@ -142,8 +160,8 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
         "labour_hours_mtd": sum(item.get("clocked_hours") or 0 for item in month_operators),
         "labour_pct_today": latest.get("labour_percentage"),
         "labour_pct_mtd": labour_pct_mtd,
-        "productivity_today": productivity(day_operators),
-        "productivity_mtd": productivity(month_operators),
+        "productivity_today": productivity_today,
+        "productivity_mtd": productivity_mtd,
         "backlog": {name: latest.get(f"backlog_{name.casefold()}") for name in ("Sort", "Grind", "Press", "Trim")},
         "backlog_weeks": latest.get("backlog_weeks"),
         "incoming_skids": latest.get("incoming_skids"),

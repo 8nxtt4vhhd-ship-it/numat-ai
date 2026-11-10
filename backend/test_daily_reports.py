@@ -43,6 +43,26 @@ class DailyDashTests(unittest.TestCase):
         self.assertEqual(payload["labour_hours_today"], 10)
         self.assertEqual(payload["monthly_invoice_target"], 80000)
 
+    def test_payload_prefers_dashboard_raw_time_productivity(self):
+        productivity_detail = {
+            "status": "ok",
+            "clocking_count": 10,
+            "summary": {"plant_productivity": 95.4},
+            "day_summary": {"plant_productivity": 91.2},
+            "cycle_status": "ok",
+            "cycles": [],
+        }
+
+        payload = build_daily_dash_payload(
+            sample_production_result(),
+            {"status": "ok", "orders": []},
+            daily_invoice_target=8000,
+            productivity_detail=productivity_detail,
+        )
+
+        self.assertEqual(payload["productivity_today"], 91.2)
+        self.assertEqual(payload["productivity_mtd"], 95.4)
+
     def test_pdf_is_valid(self):
         payload = build_daily_dash_payload(sample_production_result(), {"status": "ok", "orders": []}, daily_invoice_target=8000)
         content = build_daily_dash_pdf(payload)
@@ -82,7 +102,7 @@ class DailyDashTests(unittest.TestCase):
     def test_dry_run_writes_pdf_and_does_not_send(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(daily_reports, "fetch_production_analysis_data", return_value=sample_production_result()):
-                with patch.object(daily_reports, "fetch_cycle_records", return_value={"status": "ok", "cycles": []}):
+                with patch.object(daily_reports, "fetch_productivity_detail", return_value={"status": "ok", "clocking_count": 0, "time_bookings": [], "clockings": [], "cycles": [], "cycle_status": "ok", "summary": {}}):
                     with patch.object(daily_reports, "fetch_order_records", return_value={"status": "ok", "orders": []}):
                         with patch.object(daily_reports, "write_filemaker_orders_cache"):
                             with patch.object(daily_reports, "fetch_aged_debt_summary", return_value={"status": "ok"}):

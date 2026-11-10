@@ -17,7 +17,7 @@ from filemaker import fetch_order_records
 from finance import fetch_aged_debt_summary
 from m365 import has_m365_reporting_config, send_m365_reporting_mail
 from monthly_reports import failure_recipients, load_users
-from production import fetch_cycle_records, fetch_production_analysis_data
+from production import build_productivity_detail, fetch_production_analysis_data, fetch_productivity_detail
 
 DEFAULT_DELIVERY_LOG_PATH = BASE_DIR / "data" / "daily_dash_deliveries.json"
 ALABAMA_TIMEZONE = ZoneInfo("America/Chicago")
@@ -74,13 +74,13 @@ def notify_failure(report_day, reason):
     )
 
 
-def build_report(production_result, orders_result, finance_result, requested_day=None, cycles_result=None):
+def build_report(production_result, orders_result, finance_result, requested_day=None, productivity_detail=None):
     payload = build_daily_dash_payload(
         production_result,
         orders_result=orders_result,
         finance_result=finance_result,
         report_date=requested_day.isoformat() if requested_day else None,
-        cycles_result=cycles_result,
+        productivity_detail=productivity_detail,
     )
     report_day = payload["report_date"]
     return {
@@ -106,7 +106,26 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
             default=str(date.today() - timedelta(days=1)),
         )
     )
-    cycles_result = fetch_cycle_records(report_day_hint, report_day_hint)
+    month_start = f"{report_day_hint[:7]}-01"
+    productivity_detail = fetch_productivity_detail(
+        force_refresh=True,
+        period_start=month_start,
+        period_end=report_day_hint,
+        remember_range=False,
+    )
+    day_bookings = [
+        item for item in productivity_detail.get("time_bookings", [])
+        if str(item.get("date") or "") == report_day_hint
+    ]
+    day_clockings = [
+        item for item in productivity_detail.get("clockings", [])
+        if str(item.get("date") or "") == report_day_hint
+    ]
+    productivity_detail = dict(productivity_detail)
+    productivity_detail["day_summary"] = build_productivity_detail(
+        day_bookings,
+        day_clockings,
+    ).get("summary", {})
     fresh_orders_result = fetch_order_records(limit=get_filemaker_order_limit())
     if fresh_orders_result.get("status") == "ok":
         write_filemaker_orders_cache(fresh_orders_result)
@@ -120,7 +139,7 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
             orders_result,
             finance_result,
             requested_day=requested_day,
-            cycles_result=cycles_result,
+            productivity_detail=productivity_detail,
         )
     except Exception as error:
         report_day = requested_day.isoformat() if requested_day else str(date.today() - timedelta(days=1))
