@@ -139,6 +139,8 @@ def build_daily_dash_payload(production_result, orders_result=None, finance_resu
         (productivity_detail.get("summary") or {}).get("plant_productivity")
         if raw_productivity_available else productivity(month_operators)
     )
+    if raw_productivity_available:
+        labour_pct_mtd = (productivity_detail.get("summary") or {}).get("labour_percentage")
     labour_hours_today = (
         (productivity_detail.get("day_summary") or {}).get("clocked_hours")
         if raw_productivity_available else sum(item.get("clocked_hours") or 0 for item in day_operators)

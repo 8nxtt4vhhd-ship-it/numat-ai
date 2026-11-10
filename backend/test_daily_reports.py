@@ -67,7 +67,7 @@ class DailyDashTests(unittest.TestCase):
         productivity_detail = {
             "status": "ok",
             "clocking_count": 10,
-            "summary": {"plant_productivity": 95.4, "clocked_hours": 260.2, "labour_clocked_hours": 291.5},
+            "summary": {"plant_productivity": 95.4, "clocked_hours": 260.2, "labour_clocked_hours": 291.5, "labour_percentage": 35.0},
             "day_summary": {"plant_productivity": 91.2, "clocked_hours": 85.75, "labour_clocked_hours": 96.0},
             "cycle_status": "ok",
             "cycles": [],
@@ -84,6 +84,7 @@ class DailyDashTests(unittest.TestCase):
         self.assertEqual(payload["productivity_mtd"], 95.4)
         self.assertEqual(payload["labour_hours_today"], 85.75)
         self.assertEqual(payload["labour_hours_mtd"], 260.2)
+        self.assertEqual(payload["labour_pct_mtd"], 35.0)
 
     def test_daily_report_visible_labour_hours_exclude_manager_clockings(self):
         detail = {
