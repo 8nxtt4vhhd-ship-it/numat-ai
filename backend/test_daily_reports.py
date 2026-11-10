@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import daily_reports
 from daily_dash import build_daily_dash_payload, build_daily_dash_pdf
+from filemaker import map_filemaker_record_to_order
 
 
 def sample_production_result():
@@ -36,6 +37,25 @@ def sample_production_result():
 
 
 class DailyDashTests(unittest.TestCase):
+    def test_order_mapping_accepts_filemaker_field_name_variations(self):
+        record = {"recordId": "1", "fieldData": {
+            "Orders::CreationTimestamp": "11/09/2026 09:37:25",
+            "Orders::Created By": "NuMat Systems Customer Service",
+            "Orders::ExpectedArrivalDate": "11/16/2026",
+            "Orders::Expected Arrival No of Cages": 4,
+            "Orders::ExpectedArrivalSkids": 2,
+            "Orders::Expected Arrival Gross Weight": 3104,
+            "Orders::Order No": "3801",
+            "Orders::Customer Name": "Wildman Business Group",
+        }}
+
+        order = map_filemaker_record_to_order(record)
+
+        self.assertEqual(order["extra"]["CreatedBy"], "NuMat Systems Customer Service")
+        self.assertEqual(order["extra"]["Expected Arrival Date"], "11/16/2026")
+        self.assertEqual(order["extra"]["Expected Arrival Cages"], 4)
+        self.assertEqual(order["extra"]["Expected Arrival Skids"], 2)
+        self.assertEqual(order["extra"]["Expected Arrival Weight"], 3104)
     def test_payload_uses_all_plant_clockings(self):
         payload = build_daily_dash_payload(sample_production_result(), {"status": "ok", "orders": []}, daily_invoice_target=8000)
         self.assertEqual(payload["productivity_today"], 60)

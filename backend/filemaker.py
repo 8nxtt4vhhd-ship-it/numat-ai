@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import time
 from urllib.parse import quote
 
@@ -732,6 +733,15 @@ def map_filemaker_record_to_order(record):
         field_name: get_field_value(field_data, field_name)
         for field_name in dict.fromkeys((*config["extra_fields"], *required_daily_dash_fields))
     }
+    daily_dash_aliases = {
+        "CreatedBy": ("CreatedBy", "Created By", "Orders::CreatedBy", "Orders::Created By"),
+        "Expected Arrival Date": ("Expected Arrival Date", "ExpectedArrivalDate", "Orders::Expected Arrival Date"),
+        "Expected Arrival Cages": ("Expected Arrival Cages", "ExpectedArrivalCages", "Expected Arrival No of Cages", "Orders::Expected Arrival Cages"),
+        "Expected Arrival Skids": ("Expected Arrival Skids", "ExpectedArrivalSkids", "Expected Arrival No of Skids", "Orders::Expected Arrival Skids"),
+        "Expected Arrival Weight": ("Expected Arrival Weight", "ExpectedArrivalWeight", "Expected Arrival Gross Weight", "Orders::Expected Arrival Weight"),
+    }
+    for canonical_name, aliases in daily_dash_aliases.items():
+        extra[canonical_name] = get_first_nonempty_field_value(field_data, *aliases)
 
     customer_primary_key = normalize_text_value(
         extra.get("Companies 4::PrimaryKey") or extra.get("Customer Ref")
@@ -767,6 +777,12 @@ def get_field_value(field_data, field_name):
 
     for key, value in field_data.items():
         if key.lower().endswith(field_suffix):
+            return value
+
+    compact_bare_name = re.sub(r"[^a-z0-9]", "", bare_field_name)
+    for key, value in field_data.items():
+        compact_key = re.sub(r"[^a-z0-9]", "", key.split("::")[-1].lower())
+        if compact_key == compact_bare_name:
             return value
 
     return None

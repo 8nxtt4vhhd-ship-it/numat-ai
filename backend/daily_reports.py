@@ -130,8 +130,10 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
     if fresh_orders_result.get("status") == "ok":
         write_filemaker_orders_cache(fresh_orders_result)
         orders_result = fresh_orders_result
+        orders_refreshed = True
     else:
         orders_result = get_orders_for_analysis()
+        orders_refreshed = False
     finance_result = fetch_aged_debt_summary(force_refresh=True)
     try:
         report = build_report(
@@ -167,7 +169,7 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
         destination.mkdir(parents=True, exist_ok=True)
         path = destination / report["filename"]
         path.write_bytes(report["content"])
-        return {"status": "dry_run", "key": key, "path": str(path), "recipients": recipients, "unavailable": report["payload"].get("unavailable", [])}
+        return {"status": "dry_run", "key": key, "path": str(path), "recipients": recipients, "unavailable": report["payload"].get("unavailable", []), "order_cache_refreshed": orders_refreshed}
 
     if not has_m365_reporting_config():
         return {"status": "m365_reporting_disabled", "key": key}
@@ -187,7 +189,7 @@ def deliver(requested_day=None, dry_run=False, output_dir=None, force=False, rec
     save_delivery_log(log)
     if send_result.get("status") != "ok":
         notify_failure(report_day, log[key]["error"])
-    return {**send_result, "key": key, "recipients": recipients}
+    return {**send_result, "key": key, "recipients": recipients, "order_cache_refreshed": orders_refreshed}
 
 
 def main(argv=None):
