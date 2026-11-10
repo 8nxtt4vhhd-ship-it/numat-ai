@@ -8895,13 +8895,11 @@ def render_monthly_labour_trend(rows, period_start="", period_end=""):
             <thead><tr><th>Month</th><th>Labour $</th><th>Labour %</th></tr></thead>
             <tbody>{table_rows}</tbody>
         </table></div>'''
-    detail_url = f"/production-analysis/productivity-detail?{urlencode({'start': period_start, 'end': period_end})}#labour-calculation"
     return f'''
         <section class="panel production-labour-history-panel">
             <div class="panel-head"><div><span class="home-focus-inline-kicker">Labour trend</span><h2>Monthly labour</h2></div></div>
             <p class="small muted">Clocked labour plus insurance, using the selected period.</p>
             {body}
-            <a class="small production-labour-history-link" href="{escape(detail_url)}">View calculation</a>
         </section>
     '''
 
@@ -31843,7 +31841,6 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .production-labour-history-table th:first-child,
                     .production-labour-history-table td:first-child {{ text-align: left; }}
                     .production-labour-history-table td small {{ display: block; margin-top: 2px; color: var(--muted); font-size: 9px; }}
-                    .production-labour-history-link {{ display: inline-block; margin-top: 10px; font-weight: 700; }}
 
                     .production-department-table {{ width: 100%; border-collapse: collapse; }}
                     .production-department-table th,

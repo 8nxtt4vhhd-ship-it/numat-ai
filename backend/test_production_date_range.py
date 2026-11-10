@@ -101,6 +101,7 @@ class ProductionDateRangeTests(unittest.TestCase):
         self.assertIn("$7,720", html)
         self.assertIn("32.4%", html)
         self.assertIn("Partial month", html)
+        self.assertNotIn("View calculation", html)
 
     def test_productivity_detail_page_shows_exact_calculation(self):
         detail = {
