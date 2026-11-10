@@ -253,6 +253,7 @@ def build_daily_dash_pdf(payload):
         content = [[Paragraph(str(value), styles["BodyCompact"]) for value in headers]]
         content += [[Paragraph(str(value), styles["BodyCompact"]) for value in row] for row in rows]
         table = Table(content, colWidths=widths, repeatRows=1)
+        table.hAlign = "LEFT"
         table.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#E8F0FA")),("TEXTCOLOR",(0,0),(-1,0),colors.HexColor("#36506D")),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
             ("GRID",(0,0),(-1,-1),0.45,colors.HexColor(BORDER)),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("FONTSIZE",(0,0),(-1,-1),font_size),

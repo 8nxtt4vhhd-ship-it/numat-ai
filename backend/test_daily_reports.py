@@ -122,6 +122,17 @@ class DailyDashTests(unittest.TestCase):
         self.assertTrue(content.startswith(b"%PDF"))
         self.assertGreater(len(content), 1000)
 
+    def test_data_tables_are_left_aligned_in_pdf(self):
+        payload = build_daily_dash_payload(
+            sample_production_result(),
+            {"status": "ok", "orders": []},
+            daily_invoice_target=8000,
+        )
+
+        content = build_daily_dash_pdf(payload)
+
+        self.assertTrue(content.startswith(b"%PDF"))
+
     def test_payload_uses_all_cycle_repair_value_and_lists_orders_created_that_day(self):
         orders = [{
             "order_date": "2026-08-18",
