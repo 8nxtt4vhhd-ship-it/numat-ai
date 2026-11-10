@@ -96,6 +96,7 @@ from crm import (
     get_filemaker_crm_use_sync_cache,
     get_filemaker_promise_status_field,
     is_customer_service_activity,
+    is_departmental_contact_email,
     get_crm_sample_csv_path,
     get_uploaded_crm_csv_path,
     read_filemaker_crm_sync_cache,
@@ -253,6 +254,7 @@ _CUSTOMER_SUMMARIES_CACHE_LOCK = Lock()
 _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK = Lock()
 _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE = {
     "entries": {},
+    "full_maps": {},
 }
 
 _CRM_ACTIVITY_PREVIEW_CACHE_LOCK = Lock()
@@ -17673,6 +17675,7 @@ def clear_customer_summaries_cache():
 def clear_customer_contextual_activity_cache():
     with _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK:
         _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["entries"].clear()
+        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["full_maps"].clear()
 
 
 def should_enable_startup_prewarm():
@@ -17779,6 +17782,19 @@ def build_customers_needing_attention_response(order_result=None, crm_result=Non
         crm_result.get("activity_map", {})
         if crm_result["status"] == "ok" else {}
     )
+    if crm_result.get("status") == "ok":
+        crm_activity_map = build_contextual_crm_activity_map(
+            crm_activity_map,
+            crm_result.get("activities", []),
+            [
+                {
+                    "customer": customer_name,
+                    "customer_primary_key": get_customer_primary_key(customer_orders),
+                    "orders": customer_orders,
+                }
+                for customer_name, customer_orders in customers.items()
+            ],
+        )
     late = find_late_customers(customers)
     late_customer_names = {
         str(item.get("customer") or "").strip().lower()
@@ -17961,6 +17977,36 @@ def normalize_crm_organization_name(value):
     return organization
 
 
+def normalize_invoice_number(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    match = re.search(r"\b\d{4,10}\b", text)
+    return match.group(0) if match else ""
+
+
+def extract_crm_invoice_numbers(activity):
+    subject = str((activity or {}).get("subject") or "")
+    body = str((activity or {}).get("body") or "")
+    text = f"{subject}\n{body}"
+    numbers = set()
+    patterns = (
+        r"\binvoice\s*(?:(?:no|number)\s*)?[#:\-–—]*\s*(\d{4,10})\b",
+        r"^(?:\s*(?:re|fw|fwd)\s*:\s*)*(\d{4,10})\s+vestis\b",
+    )
+    for pattern in patterns:
+        numbers.update(re.findall(pattern, text, flags=re.IGNORECASE | re.MULTILINE))
+    return numbers
+
+
+def activity_uses_departmental_contact(activity):
+    participant_emails = set(extract_emails((activity or {}).get("sender_email", "")))
+    participant_emails.update(extract_emails((activity or {}).get("to", "")))
+    return any(is_departmental_contact_email(email) for email in participant_emails)
+
+
 def build_contextual_crm_activity_map(activity_map, activities, customer_entries):
     """Recover branch-specific and uniquely identifiable legacy CRM history."""
     contextual_map = {
@@ -17970,6 +18016,17 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
     branches_by_organization = defaultdict(list)
     activities_by_organization = defaultdict(list)
     activity_keys_by_organization = defaultdict(set)
+    customer_keys_by_invoice = defaultdict(set)
+    departmental_activity_ids = {
+        id(activity)
+        for activity in activities or []
+        if activity_uses_departmental_contact(activity)
+    }
+    if departmental_activity_ids:
+        for customer_key, items in contextual_map.items():
+            contextual_map[customer_key] = [
+                item for item in items if id(item) not in departmental_activity_ids
+            ]
 
     for entry in customer_entries or []:
         customer_name = str(entry.get("customer") or "").strip()
@@ -17979,6 +18036,12 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
         city = normalize_apollo_location_value(branch.get("city"))
         if organization and city and customer_key:
             branches_by_organization[organization].append((customer_key, city))
+        for order in entry.get("orders", []) or []:
+            invoice_number = normalize_invoice_number(
+                (order.get("extra") or {}).get("Orders::Invoice Number")
+            )
+            if invoice_number and customer_key:
+                customer_keys_by_invoice[invoice_number].add(customer_key)
 
     for activity in activities or []:
         activity_company = str(
@@ -17993,15 +18056,31 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
             if activity_key:
                 activity_keys_by_organization[organization].add(activity_key)
         candidate_branches = branches_by_organization.get(organization, [])
-        if not candidate_branches:
-            continue
-
-        searchable_text = normalize_apollo_location_value(" ".join(str(activity.get(field) or "") for field in (
-            "subject", "body", "customer_label", "customer_company"
-        )))
+        uses_departmental_contact = activity_uses_departmental_contact(activity)
+        searchable_fields = ["subject", "body", "customer_label"]
+        if not uses_departmental_contact:
+            searchable_fields.append("customer_company")
+        searchable_text = normalize_apollo_location_value(
+            " ".join(str(activity.get(field) or "") for field in searchable_fields)
+        )
         direct_key = str(activity.get("customer_primary_key") or "").strip()
+        text_matched_customer_keys = set()
         for customer_key, city in candidate_branches:
-            if customer_key != direct_key and f" {city} " in f" {searchable_text} ":
+            if f" {city} " in f" {searchable_text} ":
+                text_matched_customer_keys.add(customer_key)
+                if customer_key != direct_key:
+                    contextual_map.setdefault(customer_key, []).append(activity)
+
+        if uses_departmental_contact:
+            invoice_matched_customer_keys = set()
+            for invoice_number in extract_crm_invoice_numbers(activity):
+                invoice_matched_customer_keys.update(customer_keys_by_invoice.get(invoice_number, set()))
+            resolved_customer_keys = invoice_matched_customer_keys or text_matched_customer_keys
+
+            # A shared departmental mailbox can cause FileMaker to attach every
+            # invoice to one arbitrary contact location. Its native links were
+            # removed once above; retain it only where order or branch evidence resolves it.
+            for customer_key in resolved_customer_keys:
                 contextual_map.setdefault(customer_key, []).append(activity)
 
     for entry in customer_entries or []:
@@ -18041,11 +18120,15 @@ def get_cached_customer_detail_crm_activities(
 ):
     """Return pre-indexed CRM history, with a cached legacy-branch fallback."""
     activity_map = crm_result.get("activity_map", {})
-    direct_activities = activity_map.get(customer_primary_key)
-    if direct_activities:
-        return direct_activities
-
     activities = crm_result.get("activities", [])
+    direct_activities = activity_map.get(customer_primary_key)
+    if direct_activities and not any(activity_uses_departmental_contact(item) for item in activities):
+        return direct_activities
+    full_map_key = id(activities)
+    full_map_record = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["full_maps"].get(full_map_key)
+    if full_map_record and full_map_record.get("activities") is activities:
+        return tuple(full_map_record.get("activity_map", {}).get(customer_primary_key, []))
+
     cache_key = (
         CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_VERSION,
         id(activities),
@@ -18089,11 +18172,18 @@ def build_customer_summaries(orders, attention_by_customer, crm_activity_map=Non
     summaries = []
 
     customer_entries = build_customer_lookup_entries(grouped_customers, master_data_result)
+    source_crm_activities = crm_activities or []
     crm_activity_map = build_contextual_crm_activity_map(
         crm_activity_map or {},
-        crm_activities or [],
+        source_crm_activities,
         customer_entries,
     )
+    full_map_key = id(source_crm_activities)
+    with _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE_LOCK:
+        _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["full_maps"][full_map_key] = {
+            "activities": source_crm_activities,
+            "activity_map": crm_activity_map,
+        }
     customers_by_key = (master_data_result or {}).get("customers_by_key", {})
 
     for entry in customer_entries:

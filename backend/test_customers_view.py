@@ -372,6 +372,57 @@ class CustomersViewTests(unittest.TestCase):
 
         self.assertEqual(contextual["novato-key"], [activity])
 
+    def test_departmental_invoice_activity_routes_by_invoice_number_not_native_contact_key(self):
+        activity = {
+            "date_created": "2026-01-22 10:00:07",
+            "customer_primary_key": "cherry-hill-key",
+            "customer_company": "Vestis Uniform Services (Cherry Hill, NJ)",
+            "subject": "invoice 10602",
+            "sender_email": "customerservice@numatsystems.com",
+            "to": "apss@vestis.com",
+        }
+        entries = [{
+            "customer": "Vestis Uniform Services (Cherry Hill, NJ)",
+            "customer_primary_key": "cherry-hill-key",
+            "orders": [{"extra": {"Orders::Invoice Number": "10599"}}],
+        }, {
+            "customer": "Vestis Uniform Services (Rockford, IL)",
+            "customer_primary_key": "rockford-key",
+            "orders": [{"extra": {"Orders::Invoice Number": 10602}}],
+        }]
+
+        contextual = main.build_contextual_crm_activity_map(
+            {"cherry-hill-key": [activity]},
+            [activity],
+            entries,
+        )
+
+        self.assertEqual(contextual["rockford-key"], [activity])
+        self.assertEqual(contextual["cherry-hill-key"], [])
+
+    def test_unresolved_departmental_activity_is_not_left_on_default_location(self):
+        activity = {
+            "date_created": "2026-10-23 08:34:29",
+            "customer_primary_key": "cherry-hill-key",
+            "customer_company": "Vestis Uniform Services (Cherry Hill, NJ)",
+            "subject": "Numat Systems - Our Invoice No - 10890",
+            "sender_email": "customerservice@numatsystems.com",
+            "to": "apss@vestis.com",
+        }
+        entries = [{
+            "customer": "Vestis Uniform Services (Cherry Hill, NJ)",
+            "customer_primary_key": "cherry-hill-key",
+            "orders": [],
+        }]
+
+        contextual = main.build_contextual_crm_activity_map(
+            {"cherry-hill-key": [activity]},
+            [activity],
+            entries,
+        )
+
+        self.assertEqual(contextual["cherry-hill-key"], [])
+
     def test_shared_contact_activity_is_indexed_to_every_customer_location(self):
         activity = {
             "date_created": "2026-10-20 09:00:00",
