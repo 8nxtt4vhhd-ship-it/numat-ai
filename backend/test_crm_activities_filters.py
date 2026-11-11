@@ -145,6 +145,36 @@ class CrmActivitiesFilterTests(unittest.TestCase):
 
         self.assertIn("sender=alex%40example.com", pagination)
 
+    def test_meeting_and_call_records_display_as_tasks(self):
+        meeting = {
+            "crm_type": "Meeting",
+            "direction": "outbound",
+            "date_created": "2026-11-11 09:00:00",
+            "subject": "Customer visit",
+        }
+        phone_call = {"crm_type": "Telephone Call", "direction": "outbound"}
+        email = {"crm_type": "Outlook", "direction": "outbound"}
+
+        self.assertEqual(main.get_crm_activity_display_direction(meeting), "task")
+        self.assertEqual(main.get_crm_activity_display_direction(phone_call), "task")
+        self.assertEqual(main.get_crm_activity_display_direction(email), "outbound")
+        self.assertIn(">Task</span>", main.render_crm_activity_row(meeting))
+
+    def test_task_direction_filter_uses_display_direction(self):
+        meeting = {
+            "crm_type": "Meeting",
+            "direction": "outbound",
+            "date_created": "2026-11-11 09:00:00",
+        }
+        email = {
+            "crm_type": "Outlook",
+            "direction": "outbound",
+            "date_created": "2026-11-11 10:00:00",
+        }
+
+        self.assertEqual(main.filter_crm_activities([meeting, email], direction="task"), [meeting])
+        self.assertEqual(main.filter_customer_crm_activities([meeting, email], direction="task"), [meeting])
+
 
 if __name__ == "__main__":
     unittest.main()

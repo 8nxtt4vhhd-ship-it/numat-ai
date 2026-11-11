@@ -18867,6 +18867,21 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
     """
 
 
+def get_crm_activity_display_direction(activity):
+    crm_type = str((activity or {}).get("crm_type") or "").strip().casefold()
+    task_types = {
+        "appointment",
+        "call",
+        "meeting",
+        "promise of order",
+        "task",
+        "telephone call",
+    }
+    if crm_type in task_types:
+        return "task"
+    return str((activity or {}).get("direction") or "unknown").strip().casefold() or "unknown"
+
+
 def render_customer_crm_timeline_summary(activities, crm_direction, crm_category, start_index, shown_count):
     parts = [
         (
@@ -18880,15 +18895,19 @@ def render_customer_crm_timeline_summary(activities, crm_direction, crm_category
         parts.append(f"direction: {direction_value.title()}")
     else:
         direction_counts = Counter(
-            str(activity.get("direction") or "").strip().lower()
+            get_crm_activity_display_direction(activity)
             for activity in activities
-            if str(activity.get("direction") or "").strip()
+            if get_crm_activity_display_direction(activity)
         )
         inbound_count = direction_counts.get("inbound", 0)
         outbound_count = direction_counts.get("outbound", 0)
+        task_count = direction_counts.get("task", 0)
         unknown_count = direction_counts.get("unknown", 0)
         parts.append(f"inbound: {inbound_count}")
         parts.append(f"outbound: {outbound_count}")
+
+        if task_count:
+            parts.append(f"tasks: {task_count}")
 
         if unknown_count:
             parts.append(f"unknown: {unknown_count}")
@@ -18909,6 +18928,7 @@ def render_customer_crm_timeline_controls(customer, crm_direction, crm_category,
         "": "All",
         "inbound": "Inbound",
         "outbound": "Outbound",
+        "task": "Task",
         "unknown": "Unknown",
     }
     category_options = {
@@ -19004,12 +19024,10 @@ def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, c
 
 
 def render_customer_crm_activity(activity):
-    direction_class = "crm-direction"
+    display_direction = get_crm_activity_display_direction(activity)
+    direction_class = f"crm-direction {display_direction}".strip()
 
-    if activity.get("direction") == "inbound":
-        direction_class = "crm-direction inbound"
-    elif activity.get("direction") == "outbound":
-        direction_class = "crm-direction outbound"
+    direction_label = "Task" if display_direction == "task" else display_direction.title()
 
     category_value = get_activity_category(activity)
     category_label = (
@@ -19028,7 +19046,7 @@ def render_customer_crm_activity(activity):
             <td data-label="Type">
                 <div class="crm-pill-stack">
                     <span class="{category_class}">{escape(category_label)}</span>
-                    <span class="{direction_class}">{escape(activity.get("direction", "unknown"))}</span>
+                    <span class="{direction_class}">{escape(direction_label or "Unknown")}</span>
                 </div>
             </td>
             <td data-label="Subject">{escape(activity.get("subject", ""))}</td>
@@ -19206,6 +19224,7 @@ def render_crm_filter_form(customer, sender, direction, category, subject, page_
         "": "All",
         "inbound": "Inbound",
         "outbound": "Outbound",
+        "task": "Task",
         "unknown": "Unknown",
     }
     category_options = {
@@ -19415,19 +19434,16 @@ def render_crm_pagination(customer, sender, direction, category, subject, date_f
 
 def render_crm_activity_row(activity):
     preview = get_cached_crm_activity_preview(activity.get("body", ""), limit=320)
-    direction_class = "crm-direction"
-
-    if activity.get("direction") == "inbound":
-        direction_class = "crm-direction inbound"
-    elif activity.get("direction") == "outbound":
-        direction_class = "crm-direction outbound"
+    display_direction = get_crm_activity_display_direction(activity)
+    direction_class = f"crm-direction {display_direction}".strip()
+    direction_label = "Task" if display_direction == "task" else display_direction.title()
 
     return f"""
         <tr>
             <td>
                 <div class="crm-activity-meta">
                     <div><strong>Date:</strong> {escape(activity.get("date_created", ""))}</div>
-                    <div><strong>Direction:</strong> <span class="{direction_class}">{escape(activity.get("direction", ""))}</span></div>
+                    <div><strong>Direction:</strong> <span class="{direction_class}">{escape(direction_label or "Unknown")}</span></div>
                     <div><strong>Customer:</strong> {escape(activity.get("customer_company") or activity.get("customer_label") or "")}</div>
                     <div><strong>Subject:</strong> {escape(activity.get("subject", ""))}</div>
                     <div><strong>From:</strong> {escape(activity.get("sender_email", ""))}</div>
@@ -19491,9 +19507,7 @@ def filter_crm_activities(activities, customer="", sender="", direction="", cate
         ).lower():
             continue
 
-        if direction_filter and direction_filter != str(
-            activity.get("direction") or ""
-        ).lower():
+        if direction_filter and direction_filter != get_crm_activity_display_direction(activity):
             continue
 
         # Category inference can inspect a full email body. Only perform it
@@ -19556,7 +19570,7 @@ def filter_customer_crm_activities(activities, direction="", category=""):
     filtered = []
 
     for activity in activities:
-        if direction_filter and str(activity.get("direction") or "").strip().lower() != direction_filter:
+        if direction_filter and get_crm_activity_display_direction(activity) != direction_filter:
             continue
 
         if category_filter and get_activity_category(activity) != category_filter:
@@ -36554,6 +36568,11 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .crm-direction.outbound {{
                         background: #dbeafe;
                         color: #1d4ed8;
+                    }}
+
+                    .crm-direction.task {{
+                        background: #ede9fe;
+                        color: #6d28d9;
                     }}
 
                     .crm-pill-stack {{
