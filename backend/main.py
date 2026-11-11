@@ -38401,6 +38401,12 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             background: #fff;
                         }}
 
+                        .customers-table tr {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            gap: 14px 18px;
+                            padding: 16px;
+                        }}
+
                         .customers-table td,
                         .customer-detail-page .crm-timeline-table td,
                         .customer-detail-page .tall-table table:not(.crm-timeline-table) td {{
@@ -38427,13 +38433,44 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .customers-table td:first-child {{
+                            grid-column: 1 / -1;
                             grid-template-columns: 1fr;
-                            padding-bottom: 5px;
-                            font-size: 15px;
+                            padding-bottom: 10px;
+                            border-bottom: 1px solid var(--border);
+                            font-size: 18px;
+                            line-height: 1.3;
                         }}
 
                         .customers-table td:first-child::before {{
                             display: none;
+                        }}
+
+                        .customers-table td {{
+                            display: grid;
+                            grid-template-columns: 1fr;
+                            gap: 4px;
+                            font-size: 15px;
+                            line-height: 1.35;
+                        }}
+
+                        .customers-table td::before {{
+                            font-size: 11px;
+                        }}
+
+                        .customers-table td:nth-child(3),
+                        .customers-table td:nth-child(4),
+                        .customers-table td:nth-child(6),
+                        .customers-table td:nth-child(7) {{
+                            display: none;
+                        }}
+
+                        .customers-table td:nth-child(9) {{
+                            grid-column: 1 / -1;
+                        }}
+
+                        .customers-table .customers-last-activity {{
+                            align-items: flex-start;
+                            gap: 8px;
                         }}
 
                         .outreach-head,
