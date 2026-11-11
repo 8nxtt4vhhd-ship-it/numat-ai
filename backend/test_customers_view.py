@@ -741,7 +741,7 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn('aria-label="Territory"', toolbar)
         self.assertIn('aria-label="Customer group"', toolbar)
         self.assertIn('class="toggle-chip active"', toolbar)
-        self.assertIn("Cintas / UniFirst / Prudential", toolbar)
+        self.assertIn("Nationals", toolbar)
         self.assertIn("Find a customer", toolbar)
         self.assertIn('value="Vestis"', toolbar)
         self.assertIn(">Search<", toolbar)

@@ -13205,7 +13205,7 @@ ACTION_PLAN_GROUP_FILTERS = {
     "all": {"label": "All"},
     "A": {"label": "Vestis"},
     "B": {"label": "Independents"},
-    "C": {"label": "Cintas / UniFirst / Prudential"},
+    "C": {"label": "Nationals"},
     "D": {"label": "CSC"},
     "E": {"label": "Alsco"},
 }
@@ -25995,8 +25995,53 @@ def render_customers_filter_toolbar(group, territory, sort, direction, customer=
                 margin:0;
             }}
             @media(max-width:620px) {{
+                .customers-filter-toolbar {{
+                    width:100%;
+                    box-sizing:border-box;
+                    justify-items:stretch;
+                }}
                 .customers-filter-toolbar .customers-search-form {{ grid-template-columns:minmax(0,1fr) auto; width:100%; }}
                 .customers-filter-toolbar .customers-search-form .secondary {{ grid-column:2; }}
+                .customers-filter-toolbar .customers-filter-row {{
+                    display:grid;
+                    grid-template-columns:minmax(0,1fr);
+                    width:100%;
+                    max-width:none;
+                    min-width:0;
+                    gap:7px;
+                    justify-self:stretch;
+                    justify-items:stretch;
+                    box-sizing:border-box;
+                }}
+                .customers-filter-toolbar .customers-territory-toggle,
+                .customers-filter-toolbar .customers-group-toggle {{
+                    display:grid;
+                    width:100% !important;
+                    max-width:none;
+                    height:auto;
+                    min-height:0;
+                    gap:3px;
+                    padding:3px;
+                    box-sizing:border-box;
+                    justify-self:stretch;
+                }}
+                .customers-filter-toolbar .customers-territory-toggle {{
+                    grid-template-columns:repeat(3,minmax(0,1fr));
+                }}
+                .customers-filter-toolbar .customers-group-toggle {{
+                    grid-template-columns:repeat(3,minmax(0,1fr));
+                }}
+                .customers-filter-toolbar .customers-territory-toggle .toggle-chip,
+                .customers-filter-toolbar .customers-group-toggle .toggle-chip {{
+                    width:100%;
+                    min-width:0;
+                    min-height:32px;
+                    padding:0 5px;
+                    font-size:11px;
+                    line-height:1.15;
+                    text-align:center;
+                    white-space:normal;
+                }}
             }}
         </style>
         <section class="home-workspace-topbar customers-filter-toolbar" aria-label="Customer filters">
@@ -37946,17 +37991,30 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .nav-modules {{
                             display: grid;
-                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            grid-template-columns: repeat(4, minmax(0, 1fr));
                             order: 3;
                             flex: 1 1 100%;
                             width: 100%;
-                            padding-bottom: 2px;
+                            gap: 2px;
+                            padding: 3px;
                         }}
 
                         .nav-module-menu summary {{
                             display: flex;
                             align-items: center;
-                            justify-content: space-between;
+                            justify-content: center;
+                            padding: 7px 3px;
+                            font-size: 10px;
+                            text-align: center;
+                        }}
+
+                        .nav-module-menu summary::after {{
+                            display: none;
+                        }}
+
+                        .nav-module-menu:nth-child(n + 3) .nav-module-dropdown {{
+                            right: 0;
+                            left: auto;
                         }}
 
                         .nav-admin-menu {{
@@ -38402,8 +38460,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .customers-table tr {{
-                            grid-template-columns: repeat(2, minmax(0, 1fr));
-                            gap: 14px 18px;
+                            grid-template-columns: repeat(3, minmax(0, 1fr));
+                            gap: 14px 10px;
                             padding: 16px;
                         }}
 
@@ -38460,17 +38518,52 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         .customers-table td:nth-child(3),
                         .customers-table td:nth-child(4),
                         .customers-table td:nth-child(6),
-                        .customers-table td:nth-child(7) {{
+                        .customers-table td:nth-child(7),
+                        .customers-table td:nth-child(8) {{
                             display: none;
                         }}
 
-                        .customers-table td:nth-child(9) {{
-                            grid-column: 1 / -1;
+                        .customers-table .customer-name-link {{
+                            color: var(--blue);
+                            font-size: 19px;
+                            font-weight: 800;
+                            line-height: 1.25;
+                            text-decoration: none;
                         }}
 
                         .customers-table .customers-last-activity {{
                             align-items: flex-start;
-                            gap: 8px;
+                            gap: 6px;
+                        }}
+
+                        .customers-table .customers-last-activity:has(.badge) > span:first-child {{
+                            display: inline-flex;
+                            align-items: center;
+                            width: fit-content;
+                            min-height: 27px;
+                            padding: 4px 7px;
+                            border-radius: 6px;
+                            background: #dcfce7;
+                            color: #166534;
+                            font-weight: 700;
+                            box-sizing: border-box;
+                        }}
+
+                        .customers-table .customers-last-activity .badge {{
+                            display: none;
+                        }}
+
+                        .customers-table td:nth-child(2),
+                        .customers-table td:nth-child(5),
+                        .customers-table td:nth-child(9) {{
+                            min-width: 0;
+                            font-size: 14px;
+                        }}
+
+                        .customers-table td:nth-child(2)::before,
+                        .customers-table td:nth-child(5)::before,
+                        .customers-table td:nth-child(9)::before {{
+                            white-space: nowrap;
                         }}
 
                         .outreach-head,
