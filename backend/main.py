@@ -13936,6 +13936,107 @@ def build_filemaker_phone_call_fields(sender_email, recipient, subject, body, cr
     }
 
 
+def build_filemaker_visit_fields(sender_email, recipient, subject, body, crm_category=""):
+    return {
+        "body": str(body or "").strip(),
+        "subject": str(subject or "").strip(),
+        "CRM Category": str(crm_category or "").strip(),
+        "CRM Type": "Meeting",
+        "sender_email": str(sender_email or "").strip(),
+        "To": str(recipient or "").strip(),
+    }
+
+
+@app.post("/filemaker/record-visit", response_class=HTMLResponse)
+def post_filemaker_record_visit(
+    customer: str = Form(""),
+    return_to: str = Form("/action-plan-view"),
+    to: str = Form(""),
+    body: str = Form(""),
+    crm_category: str = Form(""),
+):
+    current_user = get_current_session_user()
+    if not current_user:
+        return RedirectResponse(url="/login?next=%2Faction-plan-view", status_code=303)
+
+    customer_name = str(customer or "").strip()
+    recipient = str(to or "").strip()
+    body_text = str(body or "").strip()
+    connection_state = get_m365_connection_state(current_user)
+    sender_email = str(
+        connection_state.get("mailbox")
+        or current_user.get("m365_email")
+        or current_user.get("email")
+        or ""
+    ).strip()
+    subject_text = f"Customer visit — {customer_name}" if customer_name else "Customer visit"
+
+    if not customer_name or not recipient or not body_text or not sender_email:
+        record_audit_event(
+            "record-visit",
+            target=customer_name,
+            details="Visit was not recorded because customer, contact email, notes, or sender was missing.",
+            area="customer-visit",
+            status="failed",
+        )
+        return RedirectResponse(
+            url=append_message_to_url(
+                return_to or "/action-plan-view",
+                error="Customer, contact email and visit notes are required.",
+            ),
+            status_code=303,
+        )
+
+    write_result = create_layout_record(
+        get_filemaker_emails_layout(),
+        build_filemaker_visit_fields(
+            sender_email,
+            recipient,
+            subject_text,
+            body_text,
+            crm_category=crm_category,
+        ),
+    )
+    if write_result.get("status") != "ok":
+        error_text = str(
+            write_result.get("error_message")
+            or write_result.get("status")
+            or "FileMaker could not create the visit record."
+        )
+        record_audit_event(
+            "record-visit",
+            target=customer_name,
+            details=f"FileMaker visit record failed for {recipient}: {error_text}",
+            area="customer-visit",
+            status="failed",
+        )
+        return RedirectResponse(
+            url=append_message_to_url(
+                return_to or "/action-plan-view",
+                error=f"Visit notes were not recorded: {error_text}",
+            ),
+            status_code=303,
+        )
+
+    record_audit_event(
+        "record-visit",
+        target=customer_name,
+        details=f"Meeting recorded for {recipient} • FileMaker record {write_result.get('record_id') or 'created'}",
+        area="customer-visit",
+        status="success",
+    )
+    clear_attention_response_cache()
+    clear_home_queue_summaries_cache()
+    clear_customer_summaries_cache()
+    return RedirectResponse(
+        url=append_message_to_url(
+            return_to or "/action-plan-view",
+            message="Visit recorded in FileMaker.",
+        ),
+        status_code=303,
+    )
+
+
 @app.post("/filemaker/record-call", response_class=HTMLResponse)
 def post_filemaker_record_call(
     customer: str = Form(""),
@@ -17994,15 +18095,15 @@ def render_customer_order_row(order):
 
     return f"""
         <tr>
-            <td>{escape(str(order.get("filemaker_record_id", "")))}</td>
-            <td>{escape(customer_name)}</td>
-            <td>{escape(str(order.get("order_date", "")))}</td>
-            <td>{escape(str(order.get("amount", "")))}</td>
-            <td>{escape(str(extra.get("Orders::Order No", "")))}</td>
-            <td>{escape(str(extra.get("Orders::Status", "")))}</td>
-            <td>{escape(str(get_order_price_list(order)))}</td>
-            <td>{escape(str(get_order_state(order)))}</td>
-            <td>{escape(str(get_order_territory(order)))}</td>
+            <td data-label="Record">{escape(str(order.get("filemaker_record_id", "")))}</td>
+            <td data-label="Customer">{escape(customer_name)}</td>
+            <td data-label="Order date">{escape(str(order.get("order_date", "")))}</td>
+            <td data-label="Amount">{escape(str(order.get("amount", "")))}</td>
+            <td data-label="Order no">{escape(str(extra.get("Orders::Order No", "")))}</td>
+            <td data-label="Status">{escape(str(extra.get("Orders::Status", "")))}</td>
+            <td data-label="Price list">{escape(str(get_order_price_list(order)))}</td>
+            <td data-label="State">{escape(str(get_order_state(order)))}</td>
+            <td data-label="Territory">{escape(str(get_order_territory(order)))}</td>
         </tr>
     """
 
@@ -18577,15 +18678,15 @@ def render_customer_summary_row(summary, return_to=""):
 
     return f"""
         <tr id="{escape(row_id)}">
-            <td>{customer_markup}</td>
-            <td>{summary["order_count"]}</td>
-            <td>{summary["crm_count"]}</td>
-            <td>{escape(str(summary["state"]))}</td>
-            <td>{format_customer_list_date(summary.get("last_order"), "No orders")}</td>
-            <td>{format_average_gap(summary["avg_cycle"])} <span class="muted-soft">({escape(str(summary.get("cycle_pattern_label") or "Not enough orders"))})</span></td>
-            <td>{format_currency(summary["total_value"])}</td>
-            <td>{format_currency(summary["avg_value"])}</td>
-            <td>
+            <td data-label="Customer">{customer_markup}</td>
+            <td data-label="Orders">{summary["order_count"]}</td>
+            <td data-label="CRM">{summary["crm_count"]}</td>
+            <td data-label="State">{escape(str(summary["state"]))}</td>
+            <td data-label="Last order">{format_customer_list_date(summary.get("last_order"), "No orders")}</td>
+            <td data-label="Avg cycle">{format_average_gap(summary["avg_cycle"])} <span class="muted-soft">({escape(str(summary.get("cycle_pattern_label") or "Not enough orders"))})</span></td>
+            <td data-label="Total value">{format_currency(summary["total_value"])}</td>
+            <td data-label="Avg value / order">{format_currency(summary["avg_value"])}</td>
+            <td data-label="Last activity">
                 <div class="customers-last-activity">
                     <span>{format_customer_list_date(summary.get("display_last_activity"), "No sales outreach")}</span>
                     {render_recent_activity_badge_for_date(summary.get("display_last_activity"))}
@@ -18923,19 +19024,19 @@ def render_customer_crm_activity(activity):
 
     return f"""
         <tr>
-            <td>{escape(format_optional_datetime(activity.get("date_created", "")))}</td>
-            <td>
+            <td data-label="Date">{escape(format_optional_datetime(activity.get("date_created", "")))}</td>
+            <td data-label="Type">
                 <div class="crm-pill-stack">
                     <span class="{category_class}">{escape(category_label)}</span>
                     <span class="{direction_class}">{escape(activity.get("direction", "unknown"))}</span>
                 </div>
             </td>
-            <td>{escape(activity.get("subject", ""))}</td>
-            <td>
+            <td data-label="Subject">{escape(activity.get("subject", ""))}</td>
+            <td data-label="From / To">
                 <div><strong>From:</strong> {escape(activity.get("sender_email", ""))}</div>
                 <div><strong>To:</strong> {escape(activity.get("to", ""))}</div>
             </td>
-            <td>{render_expandable_activity(preview, full_text)}</td>
+            <td data-label="Preview">{render_expandable_activity(preview, full_text)}</td>
         </tr>
     """
 
@@ -24241,6 +24342,7 @@ def render_home_focus_work_panel(
     call_phone_card_id = f"home-focus-call-phone-card-{slug}"
     call_cell_card_id = f"home-focus-call-cell-card-{slug}"
     call_to_id = f"home-focus-call-to-{slug}"
+    visit_to_id = f"home-focus-visit-to-{slug}"
     schedule_return_to = clear_home_selection_from_url(return_to or "/action-plan-view#focus-preview")
     schedule_form = f"""
         <form method="post" action="/action-plan-schedule" class="home-focus-schedule-form">
@@ -24393,6 +24495,15 @@ def render_home_focus_work_panel(
                     aria-pressed="{str(initial_mode == 'call').lower()}"
                     onclick="setHomeFocusMode('{slug}', 'call')"
                 >Call</button>
+                <button
+                    type="button"
+                    class="home-focus-mode-chip"
+                    data-home-focus-toggle
+                    data-home-focus-slug="{slug}"
+                    data-mode="visit"
+                    aria-pressed="false"
+                    onclick="setHomeFocusMode('{slug}', 'visit')"
+                >Visit</button>
             </div>
             <p class="home-focus-mode-note" id="{mode_note_id}">Recommended: {escape(recommended_mode_label)}</p>
         """
@@ -24567,6 +24678,27 @@ def render_home_focus_work_panel(
                             </form>
                         </div>
                     </div>
+                    <div
+                        class="home-focus-mode-panel"
+                        data-home-focus-mode="visit"
+                        data-home-focus-slug="{slug}"
+                        hidden
+                    >
+                        <div class="home-focus-visit-card">
+                            <p class="home-focus-call-note">Add a quick note after the visit. It will be saved in FileMaker as a Meeting.</p>
+                            <form method="post" action="/filemaker/record-visit" class="home-focus-visit-form">
+                                <input type="hidden" name="customer" value="{escape(customer_name)}">
+                                <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
+                                <input type="hidden" name="crm_category" value="">
+                                <input type="hidden" name="to" id="{visit_to_id}" value="{escape(target_email)}">
+                                <label>
+                                    <span class="label">Visit notes</span>
+                                    <textarea name="body" rows="7" placeholder="Who did you meet, what did you discuss, and what is the next step?" required></textarea>
+                                </label>
+                                <button type="submit" class="button home-focus-record-visit-button">Record visit in FileMaker</button>
+                            </form>
+                        </div>
+                    </div>
                 </div>
                 <script>
                     function setHomeFocusMode(slug, mode) {{
@@ -24578,6 +24710,7 @@ def render_home_focus_work_panel(
                         const labels = {{
                             email: 'Email outreach',
                             call: 'Call follow-up',
+                            visit: 'Visit notes',
                         }};
                         panels.forEach((panel) => {{
                             panel.hidden = panel.dataset.homeFocusMode !== mode;
@@ -24636,6 +24769,7 @@ def render_home_focus_work_panel(
                         const cellCard = document.getElementById(`home-focus-call-cell-card-${{slug}}`);
                         const missingState = document.getElementById(`home-focus-call-phone-card-${{slug}}-missing`);
                         const callToField = document.getElementById(`home-focus-call-to-${{slug}}`);
+                        const visitToField = document.getElementById(`home-focus-visit-to-${{slug}}`);
                         const name = selected.dataset.name || selected.value || 'Best known contact';
                         const title = selected.dataset.title || 'Likely sales contact';
                         const phone = selected.dataset.phone || '';
@@ -24659,6 +24793,7 @@ def render_home_focus_work_panel(
                         }}
                         if (missingState) missingState.hidden = !!(phone || cell);
                         if (callToField) callToField.value = selected.value || '';
+                        if (visitToField) visitToField.value = selected.value || '';
                     }}
                     async function loadHomeFocusDraft(slug) {{
                         const form = document.getElementById(`home-focus-send-form-${{slug}}`);
@@ -30344,6 +30479,37 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         width: fit-content;
                         min-width: 220px;
                         justify-content: center;
+                    }}
+
+                    .home-focus-visit-card {{
+                        display: grid;
+                        gap: 10px;
+                        padding: 14px 16px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        background: #fbfdff;
+                    }}
+
+                    .home-focus-visit-form {{
+                        display: grid;
+                        gap: 12px;
+                    }}
+
+                    .home-focus-visit-form label {{
+                        display: grid;
+                        gap: 6px;
+                    }}
+
+                    .home-focus-visit-form textarea {{
+                        min-height: 150px;
+                        font-size: 16px;
+                        line-height: 1.45;
+                    }}
+
+                    .home-focus-record-visit-button {{
+                        width: fit-content;
+                        min-width: 220px;
+                        min-height: 44px;
                     }}
 
                     .home-focus-call-missing {{
@@ -38160,6 +38326,114 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .customer-summary {{
                             grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .customer-detail-page .contact-summary {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .customer-detail-page .panel {{
+                            padding: 13px;
+                        }}
+
+                        .customer-detail-page .crm-timeline-controls {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .customer-detail-page .crm-timeline-controls button,
+                        .customer-detail-page .crm-timeline-controls .button {{
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .home-focus-mode-switch {{
+                            display: grid;
+                            grid-template-columns: repeat(3, minmax(0, 1fr));
+                            width: 100%;
+                        }}
+
+                        .home-focus-mode-chip {{
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .home-focus-visit-card {{
+                            padding: 12px;
+                        }}
+
+                        .home-focus-record-call-button,
+                        .home-focus-record-visit-button {{
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .customers-table-wrap,
+                        .customer-detail-page .table-wrap {{
+                            overflow: visible;
+                        }}
+
+                        .customers-table thead,
+                        .customer-detail-page .crm-timeline-table thead,
+                        .customer-detail-page .tall-table table:not(.crm-timeline-table) thead {{
+                            display: none;
+                        }}
+
+                        .customers-table,
+                        .customers-table tbody,
+                        .customer-detail-page .crm-timeline-table,
+                        .customer-detail-page .crm-timeline-table tbody,
+                        .customer-detail-page .tall-table table:not(.crm-timeline-table),
+                        .customer-detail-page .tall-table table:not(.crm-timeline-table) tbody {{
+                            display: grid;
+                            gap: 10px;
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .customers-table tr,
+                        .customer-detail-page .crm-timeline-table tr,
+                        .customer-detail-page .tall-table table:not(.crm-timeline-table) tr {{
+                            display: grid;
+                            gap: 8px;
+                            padding: 12px;
+                            border: 1px solid var(--border);
+                            border-radius: 10px;
+                            background: #fff;
+                        }}
+
+                        .customers-table td,
+                        .customer-detail-page .crm-timeline-table td,
+                        .customer-detail-page .tall-table table:not(.crm-timeline-table) td {{
+                            display: grid;
+                            grid-template-columns: 105px minmax(0, 1fr);
+                            gap: 8px;
+                            align-items: start;
+                            width: auto !important;
+                            padding: 0;
+                            border: 0;
+                            white-space: normal !important;
+                            overflow-wrap: anywhere;
+                        }}
+
+                        .customers-table td::before,
+                        .customer-detail-page .crm-timeline-table td::before,
+                        .customer-detail-page .tall-table table:not(.crm-timeline-table) td::before {{
+                            content: attr(data-label);
+                            color: var(--muted);
+                            font-size: 10px;
+                            font-weight: 700;
+                            letter-spacing: .04em;
+                            text-transform: uppercase;
+                        }}
+
+                        .customers-table td:first-child {{
+                            grid-template-columns: 1fr;
+                            padding-bottom: 5px;
+                            font-size: 15px;
+                        }}
+
+                        .customers-table td:first-child::before {{
+                            display: none;
                         }}
 
                         .outreach-head,

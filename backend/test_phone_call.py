@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import main
-from main import build_filemaker_phone_call_fields
+from main import build_filemaker_phone_call_fields, build_filemaker_visit_fields
 
 
 class PhoneCallActivityTests(unittest.TestCase):
@@ -46,6 +46,40 @@ class PhoneCallActivityTests(unittest.TestCase):
         self.assertEqual(fields["sender_email"], "pbinnington@numatsystems.com")
         self.assertEqual(fields["To"], "contact@example.com")
         self.assertEqual(fields["CRM Type"], "Telephone Call")
+
+    def test_filemaker_visit_activity_is_created_as_a_meeting(self):
+        fields = build_filemaker_visit_fields(
+            "pbinnington@numatsystems.com",
+            "contact@example.com",
+            "Customer visit — Customer Ltd",
+            "Met the branch manager and reviewed the repair programme.",
+        )
+
+        self.assertEqual(fields["CRM Type"], "Meeting")
+        self.assertEqual(fields["To"], "contact@example.com")
+        self.assertEqual(fields["body"], "Met the branch manager and reviewed the repair programme.")
+
+    def test_successful_visit_write_returns_to_customer(self):
+        with patch.object(main, "get_current_session_user", return_value={
+            "username": "ben",
+            "m365_email": "pbinnington@numatsystems.com",
+        }):
+            with patch.object(main, "get_m365_connection_state", return_value={"connected": False}):
+                with patch.object(main, "create_layout_record", return_value={"status": "ok", "record_id": "456"}) as create:
+                    with patch.object(main, "record_audit_event"):
+                        response = main.post_filemaker_record_visit(
+                            customer="Customer Ltd",
+                            return_to="/customer-view?customer=Customer+Ltd#contact-ready",
+                            to="contact@example.com",
+                            body="Met Kelly and agreed the next steps.",
+                            crm_category="",
+                        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("Visit%20recorded%20in%20FileMaker", response.headers["location"])
+        fields = create.call_args.args[1]
+        self.assertEqual(fields["CRM Type"], "Meeting")
+        self.assertEqual(fields["subject"], "Customer visit — Customer Ltd")
 
 
 if __name__ == "__main__":

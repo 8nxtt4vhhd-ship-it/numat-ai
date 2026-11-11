@@ -642,6 +642,8 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn("Checking in", html)
         self.assertIn("<strong>1</strong>", html)
         self.assertIn("Email outreach", html)
+        self.assertIn(">Visit</button>", html)
+        self.assertIn("Record visit in FileMaker", html)
         self.assertIn("Schedule follow-up", html)
         self.assertNotIn("<span>Enrich</span>", html)
         self.assertNotIn("Back to customers", html)
