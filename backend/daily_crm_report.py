@@ -61,6 +61,7 @@ def activities_for_day(crm_result, report_day):
         if str(item.get("date_created") or "")[:10] == report_key
         and not item.get("exclude")
         and not is_routine_non_sales_activity(item)
+        and resolve_customer(item) != "Customer not identified"
     ]
 
 

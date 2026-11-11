@@ -8,7 +8,7 @@ import daily_crm_report
 class DailyCrmReportTests(unittest.TestCase):
     def test_filters_requested_date_and_internal_activity(self):
         result = {"activities": [
-            {"date_created": "2026-11-09 08:00:00", "subject": "Sales call", "exclude": False},
+            {"date_created": "2026-11-09 08:00:00", "subject": "Sales call", "exclude": False, "customer_company": "Example Customer"},
             {"date_created": "2026-11-09 09:00:00", "subject": "Internal", "exclude": True},
             {"date_created": "2026-11-08 16:00:00", "subject": "Yesterday", "exclude": False},
         ]}
@@ -23,6 +23,27 @@ class DailyCrmReportTests(unittest.TestCase):
         rows = daily_crm_report.activities_for_day(result, date(2026, 11, 9))
         self.assertEqual(len(rows), 1)
         self.assertEqual(daily_crm_report.resolve_customer(rows[0]), "Clemens Uniform Rental")
+
+    def test_excludes_activity_without_an_identified_customer(self):
+        result = {"activities": [
+            {
+                "date_created": "2026-11-09 08:00:00",
+                "subject": "Secure IP address registration",
+                "body": "Assisted the accountant with the Child Support Portal.",
+                "sender_company": "NuMat Samples",
+                "exclude": False,
+            },
+            {
+                "date_created": "2026-11-09 09:00:00",
+                "subject": "Repair requirement",
+                "customer_company": "Clemens Uniform Rental",
+                "exclude": False,
+            },
+        ]}
+
+        rows = daily_crm_report.activities_for_day(result, date(2026, 11, 9))
+
+        self.assertEqual([item["subject"] for item in rows], ["Repair requirement"])
 
     def test_email_has_management_sections_without_counts(self):
         report = daily_crm_report.build_email(date(2026, 11, 9), {
