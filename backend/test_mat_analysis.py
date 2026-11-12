@@ -1,7 +1,9 @@
 import unittest
+from io import BytesIO
 from unittest.mock import patch
 
 import main
+from openpyxl import load_workbook
 
 
 class MatAnalysisTests(unittest.TestCase):
@@ -114,9 +116,52 @@ class MatAnalysisTests(unittest.TestCase):
         self.assertIn("MAT-100", html)
         self.assertIn("3x5", html)
         self.assertIn("Others", html)
+        self.assertIn("Customer summary Excel", html)
+        self.assertIn("Order detail Excel", html)
+        self.assertIn("Mat breakdown Excel", html)
+        self.assertIn("/mat-analysis-customer-export.xlsx", html)
+        self.assertIn("/mat-analysis-order-export.xlsx", html)
+        self.assertIn("/mat-analysis-size-export.xlsx", html)
         self.assertNotIn("Incoming gross", html)
         self.assertNotIn("Incoming cost", html)
         self.assertNotIn("Incoming skids", html)
+
+    def test_mat_analysis_excel_exports_are_numeric_and_include_buy_new_comparison(self):
+        analysis = main.build_mat_analysis(
+            self.orders,
+            customer_records=self.master_data["customers_by_key"],
+            mat_counts_by_order=self.mat_cache["orders"],
+        )
+        mat_sizes = main.build_mat_size_freight_analysis(self.orders, self.mat_cache, analysis)
+
+        customer_book = load_workbook(BytesIO(main.build_mat_analysis_workbook(
+            analysis, mat_sizes, {"customer": "Mat"}, section="customer",
+        )))
+        customer_sheet = customer_book["Customer breakdown"]
+        self.assertEqual(customer_sheet["A5"].value, "Mat Customer")
+        self.assertEqual(customer_sheet["C5"].value, 10)
+        self.assertEqual(customer_sheet["I5"].value, 1200)
+        self.assertEqual(customer_sheet.freeze_panes, "A5")
+
+        order_book = load_workbook(BytesIO(main.build_mat_analysis_workbook(
+            analysis, mat_sizes, {"state": "GA"}, section="order",
+        )))
+        order_sheet = order_book["Order breakdown"]
+        self.assertEqual(order_sheet["A5"].value, "MAT-100")
+        self.assertEqual(order_sheet["F5"].value, 10)
+        self.assertEqual(order_sheet["J5"].value, 1200)
+
+        size_book = load_workbook(BytesIO(main.build_mat_analysis_workbook(
+            analysis, mat_sizes, section="size", buy_new_price=2.0,
+        )))
+        size_sheet = size_book["Mat breakdown"]
+        self.assertEqual(size_sheet["A5"].value, "3x5")
+        self.assertEqual(size_sheet["H5"].value, 30)
+        self.assertAlmostEqual(size_sheet["I5"].value, 10 - analysis["average_freight_cost_per_mat"])
+        self.assertAlmostEqual(
+            size_sheet["J5"].value,
+            (20 + analysis["average_freight_cost_per_mat"]) / 30,
+        )
 
 
 if __name__ == "__main__":

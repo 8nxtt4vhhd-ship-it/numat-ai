@@ -15362,6 +15362,11 @@ def get_mat_analysis_view(
         mat_counts_by_order=mat_cache.get("orders", {}),
     )
     mat_sizes = build_mat_size_freight_analysis(filtered_orders, mat_cache, analysis)
+    export_query = urlencode({
+        key: value for key, value in {
+            "customer": customer, "city": city, "state": state, "start": start, "end": end,
+        }.items() if str(value or "").strip()
+    })
 
     def sortable_headers(columns):
         return "".join(
@@ -15502,6 +15507,8 @@ def get_mat_analysis_view(
         .mat-breakdown-heading {{ display:flex; align-items:end; justify-content:space-between; gap:12px; margin-bottom:7px; }}
         .mat-breakdown-heading p {{ margin:0; font-size:.69rem; }} .mat-new-price-control {{ display:flex; align-items:center; gap:7px; }}
         .mat-new-price-control label {{ font-size:.7rem; font-weight:700; color:var(--muted); }} .mat-new-price-control input {{ width:110px; height:28px; padding:4px 7px; }}
+        .mat-breakdown-actions {{ display:flex; align-items:end; justify-content:flex-end; gap:7px; flex-wrap:wrap; }}
+        .mat-export-button {{ display:inline-flex; align-items:center; width:auto!important; min-height:28px; padding:5px 9px; font-size:.68rem; line-height:1; white-space:nowrap; }}
         .mat-analysis-table {{ width:100%; font-size:.68rem; }} .mat-analysis-table th {{ padding:7px 6px; font-size:.61rem; text-align:center; white-space:normal; }}
         .mat-analysis-table td {{ padding:7px 6px; text-align:center; white-space:nowrap; }} .mat-analysis-table th:first-child,.mat-analysis-table td:first-child {{ text-align:left; }}
         .mat-sort-button {{ display:inline-flex; align-items:center; justify-content:center; gap:4px; width:100%; padding:0; border:0; background:transparent; color:inherit; font:inherit; font-weight:inherit; box-shadow:none; }}
@@ -15543,10 +15550,10 @@ def get_mat_analysis_view(
         <div class="mat-visual-grid"><section class="panel mat-chart-panel"><h2>Repaired mats by size</h2>{repair_chart}</section><section class="panel mat-chart-panel"><h2>Average repair price by size</h2>{price_chart}</section></div>
         <p class="mat-cache-note">{f"Mat counts refreshed {escape(str(mat_cache.get('updated_at') or 'unknown'))} from {int(mat_cache.get('record_count') or 0):,} mat records." if mat_cache.get('status') == 'ok' else 'Mat counts have not been cached yet.'}</p>
     </section>
-    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-customer" role="tabpanel" aria-labelledby="mat-customer-tab" hidden><h2>Customer mat breakdown</h2><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{customer_headers}</tr></thead><tbody>{customer_rows}</tbody></table></div></section>
-    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-order" role="tabpanel" aria-labelledby="mat-order-tab" hidden><h2>Individual order mat breakdown</h2><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{order_headers}</tr></thead><tbody>{order_rows}</tbody></table></div></section>
+    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-customer" role="tabpanel" aria-labelledby="mat-customer-tab" hidden><div class="mat-breakdown-heading"><h2>Customer mat breakdown</h2><a class="button secondary mat-export-button" href="/mat-analysis-customer-export.xlsx{f'?{export_query}' if export_query else ''}">Customer summary Excel</a></div><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{customer_headers}</tr></thead><tbody>{customer_rows}</tbody></table></div></section>
+    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-order" role="tabpanel" aria-labelledby="mat-order-tab" hidden><div class="mat-breakdown-heading"><h2>Individual order mat breakdown</h2><a class="button secondary mat-export-button" href="/mat-analysis-order-export.xlsx{f'?{export_query}' if export_query else ''}">Order detail Excel</a></div><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{order_headers}</tr></thead><tbody>{order_rows}</tbody></table></div></section>
     <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-size" role="tabpanel" aria-labelledby="mat-size-tab" hidden>
-        <div class="mat-breakdown-heading"><div><h2>Mat price comparison</h2><p class="muted">Compare current repair pricing, allocated freight and an estimated buy-new price by mat size.</p></div><div class="mat-new-price-control"><label for="mat-analysis-new-price">Buy-new price</label><input id="mat-analysis-new-price" type="number" min="0" step="0.01" placeholder="$ / sq ft"></div></div>
+        <div class="mat-breakdown-heading"><div><h2>Mat price comparison</h2><p class="muted">Compare current repair pricing, allocated freight and an estimated buy-new price by mat size.</p></div><div class="mat-breakdown-actions"><div class="mat-new-price-control"><label for="mat-analysis-new-price">Buy-new price</label><input id="mat-analysis-new-price" type="number" min="0" step="0.01" placeholder="$ / sq ft"></div><a id="mat-size-export" class="button secondary mat-export-button" data-base-href="/mat-analysis-size-export.xlsx{f'?{export_query}' if export_query else ''}" href="/mat-analysis-size-export.xlsx{f'?{export_query}' if export_query else ''}">Mat breakdown Excel</a></div></div>
         <div class="table-wrap tall-table"><table class="mat-analysis-table mat-size-table"><thead><tr>{size_headers}</tr></thead><tbody>{size_rows}</tbody></table></div>
     </section>
     <script>(()=>{{
@@ -15558,11 +15565,189 @@ def get_mat_analysis_view(
         requestAnimationFrame(fitSummaryValues);if('ResizeObserver' in window){{const observer=new ResizeObserver(()=>requestAnimationFrame(fitSummaryValues));document.querySelectorAll('.mat-summary>div').forEach(card=>observer.observe(card));}}else{{window.addEventListener('resize',fitSummaryValues);}}
         document.querySelectorAll('.mat-analysis-table').forEach(table=>{{const headers=[...table.querySelectorAll('thead th')];headers.forEach((header,index)=>{{header.querySelector('button').addEventListener('click',()=>{{const desc=header.getAttribute('aria-sort')==='ascending';headers.forEach(x=>x.setAttribute('aria-sort','none'));header.setAttribute('aria-sort',desc?'descending':'ascending');const numeric=header.dataset.sortType==='number';const rows=[...table.tBodies[0].rows];const value=text=>{{const match=text.replace(/[$,%]/g,'').replace(/,/g,'').match(/-?\\d+(?:\\.\\d+)?/);return match?Number(match[0]):Number.NEGATIVE_INFINITY;}};rows.sort((a,b)=>{{const left=a.cells[index]?.textContent.trim()||'',right=b.cells[index]?.textContent.trim()||'';const result=numeric?value(left)-value(right):left.localeCompare(right,undefined,{{numeric:true,sensitivity:'base'}});return desc?-result:result;}});rows.forEach(row=>table.tBodies[0].appendChild(row));}});}});}});
         const input=document.getElementById('mat-analysis-new-price'),rows=[...document.querySelectorAll('.mat-size-table tbody tr[data-square-feet]')],money=value=>new Intl.NumberFormat('en-US',{{style:'currency',currency:'USD'}}).format(value);
-        const update=()=>{{const price=Number(input.value||0);rows.forEach(row=>{{const sqft=Number(row.dataset.squareFeet||0),repair=Number(row.dataset.inclusiveRepair||0),buy=row.querySelector('.mat-buy-new-cost'),saving=row.querySelector('.mat-saving'),percent=row.querySelector('.mat-repair-percent');saving.classList.remove('positive','negative');if(!(price>0&&sqft>0&&repair>=0)){{buy.textContent=sqft>0?'Enter price / sq ft':'Square footage unavailable';saving.textContent='—';percent.textContent='—';return;}}const replacement=sqft*price,difference=replacement-repair;buy.textContent=money(replacement);saving.textContent=money(difference);saving.classList.add(difference>=0?'positive':'negative');percent.textContent=replacement?`${{(repair/replacement*100).toFixed(1)}}%`:'—';}});if(price>0)localStorage.setItem('mat-analysis-buy-new-price',String(price));else localStorage.removeItem('mat-analysis-buy-new-price');}};
+        const exportLink=document.getElementById('mat-size-export');
+        const update=()=>{{const price=Number(input.value||0);rows.forEach(row=>{{const sqft=Number(row.dataset.squareFeet||0),repair=Number(row.dataset.inclusiveRepair||0),buy=row.querySelector('.mat-buy-new-cost'),saving=row.querySelector('.mat-saving'),percent=row.querySelector('.mat-repair-percent');saving.classList.remove('positive','negative');if(!(price>0&&sqft>0&&repair>=0)){{buy.textContent=sqft>0?'Enter price / sq ft':'Square footage unavailable';saving.textContent='—';percent.textContent='—';return;}}const replacement=sqft*price,difference=replacement-repair;buy.textContent=money(replacement);saving.textContent=money(difference);saving.classList.add(difference>=0?'positive':'negative');percent.textContent=replacement?`${{(repair/replacement*100).toFixed(1)}}%`:'—';}});if(price>0)localStorage.setItem('mat-analysis-buy-new-price',String(price));else localStorage.removeItem('mat-analysis-buy-new-price');if(exportLink){{const joiner=exportLink.dataset.baseHref.includes('?')?'&':'?';exportLink.href=price>0?`${{exportLink.dataset.baseHref}}${{joiner}}buy_new_price=${{encodeURIComponent(price)}}`:exportLink.dataset.baseHref;}}}};
         input.value=localStorage.getItem('mat-analysis-buy-new-price')||'';input.addEventListener('input',update);update();
     }})();</script>
     """
     return render_page(title="Mat Analysis", body=body, main_class="mat-analysis-main")
+
+
+def build_mat_analysis_workbook(analysis, mat_sizes, filters=None, section="customer", buy_new_price=None):
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    filters = filters or {}
+    workbook = Workbook()
+    sheet = workbook.active
+    active_filters = ", ".join(
+        f"{label}: {filters.get(key)}"
+        for key, label in (("customer", "Customer"), ("city", "City"), ("state", "State"), ("start", "From"), ("end", "To"))
+        if str(filters.get(key) or "").strip()
+    ) or "No filters applied"
+
+    if section == "order":
+        sheet.title = "Order breakdown"
+        title = "Mat Analysis — Order Breakdown"
+        table_name = "MatOrderBreakdown"
+        headers = [
+            "Order", "Order Date", "Customer", "City", "State", "Mats", "Repairs", "Rejects",
+            "Repair Rate", "Repair Revenue", "Average Repair Revenue / Mat",
+            "Incoming Freight Revenue", "Outgoing Freight Revenue", "Freight Revenue", "Total Revenue",
+        ]
+        rows = [[
+            row["order_number"], parse_iso_date(row["order_date"]), row["customer"], row["city"], row["state"],
+            row["mats"], row["repairs"], row["rejects"], row["repair_rate"], row["repair_revenue"],
+            row["average_repair_revenue_per_mat"], row["incoming_revenue"], row["outgoing_revenue"],
+            row["freight_revenue"], row["total_revenue"],
+        ] for row in analysis.get("order_rows", [])]
+        date_columns, integer_columns = (2,), (6, 7, 8)
+        percent_columns, currency_columns = (9,), (10, 11, 12, 13, 14, 15)
+        widths = [14, 13, 34, 16, 9, 10, 10, 10, 13, 16, 22, 20, 20, 16, 16]
+    elif section == "size":
+        sheet.title = "Mat breakdown"
+        title = "Mat Analysis — Mat Size Breakdown"
+        table_name = "MatSizeBreakdown"
+        headers = [
+            "Mat Size", "Mats", "Repaired Mats", "Average Square Feet", "Average Repair Price",
+            "Average Freight / Mat", "Freight-Inclusive Repair Price", "Estimated Buy-New Cost",
+            "Saving vs New", "Repair Price % of New",
+        ]
+        rows = []
+        price_per_square_foot = float(buy_new_price) if buy_new_price is not None and float(buy_new_price) > 0 else None
+        for row in mat_sizes or []:
+            square_feet = row.get("average_square_feet")
+            inclusive_repair = row.get("freight_inclusive_repair_cost")
+            buy_new_cost = square_feet * price_per_square_foot if square_feet is not None and price_per_square_foot else None
+            saving = buy_new_cost - inclusive_repair if buy_new_cost is not None and inclusive_repair is not None else None
+            repair_percent = inclusive_repair / buy_new_cost if buy_new_cost and inclusive_repair is not None else None
+            rows.append([
+                row["size"], row["mats"], row["repairs"], square_feet, row.get("average_repair_cost"),
+                row.get("freight_cost_per_mat"), inclusive_repair, buy_new_cost, saving, repair_percent,
+            ])
+        if price_per_square_foot:
+            active_filters = f"{active_filters}; Buy-new price: ${price_per_square_foot:,.2f} / sq ft"
+        date_columns, integer_columns = (), (2, 3)
+        percent_columns, currency_columns = (10,), (5, 6, 7, 8, 9)
+        widths = [16, 12, 16, 20, 20, 20, 24, 22, 18, 20]
+    else:
+        sheet.title = "Customer breakdown"
+        title = "Mat Analysis — Customer Breakdown"
+        table_name = "MatCustomerBreakdown"
+        headers = [
+            "Customer", "Orders", "Mats", "Repairs", "Rejects", "Repair Rate", "City", "State",
+            "Repair Revenue", "Average Repair Revenue / Order", "Average Repair Revenue / Mat",
+            "Incoming Freight Revenue", "Outgoing Freight Revenue", "Freight Revenue", "Total Revenue",
+        ]
+        rows = [[
+            row["customer"], row["orders"], row["mats"], row["repairs"], row["rejects"], row["repair_rate"],
+            row["city"], row["state"], row["repair_revenue"], row["average_repair_revenue_per_order"],
+            row["average_repair_revenue_per_mat"], row["incoming_revenue"], row["outgoing_revenue"],
+            row["freight_revenue"], row["total_revenue"],
+        ] for row in analysis.get("rows", [])]
+        date_columns, integer_columns = (), (2, 3, 4, 5)
+        percent_columns, currency_columns = (6,), (9, 10, 11, 12, 13, 14, 15)
+        widths = [34, 10, 12, 12, 12, 13, 16, 9, 16, 24, 22, 20, 20, 16, 16]
+
+    last_column = get_column_letter(len(headers))
+    sheet["A1"] = title
+    sheet["A1"].font = Font(size=16, bold=True, color="1F2937")
+    sheet.merge_cells(f"A1:{last_column}1")
+    sheet["A2"] = active_filters
+    sheet["A2"].font = Font(size=10, italic=True, color="52657A")
+    sheet.merge_cells(f"A2:{last_column}2")
+    sheet.append([])
+    sheet.append(headers)
+    header_row = 4
+    for row in rows:
+        sheet.append(row)
+    for cell in sheet[header_row]:
+        cell.fill = PatternFill("solid", fgColor="245CFF")
+        cell.font = Font(bold=True, color="FFFFFF", size=9)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    sheet.row_dimensions[header_row].height = 34
+    sheet.freeze_panes = "A5"
+    sheet.auto_filter.ref = f"A{header_row}:{last_column}{sheet.max_row}"
+    if rows:
+        table = Table(displayName=table_name, ref=f"A{header_row}:{last_column}{sheet.max_row}")
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
+            showRowStripes=True, showColumnStripes=False,
+        )
+        sheet.add_table(table)
+    for row_number in range(header_row + 1, sheet.max_row + 1):
+        for column in date_columns:
+            sheet.cell(row_number, column).number_format = "mm/dd/yyyy"
+        for column in integer_columns:
+            sheet.cell(row_number, column).number_format = "#,##0"
+        for column in percent_columns:
+            sheet.cell(row_number, column).number_format = "0.0%"
+        for column in currency_columns:
+            sheet.cell(row_number, column).number_format = '$#,##0.00;[Red]-$#,##0.00'
+    for index, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def get_mat_analysis_export_data(customer="", city="", state="", start="", end=""):
+    order_result = get_orders_for_analysis()
+    master_data_result = fetch_filemaker_customer_data()
+    order_result = filter_order_result_to_customer_type(order_result, master_data_result)
+    if order_result.get("status") != "ok":
+        return None
+    customers_by_key = master_data_result.get("customers_by_key", {})
+    filtered_orders = filter_freight_orders(
+        order_result, customers_by_key, customer=customer, city=city, state=state,
+        start=start, end=end, complete_only=True,
+    )
+    mat_cache = read_filemaker_mat_counts_cache()
+    analysis = build_mat_analysis(
+        filtered_orders, customer_records=customers_by_key,
+        mat_counts_by_order=mat_cache.get("orders", {}),
+    )
+    mat_sizes = build_mat_size_freight_analysis(filtered_orders, mat_cache, analysis)
+    return analysis, mat_sizes
+
+
+def mat_analysis_export_response(section, customer="", city="", state="", start="", end="", buy_new_price=None):
+    export_data = get_mat_analysis_export_data(customer, city, state, start, end)
+    if export_data is None:
+        return PlainTextResponse("Mat data is currently unavailable.", status_code=503)
+    analysis, mat_sizes = export_data
+    content = build_mat_analysis_workbook(
+        analysis, mat_sizes,
+        {"customer": customer, "city": city, "state": state, "start": start, "end": end},
+        section=section, buy_new_price=buy_new_price,
+    )
+    filename = f"mat-analysis-{section}-{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/mat-analysis-customer-export.xlsx")
+def export_mat_analysis_customer_workbook(customer: str = "", city: str = "", state: str = "", start: str = "", end: str = ""):
+    return mat_analysis_export_response("customer", customer, city, state, start, end)
+
+
+@app.get("/mat-analysis-order-export.xlsx")
+def export_mat_analysis_order_workbook(customer: str = "", city: str = "", state: str = "", start: str = "", end: str = ""):
+    return mat_analysis_export_response("order", customer, city, state, start, end)
+
+
+@app.get("/mat-analysis-size-export.xlsx")
+def export_mat_analysis_size_workbook(
+    customer: str = "", city: str = "", state: str = "", start: str = "", end: str = "",
+    buy_new_price: float | None = None,
+):
+    return mat_analysis_export_response("size", customer, city, state, start, end, buy_new_price)
 
 
 def build_freight_analysis_workbook(analysis, filters=None):
