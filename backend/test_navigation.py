@@ -45,6 +45,7 @@ class NavigationTests(unittest.TestCase):
 
         self.assertIn('href="/crm-activities-view"', sales_html)
         self.assertIn('href="/insights-view"', analysis_html)
+        self.assertIn('href="/mat-analysis-view"', analysis_html)
         self.assertIn('href="/ask-data-view"', analysis_html)
         self.assertIn('href="/production-analysis-view"', management_html)
         self.assertEqual(sales_html.count('class="nav-module-menu active"'), 1)

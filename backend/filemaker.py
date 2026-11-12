@@ -128,8 +128,12 @@ def get_extra_fields():
         "Outgoing Cost",
         "Act Arrival_Gross Weight",
         "Act Arrival_Nett Weight",
+        "Act Arrival_Skids",
+        "Act Arrival_Cages",
         "Despatch_Gross Wright",
         "Despatch_Nett Weight",
+        "Despatch_No of Skids",
+        "Despatch_No of Cages",
     ):
         if freight_field not in fields:
             fields.append(freight_field)

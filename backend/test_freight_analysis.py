@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 class FreightAnalysisTests(unittest.TestCase):
     def test_freight_fields_are_always_requested_from_filemaker(self):
         self.assertIn("Orders::Status", filemaker.get_extra_fields())
-        for field in main.FREIGHT_FIELDS + main.FREIGHT_WEIGHT_FIELDS:
+        for field in main.FREIGHT_FIELDS + main.FREIGHT_WEIGHT_FIELDS + main.FREIGHT_HANDLING_UNIT_FIELDS:
             self.assertIn(field, filemaker.get_extra_fields())
 
     def test_money_parser_accepts_filemaker_currency_and_rejects_reference_numbers(self):
@@ -249,7 +249,11 @@ class FreightAnalysisTests(unittest.TestCase):
                 "Outgoing Freight": 150,
                 "Outgoing Cost": 120,
                 "Act Arrival_Gross Weight": 500,
+                "Act Arrival_Skids": 5,
+                "Act Arrival_Cages": 2,
                 "Despatch_Gross Wright": 450,
+                "Despatch_No of Skids": 3,
+                "Despatch_No of Cages": 1,
             },
         }, {
             "customer": "Variance Customer",
@@ -278,6 +282,10 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertEqual(rows[0]["recovery_percent"], 230 / 220)
         self.assertEqual(rows[0]["status"], "Charge exceeds cost")
         self.assertEqual(rows[0]["mats"], 12)
+        self.assertEqual(rows[0]["incoming_skids"], 5)
+        self.assertEqual(rows[0]["incoming_cages"], 2)
+        self.assertEqual(rows[0]["outgoing_skids"], 3)
+        self.assertEqual(rows[0]["outgoing_cages"], 1)
         self.assertEqual(rows[1]["status"], "Incomplete incoming data")
         self.assertEqual(rows[1]["missing_fields"], "Incoming Cost, Outgoing Freight, Outgoing Cost")
 
@@ -295,6 +303,10 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertEqual(sheet["L5"].value, 100)
         self.assertEqual(sheet["S5"].value, 10)
         self.assertEqual(sheet["U5"].value, "Charge exceeds cost")
+        self.assertEqual(sheet["Z5"].value, 5)
+        self.assertEqual(sheet["AA5"].value, 2)
+        self.assertEqual(sheet["AD5"].value, 3)
+        self.assertEqual(sheet["AE5"].value, 1)
         self.assertEqual(sheet.freeze_panes, "A5")
 
         missing_workbook = load_workbook(BytesIO(main.build_freight_job_detail_workbook(

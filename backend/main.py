@@ -12510,6 +12510,7 @@ def read_api_root():
         "production_analysis_view": "/production-analysis-view",
         "customers_view": "/customers-view",
         "freight_analysis_view": "/freight-analysis-view",
+        "mat_analysis_view": "/mat-analysis-view",
         "sample_data": "/sample-data",
         "customers_needing_attention_json": "/customers-needing-attention",
         "customers_needing_attention_view": "/customers-needing-attention-view",
@@ -14544,6 +14545,32 @@ def normalize_mat_size_key(value):
     return re.sub(r"\s+", "", str(value or "").strip().lower().replace("×", "x"))
 
 
+def group_mat_sizes_for_overview(rows):
+    standard_sizes = ("3x4", "3x5", "3x10", "4x6")
+    grouped = {
+        size: {"size": size, "repairs": 0, "repair_value": 0.0, "repair_value_records": 0}
+        for size in standard_sizes
+    }
+    grouped["others"] = {
+        "size": "Others", "repairs": 0, "repair_value": 0.0, "repair_value_records": 0,
+    }
+    for row in rows or []:
+        key = normalize_mat_size_key(row.get("size"))
+        target = grouped[key] if key in standard_sizes else grouped["others"]
+        target["repairs"] += int(row.get("repairs") or 0)
+        target["repair_value"] += float(row.get("repair_value") or 0)
+        target["repair_value_records"] += int(row.get("repair_value_records") or 0)
+    result = []
+    for key in (*standard_sizes, "others"):
+        row = grouped[key]
+        records = row["repair_value_records"]
+        result.append({
+            **row,
+            "average_repair_cost": row["repair_value"] / records if records else None,
+        })
+    return result
+
+
 @app.get("/freight-analysis-view", response_class=HTMLResponse)
 def get_freight_analysis_view(
     customer: str = "",
@@ -14643,7 +14670,9 @@ def get_freight_analysis_view(
         ("Outgoing revenue", "number"), ("Outgoing cost", "number"), ("Outgoing variance", "number"),
         ("Freight revenue", "number"), ("Freight cost", "number"), ("Contribution", "number"),
         ("Recovery", "number"), ("Incoming gross", "number"), ("Incoming net", "number"),
+        ("Incoming skids", "number"), ("Incoming cages", "number"),
         ("Outgoing gross", "number"), ("Outgoing net", "number"),
+        ("Outgoing skids", "number"), ("Outgoing cages", "number"),
     ]
     order_table_headers = "".join(
         f'<th data-sort-type="{sort_type}" aria-sort="none"><button type="button" class="freight-sort-button">{escape(label)}<span aria-hidden="true">↕</span></button></th>'
@@ -14744,12 +14773,16 @@ def get_freight_analysis_view(
             <td>{f"{row['recovery_percent'] * 100:,.1f}%" if row['recovery_percent'] is not None else '—'}</td>
             <td>{weight(row['incoming_gross_weight'])}</td>
             <td>{weight(row['incoming_net_weight'])}</td>
+            <td>{f"{row['incoming_skids']:,.0f}" if row['incoming_skids'] is not None else '—'}</td>
+            <td>{f"{row['incoming_cages']:,.0f}" if row['incoming_cages'] is not None else '—'}</td>
             <td>{weight(row['outgoing_gross_weight'])}</td>
             <td>{weight(row['outgoing_net_weight'])}</td>
+            <td>{f"{row['outgoing_skids']:,.0f}" if row['outgoing_skids'] is not None else '—'}</td>
+            <td>{f"{row['outgoing_cages']:,.0f}" if row['outgoing_cages'] is not None else '—'}</td>
         </tr>
         """
         for row in order_breakdown_rows
-    ) or "<tr><td colspan='22' class='empty'>No individual orders match the current filters.</td></tr>"
+    ) or "<tr><td colspan='26' class='empty'>No individual orders match the current filters.</td></tr>"
 
     body = f"""
         <style>
@@ -15284,6 +15317,254 @@ def get_freight_analysis_view(
     return render_page(title="Freight Analysis", body=body, main_class="freight-analysis-main")
 
 
+@app.get("/mat-analysis-view", response_class=HTMLResponse)
+def get_mat_analysis_view(
+    customer: str = "",
+    city: str = "",
+    state: str = "",
+    start: str = "",
+    end: str = "",
+):
+    order_result = get_orders_for_analysis()
+    master_data_result = fetch_filemaker_customer_data()
+    order_result = filter_order_result_to_customer_type(order_result, master_data_result)
+    if order_result.get("status") != "ok":
+        return render_page(
+            title="Mat Analysis",
+            body=f"<p class='status error'>Could not load order data: {escape(str(order_result.get('status') or 'unknown'))}</p>",
+        )
+
+    customers_by_key = master_data_result.get("customers_by_key", {})
+    state_query = str(state or "").strip().upper()
+    available_states = sorted({
+        str(record.get("state") or "").strip().upper()
+        for record in customers_by_key.values()
+        if str(record.get("state") or "").strip()
+    })
+    state_options = '<option value="">All states</option>' + "".join(
+        f'<option value="{escape(option)}"{" selected" if option == state_query else ""}>{escape(option)}</option>'
+        for option in available_states
+    )
+    filtered_orders = filter_freight_orders(
+        order_result,
+        customers_by_key,
+        customer=customer,
+        city=city,
+        state=state,
+        start=start,
+        end=end,
+        complete_only=True,
+    )
+    mat_cache = read_filemaker_mat_counts_cache()
+    analysis = build_mat_analysis(
+        filtered_orders,
+        customer_records=customers_by_key,
+        mat_counts_by_order=mat_cache.get("orders", {}),
+    )
+    mat_sizes = build_mat_size_freight_analysis(filtered_orders, mat_cache, analysis)
+
+    def sortable_headers(columns):
+        return "".join(
+            f'<th data-sort-type="{sort_type}" aria-sort="none"><button type="button" class="mat-sort-button">{escape(label)}<span aria-hidden="true">↕</span></button></th>'
+            for label, sort_type in columns
+        )
+
+    customer_headers = sortable_headers([
+        ("Customer", "text"), ("Orders", "number"), ("Mats", "number"),
+        ("Repairs", "number"), ("Rejects", "number"), ("Repair rate", "number"),
+        ("Location", "text"), ("Repair revenue", "number"),
+        ("Avg repair / order", "number"), ("Avg repair / mat", "number"),
+        ("Incoming revenue", "number"), ("Outgoing revenue", "number"),
+        ("Freight revenue", "number"), ("Total revenue", "number"),
+    ])
+    customer_rows = "".join(
+        f"""
+        <tr>
+            <td><a href="/customer-view?customer={quote(row['customer'])}">{escape(row['customer'])}</a></td>
+            <td>{row['orders']:,}</td><td>{row['mats']:,}</td><td>{row['repairs']:,}</td><td>{row['rejects']:,}</td>
+            <td>{row['repair_rate'] * 100:.1f}%</td>
+            <td>{escape(', '.join(part for part in (row['city'], row['state']) if part) or '—')}</td>
+            <td>{format_currency(row['repair_revenue'])}</td>
+            <td>{format_currency(row['average_repair_revenue_per_order'])}</td>
+            <td>{format_currency(row['average_repair_revenue_per_mat'])}</td>
+            <td>{format_currency(row['incoming_revenue'])}</td><td>{format_currency(row['outgoing_revenue'])}</td>
+            <td>{format_currency(row['freight_revenue'])}</td><td>{format_currency(row['total_revenue'])}</td>
+        </tr>
+        """
+        for row in analysis["rows"]
+    ) or "<tr><td colspan='14' class='empty'>No customers with cached mat records match the current filters.</td></tr>"
+
+    order_headers = sortable_headers([
+        ("Order", "text"), ("Date", "text"), ("Customer", "text"), ("Location", "text"),
+        ("Mats", "number"), ("Repairs", "number"), ("Rejects", "number"), ("Repair rate", "number"),
+        ("Repair revenue", "number"), ("Avg repair / mat", "number"),
+        ("Incoming revenue", "number"), ("Outgoing revenue", "number"),
+        ("Freight revenue", "number"), ("Total revenue", "number"),
+    ])
+    order_rows = "".join(
+        f"""
+        <tr>
+            <td>{escape(row['order_number'] or '—')}</td><td>{escape(row['order_date'] or '—')}</td>
+            <td>{escape(row['customer'])}</td>
+            <td>{escape(', '.join(part for part in (row['city'], row['state']) if part) or '—')}</td>
+            <td>{row['mats']:,}</td><td>{row['repairs']:,}</td><td>{row['rejects']:,}</td>
+            <td>{row['repair_rate'] * 100:.1f}%</td><td>{format_currency(row['repair_revenue'])}</td>
+            <td>{format_currency(row['average_repair_revenue_per_mat'])}</td>
+            <td>{format_currency(row['incoming_revenue'])}</td><td>{format_currency(row['outgoing_revenue'])}</td>
+            <td>{format_currency(row['freight_revenue'])}</td><td>{format_currency(row['total_revenue'])}</td>
+        </tr>
+        """
+        for row in analysis["order_rows"]
+    ) or "<tr><td colspan='14' class='empty'>No orders with cached mat records match the current filters.</td></tr>"
+
+    size_headers = sortable_headers([
+        ("Mat size", "text"), ("Mats", "number"), ("Repaired mats", "number"),
+        ("Avg sq ft", "number"), ("Avg repair price", "number"),
+        ("Avg freight / mat", "number"), ("Freight-inclusive repair", "number"),
+        ("Estimated buy-new", "number"), ("Saving vs new", "number"), ("Repair % of new", "number"),
+    ])
+    size_rows = "".join(
+        f"""
+        <tr data-square-feet="{row['average_square_feet'] if row['average_square_feet'] is not None else ''}"
+            data-inclusive-repair="{row['freight_inclusive_repair_cost'] if row['freight_inclusive_repair_cost'] is not None else ''}">
+            <td><strong>{escape(row['size'])}</strong></td><td>{row['mats']:,}</td><td>{row['repairs']:,}</td>
+            <td>{f"{row['average_square_feet']:,.2f}" if row['average_square_feet'] is not None else '—'}</td>
+            <td>{format_currency(row['average_repair_cost'])}</td><td>{format_currency(row['freight_cost_per_mat'])}</td>
+            <td><strong>{format_currency(row['freight_inclusive_repair_cost'])}</strong></td>
+            <td class="mat-buy-new-cost">Enter price / sq ft</td><td class="mat-saving">—</td><td class="mat-repair-percent">—</td>
+        </tr>
+        """
+        for row in mat_sizes
+    ) or "<tr><td colspan='10' class='empty'>No repaired mat sizes match the current filters.</td></tr>"
+
+    chart_sizes = group_mat_sizes_for_overview(mat_sizes)
+    max_repairs = max((row["repairs"] for row in chart_sizes), default=0)
+    repair_chart = "".join(
+        f"""
+        <div class="mat-chart-row">
+            <span class="mat-chart-label">{escape(row['size'])}</span>
+            <span class="mat-chart-track"><span class="mat-chart-fill" style="width:{(row['repairs'] / max_repairs * 100) if max_repairs else 0:.1f}%"></span></span>
+            <strong>{row['repairs']:,}</strong>
+        </div>
+        """
+        for row in chart_sizes
+    )
+    max_price = max((row["average_repair_cost"] or 0 for row in chart_sizes), default=0)
+    price_chart = "".join(
+        f"""
+        <div class="mat-chart-row">
+            <span class="mat-chart-label">{escape(row['size'])}</span>
+            <span class="mat-chart-track"><span class="mat-chart-fill price" style="width:{((row['average_repair_cost'] or 0) / max_price * 100) if max_price else 0:.1f}%"></span></span>
+            <strong>{format_currency(row['average_repair_cost'])}</strong>
+        </div>
+        """
+        for row in chart_sizes
+    )
+
+    body = f"""
+    <style>
+        main.mat-analysis-main {{ box-sizing:border-box; width:calc(100% - 32px); max-width:1440px; margin:auto; padding:0 16px; }}
+        .mat-analysis-main > h1 {{ margin-bottom:9px; font-size:1.55rem; }}
+        .mat-analysis-controls {{ padding:8px 12px; }}
+        .mat-analysis-controls h2 {{ margin:0; font-size:.96rem; }}
+        .mat-analysis-intro {{ margin:2px 0 6px; font-size:.7rem; }}
+        .mat-filter-controls {{ display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:6px; align-items:end; padding:0; border:0; background:transparent; }}
+        .mat-filter-controls label {{ gap:3px; }} .mat-filter-controls label span {{ font-size:.68rem; }}
+        .mat-filter-controls input,.mat-filter-controls select,.mat-filter-controls button,.mat-filter-controls .button {{ box-sizing:border-box; width:100%; height:28px; min-height:28px; margin:0; padding:4px 7px; font-size:.74rem; }}
+        .mat-filter-controls button,.mat-filter-controls .button {{ display:flex; align-items:center; justify-content:center; align-self:end; margin-top:0; }}
+        .mat-tabs {{ display:flex; gap:4px; width:fit-content; margin:8px 0 6px; padding:3px; border:1px solid var(--border); border-radius:10px; background:rgba(255,255,255,.72); }}
+        .mat-tab {{ min-height:29px; padding:5px 13px; border:0; border-radius:7px; background:transparent; color:var(--muted); font-size:.7rem; font-weight:700; box-shadow:none; }}
+        .mat-tab[aria-selected="true"] {{ background:var(--blue); color:#fff; }} .mat-tab-panel[hidden] {{ display:none!important; }}
+        .mat-summary {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:7px; margin:0 0 9px; }}
+        .mat-summary > div {{
+            display:flex;
+            flex-direction:column;
+            justify-content:space-between;
+            min-width:0;
+            min-height:88px;
+            padding:10px 11px 9px;
+            overflow:hidden;
+            border:1px solid var(--border);
+            border-top:3px solid var(--blue);
+            border-radius:12px;
+            background:#fff;
+            box-shadow:0 8px 18px rgba(31,42,55,.04);
+        }}
+        .mat-summary .label {{ align-self:flex-start; font-size:.7rem; line-height:1.18; }}
+        .mat-summary strong {{ display:block; align-self:flex-start; max-width:100%; margin-top:5px; font-size:1rem; line-height:1; letter-spacing:-.015em; white-space:nowrap; }}
+        .mat-visual-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }}
+        .mat-chart-panel {{ padding:12px 14px; }} .mat-chart-panel h2 {{ margin:0 0 9px; font-size:1rem; }}
+        .mat-chart-row {{ display:grid; grid-template-columns:70px minmax(90px,1fr) 78px; align-items:center; gap:8px; margin:7px 0; font-size:.72rem; }}
+        .mat-chart-label {{ font-weight:700; }} .mat-chart-row strong {{ text-align:right; }}
+        .mat-chart-track {{ height:12px; overflow:hidden; border-radius:999px; background:#e7edf7; }}
+        .mat-chart-fill {{ display:block; height:100%; border-radius:inherit; background:var(--blue); }} .mat-chart-fill.price {{ background:#16a06d; }}
+        .mat-breakdown-panel {{ padding:10px 12px; }} .mat-breakdown-panel h2 {{ margin:0 0 3px; font-size:1.05rem; }}
+        .mat-breakdown-heading {{ display:flex; align-items:end; justify-content:space-between; gap:12px; margin-bottom:7px; }}
+        .mat-breakdown-heading p {{ margin:0; font-size:.69rem; }} .mat-new-price-control {{ display:flex; align-items:center; gap:7px; }}
+        .mat-new-price-control label {{ font-size:.7rem; font-weight:700; color:var(--muted); }} .mat-new-price-control input {{ width:110px; height:28px; padding:4px 7px; }}
+        .mat-analysis-table {{ width:100%; font-size:.68rem; }} .mat-analysis-table th {{ padding:7px 6px; font-size:.61rem; text-align:center; white-space:normal; }}
+        .mat-analysis-table td {{ padding:7px 6px; text-align:center; white-space:nowrap; }} .mat-analysis-table th:first-child,.mat-analysis-table td:first-child {{ text-align:left; }}
+        .mat-sort-button {{ display:inline-flex; align-items:center; justify-content:center; gap:4px; width:100%; padding:0; border:0; background:transparent; color:inherit; font:inherit; font-weight:inherit; box-shadow:none; }}
+        .mat-analysis-table th:first-child .mat-sort-button {{ justify-content:flex-start; }} .mat-sort-button span {{ color:#7890a9; }}
+        .mat-saving.positive {{ color:#087a46; font-weight:700; }} .mat-saving.negative {{ color:#b42318; font-weight:700; }}
+        .mat-cache-note {{ margin:7px 2px 0; color:var(--muted); font-size:.68rem; }}
+        @media(max-width:1100px) {{ .mat-filter-controls {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} .mat-summary {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
+        @media(max-width:760px) {{ .mat-filter-controls,.mat-visual-grid {{ grid-template-columns:1fr; }} .mat-summary {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} }}
+    </style>
+    {render_data_availability_banner(order_result, master_data_result)}
+    <section class="panel mat-analysis-controls">
+        <span class="home-focus-inline-kicker">Current position</span><h2>Mat volume, outcomes and pricing</h2>
+        <p class="muted mat-analysis-intro">Review mat volumes, repair outcomes and revenue using the same customer, location and date filters as Freight Analysis.</p>
+        <form class="controls mat-filter-controls" method="get" action="/mat-analysis-view">
+            <label><span>Customer</span><input type="search" name="customer" value="{escape(customer)}" placeholder="All customers"></label>
+            <label><span>City</span><input type="search" name="city" value="{escape(city)}" placeholder="All cities"></label>
+            <label><span>State</span><select name="state">{state_options}</select></label>
+            <label><span>From</span><input type="date" name="start" value="{escape(start)}"></label>
+            <label><span>To</span><input type="date" name="end" value="{escape(end)}"></label>
+            <button type="submit">Apply filters</button><a class="button secondary" href="/mat-analysis-view">Reset</a>
+        </form>
+    </section>
+    <div class="mat-tabs" role="tablist" aria-label="Mat analysis sections">
+        <button class="mat-tab" id="mat-overview-tab" type="button" role="tab" aria-selected="true" aria-controls="mat-overview">Overview</button>
+        <button class="mat-tab" id="mat-customer-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-customer">Customer breakdown</button>
+        <button class="mat-tab" id="mat-order-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-order">Order breakdown</button>
+        <button class="mat-tab" id="mat-size-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-size">Mat breakdown</button>
+    </div>
+    <section class="mat-tab-panel" id="mat-overview" role="tabpanel" aria-labelledby="mat-overview-tab">
+        <div class="summary customer-summary mat-summary">
+            {render_simple_summary_item('Customers', f"{analysis['customer_count']:,}")}{render_simple_summary_item('Orders', f"{analysis['order_count']:,}")}
+            {render_simple_summary_item('Mats', f"{analysis['mats']:,}")}{render_simple_summary_item('Repaired mats', f"{analysis['repairs']:,}")}
+            {render_simple_summary_item('Rejected mats', f"{analysis['rejects']:,}")}{render_simple_summary_item('Repair rate', f"{analysis['repair_rate'] * 100:.1f}%" if analysis['repair_rate'] is not None else '—')}
+            {render_simple_summary_item('Reject rate', f"{analysis['reject_rate'] * 100:.1f}%" if analysis['reject_rate'] is not None else '—')}
+            {render_simple_summary_item('Repair revenue', format_currency(analysis['repair_revenue']))}
+            {render_simple_summary_item('Avg repair / order', format_currency(analysis['average_repair_revenue_per_order']))}
+            {render_simple_summary_item('Avg repair / mat', format_currency(analysis['average_repair_revenue_per_mat']))}
+        </div>
+        <div class="mat-visual-grid"><section class="panel mat-chart-panel"><h2>Repaired mats by size</h2>{repair_chart}</section><section class="panel mat-chart-panel"><h2>Average repair price by size</h2>{price_chart}</section></div>
+        <p class="mat-cache-note">{f"Mat counts refreshed {escape(str(mat_cache.get('updated_at') or 'unknown'))} from {int(mat_cache.get('record_count') or 0):,} mat records." if mat_cache.get('status') == 'ok' else 'Mat counts have not been cached yet.'}</p>
+    </section>
+    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-customer" role="tabpanel" aria-labelledby="mat-customer-tab" hidden><h2>Customer mat breakdown</h2><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{customer_headers}</tr></thead><tbody>{customer_rows}</tbody></table></div></section>
+    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-order" role="tabpanel" aria-labelledby="mat-order-tab" hidden><h2>Individual order mat breakdown</h2><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{order_headers}</tr></thead><tbody>{order_rows}</tbody></table></div></section>
+    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-size" role="tabpanel" aria-labelledby="mat-size-tab" hidden>
+        <div class="mat-breakdown-heading"><div><h2>Mat price comparison</h2><p class="muted">Compare current repair pricing, allocated freight and an estimated buy-new price by mat size.</p></div><div class="mat-new-price-control"><label for="mat-analysis-new-price">Buy-new price</label><input id="mat-analysis-new-price" type="number" min="0" step="0.01" placeholder="$ / sq ft"></div></div>
+        <div class="table-wrap tall-table"><table class="mat-analysis-table mat-size-table"><thead><tr>{size_headers}</tr></thead><tbody>{size_rows}</tbody></table></div>
+    </section>
+    <script>(()=>{{
+        const tabs=[...document.querySelectorAll('.mat-tab')],panels=[...document.querySelectorAll('.mat-tab-panel')];
+        const select=tab=>{{const id=tab.getAttribute('aria-controls');tabs.forEach(x=>x.setAttribute('aria-selected',String(x===tab)));panels.forEach(x=>x.hidden=x.id!==id);history.replaceState(null,'','#'+id);}};
+        tabs.forEach(tab=>tab.addEventListener('click',()=>select(tab)));const hash=document.getElementById(location.hash.slice(1)+'-tab');if(hash)select(hash);
+        const summaryValues=[...document.querySelectorAll('.mat-summary strong')];
+        const fitSummaryValues=()=>{{summaryValues.forEach(value=>{{value.style.fontSize='1rem';let size=parseFloat(getComputedStyle(value).fontSize);while(value.scrollWidth>value.clientWidth+1&&size>11){{size-=.5;value.style.fontSize=`${{size}}px`;}}}});}};
+        requestAnimationFrame(fitSummaryValues);if('ResizeObserver' in window){{const observer=new ResizeObserver(()=>requestAnimationFrame(fitSummaryValues));document.querySelectorAll('.mat-summary>div').forEach(card=>observer.observe(card));}}else{{window.addEventListener('resize',fitSummaryValues);}}
+        document.querySelectorAll('.mat-analysis-table').forEach(table=>{{const headers=[...table.querySelectorAll('thead th')];headers.forEach((header,index)=>{{header.querySelector('button').addEventListener('click',()=>{{const desc=header.getAttribute('aria-sort')==='ascending';headers.forEach(x=>x.setAttribute('aria-sort','none'));header.setAttribute('aria-sort',desc?'descending':'ascending');const numeric=header.dataset.sortType==='number';const rows=[...table.tBodies[0].rows];const value=text=>{{const match=text.replace(/[$,%]/g,'').replace(/,/g,'').match(/-?\\d+(?:\\.\\d+)?/);return match?Number(match[0]):Number.NEGATIVE_INFINITY;}};rows.sort((a,b)=>{{const left=a.cells[index]?.textContent.trim()||'',right=b.cells[index]?.textContent.trim()||'';const result=numeric?value(left)-value(right):left.localeCompare(right,undefined,{{numeric:true,sensitivity:'base'}});return desc?-result:result;}});rows.forEach(row=>table.tBodies[0].appendChild(row));}});}});}});
+        const input=document.getElementById('mat-analysis-new-price'),rows=[...document.querySelectorAll('.mat-size-table tbody tr[data-square-feet]')],money=value=>new Intl.NumberFormat('en-US',{{style:'currency',currency:'USD'}}).format(value);
+        const update=()=>{{const price=Number(input.value||0);rows.forEach(row=>{{const sqft=Number(row.dataset.squareFeet||0),repair=Number(row.dataset.inclusiveRepair||0),buy=row.querySelector('.mat-buy-new-cost'),saving=row.querySelector('.mat-saving'),percent=row.querySelector('.mat-repair-percent');saving.classList.remove('positive','negative');if(!(price>0&&sqft>0&&repair>=0)){{buy.textContent=sqft>0?'Enter price / sq ft':'Square footage unavailable';saving.textContent='—';percent.textContent='—';return;}}const replacement=sqft*price,difference=replacement-repair;buy.textContent=money(replacement);saving.textContent=money(difference);saving.classList.add(difference>=0?'positive':'negative');percent.textContent=replacement?`${{(repair/replacement*100).toFixed(1)}}%`:'—';}});if(price>0)localStorage.setItem('mat-analysis-buy-new-price',String(price));else localStorage.removeItem('mat-analysis-buy-new-price');}};
+        input.value=localStorage.getItem('mat-analysis-buy-new-price')||'';input.addEventListener('input',update);update();
+    }})();</script>
+    """
+    return render_page(title="Mat Analysis", body=body, main_class="mat-analysis-main")
+
+
 def build_freight_analysis_workbook(analysis, filters=None):
     from io import BytesIO
     from openpyxl import Workbook
@@ -15384,6 +15665,9 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
         order_number = str(extra.get("Orders::Order No") or extra.get("Order No") or "").strip()
         values = {field: parse_freight_value(extra.get(field)) for field in FREIGHT_FIELDS}
         weights = {field: parse_freight_value(extra.get(field)) for field in FREIGHT_WEIGHT_FIELDS}
+        handling_units = {
+            field: parse_freight_value(extra.get(field)) for field in FREIGHT_HANDLING_UNIT_FIELDS
+        }
         invalid_fields = [
             field for field in FREIGHT_FIELDS
             if extra.get(field) not in {None, ""} and values[field] is None
@@ -15443,8 +15727,12 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
             "missing_fields": ", ".join(missing_fields),
             "incoming_gross_weight": weights["Act Arrival_Gross Weight"],
             "incoming_net_weight": weights["Act Arrival_Nett Weight"],
+            "incoming_skids": handling_units["Act Arrival_Skids"],
+            "incoming_cages": handling_units["Act Arrival_Cages"],
             "outgoing_gross_weight": weights["Despatch_Gross Wright"],
             "outgoing_net_weight": weights["Despatch_Nett Weight"],
+            "outgoing_skids": handling_units["Despatch_No of Skids"],
+            "outgoing_cages": handling_units["Despatch_No of Cages"],
         })
     rows.sort(key=lambda item: (item["order_date"], item["order_number"]), reverse=True)
     return rows
@@ -15469,7 +15757,7 @@ def build_freight_job_detail_workbook(
     sheet.title = sheet_title
     sheet["A1"] = report_title
     sheet["A1"].font = Font(size=16, bold=True, color="1F2937")
-    sheet.merge_cells("A1:AA1")
+    sheet.merge_cells("A1:AE1")
     active_filters = ", ".join(
         f"{label}: {filters.get(key)}"
         for key, label in (("customer", "Customer"), ("city", "City"), ("state", "State"), ("start", "From"), ("end", "To"))
@@ -15477,7 +15765,7 @@ def build_freight_job_detail_workbook(
     ) or "No filters applied"
     sheet["A2"] = active_filters
     sheet["A2"].font = Font(size=10, italic=True, color="52657A")
-    sheet.merge_cells("A2:AA2")
+    sheet.merge_cells("A2:AE2")
     headers = [
         "Job No", "Order Date", "Customer", "City", "State", "FileMaker Record ID",
         "Repair Revenue", "Mats", "Repairs", "Rejects",
@@ -15485,7 +15773,8 @@ def build_freight_job_detail_workbook(
         "Outgoing Charge", "Outgoing Cost", "Outgoing Variance",
         "Total Freight Charge", "Total Freight Cost", "Freight Variance", "Recovery %",
         "Review Status", "Invalid Fields", "Missing Fields", "Incoming Gross Weight (lb)", "Incoming Net Weight (lb)",
-        "Outgoing Gross Weight (lb)", "Outgoing Net Weight (lb)",
+        "Incoming Skids", "Incoming Cages", "Outgoing Gross Weight (lb)", "Outgoing Net Weight (lb)",
+        "Outgoing Skids", "Outgoing Cages",
     ]
     sheet.append([])
     sheet.append(headers)
@@ -15500,7 +15789,9 @@ def build_freight_job_detail_workbook(
             item["total_freight_charge"], item["total_freight_cost"], item["freight_variance"],
             item["recovery_percent"], item["status"], item["invalid_fields"], item["missing_fields"],
             item["incoming_gross_weight"], item["incoming_net_weight"],
+            item["incoming_skids"], item["incoming_cages"],
             item["outgoing_gross_weight"], item["outgoing_net_weight"],
+            item["outgoing_skids"], item["outgoing_cages"],
         ])
     for cell in sheet[header_row]:
         cell.fill = PatternFill("solid", fgColor="245CFF")
@@ -15508,9 +15799,9 @@ def build_freight_job_detail_workbook(
         cell.alignment = Alignment(wrap_text=True, vertical="center")
     sheet.row_dimensions[header_row].height = 34
     sheet.freeze_panes = "A5"
-    sheet.auto_filter.ref = f"A{header_row}:AA{sheet.max_row}"
+    sheet.auto_filter.ref = f"A{header_row}:AE{sheet.max_row}"
     if rows:
-        table = Table(displayName=table_name, ref=f"A{header_row}:AA{sheet.max_row}")
+        table = Table(displayName=table_name, ref=f"A{header_row}:AE{sheet.max_row}")
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
             showRowStripes=True, showColumnStripes=False,
@@ -15522,7 +15813,7 @@ def build_freight_job_detail_workbook(
         for column in currency_columns:
             sheet.cell(row_number, column).number_format = '$#,##0.00;[Red]-$#,##0.00'
         sheet.cell(row_number, 20).number_format = "0.0%"
-        for column in range(24, 28):
+        for column in range(24, 32):
             sheet.cell(row_number, column).number_format = '#,##0.00'
         status_cell = sheet.cell(row_number, 21)
         if status_cell.value == "Undercharged":
@@ -15531,7 +15822,7 @@ def build_freight_job_detail_workbook(
         elif str(status_cell.value or "").startswith(("Incomplete", "Invalid")):
             status_cell.fill = PatternFill("solid", fgColor="FFF4CC")
             status_cell.font = Font(color="8A5A00", bold=True)
-    widths = [14, 13, 34, 16, 9, 18, 16, 10, 10, 10, 16, 16, 17, 16, 16, 17, 19, 18, 17, 13, 22, 24, 34, 22, 21, 22, 21]
+    widths = [14, 13, 34, 16, 9, 18, 16, 10, 10, 10, 16, 16, 17, 16, 16, 17, 19, 18, 17, 13, 22, 24, 34, 22, 21, 14, 14, 22, 21, 14, 14]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     output = BytesIO()
@@ -16929,7 +17220,7 @@ def get_contacts_view(
     if not rows:
         rows = (
             "<tr>"
-            f"<td colspan='6' class='empty'>No contacts match the current filters.</td>"
+            f"<td colspan='8' class='empty'>No contacts match the current filters.</td>"
             "</tr>"
         )
 
@@ -16960,13 +17251,15 @@ def get_contacts_view(
             {render_contacts_filter_form(company, name, email, position, sort, direction)}
         </div>
 
-        <div class="table-wrap tall-table">
-        <table class="contacts-table">
+        <div class="table-wrap tall-table contacts-directory-table-wrap">
+        <table class="contacts-table contacts-directory-table">
             <thead>
                 <tr>
                     <th>Company</th>
                     <th>Contact</th>
                     <th>Email</th>
+                    <th>Telephone</th>
+                    <th>Cell</th>
                     <th>Status</th>
                     <th>Position</th>
                     <th>Strategic</th>
@@ -17033,7 +17326,7 @@ def get_contacts_view(
         </script>
     """
 
-    return render_page(title="Contacts", body=body)
+    return render_page(title="Contacts", body=body, main_class="contacts-directory-page")
 
 
 def render_enrichment_view(
@@ -18735,6 +19028,23 @@ def render_contact_master_row(contact, existing_lookup=None, current_filters=Non
     email = str(contact.get("email") or "").strip() or "—"
     phone = str(contact.get("phone") or "").strip() or "—"
     cell = str(contact.get("cell") or "").strip() or "—"
+    email_markup = (
+        f'<a class="contact-detail-link" href="mailto:{escape(email)}">{escape(email)}</a>'
+        if email != "—"
+        else "<span class='muted'>—</span>"
+    )
+    phone_href = re.sub(r"[^0-9+]", "", phone)
+    phone_markup = (
+        f'<a class="contact-detail-link" href="tel:{escape(phone_href)}">{escape(phone)}</a>'
+        if phone != "—" and phone_href
+        else "<span class='muted'>—</span>"
+    )
+    cell_href = re.sub(r"[^0-9+]", "", cell)
+    cell_markup = (
+        f'<a class="contact-detail-link" href="tel:{escape(cell_href)}">{escape(cell)}</a>'
+        if cell != "—" and cell_href
+        else "<span class='muted'>—</span>"
+    )
     active_label = str(contact.get("active") or "").strip() or "Unknown"
     active_markup = (
         "<span class='contact-status contact-status-active'>Active</span>"
@@ -18796,12 +19106,14 @@ def render_contact_master_row(contact, existing_lookup=None, current_filters=Non
 
     return f"""
         <tr id="{escape(row_anchor)}">
-            <td>{company_markup}</td>
-            <td><strong>{escape(contact_name)}</strong></td>
-            <td>{escape(email)}</td>
-            <td>{active_markup}</td>
-            <td>{escape(position)}</td>
-            <td>{strategic_action}</td>
+            <td data-label="Company">{company_markup}</td>
+            <td data-label="Name"><strong>{escape(contact_name)}</strong></td>
+            <td data-label="Email">{email_markup}</td>
+            <td data-label="Telephone">{phone_markup}</td>
+            <td data-label="Cell">{cell_markup}</td>
+            <td data-label="Status">{active_markup}</td>
+            <td data-label="Position">{escape(position)}</td>
+            <td data-label="Strategic">{strategic_action}</td>
         </tr>
     """
 
@@ -20284,6 +20596,13 @@ FREIGHT_WEIGHT_FIELDS = (
     "Despatch_Nett Weight",
 )
 
+FREIGHT_HANDLING_UNIT_FIELDS = (
+    "Act Arrival_Skids",
+    "Act Arrival_Cages",
+    "Despatch_No of Skids",
+    "Despatch_No of Cages",
+)
+
 
 def order_has_freight_data(order):
     extra = (order or {}).get("extra") or {}
@@ -20443,6 +20762,113 @@ def build_freight_analysis(orders, customer_records=None, mat_counts_by_order=No
         "average_freight_income_per_mat": freight_charged / total_mats if total_mats else None,
         "average_freight_cost_per_mat": freight_cost / total_mats if total_mats else None,
         "invalid_values": invalid_values,
+    }
+
+
+def build_mat_analysis(orders, customer_records=None, mat_counts_by_order=None):
+    """Aggregate completed orders that have cached mat records for Mat Analysis."""
+    customer_records = customer_records or {}
+    mat_counts_by_order = mat_counts_by_order or {}
+    customer_rows = {}
+    order_rows = []
+
+    for order in orders or []:
+        extra = order.get("extra") or {}
+        order_number = str(extra.get("Orders::Order No") or extra.get("Order No") or "").strip()
+        mat_counts = mat_counts_by_order.get(order_number, {})
+        mats = int(mat_counts.get("mats") or 0)
+        if not mats:
+            continue
+        repairs = int(mat_counts.get("repairs") or 0)
+        rejects = int(mat_counts.get("rejects") or 0)
+        repair_revenue = parse_freight_value(order.get("amount")) or 0.0
+        freight_values = {field: parse_freight_value(extra.get(field)) for field in FREIGHT_FIELDS}
+        incoming_revenue = freight_values["Incoming Freight"] or 0.0
+        outgoing_revenue = freight_values["Outgoing Freight"] or 0.0
+        freight_revenue = incoming_revenue + outgoing_revenue
+        freight_cost = (freight_values["Incoming Cost"] or 0.0) + (freight_values["Outgoing Cost"] or 0.0)
+        customer_key = str(get_order_primary_key(order) or "").strip()
+        customer_record = customer_records.get(customer_key, {})
+        customer = str(order.get("customer") or "Unknown customer").strip() or "Unknown customer"
+        city = str(customer_record.get("city") or "").strip()
+        state = str(customer_record.get("state") or get_order_state(order) or "").strip().upper()
+        order_row = {
+            "order_number": order_number,
+            "order_date": str(order.get("order_date") or "").strip(),
+            "customer": customer,
+            "city": city,
+            "state": state,
+            "mats": mats,
+            "repairs": repairs,
+            "rejects": rejects,
+            "repair_rate": repairs / mats if mats else None,
+            "repair_revenue": repair_revenue,
+            "average_repair_revenue_per_mat": repair_revenue / repairs if repairs else None,
+            "incoming_revenue": incoming_revenue,
+            "outgoing_revenue": outgoing_revenue,
+            "freight_revenue": freight_revenue,
+            "freight_cost": freight_cost,
+            "total_revenue": repair_revenue + freight_revenue,
+        }
+        order_rows.append(order_row)
+        row = customer_rows.setdefault(customer, {
+            "customer": customer,
+            "city": city,
+            "state": state,
+            "orders": 0,
+            "mats": 0,
+            "repairs": 0,
+            "rejects": 0,
+            "repair_revenue": 0.0,
+            "incoming_revenue": 0.0,
+            "outgoing_revenue": 0.0,
+            "freight_revenue": 0.0,
+            "freight_cost": 0.0,
+            "total_revenue": 0.0,
+        })
+        row["orders"] += 1
+        for field in ("mats", "repairs", "rejects"):
+            row[field] += order_row[field]
+        for field in (
+            "repair_revenue", "incoming_revenue", "outgoing_revenue",
+            "freight_revenue", "freight_cost", "total_revenue",
+        ):
+            row[field] += order_row[field]
+
+    rows = []
+    for row in customer_rows.values():
+        rows.append({
+            **row,
+            "repair_rate": row["repairs"] / row["mats"] if row["mats"] else None,
+            "reject_rate": row["rejects"] / row["mats"] if row["mats"] else None,
+            "average_repair_revenue_per_order": row["repair_revenue"] / row["orders"] if row["orders"] else None,
+            "average_repair_revenue_per_mat": row["repair_revenue"] / row["repairs"] if row["repairs"] else None,
+        })
+    rows.sort(key=lambda item: (-item["mats"], item["customer"].casefold()))
+    order_rows.sort(key=lambda item: (item["order_date"], item["order_number"]), reverse=True)
+    total_mats = sum(row["mats"] for row in rows)
+    total_repairs = sum(row["repairs"] for row in rows)
+    total_rejects = sum(row["rejects"] for row in rows)
+    repair_revenue = sum(row["repair_revenue"] for row in rows)
+    freight_revenue = sum(row["freight_revenue"] for row in rows)
+    freight_cost = sum(row["freight_cost"] for row in rows)
+    return {
+        "rows": rows,
+        "order_rows": order_rows,
+        "customer_count": len(rows),
+        "order_count": len(order_rows),
+        "mats": total_mats,
+        "repairs": total_repairs,
+        "rejects": total_rejects,
+        "repair_rate": total_repairs / total_mats if total_mats else None,
+        "reject_rate": total_rejects / total_mats if total_mats else None,
+        "repair_revenue": repair_revenue,
+        "freight_charged": freight_revenue,
+        "freight_cost": freight_cost,
+        "total_revenue": repair_revenue + freight_revenue,
+        "average_repair_revenue_per_order": repair_revenue / len(order_rows) if order_rows else None,
+        "average_repair_revenue_per_mat": repair_revenue / total_repairs if total_repairs else None,
+        "average_freight_cost_per_mat": freight_cost / total_mats if total_mats else None,
     }
 
 
@@ -29233,6 +29659,7 @@ def render_global_nav(title):
             ("Insights", "/insights-view"),
             ("Orders", "/orders-view"),
             ("Freight Analysis", "/freight-analysis-view"),
+            ("Mat Analysis", "/mat-analysis-view"),
             ("AI Analysis", "/ai-analysis-view"),
             ("Ask The Data", "/ask-data-view"),
         ]),
@@ -29246,7 +29673,7 @@ def render_global_nav(title):
     module_title_aliases = {
         "sales": {"Home", "Action Plan", "Calendar", "CRM Activities", "Outreach Prep"},
         "customers": {"Customers", "Contacts", "Customer Map", "Strategic Contacts", "Organisation View", "Dismissed Customers"},
-        "analysis": {"Insights", "Orders", "Freight Analysis", "AI Analysis", "Ask The Data"},
+        "analysis": {"Insights", "Orders", "Freight Analysis", "Mat Analysis", "AI Analysis", "Ask The Data"},
         "management": {"Weekly KPI Dashboard", "Production Analysis", "Plant Productivity Calculation", "Overbooked Operator Days", "Meeting History", "Meeting Record", "Action History", "Promised Orders", "Priority 1 Customers"},
     }
     active_module = ""
@@ -36427,6 +36854,33 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font: inherit;
                     }}
 
+                    .contacts-directory-table {{
+                        min-width: 1280px;
+                    }}
+
+                    .contacts-directory-table th:nth-child(1),
+                    .contacts-directory-table td:nth-child(1) {{ width: 18%; }}
+                    .contacts-directory-table th:nth-child(2),
+                    .contacts-directory-table td:nth-child(2) {{ width: 14%; }}
+                    .contacts-directory-table th:nth-child(3),
+                    .contacts-directory-table td:nth-child(3) {{ width: 20%; }}
+                    .contacts-directory-table th:nth-child(4),
+                    .contacts-directory-table td:nth-child(4),
+                    .contacts-directory-table th:nth-child(5),
+                    .contacts-directory-table td:nth-child(5) {{ width: 12%; }}
+                    .contacts-directory-table th:nth-child(6),
+                    .contacts-directory-table td:nth-child(6) {{ width: 8%; }}
+                    .contacts-directory-table th:nth-child(7),
+                    .contacts-directory-table td:nth-child(7),
+                    .contacts-directory-table th:nth-child(8),
+                    .contacts-directory-table td:nth-child(8) {{ width: 12%; }}
+
+                    .contact-detail-link {{
+                        color: var(--blue);
+                        overflow-wrap: anywhere;
+                        text-decoration: none;
+                    }}
+
                     .crm-activity-meta {{
                         display: grid;
                         gap: 6px;
@@ -37690,6 +38144,87 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
                     }}
 
+                    @media (min-width: 721px) and (max-width: 900px) {{
+                        .contacts-directory-page .customer-summary {{ display: none; }}
+                        .contacts-directory-page .contacts-filter-panel .controls {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            gap: 10px;
+                        }}
+                        .contacts-directory-page .contacts-filter-panel label,
+                        .contacts-directory-page .contacts-filter-panel input,
+                        .contacts-directory-page .contacts-filter-panel select,
+                        .contacts-directory-page .contacts-filter-panel button,
+                        .contacts-directory-page .contacts-filter-panel .button {{
+                            width: 100%;
+                            min-width: 0;
+                        }}
+                        .contacts-directory-table-wrap {{ overflow: visible; }}
+                        .contacts-directory-table thead {{ display: none; }}
+                        .contacts-directory-table,
+                        .contacts-directory-table tbody {{
+                            display: grid;
+                            gap: 10px;
+                            width: 100%;
+                            min-width: 0;
+                        }}
+                        .contacts-directory-table tr {{
+                            display: grid;
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            gap: 14px 12px;
+                            padding: 16px;
+                            border: 1px solid var(--border);
+                            border-radius: 10px;
+                            background: #fff;
+                        }}
+                        .contacts-directory-table td {{
+                            display: grid;
+                            grid-template-columns: 1fr;
+                            gap: 4px;
+                            align-items: start;
+                            width: auto !important;
+                            min-width: 0 !important;
+                            padding: 0;
+                            border: 0;
+                            font-size: 14px;
+                            line-height: 1.35;
+                            white-space: normal !important;
+                            overflow-wrap: anywhere;
+                        }}
+                        .contacts-directory-table td::before {{
+                            content: attr(data-label);
+                            color: var(--muted);
+                            font-size: 10px;
+                            font-weight: 700;
+                            letter-spacing: .04em;
+                            text-transform: uppercase;
+                        }}
+                        .contacts-directory-table td:nth-child(2) {{
+                            order: -2;
+                            grid-column: 1 / -1;
+                            padding-bottom: 8px;
+                            border-bottom: 1px solid var(--border);
+                            font-size: 18px;
+                            line-height: 1.25;
+                        }}
+                        .contacts-directory-table td:nth-child(2)::before {{ display: none; }}
+                        .contacts-directory-table td:nth-child(1) {{
+                            order: -1;
+                            grid-column: 1 / -1;
+                        }}
+                        .contacts-directory-table td:nth-child(1) a {{
+                            color: var(--blue);
+                            font-size: 17px;
+                            font-weight: 800;
+                            line-height: 1.25;
+                            text-decoration: none;
+                        }}
+                        .contacts-directory-table td:nth-child(3) {{ grid-column: 1 / -1; }}
+                        .contacts-directory-table td:nth-child(6),
+                        .contacts-directory-table td:nth-child(7),
+                        .contacts-directory-table td:nth-child(8) {{ display: none; }}
+                        .contacts-directory-page .pager {{ flex-wrap: wrap; gap: 8px; }}
+                    }}
+
                     @media (max-width: 980px) {{
                         .production-kpi-grid {{
                             grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -38442,6 +38977,115 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         .home-focus-record-visit-button {{
                             width: 100%;
                             min-width: 0;
+                        }}
+
+                        .contacts-directory-page .customer-summary {{
+                            display: none;
+                        }}
+
+                        .contacts-directory-page .contacts-filter-panel .controls {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            gap: 10px;
+                        }}
+
+                        .contacts-directory-page .contacts-filter-panel label,
+                        .contacts-directory-page .contacts-filter-panel input,
+                        .contacts-directory-page .contacts-filter-panel select,
+                        .contacts-directory-page .contacts-filter-panel button,
+                        .contacts-directory-page .contacts-filter-panel .button {{
+                            min-width: 0;
+                            width: 100%;
+                        }}
+
+                        .contacts-directory-table-wrap {{
+                            overflow: visible;
+                        }}
+
+                        .contacts-directory-table thead {{
+                            display: none;
+                        }}
+
+                        .contacts-directory-table,
+                        .contacts-directory-table tbody {{
+                            display: grid;
+                            gap: 10px;
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .contacts-directory-table tr {{
+                            display: grid;
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            gap: 14px 10px;
+                            padding: 16px;
+                            border: 1px solid var(--border);
+                            border-radius: 10px;
+                            background: #fff;
+                        }}
+
+                        .contacts-directory-table td {{
+                            display: grid;
+                            grid-template-columns: 1fr;
+                            gap: 4px;
+                            align-items: start;
+                            width: auto !important;
+                            min-width: 0 !important;
+                            padding: 0;
+                            border: 0;
+                            font-size: 14px;
+                            line-height: 1.35;
+                            white-space: normal !important;
+                            overflow-wrap: anywhere;
+                        }}
+
+                        .contacts-directory-table td::before {{
+                            content: attr(data-label);
+                            color: var(--muted);
+                            font-size: 10px;
+                            font-weight: 700;
+                            letter-spacing: .04em;
+                            text-transform: uppercase;
+                        }}
+
+                        .contacts-directory-table td:nth-child(2) {{
+                            order: -2;
+                            grid-column: 1 / -1;
+                            padding-bottom: 8px;
+                            border-bottom: 1px solid var(--border);
+                            font-size: 18px;
+                            line-height: 1.25;
+                        }}
+
+                        .contacts-directory-table td:nth-child(2)::before {{
+                            display: none;
+                        }}
+
+                        .contacts-directory-table td:nth-child(1) {{
+                            order: -1;
+                            grid-column: 1 / -1;
+                        }}
+
+                        .contacts-directory-table td:nth-child(1) a {{
+                            color: var(--blue);
+                            font-size: 17px;
+                            font-weight: 800;
+                            line-height: 1.25;
+                            text-decoration: none;
+                        }}
+
+                        .contacts-directory-table td:nth-child(3) {{
+                            grid-column: 1 / -1;
+                        }}
+
+                        .contacts-directory-table td:nth-child(6),
+                        .contacts-directory-table td:nth-child(7),
+                        .contacts-directory-table td:nth-child(8) {{
+                            display: none;
+                        }}
+
+                        .contacts-directory-page .pager {{
+                            flex-wrap: wrap;
+                            gap: 8px;
                         }}
 
                         .customers-table-wrap,
