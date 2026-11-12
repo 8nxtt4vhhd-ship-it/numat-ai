@@ -78,12 +78,15 @@ def add_mat_record_to_counts(counts_by_order, record):
         size_row = row["sizes"].setdefault(mat_size, {
             "mats": 0,
             "repairs": 0,
+            "rejects": 0,
+            "repair_actions": 0,
             "repair_value": 0.0,
             "repair_value_records": 0,
             "square_feet": 0.0,
             "square_feet_records": 0,
         })
         size_row["mats"] += 1
+        size_row["repair_actions"] += normalize_count(get_field_value(field_data, "Rep_Total No"))
         if outcome == "repair":
             size_row["repairs"] += 1
             repair_cost = get_field_value(field_data, "Repair Cost")
@@ -93,6 +96,8 @@ def add_mat_record_to_counts(counts_by_order, record):
             if square_feet:
                 size_row["square_feet"] += square_feet
                 size_row["square_feet_records"] += 1
+        elif outcome == "reject":
+            size_row["rejects"] += 1
     return True
 
 

@@ -28,6 +28,8 @@ class MatDataTests(unittest.TestCase):
             "sizes": {"Unspecified": {
                 "mats": 3,
                 "repairs": 2,
+                "rejects": 1,
+                "repair_actions": 5,
                 "repair_value": 0.0,
                 "repair_value_records": 0,
                 "square_feet": 0.0,
@@ -49,6 +51,8 @@ class MatDataTests(unittest.TestCase):
         self.assertEqual(counts["1016"]["sizes"]["3 x 5"], {
             "mats": 3,
             "repairs": 2,
+            "rejects": 1,
+            "repair_actions": 0,
             "repair_value": 30.0,
             "repair_value_records": 2,
             "square_feet": 30.0,

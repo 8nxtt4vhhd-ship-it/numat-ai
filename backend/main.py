@@ -14571,6 +14571,165 @@ def group_mat_sizes_for_overview(rows):
     return result
 
 
+def build_mat_location_size_analysis(orders, customer_records=None, mat_cache=None):
+    """Group mat outcomes and allocated freight by customer location and standard size."""
+    customer_records = customer_records or {}
+    cached_orders = (mat_cache or {}).get("orders", {})
+    standard_sizes = ("3x4", "3x5", "3x10", "4x6")
+    rows = {}
+    location_repair_totals = {}
+    for order in orders or []:
+        extra = order.get("extra") or {}
+        order_number = str(extra.get("Orders::Order No") or extra.get("Order No") or "").strip()
+        cached_order = cached_orders.get(order_number, {})
+        cached_sizes = cached_order.get("sizes") or {}
+        total_mats = int(cached_order.get("mats") or 0)
+        if not total_mats or not cached_sizes:
+            continue
+        customer = str(order.get("customer") or "Unknown customer").strip() or "Unknown customer"
+        customer_key = str(get_order_primary_key(order) or "").strip()
+        customer_record = customer_records.get(customer_key, {})
+        city = str(customer_record.get("city") or "").strip()
+        state = str(customer_record.get("state") or get_order_state(order) or "").strip().upper()
+        order_date = str(order.get("order_date") or "").strip()
+        location_total = location_repair_totals.setdefault(customer, {"repairs": 0, "repair_actions": 0})
+        location_total["repairs"] += int(cached_order.get("repairs") or 0)
+        location_total["repair_actions"] += int(cached_order.get("repair_actions") or 0)
+        freight_values = {field: parse_freight_value(extra.get(field)) for field in FREIGHT_FIELDS}
+        incoming_freight = freight_values["Incoming Freight"] or 0.0
+        outgoing_freight = freight_values["Outgoing Freight"] or 0.0
+        grouped_sizes = {}
+        for size, values in cached_sizes.items():
+            normalized_size = normalize_mat_size_key(size)
+            label = normalized_size if normalized_size in standard_sizes else "Other"
+            group = grouped_sizes.setdefault(label, {
+                "mats": 0, "repairs": 0, "rejects": 0, "repair_actions": 0,
+                "repair_revenue": 0.0,
+            })
+            mats = int(values.get("mats") or 0)
+            repairs = int(values.get("repairs") or 0)
+            group["mats"] += mats
+            group["repairs"] += repairs
+            group["rejects"] += int(values.get("rejects") if values.get("rejects") is not None else max(0, mats - repairs))
+            group["repair_actions"] += int(values.get("repair_actions") or 0)
+            group["repair_revenue"] += float(values.get("repair_value") or 0)
+        for size_label, values in grouped_sizes.items():
+            key = (customer, size_label)
+            row = rows.setdefault(key, {
+                "customer": customer,
+                "city": city,
+                "state": state,
+                "size": size_label,
+                "order_numbers": set(),
+                "first_order_date": order_date,
+                "mats": 0,
+                "repairs": 0,
+                "rejects": 0,
+                "repair_actions": 0,
+                "repair_revenue": 0.0,
+                "incoming_freight": 0.0,
+                "outgoing_freight": 0.0,
+            })
+            if order_number:
+                row["order_numbers"].add(order_number)
+            if order_date and (not row["first_order_date"] or order_date < row["first_order_date"]):
+                row["first_order_date"] = order_date
+            for field in ("mats", "repairs", "rejects", "repair_actions"):
+                row[field] += values[field]
+            row["repair_revenue"] += values["repair_revenue"]
+            allocation = values["mats"] / total_mats if total_mats else 0.0
+            row["incoming_freight"] += incoming_freight * allocation
+            row["outgoing_freight"] += outgoing_freight * allocation
+
+    size_order = {size: index for index, size in enumerate((*standard_sizes, "Other"))}
+    result = []
+    for row in rows.values():
+        if row["repair_revenue"] <= 0:
+            continue
+        mats = row["mats"]
+        repairs = row["repairs"]
+        repair_actions = row["repair_actions"]
+        location_total = location_repair_totals.get(row["customer"], {})
+        location_repairs = int(location_total.get("repairs") or 0)
+        location_repair_actions = int(location_total.get("repair_actions") or 0)
+        total_with_freight = row["repair_revenue"] + row["incoming_freight"] + row["outgoing_freight"]
+        result.append({
+            **row,
+            "orders": len(row["order_numbers"]),
+            "average_per_mat_including_freight": total_with_freight / mats if mats else None,
+            "average_per_mat_excluding_freight": row["repair_revenue"] / mats if mats else None,
+            "average_repairs_per_repaired_mat": (
+                repair_actions / repairs
+                if repairs and repair_actions
+                else location_repair_actions / location_repairs if location_repairs else None
+            ),
+        })
+    result.sort(key=lambda row: (row["customer"].casefold(), size_order.get(row["size"], 99)))
+    return result
+
+
+def summarize_mat_location_rows(rows, summary_type, customer=""):
+    rows = list(rows or [])
+    first_order_dates = [row.get("first_order_date") for row in rows if row.get("first_order_date")]
+    order_keys = {
+        (row.get("customer", ""), order_number)
+        for row in rows
+        for order_number in row.get("order_numbers", set())
+    }
+    mats = sum(int(row.get("mats") or 0) for row in rows)
+    repairs = sum(int(row.get("repairs") or 0) for row in rows)
+    repair_revenue = sum(float(row.get("repair_revenue") or 0) for row in rows)
+    incoming_freight = sum(float(row.get("incoming_freight") or 0) for row in rows)
+    outgoing_freight = sum(float(row.get("outgoing_freight") or 0) for row in rows)
+    repair_action_total = sum(
+        float(row.get("average_repairs_per_repaired_mat") or 0) * int(row.get("repairs") or 0)
+        for row in rows
+    )
+    first_row = rows[0] if rows else {}
+    return {
+        "summary_type": summary_type,
+        "customer": customer or "Grand total",
+        "city": first_row.get("city", "") if summary_type == "location" else "",
+        "state": first_row.get("state", "") if summary_type == "location" else "",
+        "size": "Location total" if summary_type == "location" else "Grand total",
+        "order_numbers": {key[1] for key in order_keys},
+        "orders": len(order_keys),
+        "first_order_date": min(first_order_dates) if first_order_dates else "",
+        "mats": mats,
+        "repairs": repairs,
+        "rejects": sum(int(row.get("rejects") or 0) for row in rows),
+        "repair_actions": repair_action_total,
+        "repair_revenue": repair_revenue,
+        "incoming_freight": incoming_freight,
+        "outgoing_freight": outgoing_freight,
+        "average_per_mat_including_freight": (
+            (repair_revenue + incoming_freight + outgoing_freight) / mats if mats else None
+        ),
+        "average_per_mat_excluding_freight": repair_revenue / mats if mats else None,
+        "average_repairs_per_repaired_mat": repair_action_total / repairs if repairs else None,
+    }
+
+
+def add_mat_location_summary_rows(rows):
+    rows = list(rows or [])
+    display_rows = []
+    location_rows = []
+    current_customer = None
+    for row in rows:
+        customer = row.get("customer", "")
+        if current_customer is not None and customer != current_customer:
+            display_rows.append(summarize_mat_location_rows(location_rows, "location", current_customer))
+            location_rows = []
+        display_rows.append({**row, "summary_type": ""})
+        location_rows.append(row)
+        current_customer = customer
+    if location_rows:
+        display_rows.append(summarize_mat_location_rows(location_rows, "location", current_customer or ""))
+    if rows:
+        display_rows.append(summarize_mat_location_rows(rows, "grand"))
+    return display_rows
+
+
 @app.get("/freight-analysis-view", response_class=HTMLResponse)
 def get_freight_analysis_view(
     customer: str = "",
@@ -15362,6 +15521,7 @@ def get_mat_analysis_view(
         mat_counts_by_order=mat_cache.get("orders", {}),
     )
     mat_sizes = build_mat_size_freight_analysis(filtered_orders, mat_cache, analysis)
+    location_sizes = build_mat_location_size_analysis(filtered_orders, customers_by_key, mat_cache)
     export_query = urlencode({
         key: value for key, value in {
             "customer": customer, "city": city, "state": state, "start": start, "end": end,
@@ -15421,6 +15581,31 @@ def get_mat_analysis_view(
         """
         for row in analysis["order_rows"]
     ) or "<tr><td colspan='14' class='empty'>No orders with cached mat records match the current filters.</td></tr>"
+
+    location_headers = "".join(
+        f"<th>{escape(label)}</th>"
+        for label in (
+            "First order", "Location", "City / state", "Mat size", "Orders", "Mats",
+            "Repairs", "Rejects", "Repair revenue", "Incoming freight", "Outgoing freight",
+            "Avg / mat incl freight", "Avg / mat excl freight", "Avg repairs / repaired mat",
+        )
+    )
+    location_display_rows = add_mat_location_summary_rows(location_sizes)
+    location_rows = "".join(
+        f"""
+        <tr class="{'mat-location-' + row['summary_type'] + '-row' if row['summary_type'] else ''}">
+            <td>{escape(row['first_order_date'] or '—')}</td><td>{escape(row['customer'])}</td>
+            <td>{escape(', '.join(part for part in (row['city'], row['state']) if part) or '—')}</td>
+            <td><strong>{escape(row['size'])}</strong></td><td>{row['orders']:,}</td><td>{row['mats']:,}</td>
+            <td>{row['repairs']:,}</td><td>{row['rejects']:,}</td><td>{format_currency(row['repair_revenue'])}</td>
+            <td>{format_currency(row['incoming_freight'])}</td><td>{format_currency(row['outgoing_freight'])}</td>
+            <td>{format_currency(row['average_per_mat_including_freight'])}</td>
+            <td>{format_currency(row['average_per_mat_excluding_freight'])}</td>
+            <td>{f"{row['average_repairs_per_repaired_mat']:,.2f}" if row['average_repairs_per_repaired_mat'] is not None else '—'}</td>
+        </tr>
+        """
+        for row in location_display_rows
+    ) or "<tr><td colspan='14' class='empty'>No location and mat-size data matches the current filters.</td></tr>"
 
     size_headers = sortable_headers([
         ("Mat size", "text"), ("Mats", "number"), ("Repaired mats", "number"),
@@ -15513,6 +15698,8 @@ def get_mat_analysis_view(
         .mat-analysis-table td {{ padding:7px 6px; text-align:center; white-space:nowrap; }} .mat-analysis-table th:first-child,.mat-analysis-table td:first-child {{ text-align:left; }}
         .mat-sort-button {{ display:inline-flex; align-items:center; justify-content:center; gap:4px; width:100%; padding:0; border:0; background:transparent; color:inherit; font:inherit; font-weight:inherit; box-shadow:none; }}
         .mat-analysis-table th:first-child .mat-sort-button {{ justify-content:flex-start; }} .mat-sort-button span {{ color:#7890a9; }}
+        .mat-location-location-row td {{ background:#eef4ff; font-weight:700; border-top:2px solid #bfd1ff; }}
+        .mat-location-grand-row td {{ background:#dfe9ff; font-weight:800; border-top:3px solid var(--blue); }}
         .mat-saving.positive {{ color:#087a46; font-weight:700; }} .mat-saving.negative {{ color:#b42318; font-weight:700; }}
         .mat-cache-note {{ margin:7px 2px 0; color:var(--muted); font-size:.68rem; }}
         @media(max-width:1100px) {{ .mat-filter-controls {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} .mat-summary {{ grid-template-columns:repeat(3,minmax(0,1fr)); }} }}
@@ -15535,6 +15722,7 @@ def get_mat_analysis_view(
         <button class="mat-tab" id="mat-overview-tab" type="button" role="tab" aria-selected="true" aria-controls="mat-overview">Overview</button>
         <button class="mat-tab" id="mat-customer-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-customer">Customer breakdown</button>
         <button class="mat-tab" id="mat-order-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-order">Order breakdown</button>
+        <button class="mat-tab" id="mat-location-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-location">Location breakdown</button>
         <button class="mat-tab" id="mat-size-tab" type="button" role="tab" aria-selected="false" aria-controls="mat-size">Mat breakdown</button>
     </div>
     <section class="mat-tab-panel" id="mat-overview" role="tabpanel" aria-labelledby="mat-overview-tab">
@@ -15552,6 +15740,7 @@ def get_mat_analysis_view(
     </section>
     <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-customer" role="tabpanel" aria-labelledby="mat-customer-tab" hidden><div class="mat-breakdown-heading"><h2>Customer mat breakdown</h2><a class="button secondary mat-export-button" href="/mat-analysis-customer-export.xlsx{f'?{export_query}' if export_query else ''}">Customer summary Excel</a></div><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{customer_headers}</tr></thead><tbody>{customer_rows}</tbody></table></div></section>
     <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-order" role="tabpanel" aria-labelledby="mat-order-tab" hidden><div class="mat-breakdown-heading"><h2>Individual order mat breakdown</h2><a class="button secondary mat-export-button" href="/mat-analysis-order-export.xlsx{f'?{export_query}' if export_query else ''}">Order detail Excel</a></div><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{order_headers}</tr></thead><tbody>{order_rows}</tbody></table></div></section>
+    <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-location" role="tabpanel" aria-labelledby="mat-location-tab" hidden><div class="mat-breakdown-heading"><div><h2>Location and mat-size breakdown</h2><p class="muted">Standard sizes are shown separately; every other size is grouped as Other.</p></div><a class="button secondary mat-export-button" href="/mat-analysis-location-export.xlsx{f'?{export_query}' if export_query else ''}">Location breakdown Excel</a></div><div class="table-wrap tall-table"><table class="mat-analysis-table"><thead><tr>{location_headers}</tr></thead><tbody>{location_rows}</tbody></table></div></section>
     <section class="panel mat-breakdown-panel mat-tab-panel" id="mat-size" role="tabpanel" aria-labelledby="mat-size-tab" hidden>
         <div class="mat-breakdown-heading"><div><h2>Mat price comparison</h2><p class="muted">Compare current repair pricing, allocated freight and an estimated buy-new price by mat size.</p></div><div class="mat-breakdown-actions"><div class="mat-new-price-control"><label for="mat-analysis-new-price">Buy-new price</label><input id="mat-analysis-new-price" type="number" min="0" step="0.01" placeholder="$ / sq ft"></div><a id="mat-size-export" class="button secondary mat-export-button" data-base-href="/mat-analysis-size-export.xlsx{f'?{export_query}' if export_query else ''}" href="/mat-analysis-size-export.xlsx{f'?{export_query}' if export_query else ''}">Mat breakdown Excel</a></div></div>
         <div class="table-wrap tall-table"><table class="mat-analysis-table mat-size-table"><thead><tr>{size_headers}</tr></thead><tbody>{size_rows}</tbody></table></div>
@@ -15563,7 +15752,7 @@ def get_mat_analysis_view(
         const summaryValues=[...document.querySelectorAll('.mat-summary strong')];
         const fitSummaryValues=()=>{{summaryValues.forEach(value=>{{value.style.fontSize='1rem';let size=parseFloat(getComputedStyle(value).fontSize);while(value.scrollWidth>value.clientWidth+1&&size>11){{size-=.5;value.style.fontSize=`${{size}}px`;}}}});}};
         requestAnimationFrame(fitSummaryValues);if('ResizeObserver' in window){{const observer=new ResizeObserver(()=>requestAnimationFrame(fitSummaryValues));document.querySelectorAll('.mat-summary>div').forEach(card=>observer.observe(card));}}else{{window.addEventListener('resize',fitSummaryValues);}}
-        document.querySelectorAll('.mat-analysis-table').forEach(table=>{{const headers=[...table.querySelectorAll('thead th')];headers.forEach((header,index)=>{{header.querySelector('button').addEventListener('click',()=>{{const desc=header.getAttribute('aria-sort')==='ascending';headers.forEach(x=>x.setAttribute('aria-sort','none'));header.setAttribute('aria-sort',desc?'descending':'ascending');const numeric=header.dataset.sortType==='number';const rows=[...table.tBodies[0].rows];const value=text=>{{const match=text.replace(/[$,%]/g,'').replace(/,/g,'').match(/-?\\d+(?:\\.\\d+)?/);return match?Number(match[0]):Number.NEGATIVE_INFINITY;}};rows.sort((a,b)=>{{const left=a.cells[index]?.textContent.trim()||'',right=b.cells[index]?.textContent.trim()||'';const result=numeric?value(left)-value(right):left.localeCompare(right,undefined,{{numeric:true,sensitivity:'base'}});return desc?-result:result;}});rows.forEach(row=>table.tBodies[0].appendChild(row));}});}});}});
+        document.querySelectorAll('.mat-analysis-table').forEach(table=>{{const headers=[...table.querySelectorAll('thead th')];headers.forEach((header,index)=>{{const button=header.querySelector('button');if(!button)return;button.addEventListener('click',()=>{{const desc=header.getAttribute('aria-sort')==='ascending';headers.forEach(x=>x.setAttribute('aria-sort','none'));header.setAttribute('aria-sort',desc?'descending':'ascending');const numeric=header.dataset.sortType==='number';const rows=[...table.tBodies[0].rows];const value=text=>{{const match=text.replace(/[$,%]/g,'').replace(/,/g,'').match(/-?\\d+(?:\\.\\d+)?/);return match?Number(match[0]):Number.NEGATIVE_INFINITY;}};rows.sort((a,b)=>{{const left=a.cells[index]?.textContent.trim()||'',right=b.cells[index]?.textContent.trim()||'';const result=numeric?value(left)-value(right):left.localeCompare(right,undefined,{{numeric:true,sensitivity:'base'}});return desc?-result:result;}});rows.forEach(row=>table.tBodies[0].appendChild(row));}});}});}});
         const input=document.getElementById('mat-analysis-new-price'),rows=[...document.querySelectorAll('.mat-size-table tbody tr[data-square-feet]')],money=value=>new Intl.NumberFormat('en-US',{{style:'currency',currency:'USD'}}).format(value);
         const exportLink=document.getElementById('mat-size-export');
         const update=()=>{{const price=Number(input.value||0);rows.forEach(row=>{{const sqft=Number(row.dataset.squareFeet||0),repair=Number(row.dataset.inclusiveRepair||0),buy=row.querySelector('.mat-buy-new-cost'),saving=row.querySelector('.mat-saving'),percent=row.querySelector('.mat-repair-percent');saving.classList.remove('positive','negative');if(!(price>0&&sqft>0&&repair>=0)){{buy.textContent=sqft>0?'Enter price / sq ft':'Square footage unavailable';saving.textContent='—';percent.textContent='—';return;}}const replacement=sqft*price,difference=replacement-repair;buy.textContent=money(replacement);saving.textContent=money(difference);saving.classList.add(difference>=0?'positive':'negative');percent.textContent=replacement?`${{(repair/replacement*100).toFixed(1)}}%`:'—';}});if(price>0)localStorage.setItem('mat-analysis-buy-new-price',String(price));else localStorage.removeItem('mat-analysis-buy-new-price');if(exportLink){{const joiner=exportLink.dataset.baseHref.includes('?')?'&':'?';exportLink.href=price>0?`${{exportLink.dataset.baseHref}}${{joiner}}buy_new_price=${{encodeURIComponent(price)}}`:exportLink.dataset.baseHref;}}}};
@@ -15573,7 +15762,9 @@ def get_mat_analysis_view(
     return render_page(title="Mat Analysis", body=body, main_class="mat-analysis-main")
 
 
-def build_mat_analysis_workbook(analysis, mat_sizes, filters=None, section="customer", buy_new_price=None):
+def build_mat_analysis_workbook(
+    analysis, mat_sizes, filters=None, section="customer", buy_new_price=None, location_sizes=None,
+):
     from io import BytesIO
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -15583,13 +15774,35 @@ def build_mat_analysis_workbook(analysis, mat_sizes, filters=None, section="cust
     filters = filters or {}
     workbook = Workbook()
     sheet = workbook.active
+    summary_row_types = []
     active_filters = ", ".join(
         f"{label}: {filters.get(key)}"
         for key, label in (("customer", "Customer"), ("city", "City"), ("state", "State"), ("start", "From"), ("end", "To"))
         if str(filters.get(key) or "").strip()
     ) or "No filters applied"
 
-    if section == "order":
+    if section == "location":
+        sheet.title = "Location breakdown"
+        title = "Mat Analysis — Location and Mat Size Breakdown"
+        table_name = "MatLocationBreakdown"
+        headers = [
+            "First Order Date", "Location", "City", "State", "Mat Size", "Orders", "Mats",
+            "Repairs", "Rejects", "Repair Revenue", "Incoming Freight", "Outgoing Freight",
+            "Average / Mat Including Freight", "Average / Mat Excluding Freight",
+            "Average Repairs / Repaired Mat",
+        ]
+        location_display_rows = add_mat_location_summary_rows(location_sizes or [])
+        summary_row_types = [row.get("summary_type", "") for row in location_display_rows]
+        rows = [[
+            parse_iso_date(row["first_order_date"]), row["customer"], row["city"], row["state"], row["size"],
+            row["orders"], row["mats"], row["repairs"], row["rejects"], row["repair_revenue"],
+            row["incoming_freight"], row["outgoing_freight"], row["average_per_mat_including_freight"],
+            row["average_per_mat_excluding_freight"], row["average_repairs_per_repaired_mat"],
+        ] for row in location_display_rows]
+        date_columns, integer_columns = (1,), (6, 7, 8, 9)
+        percent_columns, currency_columns = (), (10, 11, 12, 13, 14)
+        widths = [16, 34, 16, 9, 12, 10, 10, 10, 10, 16, 17, 17, 22, 22, 24]
+    elif section == "order":
         sheet.title = "Order breakdown"
         title = "Mat Analysis — Order Breakdown"
         table_name = "MatOrderBreakdown"
@@ -15670,8 +15883,9 @@ def build_mat_analysis_workbook(analysis, mat_sizes, filters=None, section="cust
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     sheet.row_dimensions[header_row].height = 34
     sheet.freeze_panes = "A5"
-    sheet.auto_filter.ref = f"A{header_row}:{last_column}{sheet.max_row}"
-    if rows:
+    if section != "location":
+        sheet.auto_filter.ref = f"A{header_row}:{last_column}{sheet.max_row}"
+    if rows and section != "location":
         table = Table(displayName=table_name, ref=f"A{header_row}:{last_column}{sheet.max_row}")
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
@@ -15687,6 +15901,12 @@ def build_mat_analysis_workbook(analysis, mat_sizes, filters=None, section="cust
             sheet.cell(row_number, column).number_format = "0.0%"
         for column in currency_columns:
             sheet.cell(row_number, column).number_format = '$#,##0.00;[Red]-$#,##0.00'
+        if section == "location" and summary_row_types[row_number - header_row - 1]:
+            summary_type = summary_row_types[row_number - header_row - 1]
+            fill_color = "DFE9FF" if summary_type == "grand" else "EEF4FF"
+            for cell in sheet[row_number]:
+                cell.fill = PatternFill("solid", fgColor=fill_color)
+                cell.font = Font(bold=True, color="1F2937")
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     output = BytesIO()
@@ -15711,18 +15931,19 @@ def get_mat_analysis_export_data(customer="", city="", state="", start="", end="
         mat_counts_by_order=mat_cache.get("orders", {}),
     )
     mat_sizes = build_mat_size_freight_analysis(filtered_orders, mat_cache, analysis)
-    return analysis, mat_sizes
+    location_sizes = build_mat_location_size_analysis(filtered_orders, customers_by_key, mat_cache)
+    return analysis, mat_sizes, location_sizes
 
 
 def mat_analysis_export_response(section, customer="", city="", state="", start="", end="", buy_new_price=None):
     export_data = get_mat_analysis_export_data(customer, city, state, start, end)
     if export_data is None:
         return PlainTextResponse("Mat data is currently unavailable.", status_code=503)
-    analysis, mat_sizes = export_data
+    analysis, mat_sizes, location_sizes = export_data
     content = build_mat_analysis_workbook(
         analysis, mat_sizes,
         {"customer": customer, "city": city, "state": state, "start": start, "end": end},
-        section=section, buy_new_price=buy_new_price,
+        section=section, buy_new_price=buy_new_price, location_sizes=location_sizes,
     )
     filename = f"mat-analysis-{section}-{datetime.now().strftime('%Y-%m-%d')}.xlsx"
     return Response(
@@ -15740,6 +15961,11 @@ def export_mat_analysis_customer_workbook(customer: str = "", city: str = "", st
 @app.get("/mat-analysis-order-export.xlsx")
 def export_mat_analysis_order_workbook(customer: str = "", city: str = "", state: str = "", start: str = "", end: str = ""):
     return mat_analysis_export_response("order", customer, city, state, start, end)
+
+
+@app.get("/mat-analysis-location-export.xlsx")
+def export_mat_analysis_location_workbook(customer: str = "", city: str = "", state: str = "", start: str = "", end: str = ""):
+    return mat_analysis_export_response("location", customer, city, state, start, end)
 
 
 @app.get("/mat-analysis-size-export.xlsx")
