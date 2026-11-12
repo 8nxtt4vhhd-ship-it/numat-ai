@@ -153,6 +153,8 @@ class MatAnalysisTests(unittest.TestCase):
         self.assertEqual(standard["rejects"], 1)
         self.assertEqual(standard["incoming_freight"], 48)
         self.assertEqual(standard["outgoing_freight"], 72)
+        self.assertEqual(standard["average_per_mat_including_freight"], 44)
+        self.assertEqual(standard["average_per_mat_excluding_freight"], 20)
         self.assertEqual(standard["average_repairs_per_repaired_mat"], 3)
         self.assertEqual(other["mats"], 4)
         self.assertEqual(other["repairs"], 3)
@@ -160,6 +162,8 @@ class MatAnalysisTests(unittest.TestCase):
         self.assertEqual(other["repair_revenue"], 50)
         self.assertEqual(other["incoming_freight"], 32)
         self.assertEqual(other["outgoing_freight"], 48)
+        self.assertAlmostEqual(other["average_per_mat_including_freight"], 130 / 3)
+        self.assertAlmostEqual(other["average_per_mat_excluding_freight"], 50 / 3)
         self.assertAlmostEqual(other["average_repairs_per_repaired_mat"], 7 / 3)
 
     def test_location_breakdown_excludes_zero_revenue_rows(self):
@@ -205,7 +209,8 @@ class MatAnalysisTests(unittest.TestCase):
         self.assertEqual(subtotal["orders"], 2)
         self.assertEqual(subtotal["mats"], 15)
         self.assertEqual(subtotal["repair_revenue"], 250)
-        self.assertEqual(subtotal["average_per_mat_including_freight"], 310 / 15)
+        self.assertEqual(subtotal["average_per_mat_including_freight"], 310 / 12)
+        self.assertEqual(subtotal["average_per_mat_excluding_freight"], 250 / 12)
         self.assertEqual(subtotal["average_repairs_per_repaired_mat"], 32 / 12)
         self.assertEqual(display[3]["size"], "Grand total")
 

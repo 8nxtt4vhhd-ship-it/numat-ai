@@ -14656,8 +14656,8 @@ def build_mat_location_size_analysis(orders, customer_records=None, mat_cache=No
         result.append({
             **row,
             "orders": len(row["order_numbers"]),
-            "average_per_mat_including_freight": total_with_freight / mats if mats else None,
-            "average_per_mat_excluding_freight": row["repair_revenue"] / mats if mats else None,
+            "average_per_mat_including_freight": total_with_freight / repairs if repairs else None,
+            "average_per_mat_excluding_freight": row["repair_revenue"] / repairs if repairs else None,
             "average_repairs_per_repaired_mat": (
                 repair_actions / repairs
                 if repairs and repair_actions
@@ -14703,9 +14703,9 @@ def summarize_mat_location_rows(rows, summary_type, customer=""):
         "incoming_freight": incoming_freight,
         "outgoing_freight": outgoing_freight,
         "average_per_mat_including_freight": (
-            (repair_revenue + incoming_freight + outgoing_freight) / mats if mats else None
+            (repair_revenue + incoming_freight + outgoing_freight) / repairs if repairs else None
         ),
-        "average_per_mat_excluding_freight": repair_revenue / mats if mats else None,
+        "average_per_mat_excluding_freight": repair_revenue / repairs if repairs else None,
         "average_repairs_per_repaired_mat": repair_action_total / repairs if repairs else None,
     }
 
@@ -15587,7 +15587,7 @@ def get_mat_analysis_view(
         for label in (
             "First order", "Location", "City / state", "Mat size", "Orders", "Mats",
             "Repairs", "Rejects", "Repair revenue", "Incoming freight", "Outgoing freight",
-            "Avg / mat incl freight", "Avg / mat excl freight", "Avg repairs / repaired mat",
+            "Avg repair incl freight", "Avg repair excl freight", "Avg repairs / repaired mat",
         )
     )
     location_display_rows = add_mat_location_summary_rows(location_sizes)
@@ -15788,7 +15788,7 @@ def build_mat_analysis_workbook(
         headers = [
             "First Order Date", "Location", "City", "State", "Mat Size", "Orders", "Mats",
             "Repairs", "Rejects", "Repair Revenue", "Incoming Freight", "Outgoing Freight",
-            "Average / Mat Including Freight", "Average / Mat Excluding Freight",
+            "Average Repair Cost Including Freight", "Average Repair Cost Excluding Freight",
             "Average Repairs / Repaired Mat",
         ]
         location_display_rows = add_mat_location_summary_rows(location_sizes or [])
