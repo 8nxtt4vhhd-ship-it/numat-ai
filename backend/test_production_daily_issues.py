@@ -288,6 +288,30 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertIn("aged-debt-over-sixty", ids)
         self.assertEqual(len([item for item in ids if item.startswith("crm-concern-")]), 1)
 
+    def test_commercial_candidates_exclude_kelly_from_individual_outreach_checks(self):
+        production_result, detail = sample_results()
+        activities = []
+        for day in range(1, 15):
+            if issues.date(2026, 10, day).weekday() < 5:
+                activities.append({
+                    "date_created": f"2026-10-{day:02d} 09:00:00",
+                    "direction": "outbound",
+                    "activity_category": "sales_outreach",
+                    "sender_email": "kbainbridge@numatsystems.com",
+                    "subject": "Customer follow-up",
+                })
+
+        facts = issues.build_daily_issue_facts(
+            production_result,
+            detail,
+            report_day=issues.date(2026, 10, 15),
+            crm_result={"activities": activities},
+            finance_result={"status": "ok"},
+        )
+
+        ids = {item["id"] for item in facts["candidates"]}
+        self.assertNotIn("crm-outreach-low-kbainbridge-numatsystems-com", ids)
+
     def test_any_aged_debt_over_sixty_days_is_reported(self):
         production_result, detail = sample_results()
         facts = issues.build_daily_issue_facts(

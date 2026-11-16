@@ -31,6 +31,9 @@ SALES_PERSON_NAMES = {
     "barnold@numatsystems.com": "Ben Arnold",
     "pbinnington@numatsystems.com": "Peter Binnington",
 }
+SALES_OUTREACH_CHECK_EXCLUDED_EMAILS = {
+    "kbainbridge@numatsystems.com",
+}
 REPORT_TYPES = ("production", "sales", "combined")
 REPORT_LABELS = {
     "production": "Production management checks",
@@ -189,6 +192,8 @@ def add_commercial_candidates(candidates, report_key, crm_result=None, finance_r
     outbound_by_person_day = defaultdict(lambda: defaultdict(int))
     for item in activities:
         sender = str(item.get("sender_email") or "").strip().lower()
+        if sender in SALES_OUTREACH_CHECK_EXCLUDED_EMAILS:
+            continue
         if str(item.get("direction") or "").strip().lower() == "outbound" and crm_activity_day(item) and sender:
             outbound_by_person_day[sender][crm_activity_day(item)] += 1
     previous_weekdays = []
