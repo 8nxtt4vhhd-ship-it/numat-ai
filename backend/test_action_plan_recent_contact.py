@@ -80,6 +80,20 @@ class ActionPlanRecentContactTests(unittest.TestCase):
         self.assertEqual(saved["email_body"], "Body A")
         self.assertEqual(other_user, {})
 
+    def test_on_demand_outreach_starts_with_blank_email_fields(self):
+        with patch.object(main, "build_outreach_prep_fallback", return_value={
+            "suggested_mode": "Email",
+            "email_subject": "Old generated subject",
+            "email_body": "Old generated body",
+            "rationale_bullets": ["Useful recommendation"],
+        }):
+            result = main.prepare_on_demand_outreach_result({"customer": "Customer A"})
+
+        self.assertEqual(result["email_subject"], "")
+        self.assertEqual(result["email_body"], "")
+        self.assertEqual(result["suggested_mode"], "Email")
+        self.assertEqual(result["rationale_bullets"], ["Useful recommendation"])
+
     def test_customer_lookup_replaces_territory_fallback_with_master_city(self):
         orders = [{
             "customer": "Matman Designs",
@@ -304,6 +318,26 @@ class ActionPlanRecentContactTests(unittest.TestCase):
         self.assertEqual([item["customer"] for item in active], ["Due Co"])
         self.assertEqual(active[0]["days_since_last_contact"], 29)
 
+    def test_contact_date_queue_calculates_days_since_last_order(self):
+        grouped_orders = {
+            "Alsco, Inc. (St. Louis, MO)": [{
+                "customer": "Alsco, Inc. (St. Louis, MO)",
+                "customer_primary_key": "alsco-st-louis",
+                "order_date": "2026-05-21",
+            }],
+        }
+
+        with patch.object(main, "read_action_plan_dismissals", return_value={}):
+            active, _dismissed = main.build_contact_date_action_plan_customers(
+                grouped_orders,
+                {},
+                today=main.datetime(2026, 11, 16),
+                follow_ups={},
+            )
+
+        self.assertEqual(active[0]["last_order"], "2026-05-21")
+        self.assertEqual(active[0]["days_since_last"], 179)
+
     def test_scheduled_date_overrides_four_week_rule(self):
         grouped_orders = {
             "Scheduled Co": [{"customer": "Scheduled Co", "customer_primary_key": "scheduled", "order_date": "2026-01-01"}],
@@ -379,6 +413,50 @@ class ActionPlanRecentContactTests(unittest.TestCase):
         html = main.render_home_add_customer_form(customers)
 
         self.assertEqual(html.count("<option value="), 25)
+
+    def test_recipient_picker_only_includes_active_filemaker_contacts(self):
+        master_data = {"status": "ok"}
+        branch_rows = [{
+            "name": "Curtis Turner",
+            "email": "turner-curtis@aramark.com",
+            "position": "Plant Manager",
+            "active": "Inactive",
+        }, {
+            "name": "Curtis Turner",
+            "email": "curtis.turner@vestis.com",
+            "position": "General Manager of Production",
+            "active": "Active",
+        }]
+        context = {
+            "customer_contacts": [{
+                "name": "Old Contact",
+                "email": "old@example.com",
+                "active": "Inactive",
+            }],
+            "top_contacts": [{
+                "name": "CRM-only Contact",
+                "email": "crm-only@example.com",
+                "active": "",
+                "is_inactive": False,
+            }],
+        }
+
+        with (
+            patch.object(main, "fetch_filemaker_master_data", return_value=master_data),
+            patch.object(main, "build_contact_master_rows", return_value=branch_rows),
+            patch.object(main, "get_contact_row_branch_candidates", return_value=branch_rows) as candidates,
+        ):
+            options = main.build_home_focus_recipient_options(
+                customer_name="Vestis Uniform Services (Chicago, IL)",
+                context=context,
+                target_email="turner-curtis@aramark.com",
+            )
+
+        self.assertTrue(candidates.call_args.kwargs["active_only"])
+        self.assertEqual(
+            [option["email"] for option in options],
+            ["curtis.turner@vestis.com"],
+        )
 
 
 if __name__ == "__main__":

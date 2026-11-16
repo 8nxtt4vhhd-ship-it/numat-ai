@@ -644,7 +644,7 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn("Email outreach", html)
         self.assertIn(">Visit</button>", html)
         self.assertIn("Record visit in FileMaker", html)
-        self.assertIn("Schedule follow-up", html)
+        self.assertIn("Schedule Follow-Up", html)
         self.assertNotIn("<span>Enrich</span>", html)
         self.assertNotIn("Back to customers", html)
         full_directory.assert_called()

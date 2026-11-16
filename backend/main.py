@@ -18215,7 +18215,7 @@ def get_customer_view(
             build_outreach_prep_href(customer, customer_return_to),
             customer_return_to,
             include_overview=False,
-            schedule_button_label="Schedule follow-up",
+            schedule_button_label="Schedule Follow-Up",
         )
         if outreach_preview else ""
     )
@@ -21668,6 +21668,15 @@ def build_outreach_context(customer, customer_orders, attention, crm_result):
     primary_contact = select_primary_outreach_contact(top_contacts)
     order_count = len(customer_orders)
     days_since_last_order = attention.get("days_since_last") if attention else ""
+    # Keep the order date and its displayed age tied to the same source of truth.
+    # Some Action Plan queue entries can outlive the calculation that created
+    # them, so deriving the age again here prevents contradictory summaries such
+    # as "05/21/2026, 0 days ago".
+    if last_order_dt:
+        days_since_last_order = max(
+            (get_analysis_today().date() - last_order_dt.date()).days,
+            0,
+        )
 
     is_cold_outreach = bool(
         (order_count == 0 and not sales_activities)
@@ -23393,6 +23402,11 @@ def build_contact_date_action_plan_customers(grouped_orders, crm_activity_map, t
             (str(order.get("order_date") or "") for order in customer_orders),
             default="",
         )
+        last_order_dt = parse_display_datetime(last_order)
+        days_since_last_order = (
+            max((today_date - last_order_dt.date()).days, 0)
+            if last_order_dt else None
+        )
         overdue_days = max((today_date - due_date).days, 0)
         # The score is now solely a contact-recency ordering key. Never-contacted
         # customers deliberately sort first, then oldest contact first.
@@ -23409,7 +23423,7 @@ def build_contact_date_action_plan_customers(grouped_orders, crm_activity_map, t
             "due_source": "scheduled" if scheduled_date else "four_week_rule",
             "action": "Follow up now",
             "last_order": last_order,
-            "days_since_last": 0,
+            "days_since_last": days_since_last_order,
             "avg_gap": None,
             "status": "needs_attention",
             "display_last_contact": build_last_contact_display(
@@ -23534,6 +23548,7 @@ def build_cached_home_action_plan_workflow(
     cache_key = (
         HOME_ACTION_PLAN_CACHE_VERSION,
         build_attention_cache_key(order_result, crm_result),
+        get_analysis_today().date().isoformat(),
         normalized_group,
         normalized_territory,
     )
@@ -23550,7 +23565,7 @@ def build_cached_home_action_plan_workflow(
 
         # Retain filter variants only for the current order/CRM data version.
         # This bounds memory if upstream cache versions change repeatedly.
-        if any(existing_key[:2] != cache_key[:2] for existing_key in entries):
+        if any(existing_key[:3] != cache_key[:3] for existing_key in entries):
             entries.clear()
 
         master_data_result = fetch_filemaker_master_data()
@@ -24580,6 +24595,14 @@ def apply_test_customer_outreach_mode_overrides(outreach_result, customer_name):
     return outreach_result
 
 
+def prepare_on_demand_outreach_result(context):
+    """Build non-draft recommendations while leaving email copy user-triggered."""
+    result = build_outreach_prep_fallback(context)
+    result["email_subject"] = ""
+    result["email_body"] = ""
+    return result
+
+
 def build_forced_action_plan_customer(customer_name, customer_orders, crm_matches=None):
     customer_name = str(customer_name or "").strip()
     customer_orders = customer_orders or []
@@ -24812,17 +24835,10 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         if not attention:
             attention = manual_customer
     context = build_outreach_context(selected_customer, customer_orders, attention, crm_result)
-    # Render immediately with local data; the tailored draft is fetched after the
-    # page is interactive so model latency never blocks navigation.
-    result = build_outreach_prep_fallback(context)
+    # Render recommendations immediately, but do not place email copy in the
+    # editor until the user explicitly presses Generate AI outreach.
+    result = prepare_on_demand_outreach_result(context)
     current_user = get_current_session_user() or {}
-    saved_draft = get_saved_outreach_draft(current_user.get("username"), selected_customer)
-    if (
-        not is_recent_order_acknowledgement_context(context)
-        and int(context.get("consecutive_unanswered_outbound_count") or 0) < 3
-    ):
-        result["email_subject"] = str(saved_draft.get("email_subject") or "").strip()
-        result["email_body"] = str(saved_draft.get("email_body") or "").strip()
     draft_token = itsdangerous.URLSafeTimedSerializer(
         os.getenv("APP_SESSION_SECRET", "change-this-session-secret"),
         salt="action-plan-draft",
@@ -24862,7 +24878,7 @@ def build_home_preview_payload(selected_customer, queue_summaries, grouped_order
         "context": context,
         "result": result,
         "draft_async": False,
-        "draft_saved": bool(result["email_subject"] or result["email_body"]),
+        "draft_saved": False,
         "draft_token": draft_token,
         "target_name": target_contact_name,
         "target_email": target_contact_email,
@@ -25045,9 +25061,11 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
             expected_city=branch_parts.get("city"),
             expected_state=branch_parts.get("state"),
             require_email=True,
-            active_only=False,
+            active_only=True,
         )
         for row in branch_rows:
+            if str(row.get("active") or "").strip().lower() != "active":
+                continue
             email = str(row.get("email") or "").strip()
             if not email:
                 continue
@@ -25069,6 +25087,8 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
             })
 
     for contact in context.get("customer_contacts", []) or []:
+        if str(contact.get("active") or "").strip().lower() != "active":
+            continue
         email = str(contact.get("email") or "").strip()
         if not email:
             continue
@@ -25078,10 +25098,7 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
         seen.add(key)
         name = str(contact.get("name") or "").strip()
         title = str(contact.get("position") or "").strip()
-        active = str(contact.get("active") or "").strip().lower()
         label_bits = [bit for bit in [name, title] if bit]
-        if active and active != "active":
-            label_bits.append("inactive")
         label = " • ".join(label_bits)
         options.append({
             "email": email,
@@ -25089,11 +25106,16 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
             "title": title,
             "phone": str(contact.get("phone") or "").strip(),
             "cell": str(contact.get("cell") or "").strip(),
-            "status_note": "Inactive contact" if active and active != "active" else "",
+            "status_note": "",
             "label": label,
         })
 
     for contact in context.get("top_contacts", []) or []:
+        if (
+            str(contact.get("active") or "").strip().lower() != "active"
+            or contact.get("is_inactive")
+        ):
+            continue
         email = str(contact.get("email") or "").strip()
         if not email:
             continue
@@ -25114,18 +25136,6 @@ def build_home_focus_recipient_options(customer_name="", context=None, target_em
             "label": label,
         })
 
-    target_key = str(target_email or "").strip().lower()
-    if target_key and target_key not in seen:
-        options.insert(0, {
-            "email": str(target_email).strip(),
-            "name": "",
-            "title": "",
-            "phone": "",
-            "cell": "",
-            "status_note": "",
-            "label": "Suggested recipient",
-        })
-
     return options
 
 
@@ -25134,7 +25144,7 @@ def render_home_focus_work_panel(
     outreach_prep_href,
     return_to,
     include_overview=True,
-    schedule_button_label="Schedule & next customer",
+    schedule_button_label="Schedule Follow-Up",
 ):
     customer_name = str(preview.get("customer") or "").strip()
     context = preview.get("context") or {}
@@ -25679,7 +25689,7 @@ def render_home_focus_work_panel(
                             if (recommendedBody) recommendedBody.value = payload.email_body;
                             if (status) {{
                                 status.hidden = false;
-                                status.textContent = 'AI outreach generated and saved. It will be reused until you generate it again.';
+                                status.textContent = 'AI outreach generated. Review it before sending.';
                             }}
                             if (generateButton) generateButton.disabled = false;
                             if (sendButton?.tagName === 'BUTTON') sendButton.disabled = false;
@@ -39032,7 +39042,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         .home-workspace-topbar {{
                             grid-template-columns: 1fr;
                             align-items: stretch;
-                            gap: 8px;
+                            gap: 6px;
+                        }}
+
+                        .home-topbar-primary,
+                        .home-topbar-secondary {{
+                            display: grid;
+                            grid-template-columns: 1fr;
+                            gap: 6px;
+                            width: 100%;
                         }}
 
                         .home-topbar-filters {{
@@ -39043,35 +39061,61 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .home-view-toggle {{
+                            display: grid;
                             margin-bottom: 0;
                             padding: 3px;
-                            gap: 6px;
+                            gap: 3px;
+                            width: 100%;
+                            height: auto;
+                            min-height: 0;
+                            box-sizing: border-box;
                         }}
 
                         .home-view-toggle .toggle-chip {{
-                            min-height: 34px;
-                            min-width: 74px;
-                            padding: 0 14px;
-                            font-size: 13px;
+                            width: 100%;
+                            min-width: 0;
+                            min-height: 32px;
+                            padding: 0 5px;
+                            font-size: 11px;
+                            line-height: 1.15;
+                            text-align: center;
+                        }}
+
+                        .home-territory-toggle {{
+                            grid-template-columns: repeat(3, minmax(0, 1fr));
+                        }}
+
+                        .home-group-toggle {{
+                            grid-template-columns: repeat(3, minmax(0, 1fr));
+                        }}
+
+                        .home-topbar-secondary > .home-view-toggle {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
                         }}
 
                         .home-add-customer-form {{
                             width: 100%;
-                            flex-direction: column;
-                            align-items: stretch;
-                            gap: 8px;
+                            display: grid;
+                            grid-template-columns: minmax(0, 1fr) 56px;
+                            align-items: center;
+                            gap: 6px;
                         }}
 
                         .home-add-customer-input {{
                             width: 100%;
                             min-width: 0;
+                            height: 36px;
                             min-height: 36px;
                             font-size: 12px;
                         }}
 
                         .home-add-customer-button {{
-                            width: 100%;
+                            width: 56px !important;
+                            min-width: 56px;
+                            max-width: 56px;
+                            height: 36px;
                             min-height: 36px;
+                            padding: 0 8px;
                         }}
 
                         .home-preview-dismiss-form {{
