@@ -162,6 +162,13 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         self.assertEqual(saved[1]["owner"], "Lois")
         update.assert_called_once()
 
+    def test_meeting_retry_explains_expired_sessions_before_parsing_json(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("Your login session expired. Sign in again in this browser", source)
+        self.assertIn("const readApiJson = async", source)
+        self.assertIn("readApiJson(response, `Section ${index + 1} could not be transcribed.`)", source)
+
     def test_admin_can_edit_saved_meeting_transcript(self):
         with TemporaryDirectory() as temp_dir, patch.object(
             main, "get_weekly_kpi_meetings_path", return_value=Path(temp_dir) / "meetings.json"

@@ -10707,6 +10707,18 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                 retry.hidden = download.hidden = discard.hidden = false;
                 status.textContent = message;
             };
+            const readApiJson = async (response, fallbackMessage) => {
+                const contentType = response.headers.get('content-type') || '';
+                if (response.redirected || !contentType.toLowerCase().includes('application/json')) {
+                    const sessionExpired = response.redirected && response.url.includes('/login');
+                    throw new Error(sessionExpired
+                        ? 'Your login session expired. Sign in again in this browser, then return here and retry transcription.'
+                        : 'The server returned an unexpected page instead of transcription data. Refresh the page, then retry.');
+                }
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error_message || fallbackMessage);
+                return data;
+            };
             const renderMeetingResult = data => {
                 const actions = data.actions || [];
                 const list = items => (items || []).length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '<p class="small muted">None recorded.</p>';
@@ -10754,8 +10766,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                         const form = new FormData();
                         form.append('audio', segments[index].blob, `weekly-meeting-${index + 1}.webm`);
                         const response = await fetch('/api/weekly-kpi/meetings/transcribe-segment', {method: 'POST', body: form});
-                        const data = await response.json();
-                        if (!response.ok) throw new Error(data.error_message || `Section ${index + 1} could not be transcribed.`);
+                        const data = await readApiJson(response, `Section ${index + 1} could not be transcribed.`);
                         transcripts.push(data.transcript || '');
                     }
                     status.textContent = 'Creating the meeting summary and actions…';
@@ -10763,8 +10774,7 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({transcript: transcripts.filter(Boolean).join('\\n\\n')}),
                     });
-                    const data = await response.json();
-                    if (!response.ok) throw new Error(data.error_message || 'Meeting analysis failed.');
+                    const data = await readApiJson(response, 'Meeting analysis failed.');
                     renderMeetingResult(data);
                     await clearSavedRecording();
                 } catch (error) {
