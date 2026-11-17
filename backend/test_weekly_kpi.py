@@ -175,6 +175,8 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         self.assertIn("width:min(480px, calc(100vw - 32px))", source)
         self.assertIn(".kpi-record-actions .button {{ width:auto; min-width:0; height:32px", source)
         self.assertIn("#meeting-record-status {{ flex:1 0 100%", source)
+        self.assertIn(".kpi-proposal input[type=checkbox] {{ flex:0 0 16px", source)
+        self.assertIn("#meeting-actions-add {{ width:auto; min-width:0; height:32px", source)
 
     def test_admin_can_edit_saved_meeting_transcript(self):
         with TemporaryDirectory() as temp_dir, patch.object(

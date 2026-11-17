@@ -31871,9 +31871,9 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     #meeting-action-proposals h3 {{ margin:10px 0 5px; font-size:14px; }}
                     #meeting-action-proposals p, #meeting-action-proposals li {{ font-size:12px; line-height:1.4; }}
                     #meeting-action-proposals ul {{ margin:5px 0; padding-left:20px; }}
-                    #meeting-actions-add {{ margin-top:7px; }}
+                    #meeting-actions-add {{ width:auto; min-width:0; height:32px; margin-top:7px; padding:5px 10px; font-size:12px; }}
                     .kpi-proposal {{ display:flex; align-items:flex-start; gap:7px; margin:6px 0; font-size:12px; line-height:1.35; }}
-                    .kpi-proposal input {{ flex:0 0 auto; margin-top:2px; }}
+                    .kpi-proposal input[type=checkbox] {{ flex:0 0 16px; box-sizing:border-box; width:16px; min-width:16px; height:16px; padding:0; margin:2px 0 0; accent-color:var(--blue); }}
                     .kpi-proposal span, .kpi-proposal small {{ display:block; }}
                     @media(max-width:620px) {{
                         .kpi-meeting-ai-body {{ right:16px; }}
