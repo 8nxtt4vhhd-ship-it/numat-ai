@@ -169,6 +169,13 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         self.assertIn("const readApiJson = async", source)
         self.assertIn("readApiJson(response, `Section ${index + 1} could not be transcribed.`)", source)
 
+    def test_meeting_notes_panel_uses_compact_aligned_controls(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("width:min(480px, calc(100vw - 32px))", source)
+        self.assertIn(".kpi-record-actions .button {{ width:auto; min-width:0; height:32px", source)
+        self.assertIn("#meeting-record-status {{ flex:1 0 100%", source)
+
     def test_admin_can_edit_saved_meeting_transcript(self):
         with TemporaryDirectory() as temp_dir, patch.object(
             main, "get_weekly_kpi_meetings_path", return_value=Path(temp_dir) / "meetings.json"

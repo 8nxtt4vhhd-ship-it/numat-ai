@@ -31858,16 +31858,27 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .kpi-todo-delete:hover {{ background:#fff0f0; }}
                     .kpi-meeting-history-links {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:8px 0 2px; font-size:12px; font-weight:700; }}
                     .kpi-meeting-history-links a {{ color:var(--blue); }}
-                    .kpi-meeting-ai {{ min-width:180px; }}
-                    .kpi-meeting-ai summary {{ cursor:pointer; color:var(--blue); font-weight:800; }}
-                    .kpi-meeting-ai-body {{ position:absolute; right:24px; z-index:20; width:min(520px, calc(100vw - 48px)); padding:14px; border:1px solid var(--border); border-radius:14px; background:white; box-shadow:0 18px 45px rgba(34,55,82,.18); }}
-                    .kpi-meeting-ai-panel-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }}
-                    .kpi-meeting-ai-panel-head p {{ margin:0; }}
-                    .kpi-meeting-ai-close {{ flex:0 0 30px; width:30px; height:30px; padding:0; border:0; border-radius:8px; background:#eef3fb; color:#52667e; font-size:22px; line-height:1; }}
+                    .kpi-meeting-ai {{ min-width:160px; }}
+                    .kpi-meeting-ai summary {{ cursor:pointer; color:var(--blue); font-size:13px; font-weight:800; }}
+                    .kpi-meeting-ai-body {{ position:absolute; right:24px; z-index:20; box-sizing:border-box; width:min(480px, calc(100vw - 32px)); padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:white; box-shadow:0 18px 45px rgba(34,55,82,.18); }}
+                    .kpi-meeting-ai-panel-head {{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }}
+                    .kpi-meeting-ai-panel-head p {{ margin:0; font-size:12px; line-height:1.35; }}
+                    .kpi-meeting-ai-close {{ flex:0 0 26px; width:26px; min-width:26px; height:26px; padding:0; border:0; border-radius:7px; background:#eef3fb; color:#52667e; font-size:18px; line-height:1; }}
                     .kpi-meeting-ai-close:hover {{ background:#dfe8f5; }}
-                    .kpi-record-actions {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
-                    .kpi-proposal {{ display:flex; gap:8px; margin:8px 0; }}
+                    .kpi-record-actions {{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; }}
+                    .kpi-record-actions .button {{ width:auto; min-width:0; height:32px; padding:5px 9px; font-size:12px; line-height:1.1; }}
+                    #meeting-record-status {{ flex:1 0 100%; margin-top:1px; font-size:11px; line-height:1.35; }}
+                    #meeting-action-proposals h3 {{ margin:10px 0 5px; font-size:14px; }}
+                    #meeting-action-proposals p, #meeting-action-proposals li {{ font-size:12px; line-height:1.4; }}
+                    #meeting-action-proposals ul {{ margin:5px 0; padding-left:20px; }}
+                    #meeting-actions-add {{ margin-top:7px; }}
+                    .kpi-proposal {{ display:flex; align-items:flex-start; gap:7px; margin:6px 0; font-size:12px; line-height:1.35; }}
+                    .kpi-proposal input {{ flex:0 0 auto; margin-top:2px; }}
                     .kpi-proposal span, .kpi-proposal small {{ display:block; }}
+                    @media(max-width:620px) {{
+                        .kpi-meeting-ai-body {{ right:16px; }}
+                        .kpi-record-actions .button {{ flex:1 1 calc(50% - 6px); }}
+                    }}
                     .kpi-meeting-result {{ padding:10px 12px; border-radius:12px; background:#f7f9fc; }}
                     .kpi-meeting-result h3 {{ margin:8px 0 4px; font-size:14px; }}
                     .kpi-meeting-result p, .kpi-meeting-result ul {{ margin:4px 0 8px; }}
