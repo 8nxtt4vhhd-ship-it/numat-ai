@@ -14450,6 +14450,10 @@ def filter_freight_orders(
     state_query = str(state or "").strip().upper()
     start_date = parse_iso_date(start)
     end_date = parse_iso_date(end)
+    if (str(start or "").strip() and not start_date) or (str(end or "").strip() and not end_date):
+        return []
+    if start_date and end_date and start_date > end_date:
+        return []
     filtered_orders = []
     for order in order_result.get("orders", []):
         if complete_only and not is_complete_freight_order(order):
@@ -14758,6 +14762,11 @@ def get_freight_analysis_view(
     state_options = '<option value="">All states</option>' + "".join(
         f'<option value="{escape(option)}"{" selected" if option == state_query else ""}>{escape(option)}</option>'
         for option in available_states
+    )
+    date_filter_error = analysis_date_filter_error(start, end)
+    date_filter_status = (
+        f'<p class="status error analysis-date-error">{escape(date_filter_error)}</p>'
+        if date_filter_error else ""
     )
     scoped_orders = filter_freight_orders(
         order_result,
@@ -15177,11 +15186,12 @@ def get_freight_analysis_view(
                 <label><span>Customer</span><input type="search" name="customer" value="{escape(customer)}" placeholder="All customers"></label>
                 <label><span>City</span><input type="search" name="city" value="{escape(city)}" placeholder="All cities"></label>
                 <label><span>State</span><select name="state">{state_options}</select></label>
-                <label><span>From</span><input type="date" name="start" value="{escape(start)}"></label>
-                <label><span>To</span><input type="date" name="end" value="{escape(end)}"></label>
+                <label><span>From (MM/DD/YYYY)</span><input type="text" inputmode="numeric" name="start" value="{escape(format_analysis_date_input(start))}" placeholder="MM/DD/YYYY" pattern="(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])/[0-9]{{4}}"></label>
+                <label><span>To (MM/DD/YYYY)</span><input type="text" inputmode="numeric" name="end" value="{escape(format_analysis_date_input(end))}" placeholder="MM/DD/YYYY" pattern="(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])/[0-9]{{4}}"></label>
                 <button type="submit">Apply filters</button>
                 <a class="button secondary" href="/freight-analysis-view">Reset</a>
             </form>
+            {date_filter_status}
         </section>
 
         <div class="freight-tabs" role="tablist" aria-label="Freight analysis sections">
@@ -15504,6 +15514,11 @@ def get_mat_analysis_view(
         f'<option value="{escape(option)}"{" selected" if option == state_query else ""}>{escape(option)}</option>'
         for option in available_states
     )
+    date_filter_error = analysis_date_filter_error(start, end)
+    date_filter_status = (
+        f'<p class="status error analysis-date-error">{escape(date_filter_error)}</p>'
+        if date_filter_error else ""
+    )
     filtered_orders = filter_freight_orders(
         order_result,
         customers_by_key,
@@ -15713,10 +15728,11 @@ def get_mat_analysis_view(
             <label><span>Customer</span><input type="search" name="customer" value="{escape(customer)}" placeholder="All customers"></label>
             <label><span>City</span><input type="search" name="city" value="{escape(city)}" placeholder="All cities"></label>
             <label><span>State</span><select name="state">{state_options}</select></label>
-            <label><span>From</span><input type="date" name="start" value="{escape(start)}"></label>
-            <label><span>To</span><input type="date" name="end" value="{escape(end)}"></label>
+            <label><span>From (MM/DD/YYYY)</span><input type="text" inputmode="numeric" name="start" value="{escape(format_analysis_date_input(start))}" placeholder="MM/DD/YYYY" pattern="(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])/[0-9]{{4}}"></label>
+            <label><span>To (MM/DD/YYYY)</span><input type="text" inputmode="numeric" name="end" value="{escape(format_analysis_date_input(end))}" placeholder="MM/DD/YYYY" pattern="(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])/[0-9]{{4}}"></label>
             <button type="submit">Apply filters</button><a class="button secondary" href="/mat-analysis-view">Reset</a>
         </form>
+        {date_filter_status}
     </section>
     <div class="mat-tabs" role="tablist" aria-label="Mat analysis sections">
         <button class="mat-tab" id="mat-overview-tab" type="button" role="tab" aria-selected="true" aria-controls="mat-overview">Overview</button>
@@ -26670,10 +26686,32 @@ def parse_iso_date(value):
     if not value:
         return None
 
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d")
-    except ValueError:
-        return None
+    cleaned = str(value).strip()
+    for date_format in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(cleaned, date_format)
+        except ValueError:
+            continue
+    return None
+
+
+def format_analysis_date_input(value):
+    parsed = parse_iso_date(value)
+    return parsed.strftime("%m/%d/%Y") if parsed else str(value or "").strip()
+
+
+def analysis_date_filter_error(start="", end=""):
+    start_value = str(start or "").strip()
+    end_value = str(end or "").strip()
+    start_date = parse_iso_date(start_value)
+    end_date = parse_iso_date(end_value)
+    if start_value and not start_date:
+        return "Enter the From date as MM/DD/YYYY."
+    if end_value and not end_date:
+        return "Enter the To date as MM/DD/YYYY."
+    if start_date and end_date and start_date > end_date:
+        return "The From date must be on or before the To date."
+    return ""
 
 
 def render_orders_filter_form(customer, status, sort, direction):

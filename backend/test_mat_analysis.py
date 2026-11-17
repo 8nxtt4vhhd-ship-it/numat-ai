@@ -107,6 +107,8 @@ class MatAnalysisTests(unittest.TestCase):
 
         html = str(response)
         self.assertIn("Mat volume, outcomes and pricing", html)
+        self.assertIn("From (MM/DD/YYYY)", html)
+        self.assertIn('value="11/01/2026"', html)
         self.assertIn("Repaired mats by size", html)
         self.assertIn("Average repair price by size", html)
         self.assertIn('id="mat-customer-tab"', html)

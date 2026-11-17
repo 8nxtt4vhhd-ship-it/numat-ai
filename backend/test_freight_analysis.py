@@ -8,6 +8,27 @@ from openpyxl import load_workbook
 
 
 class FreightAnalysisTests(unittest.TestCase):
+    def test_analysis_date_filter_accepts_us_dates_and_rejects_invalid_ranges(self):
+        orders = {"orders": [
+            {"customer": "Before", "order_date": "2025-01-15", "extra": {"Orders::Status": "Complete"}},
+            {"customer": "Included", "order_date": "2025-10-15", "extra": {"Orders::Status": "Complete"}},
+            {"customer": "After", "order_date": "2026-10-01", "extra": {"Orders::Status": "Complete"}},
+        ]}
+
+        filtered = main.filter_freight_orders(
+            orders, {}, start="10/1/2025", end="9/30/2026",
+        )
+
+        self.assertEqual([order["customer"] for order in filtered], ["Included"])
+        self.assertEqual(main.format_analysis_date_input("2025-10-01"), "10/01/2025")
+        self.assertEqual(main.analysis_date_filter_error("10/1/2025", "9/30/2026"), "")
+        self.assertEqual(main.filter_freight_orders(orders, {}, start="13/1/2025"), [])
+        self.assertIn("MM/DD/YYYY", main.analysis_date_filter_error("13/1/2025", ""))
+        self.assertEqual(
+            main.filter_freight_orders(orders, {}, start="10/1/2026", end="9/30/2025"),
+            [],
+        )
+
     def test_freight_fields_are_always_requested_from_filemaker(self):
         self.assertIn("Orders::Status", filemaker.get_extra_fields())
         for field in main.FREIGHT_FIELDS + main.FREIGHT_WEIGHT_FIELDS + main.FREIGHT_HANDLING_UNIT_FIELDS:
@@ -187,6 +208,8 @@ class FreightAnalysisTests(unittest.TestCase):
         html = str(response)
         self.assertIn("Special Customer", html)
         self.assertIn("Freight revenue and cost analysis", html)
+        self.assertIn("From (MM/DD/YYYY)", html)
+        self.assertIn('value="10/01/2026"', html)
         self.assertIn("Total billed revenue", html)
         self.assertIn('id="freight-overview-tab"', html)
         self.assertIn('id="freight-breakdown-tab"', html)
