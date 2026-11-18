@@ -1,11 +1,42 @@
 from datetime import date, datetime
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import daily_crm_report
 
 
 class DailyCrmReportTests(unittest.TestCase):
+    def test_failed_fresh_refresh_marks_fallback_as_unsafe_for_delivery(self):
+        with patch.object(
+            daily_crm_report,
+            "sync_filemaker_crm_recent_cache",
+            return_value={"status": "filemaker_error", "error_message": "Status 500"},
+        ), patch.object(
+            daily_crm_report,
+            "fetch_crm_activities",
+            return_value={"status": "ok", "activities": [{"subject": "Old cached activity"}]},
+        ):
+            result = daily_crm_report.fetch_fresh_crm_activities()
+
+        self.assertTrue(result["fresh_refresh_failed"])
+        self.assertEqual(result["fresh_refresh_status"], "filemaker_error")
+        self.assertEqual(result["activities"][0]["subject"], "Old cached activity")
+
+    def test_report_is_not_generated_from_stale_cache_after_refresh_failure(self):
+        stale_result = {
+            "status": "ok",
+            "fresh_refresh_failed": True,
+            "activities": [],
+        }
+        with patch.object(daily_crm_report, "fetch_fresh_crm_activities", return_value=stale_result), patch.object(
+            daily_crm_report, "generate_analysis"
+        ) as analysis:
+            with self.assertRaisesRegex(RuntimeError, "not sent from stale data"):
+                daily_crm_report.generate_report(date(2026, 11, 17))
+
+        analysis.assert_not_called()
+
     def test_filters_requested_date_and_internal_activity(self):
         result = {"activities": [
             {"date_created": "2026-11-09 08:00:00", "subject": "Sales call", "exclude": False, "customer_company": "Example Customer"},

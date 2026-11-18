@@ -50,8 +50,19 @@ def save_delivery_log(payload):
 
 
 def fetch_fresh_crm_activities():
-    refreshed = sync_filemaker_crm_recent_cache()
-    return refreshed if refreshed.get("status") == "ok" else fetch_crm_activities()
+    try:
+        refreshed = sync_filemaker_crm_recent_cache()
+    except Exception as error:
+        refreshed = {"status": "error", "error_message": str(error)}
+    if refreshed.get("status") == "ok":
+        return refreshed
+    fallback = dict(fetch_crm_activities() or {})
+    fallback["fresh_refresh_failed"] = True
+    fallback["fresh_refresh_status"] = str(refreshed.get("status") or "error")
+    fallback["fresh_refresh_error"] = str(
+        refreshed.get("error_message") or refreshed.get("warning") or "FileMaker CRM refresh failed."
+    )
+    return fallback
 
 
 def activities_for_day(crm_result, report_day):
@@ -187,6 +198,10 @@ def generate_report(report_day):
     result = fetch_fresh_crm_activities()
     if result.get("status") != "ok":
         raise RuntimeError("CRM data is unavailable.")
+    if result.get("fresh_refresh_failed"):
+        raise RuntimeError(
+            "The fresh FileMaker CRM update failed, so the Daily CRM Summary was not sent from stale data."
+        )
     activities = activities_for_day(result, report_day)
     analysis = generate_analysis(report_day, activities) if activities else {
         "overall_summary": "No material CRM activity was recorded for this date.",
