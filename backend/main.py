@@ -18242,14 +18242,11 @@ def get_customer_view(
         latest_sales_crm_activity.get("date_created", "")
     ) if latest_sales_crm_activity else None
     display_last_activity = latest_sales_crm_activity_date
-    attention_result = build_customers_needing_attention_response(
-        order_result=result,
-        crm_result=crm_result,
+    customer_attention = build_single_customer_attention(
+        customer,
+        customer_orders,
+        crm_activities,
     )
-    attention_by_customer = {
-        item["customer"]: item
-        for item in attention_result["late_customers"]
-    }
     customer_return_to = (
         f"/customer-view?{urlencode({
             'customer': customer,
@@ -18266,7 +18263,7 @@ def get_customer_view(
         customer=customer,
         customer_orders=customer_orders,
         customer_primary_key=customer_primary_key,
-        attention=attention_by_customer.get(customer),
+        attention=customer_attention,
         crm_result=crm_result,
         crm_activities=crm_activities,
     )
@@ -18377,7 +18374,7 @@ def get_customer_view(
         <div class="customer-detail-tab-panel active" id="customer-outreach-tab" role="tabpanel">
         {render_contact_ready_panel(
             customer=customer,
-            attention=attention_by_customer.get(customer),
+            attention=customer_attention,
             latest_crm_activity=latest_crm_activity,
             latest_sales_crm_activity=latest_sales_crm_activity,
             crm_activities=crm_activities,
@@ -18968,6 +18965,62 @@ def build_customers_needing_attention_response(order_result=None, crm_result=Non
         _ATTENTION_RESPONSE_CACHE["result"] = result
 
     return result
+
+
+def build_single_customer_attention(customer_name, customer_orders, crm_activities):
+    """Build detail-page attention context without analysing every customer."""
+    customer_name = str(customer_name or "").strip()
+    customer_orders = list(customer_orders or [])
+    if not customer_name or not customer_orders:
+        return None
+
+    crm_matches = merge_recent_sent_emails_with_crm(
+        customer_name,
+        list(crm_activities or []),
+    )
+    late = find_late_customers({customer_name: customer_orders})
+    if not late and customer_name in get_forced_action_plan_customers():
+        forced_customer = build_forced_action_plan_customer(
+            customer_name,
+            customer_orders,
+            crm_matches=crm_matches,
+        )
+        if forced_customer:
+            late = [forced_customer]
+    if not late:
+        return None
+
+    customer = late[0]
+    customer["last_order"] = max(
+        (order.get("order_date", "") for order in customer_orders),
+        default="",
+    )
+    sales_crm_matches = get_sales_outreach_activities(crm_matches)
+    latest_crm_activity = crm_matches[0] if crm_matches else None
+    latest_sales_crm_activity = sales_crm_matches[0] if sales_crm_matches else None
+    display_last_contact, _last_contact_source = build_last_contact_display(
+        customer.get("last_activity_content", ""),
+        latest_crm_activity,
+        crm_activities=crm_matches,
+    )
+    customer["display_last_contact"] = display_last_contact
+    apply_newer_crm_activity_to_customer(
+        customer,
+        latest_sales_crm_activity,
+        get_crm_days_since_latest_activity(latest_sales_crm_activity),
+    )
+
+    if get_action_plan_dismissal(
+        customer_name,
+        customer.get("last_order", ""),
+        dismissals=read_action_plan_dismissals(),
+    ):
+        return None
+
+    if should_add_ai_explanations():
+        explained = add_ai_explanations([customer])
+        return explained[0] if explained else customer
+    return customer
 
 
 def render_late_customer_row(customer):

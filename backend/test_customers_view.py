@@ -138,6 +138,29 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn("receivedDateTime", html)
         self.assertNotIn("Upload CRM CSV", html)
 
+    def test_customer_detail_attention_only_analyses_selected_customer(self):
+        orders = [{"customer": "Selected Customer", "order_date": "2026-01-01"}]
+        attention = {
+            "customer": "Selected Customer",
+            "last_activity_content": "",
+            "days_since_last_activity": None,
+        }
+        with (
+            patch.object(main, "find_late_customers", return_value=[attention]) as find_late,
+            patch.object(main, "merge_recent_sent_emails_with_crm", return_value=[]),
+            patch.object(main, "read_action_plan_dismissals", return_value={}),
+            patch.object(main, "get_action_plan_dismissal", return_value=None),
+            patch.object(main, "should_add_ai_explanations", return_value=False),
+        ):
+            result = main.build_single_customer_attention(
+                "Selected Customer",
+                orders,
+                [],
+            )
+
+        self.assertIs(result, attention)
+        find_late.assert_called_once_with({"Selected Customer": orders})
+
     def test_customer_search_reuses_built_directory_without_reloading_sources(self):
         summaries = [{"customer": "Vestis Uniform Services", "state": "IL"}]
         sources = (
