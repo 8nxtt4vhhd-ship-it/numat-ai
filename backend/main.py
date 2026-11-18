@@ -11295,7 +11295,7 @@ def get_customer_profile_view(
 
     crm_rows = "".join(render_customer_crm_activity(activity) for activity in filtered_crm[:50])
     crm_markup = (
-        f"<section class='panel'><h2>Sales outreach history</h2><p class='muted'>Showing the latest {min(len(filtered_crm), 50)} of {len(filtered_crm)} sales-related CRM communications. Customer-service and operational messages are excluded.</p><div class='table-wrap tall-table crm-timeline-wrap'><table class='crm-timeline-table'><thead><tr><th>Details</th><th>Email content</th></tr></thead><tbody>{crm_rows}</tbody></table></div></section>"
+        f"<section class='panel'><h2>Sales outreach history</h2><p class='muted'>Showing the latest {min(len(filtered_crm), 50)} of {len(filtered_crm)} sales-related CRM communications. Customer-service and operational messages are excluded.</p><div class='table-wrap tall-table crm-timeline-wrap'><table class='crm-timeline-table'><thead><tr><th>Details</th><th>Email content</th></tr></thead><tbody>{crm_rows}</tbody></table></div>{render_full_crm_body_loader_script()}</section>"
         if crm_rows else "<section class='panel'><h2>Sales outreach history</h2><p class='empty-action'>No sales-related CRM communications are linked to this customer yet.</p></section>"
     )
 
@@ -12689,13 +12689,14 @@ def get_crm_activities_view(
             <thead>
                 <tr>
                     <th>Details</th>
-                    <th>Preview</th>
+                    <th>Email content</th>
                 </tr>
             </thead>
             <tbody>{rows}</tbody>
         </table>
         </div>
 
+        {render_full_crm_body_loader_script()}
         {render_crm_pagination(customer, sender, direction, category, subject, date_from, date_to, range_key, page, total_pages, page_size, total_filtered)}
     """
 
@@ -20021,8 +20022,14 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
             </div>
             {pagination_html}
         </section>
+        {render_full_crm_body_loader_script()}
+    """
+
+
+def render_full_crm_body_loader_script():
+    return """
         <script>
-            async function loadFullCrmBody(details) {{
+            async function loadFullCrmBody(details) {
                 if (!details?.open || details.dataset.fullBodyLoaded === 'true' || details.dataset.fullBodyLoading === 'true') return;
                 const recordId = details.dataset.recordId || '';
                 if (!recordId) return;
@@ -20030,19 +20037,19 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
                 const status = details.querySelector('[data-full-crm-status]');
                 details.dataset.fullBodyLoading = 'true';
                 if (status) status.textContent = 'Loading complete email…';
-                try {{
-                    const response = await fetch('/customer-crm/full-body?record_id=' + encodeURIComponent(recordId), {{headers: {{'Accept': 'application/json'}}}});
+                try {
+                    const response = await fetch('/customer-crm/full-body?record_id=' + encodeURIComponent(recordId), {headers: {'Accept': 'application/json'}});
                     const payload = await response.json();
                     if (!response.ok || payload.status !== 'ok') throw new Error(payload.status || 'unavailable');
                     if (body) body.textContent = payload.body || 'No email content was recorded.';
                     details.dataset.fullBodyLoaded = 'true';
                     if (status) status.textContent = '';
-                }} catch (error) {{
+                } catch (error) {
                     if (status) status.textContent = 'The complete email could not be loaded. The cached text is shown above.';
-                }} finally {{
+                } finally {
                     details.dataset.fullBodyLoading = 'false';
-                }}
-            }}
+                }
+            }
         </script>
     """
 
@@ -20204,19 +20211,6 @@ def render_customer_crm_pagination(customer, crm_page, total_pages, crm_limit, c
 
 
 def render_customer_crm_activity(activity):
-    display_direction = get_crm_activity_display_direction(activity)
-    direction_class = f"crm-direction {display_direction}".strip()
-
-    direction_label = "Task" if display_direction == "task" else display_direction.title()
-
-    category_value = get_activity_category(activity)
-    category_label = (
-        "Customer Services"
-        if category_value == "customer_services"
-        else "Sales Outreach"
-    )
-    category_class = f"crm-category {category_value.replace('_', '-')}"
-
     raw_body = str(activity.get("body") or "")
     full_text = clean_activity_content(raw_body)
     preview = truncate_text(full_text, 260)
@@ -20227,31 +20221,56 @@ def render_customer_crm_activity(activity):
 
     return f"""
         <tr>
-            <td data-label="Details">
-                <div class="crm-activity-details">
-                    <div class="crm-detail-type">
-                        <span class="crm-detail-label">Type:</span>
-                        <div class="crm-pill-stack">
-                            <span class="{category_class}">{escape(category_label)}</span>
-                            <span class="{direction_class}">{escape(direction_label or "Unknown")}</span>
-                        </div>
-                    </div>
-                    <div class="crm-detail-date">
-                        <span class="crm-detail-label">Date:</span>
-                        {escape(format_optional_datetime(activity.get("date_created", "")))}
-                    </div>
-                    <div class="crm-detail-subject">
-                        <span class="crm-detail-label">Subject:</span>
-                        {escape(activity.get("subject", ""))}
-                    </div>
-                    <div class="crm-detail-correspondents">
-                        <div><span class="crm-detail-label">From:</span>{escape(activity.get("sender_email", ""))}</div>
-                        <div><span class="crm-detail-label">To:</span>{escape(activity.get("to", ""))}</div>
-                    </div>
-                </div>
-            </td>
+            <td data-label="Details">{render_crm_activity_details(activity)}</td>
             <td data-label="Email content">{render_expandable_activity(preview, full_text, record_id, body_may_be_truncated)}</td>
         </tr>
+    """
+
+
+def render_crm_activity_details(activity, include_customer=False):
+    display_direction = get_crm_activity_display_direction(activity)
+    direction_class = f"crm-direction {display_direction}".strip()
+    direction_label = "Task" if display_direction == "task" else display_direction.title()
+    category_value = get_activity_category(activity)
+    category_label = (
+        "Customer Services"
+        if category_value == "customer_services"
+        else "Sales Outreach"
+    )
+    category_class = f"crm-category {category_value.replace('_', '-')}"
+    customer = str(
+        activity.get("customer_company")
+        or activity.get("customer_label")
+        or ""
+    ).strip()
+    customer_html = (
+        f'<div class="crm-detail-customer"><span class="crm-detail-label">Customer:</span>{escape(customer)}</div>'
+        if include_customer else ""
+    )
+
+    return f"""
+        <div class="crm-activity-details">
+            <div class="crm-detail-type">
+                <span class="crm-detail-label">Type:</span>
+                <div class="crm-pill-stack">
+                    <span class="{category_class}">{escape(category_label)}</span>
+                    <span class="{direction_class}">{escape(direction_label or "Unknown")}</span>
+                </div>
+            </div>
+            <div class="crm-detail-date">
+                <span class="crm-detail-label">Date:</span>
+                {escape(format_optional_datetime(activity.get("date_created", "")))}
+            </div>
+            <div class="crm-detail-subject">
+                <span class="crm-detail-label">Subject:</span>
+                {escape(activity.get("subject", ""))}
+            </div>
+            {customer_html}
+            <div class="crm-detail-correspondents">
+                <div><span class="crm-detail-label">From:</span>{escape(activity.get("sender_email", ""))}</div>
+                <div><span class="crm-detail-label">To:</span>{escape(activity.get("to", ""))}</div>
+            </div>
+        </div>
     """
 
 
@@ -20639,24 +20658,18 @@ def render_crm_pagination(customer, sender, direction, category, subject, date_f
 
 
 def render_crm_activity_row(activity):
-    preview = get_cached_crm_activity_preview(activity.get("body", ""), limit=320)
-    display_direction = get_crm_activity_display_direction(activity)
-    direction_class = f"crm-direction {display_direction}".strip()
-    direction_label = "Task" if display_direction == "task" else display_direction.title()
+    raw_body = str(activity.get("body") or "")
+    full_text = clean_activity_content(raw_body)
+    preview = get_cached_crm_activity_preview(raw_body, limit=320)
+    record_id = str(activity.get("filemaker_record_id") or "").strip()
+    body_may_be_truncated = bool(
+        record_id and len(raw_body) >= get_filemaker_crm_cached_body_chars()
+    )
 
     return f"""
         <tr>
-            <td>
-                <div class="crm-activity-meta">
-                    <div><strong>Date:</strong> {escape(activity.get("date_created", ""))}</div>
-                    <div><strong>Direction:</strong> <span class="{direction_class}">{escape(direction_label or "Unknown")}</span></div>
-                    <div><strong>Customer:</strong> {escape(activity.get("customer_company") or activity.get("customer_label") or "")}</div>
-                    <div><strong>Subject:</strong> {escape(activity.get("subject", ""))}</div>
-                    <div><strong>From:</strong> {escape(activity.get("sender_email", ""))}</div>
-                    <div><strong>To:</strong> {escape(activity.get("to", ""))}</div>
-                </div>
-            </td>
-            <td><span class="activity-note">{escape(preview)}</span></td>
+            <td data-label="Details">{render_crm_activity_details(activity, include_customer=True)}</td>
+            <td data-label="Email content">{render_expandable_activity(preview, full_text, record_id, body_may_be_truncated)}</td>
         </tr>
     """
 
@@ -37453,9 +37466,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .crm-activity-details {{
                         display: grid;
-                        grid-template-columns: 150px minmax(0, 1fr);
+                        grid-template-columns: 200px minmax(0, 1fr);
                         gap: 10px 12px;
                         align-items: start;
+                        color: #334e68;
+                        font-family: inherit;
+                        font-size: 13px;
+                        line-height: 1.45;
                     }}
 
                     .crm-detail-type {{
@@ -37472,6 +37489,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .crm-detail-date,
                     .crm-detail-subject,
+                    .crm-detail-customer,
                     .crm-detail-correspondents > div {{
                         display: flex;
                         align-items: baseline;
@@ -37479,8 +37497,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         min-width: 0;
                     }}
 
+                    .crm-detail-date {{
+                        white-space: nowrap;
+                    }}
+
                     .crm-detail-date .crm-detail-label,
                     .crm-detail-subject .crm-detail-label,
+                    .crm-detail-customer .crm-detail-label,
                     .crm-detail-correspondents .crm-detail-label {{
                         flex: 0 0 auto;
                         margin-bottom: 0;
@@ -37496,8 +37519,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .crm-detail-label {{
                         display: block;
                         margin-bottom: 5px;
-                        color: var(--muted);
-                        font-size: 10px;
+                        color: #334e68;
+                        font-size: 13px;
                         font-weight: 700;
                         letter-spacing: .04em;
                         text-transform: uppercase;
@@ -37512,22 +37535,43 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         line-height: 1.35;
                     }}
 
+                    .crm-detail-customer {{
+                        grid-column: 1 / -1;
+                        color: #334e68;
+                        line-height: 1.35;
+                    }}
+
                     .crm-activities-table {{
                         table-layout: fixed;
                     }}
 
+                    .crm-timeline-table,
+                    .crm-activities-table,
+                    .crm-timeline-table .crm-activity-details,
+                    .crm-activities-table .crm-activity-details,
+                    .crm-timeline-table .crm-activity-details *,
+                    .crm-activities-table .crm-activity-details *,
+                    .crm-timeline-table .activity-note,
+                    .crm-activities-table .activity-note,
+                    .crm-timeline-table .activity-expand summary,
+                    .crm-activities-table .activity-expand summary {{
+                        color: #334e68 !important;
+                        font-family: inherit !important;
+                        font-size: 13px !important;
+                    }}
+
                     .crm-activities-table th:nth-child(1),
                     .crm-activities-table td:nth-child(1) {{
-                        width: 38%;
-                        min-width: 320px;
+                        width: 42%;
+                        min-width: 390px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
 
                     .crm-activities-table th:nth-child(2),
                     .crm-activities-table td:nth-child(2) {{
-                        width: 62%;
-                        min-width: 420px;
+                        width: 58%;
+                        min-width: 460px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
@@ -38288,6 +38332,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .crm-category.customer-services {{
                         background: #fff7ed;
                         color: #c2410c;
+                    }}
+
+                    .crm-timeline-table .crm-category,
+                    .crm-timeline-table .crm-direction,
+                    .crm-activities-table .crm-category,
+                    .crm-activities-table .crm-direction,
+                    .crm-timeline-table .activity-full-status,
+                    .crm-activities-table .activity-full-status {{
+                        color: #334e68;
+                        font-size: 13px;
                     }}
 
                     .activity-expand {{

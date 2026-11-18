@@ -160,6 +160,34 @@ class CrmActivitiesFilterTests(unittest.TestCase):
         self.assertEqual(main.get_crm_activity_display_direction(email), "outbound")
         self.assertIn(">Task</span>", main.render_crm_activity_row(meeting))
 
+    def test_main_crm_row_uses_customer_layout_and_loads_complete_email(self):
+        activity = {
+            "filemaker_record_id": "17866894",
+            "date_created": "2026-11-17 14:20:31",
+            "activity_category": "sales_outreach",
+            "direction": "inbound",
+            "customer_company": "Vestis Corporate",
+            "subject": "RE: numat Point of Contact",
+            "sender_email": "carolina.bulle@vestis.com",
+            "to": "pbinington@numatsystems.com",
+            "body": "A" * crm.get_filemaker_crm_cached_body_chars(),
+        }
+
+        html = main.render_crm_activity_row(activity)
+
+        self.assertIn("crm-activity-details", html)
+        self.assertIn("Vestis Corporate", html)
+        self.assertIn("RE: numat Point of Contact", html)
+        self.assertIn('data-record-id="17866894"', html)
+        self.assertIn('ontoggle="loadFullCrmBody(this)"', html)
+        self.assertIn("Email content", html)
+
+    def test_full_crm_body_loader_is_reusable_outside_customer_page(self):
+        script = main.render_full_crm_body_loader_script()
+
+        self.assertIn("async function loadFullCrmBody", script)
+        self.assertIn("/customer-crm/full-body", script)
+
     def test_task_direction_filter_uses_display_direction(self):
         meeting = {
             "crm_type": "Meeting",
