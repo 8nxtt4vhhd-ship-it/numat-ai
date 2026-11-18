@@ -19064,12 +19064,13 @@ def render_order_row(order):
 def render_customer_order_row(order):
     extra = order.get("extra", {})
     customer_name = str(order.get("customer", ""))
+    order_date = format_customer_list_date(order.get("order_date"), "—")
 
     return f"""
         <tr>
             <td data-label="Record">{escape(str(order.get("filemaker_record_id", "")))}</td>
             <td data-label="Customer">{escape(customer_name)}</td>
-            <td data-label="Order date">{escape(str(order.get("order_date", "")))}</td>
+            <td data-label="Order date">{order_date}</td>
             <td data-label="Amount">{escape(str(order.get("amount", "")))}</td>
             <td data-label="Order no">{escape(str(extra.get("Orders::Order No", "")))}</td>
             <td data-label="Status">{escape(str(extra.get("Orders::Status", "")))}</td>
@@ -30601,7 +30602,7 @@ def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, cr
     }
 
     return f"""
-        <form class="controls compact" method="get" action="/customer-view#customer-orders-tab">
+        <form class="controls compact customer-order-sort-form" method="get" action="/customer-view#customer-orders-tab">
             <input type="hidden" name="customer" value="{escape(customer)}">
             <input type="hidden" name="crm_limit" value="{crm_limit}">
             <input type="hidden" name="crm_page" value="{crm_page}">
@@ -37240,6 +37241,23 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 12px;
                     }}
 
+                    .customer-detail-page .customer-order-sort-form {{
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        align-items: end;
+                    }}
+
+                    .customer-detail-page .customer-order-sort-form select,
+                    .customer-detail-page .customer-order-sort-form button {{
+                        width: 100%;
+                        height: 36px;
+                        min-height: 36px;
+                        box-sizing: border-box;
+                    }}
+
+                    .customer-detail-page .customer-order-sort-form button {{
+                        align-self: end;
+                    }}
+
                     input, select, textarea {{
                         width: 100%;
                         box-sizing: border-box;
@@ -40228,6 +40246,10 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         }}
 
                         .controls.compact {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .customer-detail-page .customer-order-sort-form {{
                             grid-template-columns: 1fr;
                         }}
 

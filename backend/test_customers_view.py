@@ -17,6 +17,18 @@ class CustomersViewTests(unittest.TestCase):
         main.clear_customer_summaries_cache()
         main.clear_customer_contextual_activity_cache()
 
+    def test_customer_order_row_displays_us_date_format(self):
+        html = main.render_customer_order_row({
+            "filemaker_record_id": "3069",
+            "customer": "Sanitary Linen Mat & Uniform Service",
+            "order_date": "2026-03-11",
+            "amount": 7446.11,
+            "extra": {"Orders::Order No": 3507, "Orders::Status": "Complete"},
+        })
+
+        self.assertIn('data-label="Order date">03/11/2026</td>', html)
+        self.assertNotIn(">2026-03-11</td>", html)
+
     def test_truncated_crm_activity_loads_complete_body_when_expanded(self):
         activity = {
             "date_created": "2026-11-18 09:00:00",
