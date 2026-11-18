@@ -457,6 +457,40 @@ class CustomersViewTests(unittest.TestCase):
 
         self.assertEqual(contextual["cottondale-key"], [activity])
 
+    def test_branch_context_does_not_pollute_existing_branch_history(self):
+        phoenix_activity = {
+            "date_created": "2026-01-21 09:30:09",
+            "customer_primary_key": "phoenix-key",
+            "customer_company": "Cintas (Phoenix, AZ-2)",
+            "subject": "Visit to Phoenix",
+            "body": "Planning a Phoenix visit.",
+            "sender_email": "sales@numatsystems.com",
+            "to": "phoenix@cintas.com",
+        }
+        statesville_activity = {
+            "date_created": "2026-10-16 15:00:06",
+            "customer_primary_key": "statesville-key",
+            "customer_company": "Cintas (Statesville, NC)",
+            "subject": "Visit to Statesville",
+            "body": "I will travel through Phoenix before visiting Statesville.",
+            "sender_email": "sales@numatsystems.com",
+            "to": "statesville@cintas.com",
+        }
+        contextual = main.build_contextual_crm_activity_map(
+            {
+                "phoenix-key": [phoenix_activity],
+                "statesville-key": [statesville_activity],
+            },
+            [statesville_activity, phoenix_activity],
+            [{
+                "customer": "Cintas (Phoenix, AZ-2)",
+                "customer_primary_key": "phoenix-key",
+                "orders": [],
+            }],
+        )
+
+        self.assertEqual(contextual["phoenix-key"], [phoenix_activity])
+
     def test_unique_legacy_organization_history_follows_new_customer_key(self):
         activity = {
             "date_created": "2025-12-15 13:29:32",

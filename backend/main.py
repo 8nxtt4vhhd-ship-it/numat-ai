@@ -19125,6 +19125,11 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
         str(key): list(items or [])
         for key, items in (activity_map or {}).items()
     }
+    customer_keys_with_direct_activity = {
+        str(key)
+        for key, items in (activity_map or {}).items()
+        if items
+    }
     branches_by_organization = defaultdict(list)
     activities_by_organization = defaultdict(list)
     activity_keys_by_organization = defaultdict(set)
@@ -19180,7 +19185,10 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
         for customer_key, city in candidate_branches:
             if f" {city} " in f" {searchable_text} ":
                 text_matched_customer_keys.add(customer_key)
-                if customer_key != direct_key:
+                if (
+                    customer_key != direct_key
+                    and customer_key not in customer_keys_with_direct_activity
+                ):
                     contextual_map.setdefault(customer_key, []).append(activity)
 
         if uses_departmental_contact:
@@ -19234,7 +19242,9 @@ def get_cached_customer_detail_crm_activities(
     activity_map = crm_result.get("activity_map", {})
     activities = crm_result.get("activities", [])
     direct_activities = activity_map.get(customer_primary_key)
-    if direct_activities and not any(activity_uses_departmental_contact(item) for item in activities):
+    if direct_activities and not any(
+        activity_uses_departmental_contact(item) for item in direct_activities
+    ):
         return sorted(direct_activities, key=get_crm_activity_sort_key, reverse=True)
     full_map_key = id(activities)
     full_map_record = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["full_maps"].get(full_map_key)
