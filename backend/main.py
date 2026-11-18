@@ -12643,7 +12643,6 @@ def get_crm_activities_view(
             "</tr>"
         )
 
-    counts = result["counts"]
     filter_summary = render_crm_filter_summary(
         total_filtered=total_filtered,
         customer=customer,
@@ -12657,29 +12656,6 @@ def get_crm_activities_view(
     )
     body = f"""
         {render_data_availability_banner(result)}
-
-        <div class="summary crm-summary">
-            <div>
-                <span class="label">Source</span>
-                <strong>{escape(result["source"])}</strong>
-            </div>
-            <div>
-                <span class="label">Total Rows</span>
-                <strong>{counts["total_rows"]}</strong>
-            </div>
-            <div>
-                <span class="label">Usable Rows</span>
-                <strong>{counts["kept_rows"]}</strong>
-            </div>
-            <div>
-                <span class="label">Internal Only Removed</span>
-                <strong>{counts["excluded_internal_only"]}</strong>
-            </div>
-            <div>
-                <span class="label">Showing</span>
-                <strong>{len(paged_activities)} of {total_filtered}</strong>
-            </div>
-        </div>
 
         {render_crm_filter_form(customer, sender, direction, category, subject, page_size, date_from, date_to, range_key)}
         {filter_summary}
@@ -37121,8 +37097,8 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         grid-template-areas:
                             "customer sender subject direction category rows"
                             "toggle toggle range datefrom dateto actions";
-                        gap: 10px;
-                        padding: 12px;
+                        gap: 6px 8px;
+                        padding: 8px;
                     }}
 
                     .crm-filter-toggle {{
@@ -37135,7 +37111,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     }}
 
                     .toggle-label {{
-                        font-size: 13px;
+                        font-size: 11px;
                         font-weight: 600;
                         color: var(--muted);
                     }}
@@ -37143,15 +37119,15 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .toggle-chips {{
                         display: flex;
                         flex-wrap: wrap;
-                        gap: 10px;
+                        gap: 6px;
                     }}
 
                     .toggle-chip {{
                         display: inline-flex;
                         align-items: center;
                         justify-content: center;
-                        min-height: 36px;
-                        padding: 0 14px;
+                        min-height: 32px;
+                        padding: 0 10px;
                         border: 1px solid var(--border);
                         border-radius: 999px;
                         background: #fff;
@@ -37206,14 +37182,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .crm-filter-grid .crm-field select,
                     .crm-filter-grid .toggle-chip,
                     .crm-filter-grid .crm-filter-action {{
-                        height: 40px;
-                        min-height: 40px;
+                        height: 32px;
+                        min-height: 32px;
+                        font-size: 12px;
                     }}
 
                     .crm-filter-grid .crm-field input,
                     .crm-filter-grid .crm-field select {{
-                        padding-top: 8px;
-                        padding-bottom: 8px;
+                        padding: 5px 8px;
                     }}
 
                     .crm-filter-action {{
@@ -37225,13 +37201,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         grid-area: actions;
                         display: grid;
                         grid-template-columns: repeat(2, minmax(0, 1fr));
-                        gap: 12px;
+                        gap: 6px;
                         align-self: end;
                     }}
 
                     .controls label {{
                         display: grid;
-                        gap: 6px;
+                        gap: 3px;
                         min-width: 0;
                         position: relative;
                         z-index: 1;
@@ -37239,7 +37215,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .controls span {{
                         color: var(--muted);
-                        font-size: 13px;
+                        font-size: 11px;
                     }}
 
                     .customer-detail-page .crm-filter-grid {{
@@ -39894,6 +39870,28 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .summary div {{
                             padding: 11px 12px;
+                        }}
+
+                        .crm-filter-grid {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            grid-template-areas:
+                                "toggle toggle"
+                                "customer customer"
+                                "sender sender"
+                                "subject subject"
+                                "direction category"
+                                "rows range"
+                                "datefrom dateto"
+                                "actions actions";
+                        }}
+
+                        .crm-filter-toggle {{
+                            flex-direction: row;
+                            align-items: center;
+                        }}
+
+                        .crm-filter-actions {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
                         }}
 
                         .home-workspace {{
