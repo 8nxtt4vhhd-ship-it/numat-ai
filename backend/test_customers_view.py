@@ -617,15 +617,28 @@ class CustomersViewTests(unittest.TestCase):
                 "customer-key": {
                     "primary_key": "customer-key",
                     "company": "No Order Customer",
-                }
+                },
+                "destination-key": {
+                    "primary_key": "destination-key",
+                    "company": "Destination Customer (Austin, TX)",
+                },
+            },
+            "contacts_by_customer_key": {
+                "customer-key": [{
+                    "filemaker_record_id": "contact-record-17",
+                    "customer_ref": "customer-key",
+                    "name": "Active Contact",
+                    "position": "Plant Manager",
+                    "email": "contact@example.com",
+                    "phone": "555-0100",
+                    "cell": "555-0199",
+                    "active": "Active",
+                }],
             },
         }
         contact_directory = {
             **master_result,
-            "all_contacts": [{
-                "email": "contact@example.com",
-                "customer_ref": "customer-key",
-            }],
+            "all_contacts": list(master_result["contacts_by_customer_key"]["customer-key"]),
         }
         with (
             patch.object(main, "get_orders_for_analysis", return_value=order_result),
@@ -645,6 +658,14 @@ class CustomersViewTests(unittest.TestCase):
         self.assertIn(">Visit</button>", html)
         self.assertIn("Record visit in FileMaker", html)
         self.assertIn("Schedule Follow-Up", html)
+        self.assertIn('data-customer-tab="customer-outreach-tab"', html)
+        self.assertIn('data-customer-tab="customer-crm-tab"', html)
+        self.assertIn('data-customer-tab="customer-orders-tab"', html)
+        self.assertIn('data-customer-tab="customer-contacts-tab"', html)
+        self.assertIn("Active Contact", html)
+        self.assertIn("contact@example.com", html)
+        self.assertIn("555-0100", html)
+        self.assertIn("555-0199", html)
         self.assertNotIn("<span>Enrich</span>", html)
         self.assertNotIn("Back to customers", html)
         full_directory.assert_called()
@@ -1057,6 +1078,102 @@ class CustomersViewTests(unittest.TestCase):
 
         self.assertEqual(result, [activity])
         contextual.assert_not_called()
+
+    def test_move_customer_contact_updates_filemaker_customer_reference(self):
+        master_data = {
+            "status": "ok",
+            "all_contacts": [{
+                "filemaker_record_id": "record-17",
+                "customer_ref": "old-location",
+                "name": "Jordan Smith",
+            }],
+            "customers_by_key": {
+                "old-location": {"company": "Old Location"},
+                "new-location": {"company": "New Location"},
+            },
+        }
+        with (
+            patch.object(main, "get_filemaker_config", return_value={
+                "contacts_layout": "Contacts",
+                "contacts_customer_ref_field": "CustomerRef",
+            }),
+            patch.object(main, "fetch_filemaker_master_data", return_value=master_data),
+            patch.object(main, "update_layout_record", return_value={"status": "ok"}) as update,
+            patch.object(main, "apply_filemaker_contact_move_to_cache", return_value=True) as update_cache,
+            patch.object(main, "clear_filemaker_master_data_cache") as clear_master,
+        ):
+            result = main.move_filemaker_customer_contact(
+                "record-17",
+                "old-location",
+                "new-location",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("Jordan Smith moved to New Location", result["message"])
+        update.assert_called_once_with("Contacts", "record-17", {"CustomerRef": "new-location"})
+        update_cache.assert_called_once_with("record-17", "new-location")
+        clear_master.assert_not_called()
+
+    def test_contact_move_updates_warm_master_cache_without_refetch(self):
+        cache_key = ("master-cache",)
+        result = {
+            "status": "ok",
+            "customers_by_key": {
+                "old-location": {"company": "Old"},
+                "new-location": {"company": "New"},
+            },
+            "all_contacts": [{
+                "filemaker_record_id": "record-17",
+                "customer_ref": "old-location",
+                "name": "Jordan Smith",
+                "email": "jordan@example.com",
+                "active": "Active",
+                "unsubscribe": "",
+            }],
+            "contacts_by_customer_key": {},
+            "contacts_by_email": {},
+        }
+        filemaker._FILEMAKER_MASTER_DATA_CACHE.update({
+            "key": cache_key,
+            "expires_at": float("inf"),
+            "result": result,
+        })
+        with (
+            patch.object(filemaker, "build_filemaker_master_data_cache_key", return_value=cache_key),
+            patch.object(filemaker, "Thread") as background_thread,
+        ):
+            updated = filemaker.apply_filemaker_contact_move_to_cache("record-17", "new-location")
+
+        self.assertTrue(updated)
+        self.assertNotIn("old-location", result["contacts_by_customer_key"])
+        self.assertEqual(
+            result["contacts_by_customer_key"]["new-location"][0]["customer_ref"],
+            "new-location",
+        )
+        self.assertEqual(result["contacts_by_email"]["jordan@example.com"]["customer_ref"], "new-location")
+        background_thread.assert_called_once()
+        background_thread.return_value.start.assert_called_once()
+
+    def test_customer_contacts_panel_renders_move_dialog_and_destination(self):
+        html = main.render_customer_contacts_panel(
+            [{
+                "filemaker_record_id": "contact-record-17",
+                "customer_ref": "customer-key",
+                "name": "Active Contact",
+                "active": "Active",
+            }],
+            move_destinations=[{
+                "customer_ref": "destination-key",
+                "label": "Destination Customer (Austin, TX)",
+            }],
+            can_move=True,
+            customer="No Order Customer",
+        )
+
+        self.assertIn('class="customer-contact-move-button"', html)
+        self.assertIn('aria-label="Move Active Contact to another location"', html)
+        self.assertIn("Destination Customer (Austin, TX)", html)
+        self.assertIn('action="/customer-contact/move"', html)
 
 
 if __name__ == "__main__":

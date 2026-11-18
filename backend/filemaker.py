@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import re
+from threading import Lock, Thread
 import time
 from urllib.parse import quote
 
@@ -25,6 +26,8 @@ _FILEMAKER_CUSTOMER_DATA_CACHE = {
     "expires_at": 0,
     "result": None,
 }
+_FILEMAKER_MASTER_CACHE_LOCK = Lock()
+_FILEMAKER_MASTER_DISK_WRITE_LOCK = Lock()
 
 
 def get_filemaker_config():
@@ -849,15 +852,16 @@ def read_filemaker_master_data_disk_cache(cache_key):
 
 
 def write_filemaker_master_data_disk_cache(cache_key, result):
-    cache_path = get_filemaker_master_cache_path()
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    temporary_path.write_text(json.dumps({
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "cache_key": list(cache_key),
-        "result": result,
-    }), encoding="utf-8")
-    temporary_path.replace(cache_path)
+    with _FILEMAKER_MASTER_DISK_WRITE_LOCK:
+        cache_path = get_filemaker_master_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        temporary_path.write_text(json.dumps({
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "cache_key": list(cache_key),
+            "result": result,
+        }), encoding="utf-8")
+        temporary_path.replace(cache_path)
 
 
 def clear_filemaker_master_data_cache(clear_persisted=False):
@@ -873,6 +877,96 @@ def clear_filemaker_master_data_cache(clear_persisted=False):
             cache_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def apply_filemaker_contact_move_to_cache(contact_record_id, target_customer_ref):
+    """Update a moved contact in the warm master cache without a full refetch."""
+    record_id = str(contact_record_id or "").strip()
+    target_ref = str(target_customer_ref or "").strip()
+    if not record_id or not target_ref:
+        return False
+
+    cache_key = build_filemaker_master_data_cache_key()
+    result = None
+    with _FILEMAKER_MASTER_CACHE_LOCK:
+        if (
+            _FILEMAKER_MASTER_DATA_CACHE.get("key") == cache_key
+            and isinstance(_FILEMAKER_MASTER_DATA_CACHE.get("result"), dict)
+        ):
+            result = _FILEMAKER_MASTER_DATA_CACHE["result"]
+        elif (
+            _FILEMAKER_CUSTOMER_DATA_CACHE.get("key") == cache_key
+            and isinstance(_FILEMAKER_CUSTOMER_DATA_CACHE.get("result"), dict)
+            and _FILEMAKER_CUSTOMER_DATA_CACHE["result"].get("all_contacts") is not None
+        ):
+            result = _FILEMAKER_CUSTOMER_DATA_CACHE["result"]
+        else:
+            result = read_filemaker_master_data_disk_cache(cache_key)
+
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return False
+
+        moved_contact = next(
+            (
+                contact for contact in result.get("all_contacts", [])
+                if str(contact.get("filemaker_record_id") or "").strip() == record_id
+            ),
+            None,
+        )
+        if not moved_contact:
+            return False
+        moved_contact["customer_ref"] = target_ref
+
+        customers_by_key = result.get("customers_by_key") or {}
+        contacts_by_customer_key = {}
+        contacts_by_email = {}
+        unsubscribed_emails = set()
+        for contact in result.get("all_contacts", []):
+            email = str(contact.get("email") or "").strip().lower()
+            customer_ref = str(contact.get("customer_ref") or "").strip()
+            active = str(contact.get("active") or "").strip().lower()
+            unsubscribed = is_truthy_contact_flag(contact.get("unsubscribe"))
+            if email and unsubscribed:
+                unsubscribed_emails.add(email)
+            if customer_ref in customers_by_key and active == "active" and not unsubscribed:
+                contacts_by_customer_key.setdefault(customer_ref, []).append(contact)
+            if email and not unsubscribed:
+                existing = contacts_by_email.get(email)
+                if existing is None or (
+                    str(existing.get("active") or "").strip().lower() != "active"
+                    and active == "active"
+                ):
+                    contacts_by_email[email] = contact
+
+        for customer_contacts in contacts_by_customer_key.values():
+            customer_contacts.sort(key=lambda item: (
+                str(item.get("name") or "").lower(),
+                str(item.get("email") or ""),
+            ))
+        result["contacts_by_customer_key"] = contacts_by_customer_key
+        result["contacts_by_email"] = contacts_by_email
+        result["unsubscribed_emails"] = sorted(unsubscribed_emails)
+
+        _FILEMAKER_MASTER_DATA_CACHE.update({
+            "key": cache_key,
+            "expires_at": float("inf"),
+            "result": result,
+        })
+        customer_cache_result = _FILEMAKER_CUSTOMER_DATA_CACHE.get("result") or {}
+        if customer_cache_result.get("all_contacts") is not None:
+            _FILEMAKER_CUSTOMER_DATA_CACHE.update({
+                "key": cache_key,
+                "expires_at": float("inf"),
+                "result": result,
+            })
+
+    Thread(
+        target=write_filemaker_master_data_disk_cache,
+        args=(cache_key, result),
+        daemon=True,
+        name="filemaker-master-cache-contact-move",
+    ).start()
+    return True
 
 
 def build_filemaker_master_data_cache_key():

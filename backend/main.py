@@ -113,6 +113,7 @@ from calendar_sync import (
     update_calendar_event,
 )
 from filemaker import (
+    apply_filemaker_contact_move_to_cache,
     check_filemaker_connection,
     clear_filemaker_master_data_cache,
     create_layout_record,
@@ -18131,6 +18132,8 @@ def get_customer_view(
     crm_page: int = 1,
     crm_direction: str = "",
     crm_category: str = "",
+    message: str = "",
+    error: str = "",
 ):
     view_started_at = time.perf_counter()
     stage_started_at = time.perf_counter()
@@ -18176,6 +18179,21 @@ def get_customer_view(
         get_customer_primary_key(customer_orders)
         or str(customer_master_record.get("primary_key") or "").strip()
     )
+    contact_directory_result = fetch_filemaker_master_data()
+    customer_contacts = list(
+        contact_directory_result.get("contacts_by_customer_key", {}).get(customer_primary_key, [])
+        if contact_directory_result.get("status") == "ok"
+        else master_data_result.get("contacts_by_customer_key", {}).get(customer_primary_key, [])
+    )
+    move_destinations = [
+        {
+            "customer_ref": str(customer_key or "").strip(),
+            "label": str(customer_record.get("company") or "").strip(),
+        }
+        for customer_key, customer_record in contact_directory_result.get("customers_by_key", {}).items()
+        if str(customer_key or "").strip() != customer_primary_key
+        and str(customer_record.get("company") or "").strip()
+    ]
 
     total_value = sum_order_amounts(customer_orders)
     first_order = min((order["order_date"] for order in customer_orders), default="")
@@ -18266,9 +18284,23 @@ def get_customer_view(
             </section>
         """
 
+    contacts_html = render_customer_contacts_panel(
+        customer_contacts,
+        move_destinations=move_destinations,
+        can_move=can_manage_strategic_contacts(get_current_session_user()),
+        customer=customer,
+        return_to=customers_return_to,
+    )
+    status_markup = ""
+    if message:
+        status_markup = f'<p class="status ok">{escape(message)}</p>'
+    elif error:
+        status_markup = f'<p class="status error">{escape(error)}</p>'
+
     body = f"""
         <div class="customer-detail-page">
         {render_data_availability_banner(result, crm_result, master_data_result)}
+        {status_markup}
 
         <div class="summary customer-summary">
             <div>
@@ -18318,6 +18350,14 @@ def get_customer_view(
             </div>
         </div>
 
+        <div class="customer-detail-tabs" role="tablist" aria-label="Customer details">
+            <button class="customer-detail-tab active" type="button" role="tab" aria-selected="true" data-customer-tab="customer-outreach-tab">Outreach</button>
+            <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-crm-tab">CRM <span class="customer-tab-count">{len(crm_activities)}</span></button>
+            <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-orders-tab">Orders <span class="customer-tab-count">{len(customer_orders)}</span></button>
+            <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-contacts-tab">Contacts <span class="customer-tab-count">{len(customer_contacts)}</span></button>
+        </div>
+
+        <div class="customer-detail-tab-panel active" id="customer-outreach-tab" role="tabpanel">
         {render_contact_ready_panel(
             customer=customer,
             attention=attention_by_customer.get(customer),
@@ -18329,7 +18369,9 @@ def get_customer_view(
             last_activity=last_activity,
             actions_html=outreach_actions,
         )}
+        </div>
 
+        <div class="customer-detail-tab-panel" id="customer-crm-tab" role="tabpanel" hidden>
         {render_customer_crm_timeline(
             customer,
             filtered_crm_activities,
@@ -18341,8 +18383,43 @@ def get_customer_view(
             direction,
             customers_return_to,
         )}
+        </div>
 
+        <div class="customer-detail-tab-panel" id="customer-orders-tab" role="tabpanel" hidden>
         {order_history_html}
+        </div>
+
+        <div class="customer-detail-tab-panel" id="customer-contacts-tab" role="tabpanel" hidden>
+        {contacts_html}
+        </div>
+
+        <script>
+            (function () {{
+                const tabs = Array.from(document.querySelectorAll('[data-customer-tab]'));
+                const panels = Array.from(document.querySelectorAll('.customer-detail-tab-panel'));
+                function activateCustomerTab(panelId, updateHash) {{
+                    if (!panels.some(panel => panel.id === panelId)) panelId = 'customer-outreach-tab';
+                    tabs.forEach(tab => {{
+                        const active = tab.dataset.customerTab === panelId;
+                        tab.classList.toggle('active', active);
+                        tab.setAttribute('aria-selected', active ? 'true' : 'false');
+                    }});
+                    panels.forEach(panel => {{
+                        const active = panel.id === panelId;
+                        panel.classList.toggle('active', active);
+                        panel.hidden = !active;
+                    }});
+                    if (updateHash && window.history?.replaceState) {{
+                        window.history.replaceState(null, '', '#' + panelId);
+                    }}
+                }}
+                tabs.forEach(tab => tab.addEventListener('click', () => activateCustomerTab(tab.dataset.customerTab, true)));
+                const hashTarget = document.getElementById(window.location.hash.slice(1));
+                const initialPanel = hashTarget?.closest('.customer-detail-tab-panel')?.id ||
+                    (panels.some(panel => '#' + panel.id === window.location.hash) ? window.location.hash.slice(1) : 'customer-outreach-tab');
+                activateCustomerTab(initialPanel, false);
+            }})();
+        </script>
         </div>
     """
 
@@ -18357,6 +18434,109 @@ def get_customer_view(
         title=f"Customer: {customer}",
         body=body,
         page_actions=back_action,
+    )
+
+
+def move_filemaker_customer_contact(contact_record_id, source_customer_ref, target_customer_ref):
+    record_id = str(contact_record_id or "").strip()
+    source_ref = str(source_customer_ref or "").strip()
+    target_ref = str(target_customer_ref or "").strip()
+    if not record_id or not source_ref or not target_ref:
+        return {"ok": False, "message": "", "error": "Choose a contact and a new location."}
+    if source_ref == target_ref:
+        return {"ok": False, "message": "", "error": "Choose a different location for this contact."}
+
+    config = get_filemaker_config()
+    if not config.get("contacts_layout") or not config.get("contacts_customer_ref_field"):
+        return {"ok": False, "message": "", "error": "FileMaker contact moving is not configured."}
+
+    master_data = fetch_filemaker_master_data()
+    if master_data.get("status") != "ok":
+        return {"ok": False, "message": "", "error": "The FileMaker contact directory could not be loaded."}
+
+    contact = next(
+        (
+            item for item in master_data.get("all_contacts", [])
+            if str(item.get("filemaker_record_id") or "").strip() == record_id
+        ),
+        None,
+    )
+    if not contact:
+        return {"ok": False, "message": "", "error": "That FileMaker contact could not be found."}
+    if str(contact.get("customer_ref") or "").strip() != source_ref:
+        return {
+            "ok": False,
+            "message": "",
+            "error": "This contact has changed since the page was opened. Refresh and try again.",
+        }
+
+    target_customer = (master_data.get("customers_by_key") or {}).get(target_ref)
+    if not target_customer:
+        return {"ok": False, "message": "", "error": "The selected destination is no longer available."}
+
+    write_result = update_layout_record(
+        config["contacts_layout"],
+        record_id,
+        {config["contacts_customer_ref_field"]: target_ref},
+    )
+    if write_result.get("status") != "ok":
+        detail = str(write_result.get("error_message") or "").strip()
+        return {
+            "ok": False,
+            "message": "",
+            "error": f"FileMaker could not move the contact{f': {detail}' if detail else '.'}",
+        }
+
+    cache_updated = apply_filemaker_contact_move_to_cache(record_id, target_ref)
+    if not cache_updated:
+        # A cold or unavailable cache is unusual; fall back to the authoritative
+        # refresh path rather than showing stale contact data.
+        clear_filemaker_master_data_cache(clear_persisted=True)
+    target_label = str(target_customer.get("company") or "the selected location").strip()
+    return {
+        "ok": True,
+        "message": f"{str(contact.get('name') or 'Contact').strip()} moved to {target_label}.",
+        "error": "",
+    }
+
+
+@app.post("/customer-contact/move", response_class=HTMLResponse)
+def post_customer_contact_move(
+    contact_record_id: str = Form(""),
+    source_customer_ref: str = Form(""),
+    target_customer_ref: str = Form(""),
+    customer: str = Form(""),
+    return_to: str = Form(""),
+):
+    current_user = get_current_session_user()
+    if not can_manage_strategic_contacts(current_user):
+        result = {"ok": False, "message": "", "error": "You do not have permission to move contacts."}
+    else:
+        result = move_filemaker_customer_contact(
+            contact_record_id,
+            source_customer_ref,
+            target_customer_ref,
+        )
+        record_audit_event(
+            "customer-contact-move",
+            target=str(contact_record_id or ""),
+            details=result.get("message") or result.get("error") or "Contact move requested.",
+            user=current_user,
+            area="filemaker",
+            status="success" if result.get("ok") else "failed",
+        )
+
+    query = {"customer": str(customer or "").strip()}
+    normalized_return_to = normalize_customer_detail_return_to(return_to)
+    if normalized_return_to:
+        query["return_to"] = normalized_return_to
+    if result.get("ok"):
+        query["message"] = result.get("message") or "Contact moved."
+    else:
+        query["error"] = result.get("error") or "The contact could not be moved."
+    return RedirectResponse(
+        url=f"/customer-view?{urlencode(query, quote_via=quote)}#customer-contacts-tab",
+        status_code=303,
     )
 
 
@@ -19423,6 +19603,152 @@ def render_customer_summary_row(summary, return_to=""):
                 </div>
             </td>
         </tr>
+    """
+
+
+def render_customer_contacts_panel(
+    contacts,
+    move_destinations=None,
+    can_move=False,
+    customer="",
+    return_to="",
+):
+    move_destinations = sorted(
+        (dict(destination or {}) for destination in (move_destinations or [])),
+        key=lambda destination: str(destination.get("label") or "").casefold(),
+    )
+    contacts = sorted(
+        (dict(contact or {}) for contact in (contacts or [])),
+        key=lambda contact: (
+            str(contact.get("active") or "").strip().casefold() != "active",
+            str(contact.get("name") or "").strip().casefold(),
+            str(contact.get("email") or "").strip().casefold(),
+        ),
+    )
+    rows = []
+    for contact in contacts:
+        name = str(contact.get("name") or "").strip() or "Unnamed contact"
+        position = str(contact.get("position") or "").strip() or "—"
+        email = str(contact.get("email") or "").strip()
+        phone = str(contact.get("phone") or "").strip()
+        cell = str(contact.get("cell") or "").strip()
+        active = str(contact.get("active") or "").strip() or "Unknown"
+        email_html = (
+            f'<a class="contact-detail-link" href="mailto:{escape(email)}">{escape(email)}</a>'
+            if email else '<span class="muted">—</span>'
+        )
+        phone_href = re.sub(r"[^0-9+]", "", phone)
+        phone_html = (
+            f'<a class="contact-detail-link" href="tel:{escape(phone_href)}">{escape(phone)}</a>'
+            if phone and phone_href else '<span class="muted">—</span>'
+        )
+        cell_href = re.sub(r"[^0-9+]", "", cell)
+        cell_html = (
+            f'<a class="contact-detail-link" href="tel:{escape(cell_href)}">{escape(cell)}</a>'
+            if cell and cell_href else '<span class="muted">—</span>'
+        )
+        status_class = "contact-status-active" if active.casefold() == "active" else "contact-status-inactive"
+        record_id = str(contact.get("filemaker_record_id") or "").strip()
+        move_button = (
+            f'<button class="customer-contact-move-button" type="button" '
+            f'data-contact-record-id="{escape(record_id)}" data-contact-name="{escape(name)}" '
+            f'aria-label="Move {escape(name)} to another location" title="Move contact">'
+            '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+            '<path d="M7 7h11m0 0-3-3m3 3-3 3M17 17H6m0 0 3 3m-3-3 3-3" />'
+            '</svg></button>'
+            if can_move and record_id and move_destinations else ""
+        )
+        rows.append(f"""
+            <tr>
+                <td data-label="Name"><strong>{escape(name)}</strong></td>
+                <td data-label="Position">{escape(position)}</td>
+                <td data-label="Email">{email_html}</td>
+                <td data-label="Telephone">{phone_html}</td>
+                <td data-label="Cell">{cell_html}</td>
+                <td data-label="Status"><span class="contact-status {status_class}">{escape(active.title())}</span></td>
+                <td data-label="Action">{move_button}</td>
+            </tr>
+        """)
+
+    if not rows:
+        rows.append("<tr><td colspan='7' class='empty'>No contacts are linked to this customer yet.</td></tr>")
+
+    destination_options = "".join(
+        f'<option value="{escape(str(destination.get("customer_ref") or ""))}">'
+        f'{escape(str(destination.get("label") or ""))}</option>'
+        for destination in move_destinations
+        if str(destination.get("customer_ref") or "").strip()
+    )
+    source_customer_ref = str(contacts[0].get("customer_ref") or "").strip() if contacts else ""
+    move_dialog = ""
+    if can_move and destination_options:
+        move_dialog = f"""
+            <dialog class="customer-contact-move-dialog" id="customer-contact-move-dialog">
+                <form method="post" action="/customer-contact/move" id="customer-contact-move-form">
+                    <input type="hidden" name="contact_record_id" id="move-contact-record-id" value="" />
+                    <input type="hidden" name="source_customer_ref" value="{escape(source_customer_ref)}" />
+                    <input type="hidden" name="customer" value="{escape(str(customer or ''))}" />
+                    <input type="hidden" name="return_to" value="{escape(normalize_customer_detail_return_to(return_to))}" />
+                    <div class="customer-contact-move-dialog-head">
+                        <div>
+                            <span class="home-focus-inline-kicker">Move contact</span>
+                            <h3 id="move-contact-title">Choose a new location</h3>
+                        </div>
+                        <button class="customer-contact-move-close" type="button" aria-label="Close">×</button>
+                    </div>
+                    <p class="muted">This changes the contact's linked customer location in FileMaker.</p>
+                    <label>
+                        <span>New location</span>
+                        <select name="target_customer_ref" required>
+                            <option value="">Select location…</option>
+                            {destination_options}
+                        </select>
+                    </label>
+                    <div class="customer-contact-move-actions">
+                        <button class="button secondary" type="button" data-cancel-contact-move>Cancel</button>
+                        <button class="button" type="submit">Move Contact</button>
+                    </div>
+                </form>
+            </dialog>
+            <script>
+                (function () {{
+                    const dialog = document.getElementById('customer-contact-move-dialog');
+                    const recordInput = document.getElementById('move-contact-record-id');
+                    const title = document.getElementById('move-contact-title');
+                    if (!dialog || !recordInput) return;
+                    document.querySelectorAll('.customer-contact-move-button').forEach(button => {{
+                        button.addEventListener('click', () => {{
+                            recordInput.value = button.dataset.contactRecordId || '';
+                            title.textContent = `Move ${{button.dataset.contactName || 'contact'}}`;
+                            dialog.showModal();
+                        }});
+                    }});
+                    const close = () => dialog.close();
+                    dialog.querySelector('.customer-contact-move-close')?.addEventListener('click', close);
+                    dialog.querySelector('[data-cancel-contact-move]')?.addEventListener('click', close);
+                    dialog.addEventListener('click', event => {{
+                        if (event.target === dialog) close();
+                    }});
+                }})();
+            </script>
+        """
+
+    return f"""
+        <section class="panel customer-contacts-panel">
+            <div class="customer-tab-section-heading">
+                <div>
+                    <h2>Contacts</h2>
+                    <p class="muted">People linked to this customer in FileMaker.</p>
+                </div>
+            </div>
+            <div class="table-wrap customer-contacts-table-wrap">
+                <table class="customer-contacts-table">
+                    <thead><tr><th>Name</th><th>Position</th><th>Email</th><th>Telephone</th><th>Cell</th><th>Status</th><th>Action</th></tr></thead>
+                    <tbody>{''.join(rows)}</tbody>
+                </table>
+            </div>
+            {move_dialog}
+        </section>
     """
 
 
@@ -30057,7 +30383,7 @@ def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, cr
     }
 
     return f"""
-        <form class="controls compact" method="get" action="/customer-view">
+        <form class="controls compact" method="get" action="/customer-view#customer-orders-tab">
             <input type="hidden" name="customer" value="{escape(customer)}">
             <input type="hidden" name="crm_limit" value="{crm_limit}">
             <input type="hidden" name="crm_page" value="{crm_page}">
@@ -33774,6 +34100,164 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .customer-detail-page {{
                         display: grid;
                         gap: 12px;
+                    }}
+
+                    .customer-detail-tabs {{
+                        display: grid;
+                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        gap: 4px;
+                        padding: 4px;
+                        border: 1px solid var(--border);
+                        border-radius: 12px;
+                        background: #fff;
+                        box-shadow: var(--shadow-soft);
+                    }}
+
+                    .customer-detail-tab {{
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        gap: 7px;
+                        min-width: 0;
+                        min-height: 42px;
+                        padding: 8px 14px;
+                        border: 1px solid transparent;
+                        border-radius: 9px;
+                        background: transparent;
+                        color: var(--muted);
+                        font-size: 14px;
+                        font-weight: 700;
+                        box-shadow: none;
+                    }}
+
+                    .customer-detail-tab:hover,
+                    .customer-detail-tab.active {{
+                        border-color: #b9ceff;
+                        background: #eef4ff;
+                        color: var(--blue);
+                    }}
+
+                    .customer-tab-count {{
+                        min-width: 22px;
+                        padding: 2px 6px;
+                        border-radius: 999px;
+                        background: rgba(37, 92, 255, .1);
+                        font-size: 11px;
+                        line-height: 1.4;
+                    }}
+
+                    .customer-detail-tab-panel {{
+                        min-width: 0;
+                    }}
+
+                    .customer-detail-tab-panel[hidden] {{
+                        display: none !important;
+                    }}
+
+                    .customer-tab-section-heading p {{
+                        margin: 0 0 12px;
+                    }}
+
+                    .customer-contact-move-dialog {{
+                        width: min(520px, calc(100vw - 32px));
+                        padding: 0;
+                        border: 1px solid var(--border);
+                        border-radius: 14px;
+                        background: #fff;
+                        color: var(--text);
+                        box-shadow: 0 24px 70px rgba(20, 43, 80, .24);
+                    }}
+
+                    .customer-contact-move-dialog::backdrop {{
+                        background: rgba(18, 31, 53, .48);
+                    }}
+
+                    .customer-contact-move-dialog form {{
+                        display: grid;
+                        gap: 16px;
+                        padding: 22px;
+                    }}
+
+                    .customer-contact-move-dialog-head {{
+                        display: flex;
+                        align-items: flex-start;
+                        justify-content: space-between;
+                        gap: 16px;
+                    }}
+
+                    .customer-contact-move-dialog-head h3 {{
+                        margin: 3px 0 0;
+                    }}
+
+                    .customer-contact-move-dialog p {{
+                        margin: 0;
+                    }}
+
+                    .customer-contact-move-dialog label {{
+                        display: grid;
+                        gap: 7px;
+                        color: var(--muted);
+                        font-size: 13px;
+                        font-weight: 700;
+                    }}
+
+                    .customer-contact-move-dialog select {{
+                        width: 100%;
+                    }}
+
+                    .customer-contact-move-close {{
+                        min-width: 36px;
+                        min-height: 36px;
+                        padding: 0;
+                        border: 1px solid var(--border);
+                        border-radius: 9px;
+                        background: #fff;
+                        color: var(--muted);
+                        font-size: 22px;
+                        line-height: 1;
+                        box-shadow: none;
+                    }}
+
+                    .customer-contact-move-actions {{
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px;
+                    }}
+
+                    .customer-contact-move-actions .button {{
+                        width: 100%;
+                    }}
+
+                    .customer-contact-move-button {{
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        width: 36px;
+                        min-width: 36px;
+                        height: 36px;
+                        min-height: 36px;
+                        padding: 0;
+                        border: 1px solid #b9ceff;
+                        border-radius: 9px;
+                        background: #eef4ff;
+                        color: var(--blue);
+                        box-shadow: none;
+                    }}
+
+                    .customer-contact-move-button:hover {{
+                        border-color: var(--blue);
+                        background: var(--blue);
+                        color: #fff;
+                    }}
+
+                    .customer-contact-move-button svg {{
+                        width: 19px;
+                        height: 19px;
+                        fill: none;
+                        stroke: currentColor;
+                        stroke-width: 2;
+                        stroke-linecap: round;
+                        stroke-linejoin: round;
                     }}
 
                     .customer-detail-page .summary.customer-summary {{
@@ -39458,6 +39942,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                             grid-template-columns: 1fr;
                         }}
 
+                        .customer-detail-tabs {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .customer-detail-tab {{
+                            min-height: 38px;
+                            padding: 7px 8px;
+                            font-size: 13px;
+                        }}
+
                         .customer-detail-page .panel {{
                             padding: 13px;
                         }}
@@ -39595,6 +40089,60 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         .contacts-directory-table td:nth-child(7),
                         .contacts-directory-table td:nth-child(8) {{
                             display: none;
+                        }}
+
+                        .customer-contacts-table-wrap {{
+                            overflow: visible;
+                        }}
+
+                        .customer-contacts-table thead {{
+                            display: none;
+                        }}
+
+                        .customer-contacts-table,
+                        .customer-contacts-table tbody {{
+                            display: grid;
+                            gap: 10px;
+                            width: 100%;
+                            min-width: 0;
+                        }}
+
+                        .customer-contacts-table tr {{
+                            display: grid;
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                            gap: 12px 10px;
+                            padding: 14px;
+                            border: 1px solid var(--border);
+                            border-radius: 10px;
+                            background: #fff;
+                        }}
+
+                        .customer-contacts-table td {{
+                            display: grid;
+                            gap: 4px;
+                            min-width: 0;
+                            padding: 0;
+                            border: 0;
+                            white-space: normal;
+                            overflow-wrap: anywhere;
+                        }}
+
+                        .customer-contacts-table td::before {{
+                            content: attr(data-label);
+                            color: var(--muted);
+                            font-size: 10px;
+                            font-weight: 700;
+                            letter-spacing: .04em;
+                            text-transform: uppercase;
+                        }}
+
+                        .customer-contacts-table td:first-child,
+                        .customer-contacts-table td:nth-child(3) {{
+                            grid-column: 1 / -1;
+                        }}
+
+                        .customer-contact-move-dialog form {{
+                            padding: 17px;
                         }}
 
                         .contacts-directory-page .pager {{
