@@ -87,13 +87,13 @@ class CustomersViewTests(unittest.TestCase):
 
     def test_outlook_crm_row_uses_received_datetime_instead_of_record_creation(self):
         activity = crm.normalize_crm_row({
-            "emails::receivedDateTime": "11/16/2026 17:45:00",
+            "emails::receivedDateTime": "2026-11-17T19:20:31Z",
             "emails::Date Created": "11/17/2026 18:50:00",
             "emails::sender_email": "customer@example.com",
             "emails::To": "sales@numatsystems.com",
         }, 1)
 
-        self.assertEqual(activity["date_created"], "2026-11-16 17:45:00")
+        self.assertEqual(activity["date_created"], "2026-11-17 14:20:31")
         self.assertEqual(activity["date_source"], "receivedDateTime")
 
     def test_non_email_crm_row_falls_back_to_record_creation_datetime(self):
@@ -1127,6 +1127,7 @@ class CustomersViewTests(unittest.TestCase):
                 cache_path = Path(temp_dir) / "recent.json"
                 cache_path.write_text(json.dumps({
                     "timestamp_field": "receivedDateTime",
+                    "timestamp_schema": crm.CRM_TIMESTAMP_SCHEMA_VERSION,
                     "activities": [older],
                 }), encoding="utf-8")
                 with (

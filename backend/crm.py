@@ -7,6 +7,7 @@ import re
 from threading import Lock, Thread
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil import parser
 from dotenv import load_dotenv
@@ -25,6 +26,7 @@ DEFAULT_UPLOADED_CRM_CSV_PATH = BASE_DIR / "data" / "sample_crm.csv"
 DEFAULT_FILEMAKER_CRM_CACHE_PATH = BASE_DIR / "data" / "filemaker_crm_cache.json"
 DEFAULT_FILEMAKER_CRM_RECENT_CACHE_PATH = BASE_DIR / "data" / "filemaker_crm_recent_cache.json"
 MAX_CRM_SAMPLE_ROWS = 50000
+CRM_TIMESTAMP_SCHEMA_VERSION = "v2-received-local-time"
 _CRM_CACHE = {
     "key": None,
     "expires_at": 0,
@@ -211,6 +213,13 @@ def get_filemaker_crm_timestamp_field():
         "FILEMAKER_CRM_TIMESTAMP_FIELD",
         "receivedDateTime",
     ).strip() or "receivedDateTime"
+
+
+def get_filemaker_crm_display_timezone():
+    return os.getenv(
+        "FILEMAKER_CRM_DISPLAY_TIMEZONE",
+        "America/New_York",
+    ).strip() or "America/New_York"
 
 
 def get_filemaker_crm_complete_field():
@@ -922,6 +931,7 @@ def sync_filemaker_crm_cache(force_full=False):
         and existing_sync_result is not None
         and existing_sync_result.get("activities")
         and existing_sync_result.get("timestamp_field") == get_filemaker_crm_timestamp_field()
+        and existing_sync_result.get("timestamp_schema") == CRM_TIMESTAMP_SCHEMA_VERSION
     ):
         incremental_result = sync_filemaker_crm_cache_incremental(existing_sync_result)
 
@@ -1049,6 +1059,7 @@ def write_filemaker_crm_sync_payload(result):
     payload = {
         "synced_at": result.get("synced_at", ""),
         "timestamp_field": get_filemaker_crm_timestamp_field(),
+        "timestamp_schema": CRM_TIMESTAMP_SCHEMA_VERSION,
         "source": result.get("source", "filemaker_sync_cache"),
         "status": result.get("status", "ok"),
         "path": result.get("path", str(cache_path)),
@@ -1169,7 +1180,10 @@ def write_filemaker_crm_recent_cache(result):
     ):
         try:
             existing_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            if existing_payload.get("timestamp_field") == get_filemaker_crm_timestamp_field():
+            if (
+                existing_payload.get("timestamp_field") == get_filemaker_crm_timestamp_field()
+                and existing_payload.get("timestamp_schema") == CRM_TIMESTAMP_SCHEMA_VERSION
+            ):
                 existing_activities = compact_crm_activities_in_place(
                     existing_payload.get("activities", [])
                 )
@@ -1190,6 +1204,7 @@ def write_filemaker_crm_recent_cache(result):
     payload = {
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp_field": get_filemaker_crm_timestamp_field(),
+        "timestamp_schema": CRM_TIMESTAMP_SCHEMA_VERSION,
         "source": "filemaker_recent_cache",
         "status": "ok",
         "path": result.get("path", ""),
@@ -1233,6 +1248,12 @@ def read_filemaker_crm_recent_cache():
     except (OSError, ValueError):
         return None
 
+    if (
+        payload.get("timestamp_field") != get_filemaker_crm_timestamp_field()
+        or payload.get("timestamp_schema") != CRM_TIMESTAMP_SCHEMA_VERSION
+    ):
+        return None
+
     activities = sort_crm_activities(compact_crm_activities_in_place(
         payload.get("activities", [])
     ))
@@ -1256,6 +1277,7 @@ def read_filemaker_crm_recent_cache():
         "warning": "FileMaker CRM is currently unavailable. Showing the last successful cached CRM snapshot.",
         "synced_at": payload.get("updated_at", ""),
         "timestamp_field": payload.get("timestamp_field", ""),
+        "timestamp_schema": payload.get("timestamp_schema", ""),
     }
 
 
@@ -1291,6 +1313,7 @@ def read_filemaker_crm_sync_cache():
         },
         "synced_at": payload.get("synced_at", ""),
         "timestamp_field": payload.get("timestamp_field", ""),
+        "timestamp_schema": payload.get("timestamp_schema", ""),
     }
 
 
@@ -1629,8 +1652,10 @@ def normalize_crm_row(row, index):
     return {
         "row_number": index,
         "filemaker_record_id": str(row.get("__filemaker_record_id") or "").strip(),
-        "date_created": normalize_crm_date(
-            received_datetime or filemaker_date_created
+        "date_created": (
+            normalize_crm_received_datetime(received_datetime)
+            if received_datetime
+            else normalize_crm_date(filemaker_date_created)
         ),
         "filemaker_date_created": normalize_crm_date(filemaker_date_created),
         "date_source": (
@@ -1695,6 +1720,22 @@ def normalize_crm_date(value):
         return parser.parse(str(value), dayfirst=False).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def normalize_crm_received_datetime(value):
+    if not value:
+        return ""
+
+    try:
+        parsed = parser.parse(str(value))
+        if parsed.tzinfo is not None:
+            try:
+                parsed = parsed.astimezone(ZoneInfo(get_filemaker_crm_display_timezone()))
+            except ZoneInfoNotFoundError:
+                pass
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return str(value)
 
