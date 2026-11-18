@@ -93,7 +93,10 @@ from crm import (
     get_filemaker_emails_layout,
     get_filemaker_crm_body_field,
     get_filemaker_crm_cache_path,
+    get_filemaker_crm_cached_body_chars,
+    get_filemaker_crm_timestamp_field,
     get_filemaker_crm_use_sync_cache,
+    get_full_crm_body_from_record,
     get_filemaker_promise_status_field,
     is_customer_service_activity,
     is_departmental_contact_email,
@@ -119,6 +122,7 @@ from filemaker import (
     create_layout_record,
     fetch_filemaker_customer_data,
     fetch_filemaker_master_data,
+    fetch_layout_record,
     fetch_order_records,
     find_layout_records,
     get_filemaker_config,
@@ -6176,7 +6180,9 @@ def run_crm_sync_in_background(trigger="manual"):
     )
 
     try:
-        result = sync_filemaker_crm_cache()
+        result = sync_filemaker_crm_cache(
+            force_full=str(trigger).strip().lower() == "manual_full"
+        )
         finished_at = format_optional_datetime(datetime.now())
 
         if result.get("status") == "ok":
@@ -11289,7 +11295,7 @@ def get_customer_profile_view(
 
     crm_rows = "".join(render_customer_crm_activity(activity) for activity in filtered_crm[:50])
     crm_markup = (
-        f"<section class='panel'><h2>Sales outreach history</h2><p class='muted'>Showing the latest {min(len(filtered_crm), 50)} of {len(filtered_crm)} sales-related CRM communications. Customer-service and operational messages are excluded.</p><div class='table-wrap tall-table crm-timeline-wrap'><table class='crm-timeline-table'><thead><tr><th>Date</th><th>Direction</th><th>Subject</th><th>From / To</th><th>Preview</th></tr></thead><tbody>{crm_rows}</tbody></table></div></section>"
+        f"<section class='panel'><h2>Sales outreach history</h2><p class='muted'>Showing the latest {min(len(filtered_crm), 50)} of {len(filtered_crm)} sales-related CRM communications. Customer-service and operational messages are excluded.</p><div class='table-wrap tall-table crm-timeline-wrap'><table class='crm-timeline-table'><thead><tr><th>Details</th><th>Email content</th></tr></thead><tbody>{crm_rows}</tbody></table></div></section>"
         if crm_rows else "<section class='panel'><h2>Sales outreach history</h2><p class='empty-action'>No sales-related CRM communications are linked to this customer yet.</p></section>"
     )
 
@@ -12736,10 +12742,21 @@ async def upload_crm_data(file: UploadFile = File(...)):
 
 @app.post("/crm-sync-full", response_class=HTMLResponse)
 def post_crm_sync_full():
+    if not auto_crm_sync_supported():
+        return render_crm_data_page(sync_result={
+            "status": "not_configured",
+            "saved": False,
+            "message": "Full CRM sync is not configured on this environment.",
+        })
+
     sync_status = get_crm_sync_status()
 
     if not sync_status.get("running"):
-        worker = Thread(target=run_crm_sync_in_background, daemon=True)
+        worker = Thread(
+            target=run_crm_sync_in_background,
+            kwargs={"trigger": "manual_full"},
+            daemon=True,
+        )
         worker.start()
         sync_result = {
             "status": "started",
@@ -18437,6 +18454,21 @@ def get_customer_view(
     )
 
 
+@app.get("/customer-crm/full-body", response_class=JSONResponse)
+def get_customer_crm_full_body(record_id: str = ""):
+    record_id = str(record_id or "").strip()
+    if not record_id or not re.fullmatch(r"[A-Za-z0-9_-]+", record_id):
+        return JSONResponse({"status": "invalid_record", "body": ""}, status_code=400)
+    result = fetch_layout_record(get_filemaker_emails_layout(), record_id)
+    if result.get("status") != "ok" or not result.get("record"):
+        return JSONResponse(
+            {"status": result.get("status") or "not_found", "body": ""},
+            status_code=404,
+        )
+    body = clean_activity_content(get_full_crm_body_from_record(result.get("record")))
+    return {"status": "ok", "body": body}
+
+
 def move_filemaker_customer_contact(contact_record_id, source_customer_ref, target_customer_ref):
     record_id = str(contact_record_id or "").strip()
     source_ref = str(source_customer_ref or "").strip()
@@ -19154,7 +19186,7 @@ def build_contextual_crm_activity_map(activity_map, activities, customer_entries
             deduped[dedupe_key] = activity
         contextual_map[customer_key] = sorted(
             deduped.values(),
-            key=lambda item: str(item.get("date_created") or ""),
+            key=get_crm_activity_sort_key,
             reverse=True,
         )
 
@@ -19172,7 +19204,7 @@ def get_cached_customer_detail_crm_activities(
     activities = crm_result.get("activities", [])
     direct_activities = activity_map.get(customer_primary_key)
     if direct_activities and not any(activity_uses_departmental_contact(item) for item in activities):
-        return direct_activities
+        return sorted(direct_activities, key=get_crm_activity_sort_key, reverse=True)
     full_map_key = id(activities)
     full_map_record = _CUSTOMER_CONTEXTUAL_ACTIVITY_CACHE["full_maps"].get(full_map_key)
     if full_map_record and full_map_record.get("activities") is activities:
@@ -19902,7 +19934,7 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
     if not rows:
         rows = (
             "<tr>"
-            "<td colspan='5' class='empty'>No CRM email history linked to this customer key yet.</td>"
+            "<td colspan='2' class='empty'>No CRM email history linked to this customer key yet.</td>"
             "</tr>"
         )
 
@@ -19927,11 +19959,8 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
             <table class="crm-timeline-table">
                 <thead>
                     <tr>
-                        <th>Date</th>
-                        <th>Direction</th>
-                        <th>Subject</th>
-                        <th>From / To</th>
-                        <th>Preview</th>
+                        <th>Details</th>
+                        <th>Email content</th>
                     </tr>
                 </thead>
                 <tbody>{rows}</tbody>
@@ -19939,6 +19968,29 @@ def render_customer_crm_timeline(customer, activities, crm_limit, crm_page, crm_
             </div>
             {pagination_html}
         </section>
+        <script>
+            async function loadFullCrmBody(details) {{
+                if (!details?.open || details.dataset.fullBodyLoaded === 'true' || details.dataset.fullBodyLoading === 'true') return;
+                const recordId = details.dataset.recordId || '';
+                if (!recordId) return;
+                const body = details.querySelector('[data-full-crm-body]');
+                const status = details.querySelector('[data-full-crm-status]');
+                details.dataset.fullBodyLoading = 'true';
+                if (status) status.textContent = 'Loading complete email…';
+                try {{
+                    const response = await fetch('/customer-crm/full-body?record_id=' + encodeURIComponent(recordId), {{headers: {{'Accept': 'application/json'}}}});
+                    const payload = await response.json();
+                    if (!response.ok || payload.status !== 'ok') throw new Error(payload.status || 'unavailable');
+                    if (body) body.textContent = payload.body || 'No email content was recorded.';
+                    details.dataset.fullBodyLoaded = 'true';
+                    if (status) status.textContent = '';
+                }} catch (error) {{
+                    if (status) status.textContent = 'The complete email could not be loaded. The cached text is shown above.';
+                }} finally {{
+                    details.dataset.fullBodyLoading = 'false';
+                }}
+            }}
+        </script>
     """
 
 
@@ -20112,39 +20164,65 @@ def render_customer_crm_activity(activity):
     )
     category_class = f"crm-category {category_value.replace('_', '-')}"
 
-    full_text = clean_activity_content(activity.get("body", ""))
+    raw_body = str(activity.get("body") or "")
+    full_text = clean_activity_content(raw_body)
     preview = truncate_text(full_text, 260)
+    record_id = str(activity.get("filemaker_record_id") or "").strip()
+    body_may_be_truncated = bool(
+        record_id and len(raw_body) >= get_filemaker_crm_cached_body_chars()
+    )
 
     return f"""
         <tr>
-            <td data-label="Date">{escape(format_optional_datetime(activity.get("date_created", "")))}</td>
-            <td data-label="Type">
-                <div class="crm-pill-stack">
-                    <span class="{category_class}">{escape(category_label)}</span>
-                    <span class="{direction_class}">{escape(direction_label or "Unknown")}</span>
+            <td data-label="Details">
+                <div class="crm-activity-details">
+                    <div class="crm-detail-type">
+                        <span class="crm-detail-label">Type:</span>
+                        <div class="crm-pill-stack">
+                            <span class="{category_class}">{escape(category_label)}</span>
+                            <span class="{direction_class}">{escape(direction_label or "Unknown")}</span>
+                        </div>
+                    </div>
+                    <div class="crm-detail-date">
+                        <span class="crm-detail-label">Date:</span>
+                        {escape(format_optional_datetime(activity.get("date_created", "")))}
+                    </div>
+                    <div class="crm-detail-subject">
+                        <span class="crm-detail-label">Subject:</span>
+                        {escape(activity.get("subject", ""))}
+                    </div>
+                    <div class="crm-detail-correspondents">
+                        <div><span class="crm-detail-label">From:</span>{escape(activity.get("sender_email", ""))}</div>
+                        <div><span class="crm-detail-label">To:</span>{escape(activity.get("to", ""))}</div>
+                    </div>
                 </div>
             </td>
-            <td data-label="Subject">{escape(activity.get("subject", ""))}</td>
-            <td data-label="From / To">
-                <div><strong>From:</strong> {escape(activity.get("sender_email", ""))}</div>
-                <div><strong>To:</strong> {escape(activity.get("to", ""))}</div>
-            </td>
-            <td data-label="Preview">{render_expandable_activity(preview, full_text)}</td>
+            <td data-label="Email content">{render_expandable_activity(preview, full_text, record_id, body_may_be_truncated)}</td>
         </tr>
     """
 
 
-def render_expandable_activity(preview, full_text):
+def render_expandable_activity(preview, full_text, record_id="", body_may_be_truncated=False):
     if not full_text:
         return ""
 
-    if len(full_text) <= len(preview):
+    if len(full_text) <= len(preview) and not body_may_be_truncated:
         return f"<span class=\"activity-note\">{escape(full_text)}</span>"
 
+    fetch_attributes = (
+        f' data-record-id="{escape(str(record_id or ""))}" '
+        'data-full-body-loaded="false" ontoggle="loadFullCrmBody(this)"'
+        if body_may_be_truncated else ""
+    )
+    status_html = (
+        '<div class="activity-full-status" data-full-crm-status>Expand to load the complete email.</div>'
+        if body_may_be_truncated else ""
+    )
     return f"""
-        <details class="activity-expand">
+        <details class="activity-expand"{fetch_attributes}>
             <summary>{escape(preview)}</summary>
-            <div class="activity-note">{escape(full_text)}</div>
+            <div class="activity-note" data-full-crm-body>{escape(full_text)}</div>
+            {status_html}
         </details>
     """
 
@@ -20670,7 +20748,7 @@ def build_crm_activity_map(activities):
     for key, items in activity_map.items():
         activity_map[key] = sorted(
             items,
-            key=lambda activity: activity.get("date_created", ""),
+            key=get_crm_activity_sort_key,
             reverse=True,
         )
 
@@ -20712,7 +20790,7 @@ def get_customer_crm_activities(activities, customer_primary_key):
 
     return sorted(
         matching_activities,
-        key=lambda activity: activity.get("date_created", ""),
+        key=get_crm_activity_sort_key,
         reverse=True,
     )
 
@@ -24325,10 +24403,19 @@ def get_sales_outreach_activities(activities):
     ]
 
 
+def get_crm_activity_sort_key(activity):
+    """Sort CRM rows newest-first, including rows sharing the same timestamp."""
+    activity = activity or {}
+    activity_date = parse_crm_datetime(activity.get("date_created", "")) or datetime.min
+    record_id = str(activity.get("filemaker_record_id") or "").strip()
+    numeric_record_id = int(record_id) if record_id.isdigit() else -1
+    return activity_date, numeric_record_id, record_id
+
+
 def sort_sales_activities_by_date(activities):
     return sorted(
         activities,
-        key=lambda activity: parse_crm_datetime(activity.get("date_created", "")) or datetime.min,
+        key=get_crm_activity_sort_key,
         reverse=True,
     )
 
@@ -26659,7 +26746,7 @@ def render_ai_analysis_page(
     return render_page(title="AI Analysis", body=body, main_class="ai-analysis-main")
 
 
-def render_crm_data_page(upload_result=None, sync_result=None):
+def render_legacy_crm_data_page(upload_result=None, sync_result=None):
     active_result = fetch_crm_activities()
     validation = (
         build_crm_validation_from_result(active_result)
@@ -26874,6 +26961,95 @@ def render_crm_data_page(upload_result=None, sync_result=None):
     """
 
     return render_page(title="CRM Data", body=body)
+
+
+def render_crm_data_page(upload_result=None, sync_result=None):
+    active_result = fetch_crm_activities()
+    counts = active_result.get("counts", {})
+    background_sync_status = get_crm_sync_status()
+    sync_supported = auto_crm_sync_supported()
+    running = bool(background_sync_status.get("running"))
+    last_synced = (
+        active_result.get("synced_at")
+        or (read_filemaker_crm_sync_cache() or {}).get("synced_at")
+        or "Not synced yet"
+    )
+
+    message = ""
+    if sync_result and sync_result.get("status") in {"started", "running"}:
+        message = (
+            "<p class='status'>The full CRM sync is running in the background. "
+            "You can continue using Sales Focus and return here to check it.</p>"
+        )
+    elif upload_result:
+        message = (
+            "<p class='status'>CSV uploads have been retired. Use the full FileMaker CRM sync below.</p>"
+        )
+    elif running:
+        message = (
+            "<p class='status'>The full CRM sync is currently running in the background.</p>"
+        )
+
+    if not sync_supported:
+        message = (
+            "<p class='status error'>Full CRM sync is unavailable because the FileMaker CRM cache "
+            "is not configured on this environment.</p>"
+        )
+
+    sync_button = f"""
+        <form class="upload-form" method="post" action="/crm-sync-full">
+            <button type="submit" {"disabled" if running or not sync_supported else ""}>
+                {"Full CRM Sync Running…" if running else "Run Full CRM Sync"}
+            </button>
+        </form>
+    """
+
+    body = f"""
+        {message}
+
+        <section class="panel">
+            <h2>Full CRM Sync</h2>
+            <p class="muted">
+                Rebuild the complete Sales Focus CRM cache from FileMaker. Outlook emails use
+                <strong>{escape(get_filemaker_crm_timestamp_field())}</strong> for their true email time;
+                meetings, calls, visits and other tasks fall back to <strong>Date Created</strong>.
+            </p>
+            <p class="muted">
+                This can take several minutes. Sales Focus remains available while it runs.
+                Scheduled refreshes remain incremental and faster.
+            </p>
+            {sync_button}
+        </section>
+
+        <div class="summary">
+            <div>
+                <span class="label">Status</span>
+                <strong>{"Running" if running else escape(str(active_result.get("status") or "Unknown").title())}</strong>
+            </div>
+            <div>
+                <span class="label">Last Full Sync</span>
+                <strong>{escape(str(last_synced))}</strong>
+            </div>
+            <div>
+                <span class="label">CRM Activities</span>
+                <strong>{int(counts.get("kept_rows") or len(active_result.get("activities", []))):,}</strong>
+            </div>
+            <div>
+                <span class="label">Matched Customers</span>
+                <strong>{int(counts.get("customer_count") or 0):,}</strong>
+            </div>
+        </div>
+
+        {render_crm_sync_status_panel(background_sync_status)}
+
+        <section class="panel">
+            <h2>Check Progress</h2>
+            <p class="muted">Refresh this page to see whether the background sync has finished.</p>
+            <a class="button secondary" href="/crm-data">Refresh Status</a>
+        </section>
+    """
+
+    return render_page(title="Full CRM Sync", body=body)
 
 
 def render_crm_sync_status_panel(sync_status):
@@ -30510,7 +30686,7 @@ def render_global_nav(title):
                 <a href="/dismissed-customers-view">Dismissed Customers</a>
                 <a href="/filemaker-health">FileMaker Health</a>
                 <a href="/crm-activities-view">CRM Activities</a>
-                <a href="/crm-data">CRM Data</a>
+                <a href="/crm-data">Full CRM Sync</a>
                 <a href="/sample-data">Sample Data</a>
                 <a href="/api">API</a>
             </div>
@@ -37208,40 +37384,79 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .crm-timeline-table th:nth-child(1),
                     .crm-timeline-table td:nth-child(1) {{
-                        width: 11%;
-                        min-width: 96px;
+                        width: 42%;
+                        min-width: 390px;
                         white-space: normal;
+                        overflow-wrap: anywhere;
                     }}
 
                     .crm-timeline-table th:nth-child(2),
                     .crm-timeline-table td:nth-child(2) {{
-                        width: 9%;
-                        min-width: 88px;
-                        white-space: normal;
-                    }}
-
-                    .crm-timeline-table th:nth-child(3),
-                    .crm-timeline-table td:nth-child(3) {{
-                        width: 18%;
-                        min-width: 150px;
+                        width: 58%;
+                        min-width: 460px;
                         white-space: normal;
                         overflow-wrap: anywhere;
                     }}
 
-                    .crm-timeline-table th:nth-child(4),
-                    .crm-timeline-table td:nth-child(4) {{
-                        width: 23%;
-                        min-width: 190px;
-                        white-space: normal;
-                        overflow-wrap: anywhere;
+                    .crm-activity-details {{
+                        display: grid;
+                        grid-template-columns: 150px minmax(0, 1fr);
+                        gap: 10px 12px;
+                        align-items: start;
                     }}
 
-                    .crm-timeline-table th:nth-child(5),
-                    .crm-timeline-table td:nth-child(5) {{
-                        width: 39%;
-                        min-width: 300px;
-                        white-space: normal;
-                        overflow-wrap: anywhere;
+                    .crm-detail-type {{
+                        grid-column: 1 / -1;
+                        display: flex;
+                        align-items: center;
+                        gap: 10px;
+                        flex-wrap: wrap;
+                    }}
+
+                    .crm-detail-type .crm-detail-label {{
+                        margin-bottom: 0;
+                    }}
+
+                    .crm-detail-date,
+                    .crm-detail-subject,
+                    .crm-detail-correspondents > div {{
+                        display: flex;
+                        align-items: baseline;
+                        gap: 5px;
+                        min-width: 0;
+                    }}
+
+                    .crm-detail-date .crm-detail-label,
+                    .crm-detail-subject .crm-detail-label,
+                    .crm-detail-correspondents .crm-detail-label {{
+                        flex: 0 0 auto;
+                        margin-bottom: 0;
+                    }}
+
+                    .crm-detail-type .crm-pill-stack {{
+                        flex-direction: row;
+                        align-items: center;
+                        gap: 6px;
+                        flex-wrap: wrap;
+                    }}
+
+                    .crm-detail-label {{
+                        display: block;
+                        margin-bottom: 5px;
+                        color: var(--muted);
+                        font-size: 10px;
+                        font-weight: 700;
+                        letter-spacing: .04em;
+                        text-transform: uppercase;
+                    }}
+
+                    .crm-detail-correspondents {{
+                        grid-column: 1 / -1;
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr);
+                        gap: 5px;
+                        color: #334e68;
+                        line-height: 1.35;
                     }}
 
                     .crm-activities-table {{
@@ -38034,6 +38249,13 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .activity-expand[open] summary {{
                         margin-bottom: 8px;
+                    }}
+
+                    .activity-full-status {{
+                        margin-top: 6px;
+                        color: var(--muted);
+                        font-size: 12px;
+                        line-height: 1.4;
                     }}
 
                     .contact-panel {{
@@ -40289,6 +40511,26 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         .customers-table td:nth-child(5)::before,
                         .customers-table td:nth-child(9)::before {{
                             white-space: nowrap;
+                        }}
+
+                        .customer-detail-page .crm-timeline-table td {{
+                            min-width: 0;
+                        }}
+
+                        .customer-detail-page .crm-timeline-table td:first-child {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .customer-detail-page .crm-timeline-table td:first-child::before {{
+                            display: none;
+                        }}
+
+                        .customer-detail-page .crm-activity-details {{
+                            grid-template-columns: repeat(2, minmax(0, 1fr));
+                        }}
+
+                        .customer-detail-page .crm-detail-correspondents {{
+                            grid-column: 1 / -1;
                         }}
 
                         .outreach-head,

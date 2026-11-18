@@ -17,6 +17,127 @@ class CustomersViewTests(unittest.TestCase):
         main.clear_customer_summaries_cache()
         main.clear_customer_contextual_activity_cache()
 
+    def test_truncated_crm_activity_loads_complete_body_when_expanded(self):
+        activity = {
+            "date_created": "2026-11-18 09:00:00",
+            "activity_category": "sales_outreach",
+            "direction": "outbound",
+            "subject": "Long email",
+            "sender_email": "sales@numatsystems.com",
+            "to": "customer@example.com",
+            "body": "A" * crm.get_filemaker_crm_cached_body_chars(),
+            "filemaker_record_id": "12345",
+        }
+
+        html = main.render_customer_crm_activity(activity)
+
+        self.assertIn('data-record-id="12345"', html)
+        self.assertIn('ontoggle="loadFullCrmBody(this)"', html)
+        self.assertIn("Expand to load the complete email.", html)
+
+    def test_short_crm_activity_expands_without_filemaker_reload(self):
+        html = main.render_expandable_activity(
+            "A short preview",
+            "A short preview with a little more detail",
+            "12345",
+            False,
+        )
+
+        self.assertIn("<details", html)
+        self.assertNotIn("data-record-id", html)
+        self.assertNotIn("loadFullCrmBody", html)
+
+    def test_full_crm_body_endpoint_returns_complete_filemaker_body(self):
+        full_body = "Complete message " * 500
+        record = {"fieldData": {"emails::body": full_body}}
+
+        with (
+            patch.object(main, "get_filemaker_emails_layout", return_value="emails"),
+            patch.object(
+                main,
+                "fetch_layout_record",
+                return_value={"status": "ok", "record": record},
+            ) as fetch_record,
+        ):
+            result = main.get_customer_crm_full_body("12345")
+
+        self.assertEqual(result, {"status": "ok", "body": full_body.strip()})
+        fetch_record.assert_called_once_with("emails", "12345")
+
+    def test_crm_rows_with_same_timestamp_show_newer_filemaker_record_first(self):
+        activities = [
+            {
+                "date_created": "2026-11-17 18:50:00",
+                "filemaker_record_id": "120",
+                "subject": "Earlier record",
+            },
+            {
+                "date_created": "2026-11-17 18:50:00",
+                "filemaker_record_id": "121",
+                "subject": "Later record",
+            },
+        ]
+
+        sorted_activities = main.sort_sales_activities_by_date(activities)
+
+        self.assertEqual(
+            [activity["subject"] for activity in sorted_activities],
+            ["Later record", "Earlier record"],
+        )
+
+    def test_outlook_crm_row_uses_received_datetime_instead_of_record_creation(self):
+        activity = crm.normalize_crm_row({
+            "emails::receivedDateTime": "11/16/2026 17:45:00",
+            "emails::Date Created": "11/17/2026 18:50:00",
+            "emails::sender_email": "customer@example.com",
+            "emails::To": "sales@numatsystems.com",
+        }, 1)
+
+        self.assertEqual(activity["date_created"], "2026-11-16 17:45:00")
+        self.assertEqual(activity["date_source"], "receivedDateTime")
+
+    def test_non_email_crm_row_falls_back_to_record_creation_datetime(self):
+        activity = crm.normalize_crm_row({
+            "emails::Date Created": "11/17/2026 09:30:00",
+            "emails::CRM Type": "Meeting",
+            "emails::sender_email": "sales@numatsystems.com",
+            "emails::To": "customer@example.com",
+        }, 1)
+
+        self.assertEqual(activity["date_created"], "2026-11-17 09:30:00")
+        self.assertEqual(activity["date_source"], "Date Created")
+
+    def test_manual_full_crm_sync_forces_complete_cache_rebuild(self):
+        with patch.object(
+            main,
+            "sync_filemaker_crm_cache",
+            return_value={"status": "ok"},
+        ) as sync:
+            main.run_crm_sync_in_background(trigger="manual_full")
+
+        sync.assert_called_once_with(force_full=True)
+        self.assertEqual(main.get_crm_sync_status()["status"], "ok")
+
+    def test_crm_admin_page_is_dedicated_to_full_sync(self):
+        active_result = {
+            "status": "ok",
+            "source": "filemaker_sync_cache",
+            "synced_at": "2026-11-18 10:00:00",
+            "activities": [{"subject": "One"}],
+            "counts": {"kept_rows": 1, "customer_count": 1},
+        }
+        with (
+            patch.object(main, "fetch_crm_activities", return_value=active_result),
+            patch.object(main, "auto_crm_sync_supported", return_value=True),
+            patch.object(main, "get_crm_sync_status", return_value={"running": False}),
+        ):
+            html = main.render_crm_data_page()
+
+        self.assertIn("Full CRM Sync", html)
+        self.assertIn("Run Full CRM Sync", html)
+        self.assertIn("receivedDateTime", html)
+        self.assertNotIn("Upload CRM CSV", html)
+
     def test_customer_search_reuses_built_directory_without_reloading_sources(self):
         summaries = [{"customer": "Vestis Uniform Services", "state": "IL"}]
         sources = (
@@ -1004,7 +1125,10 @@ class CustomersViewTests(unittest.TestCase):
             from pathlib import Path
             with TemporaryDirectory() as temp_dir:
                 cache_path = Path(temp_dir) / "recent.json"
-                cache_path.write_text(json.dumps({"activities": [older]}), encoding="utf-8")
+                cache_path.write_text(json.dumps({
+                    "timestamp_field": "receivedDateTime",
+                    "activities": [older],
+                }), encoding="utf-8")
                 with (
                     patch.object(crm, "get_filemaker_crm_recent_cache_path", return_value=cache_path),
                     patch.object(crm, "clear_crm_cache") as clear_cache,

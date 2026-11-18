@@ -330,6 +330,51 @@ def fetch_layout_records(layout, limit=100, offset=1, sort_fields=None):
         close_session(token)
 
 
+def fetch_layout_record(layout, record_id):
+    record_id = str(record_id or "").strip()
+    if not layout or not record_id:
+        return {"connected": False, "status": "missing_layout_or_record", "record": None}
+
+    token = None
+    try:
+        config = get_filemaker_config()
+        token = get_session_token()
+        if not token:
+            return {"connected": False, "status": "login_failed", "record": None}
+
+        layout_name = quote(layout, safe="")
+        safe_record_id = quote(record_id, safe="")
+        url = f"{get_database_path(config)}/layouts/{layout_name}/records/{safe_record_id}"
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+            verify=config["verify_ssl"],
+        )
+        if response.status_code != 200:
+            return {
+                "connected": True,
+                "status": f"http_{response.status_code}",
+                "record": None,
+            }
+        records = response.json().get("response", {}).get("data", [])
+        return {
+            "connected": True,
+            "status": "ok" if records else "record_not_found",
+            "record": records[0] if records else None,
+        }
+    except requests.RequestException as error:
+        return {
+            "connected": False,
+            "status": get_request_error_status(error),
+            "record": None,
+        }
+    except ValueError:
+        return {"connected": True, "status": "invalid_response", "record": None}
+    finally:
+        close_session(token)
+
+
 def find_layout_records(layout, query, limit=100, offset=1, sort_fields=None):
     if not layout or not query:
         return {

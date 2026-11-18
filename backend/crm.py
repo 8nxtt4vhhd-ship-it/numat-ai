@@ -201,7 +201,16 @@ def get_filemaker_crm_incremental_sync_enabled():
 
 
 def get_filemaker_crm_sort_field():
+    # Acquisition remains ordered by record creation so newly-created tasks,
+    # which have no receivedDateTime, are included in incremental refreshes.
     return os.getenv("FILEMAKER_CRM_SORT_FIELD", "Date Created").strip()
+
+
+def get_filemaker_crm_timestamp_field():
+    return os.getenv(
+        "FILEMAKER_CRM_TIMESTAMP_FIELD",
+        "receivedDateTime",
+    ).strip() or "receivedDateTime"
 
 
 def get_filemaker_crm_complete_field():
@@ -311,6 +320,33 @@ def get_filemaker_crm_cached_body_chars():
         return max(500, int(raw_limit))
     except ValueError:
         return 4000
+
+
+def get_full_crm_body_from_record(record):
+    field_data = (record or {}).get("fieldData", {})
+    return str(get_row_value(
+        field_data,
+        "emails::Body",
+        "emails::body",
+        "Body",
+        "body",
+        "emails::Content",
+        "emails::content",
+        "Content",
+        "content",
+        "emails::Message",
+        "emails::message",
+        "Message",
+        "message",
+    ) or "")
+
+
+def get_filemaker_crm_record_row(record):
+    row = dict((record or {}).get("fieldData", {}) or {})
+    record_id = str((record or {}).get("recordId") or "").strip()
+    if record_id:
+        row["__filemaker_record_id"] = record_id
+    return row
 
 
 def get_filemaker_crm_recent_cache_max_activities():
@@ -764,7 +800,7 @@ def build_filemaker_crm_result(limit_override=None):
                 return empty_crm_result("filemaker", layout, result["status"])
 
             batch_rows = [
-                record.get("fieldData", {})
+                get_filemaker_crm_record_row(record)
                 for record in result.get("records", [])
             ]
             rows.extend(batch_rows)
@@ -797,7 +833,7 @@ def build_filemaker_crm_result(limit_override=None):
             return empty_crm_result("filemaker", layout, result["status"])
 
         rows = [
-            record.get("fieldData", {})
+            get_filemaker_crm_record_row(record)
             for record in result.get("records", [])
         ]
 
@@ -856,7 +892,7 @@ def sync_filemaker_crm_recent_cache():
                 "filemaker", layout, result.get("status", "fetch_failed")
             )
         batch_rows = [
-            record.get("fieldData", {})
+            get_filemaker_crm_record_row(record)
             for record in result.get("records", [])
         ]
         for row in batch_rows:
@@ -877,13 +913,15 @@ def sync_filemaker_crm_recent_cache():
     return result
 
 
-def sync_filemaker_crm_cache():
+def sync_filemaker_crm_cache(force_full=False):
     existing_sync_result = read_filemaker_crm_sync_cache()
 
     if (
-        get_filemaker_crm_incremental_sync_enabled()
+        not force_full
+        and get_filemaker_crm_incremental_sync_enabled()
         and existing_sync_result is not None
         and existing_sync_result.get("activities")
+        and existing_sync_result.get("timestamp_field") == get_filemaker_crm_timestamp_field()
     ):
         incremental_result = sync_filemaker_crm_cache_incremental(existing_sync_result)
 
@@ -917,7 +955,7 @@ def sync_filemaker_crm_cache():
             return empty_crm_result("filemaker_sync_cache", str(get_filemaker_crm_cache_path()), result["status"])
 
         batch_rows = [
-            record.get("fieldData", {})
+            get_filemaker_crm_record_row(record)
             for record in result.get("records", [])
         ]
         total_rows += len(batch_rows)
@@ -988,9 +1026,17 @@ def get_latest_cached_crm_activity_timestamp(existing_sync_result):
 
     return max(
         (
-            str(activity.get("date_created") or "").strip()
+            str(
+                activity.get("filemaker_date_created")
+                or activity.get("date_created")
+                or ""
+            ).strip()
             for activity in activities
-            if str(activity.get("date_created") or "").strip()
+            if str(
+                activity.get("filemaker_date_created")
+                or activity.get("date_created")
+                or ""
+            ).strip()
         ),
         default="",
     )
@@ -1002,6 +1048,7 @@ def write_filemaker_crm_sync_payload(result):
     activities = compact_crm_activities_in_place(result.get("activities", []))
     payload = {
         "synced_at": result.get("synced_at", ""),
+        "timestamp_field": get_filemaker_crm_timestamp_field(),
         "source": result.get("source", "filemaker_sync_cache"),
         "status": result.get("status", "ok"),
         "path": result.get("path", str(cache_path)),
@@ -1045,7 +1092,7 @@ def sync_filemaker_crm_cache_incremental(existing_sync_result):
             return empty_crm_result("filemaker_sync_cache", str(get_filemaker_crm_cache_path()), result["status"])
 
         batch_rows = [
-            record.get("fieldData", {})
+            get_filemaker_crm_record_row(record)
             for record in result.get("records", [])
         ]
 
@@ -1054,7 +1101,11 @@ def sync_filemaker_crm_cache_incremental(existing_sync_result):
 
         for index, row in enumerate(batch_rows, start=offset):
             activity = normalize_crm_row(row, index=index)
-            activity_timestamp = str(activity.get("date_created") or "").strip()
+            activity_timestamp = str(
+                activity.get("filemaker_date_created")
+                or activity.get("date_created")
+                or ""
+            ).strip()
 
             if activity_timestamp and activity_timestamp <= latest_cached_timestamp:
                 reached_cached_rows = True
@@ -1118,9 +1169,10 @@ def write_filemaker_crm_recent_cache(result):
     ):
         try:
             existing_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            existing_activities = compact_crm_activities_in_place(
-                existing_payload.get("activities", [])
-            )
+            if existing_payload.get("timestamp_field") == get_filemaker_crm_timestamp_field():
+                existing_activities = compact_crm_activities_in_place(
+                    existing_payload.get("activities", [])
+                )
         except (OSError, ValueError):
             existing_activities = []
 
@@ -1137,6 +1189,7 @@ def write_filemaker_crm_recent_cache(result):
     result_counts = result.get("counts", {})
     payload = {
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp_field": get_filemaker_crm_timestamp_field(),
         "source": "filemaker_recent_cache",
         "status": "ok",
         "path": result.get("path", ""),
@@ -1202,6 +1255,7 @@ def read_filemaker_crm_recent_cache():
         "stale": True,
         "warning": "FileMaker CRM is currently unavailable. Showing the last successful cached CRM snapshot.",
         "synced_at": payload.get("updated_at", ""),
+        "timestamp_field": payload.get("timestamp_field", ""),
     }
 
 
@@ -1236,6 +1290,7 @@ def read_filemaker_crm_sync_cache():
             "unknown_direction_count": counts.get("unknown_direction_count", 0),
         },
         "synced_at": payload.get("synced_at", ""),
+        "timestamp_field": payload.get("timestamp_field", ""),
     }
 
 
@@ -1558,10 +1613,29 @@ def normalize_crm_row(row, index):
         )
     ).strip()
 
+    received_datetime = get_row_value(
+        row,
+        f"emails::{get_filemaker_crm_timestamp_field()}",
+        get_filemaker_crm_timestamp_field(),
+        "emails::receivedDateTime",
+        "receivedDateTime",
+    )
+    filemaker_date_created = get_row_value(
+        row,
+        "emails::Date Created",
+        "Date Created",
+    )
+
     return {
         "row_number": index,
+        "filemaker_record_id": str(row.get("__filemaker_record_id") or "").strip(),
         "date_created": normalize_crm_date(
-            get_row_value(row, "emails::Date Created", "Date Created")
+            received_datetime or filemaker_date_created
+        ),
+        "filemaker_date_created": normalize_crm_date(filemaker_date_created),
+        "date_source": (
+            get_filemaker_crm_timestamp_field()
+            if received_datetime else "Date Created"
         ),
         "subject": subject,
         "body": body[:get_filemaker_crm_cached_body_chars()],
