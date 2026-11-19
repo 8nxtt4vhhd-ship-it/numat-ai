@@ -34729,6 +34729,16 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         width: 8%;
                     }}
 
+                    .customer-shipments-table th:is(:nth-child(6), :nth-child(7), :nth-child(11), :nth-child(12)),
+                    .customer-shipments-table td:is(:nth-child(6), :nth-child(7), :nth-child(11), :nth-child(12)) {{
+                        text-align: center;
+                    }}
+
+                    .customer-shipments-table th:is(:nth-child(6), :nth-child(7), :nth-child(11), :nth-child(12)) .customer-table-sort {{
+                        width: 100%;
+                        text-align: center;
+                    }}
+
                     .customer-detail-tab:hover,
                     .customer-detail-tab.active {{
                         border-color: #b9ceff;
