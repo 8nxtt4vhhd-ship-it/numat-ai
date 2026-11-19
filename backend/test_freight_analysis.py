@@ -405,6 +405,25 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertNotIn("4000", html)
         self.assertIn("Shipment breakdown by order", html)
 
+    def test_customer_shipments_show_completed_orders_when_only_handling_units_are_available(self):
+        order = {
+            "customer": "Acme",
+            "order_date": "2026-11-18",
+            "amount": 1200,
+            "extra": {
+                "Orders::Order No": "4002",
+                "Orders::Status": "Complete",
+                "Act Arrival_Skids": 3,
+                "Despatch_No of Cages": 2,
+            },
+        }
+
+        html = main.render_customer_shipments([order])
+
+        self.assertIn("4002", html)
+        self.assertIn('data-label="Incoming skids"', html)
+        self.assertIn(">3</td>", html)
+
 
 if __name__ == "__main__":
     unittest.main()

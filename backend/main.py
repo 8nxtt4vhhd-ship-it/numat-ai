@@ -16172,12 +16172,21 @@ def build_freight_analysis_workbook(analysis, filters=None):
     return output.getvalue()
 
 
-def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=None):
+def build_freight_job_rows(
+    orders,
+    customer_records=None,
+    mat_counts_by_order=None,
+    include_shipment_only=False,
+):
     customer_records = customer_records or {}
     mat_counts_by_order = mat_counts_by_order or {}
     rows = []
     for order in orders or []:
-        if not order_has_freight_data(order):
+        if not (
+            order_has_shipment_data(order)
+            if include_shipment_only
+            else order_has_freight_data(order)
+        ):
             continue
         extra = order.get("extra") or {}
         customer_key = str(get_order_primary_key(order) or "").strip()
@@ -16260,11 +16269,14 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
 
 def render_customer_shipments(orders):
     rows = build_freight_job_rows(
-        order for order in orders
-        if is_complete_freight_order(order) and has_complete_freight_data(order)
+        (
+            order for order in orders
+            if is_complete_freight_order(order) and order_has_shipment_data(order)
+        ),
+        include_shipment_only=True,
     )
     if not rows:
-        return '<section class="panel"><p class="empty">No completed orders with complete freight data for this customer.</p></section>'
+        return '<section class="panel"><p class="empty">No completed orders with shipment data for this customer.</p></section>'
 
     columns = (
         ("Order No", "order_number", lambda value: escape(value or "—")),
@@ -21718,6 +21730,12 @@ FREIGHT_HANDLING_UNIT_FIELDS = (
 def order_has_freight_data(order):
     extra = (order or {}).get("extra") or {}
     return any(parse_freight_value(extra.get(field)) is not None for field in FREIGHT_FIELDS)
+
+
+def order_has_shipment_data(order):
+    extra = (order or {}).get("extra") or {}
+    shipment_fields = FREIGHT_FIELDS + FREIGHT_WEIGHT_FIELDS + FREIGHT_HANDLING_UNIT_FIELDS
+    return any(parse_freight_value(extra.get(field)) is not None for field in shipment_fields)
 
 
 def parse_freight_value(value):
