@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import daily_reports
-from daily_dash import build_daily_dash_payload, build_daily_dash_pdf
+from daily_dash import _format_us_date, build_daily_dash_payload, build_daily_dash_pdf
 from filemaker import map_filemaker_record_to_order
 
 
@@ -55,14 +55,21 @@ class DailyDashTests(unittest.TestCase):
             daily_invoice_target=8000,
         )
 
-        self.assertEqual([item["customer"] for item in payload["new_and_returning_accounts"]], ["Returning Co", "Brand New Co", "Regular Co"])
+        self.assertEqual([item["customer"] for item in payload["new_and_returning_accounts"]], ["Returning Co", "Brand New Co"])
         self.assertEqual(payload["new_and_returning_accounts"][0]["category"], "Lost & lapsed return")
         self.assertEqual(payload["new_and_returning_accounts"][1]["category"], "New")
 
-    def test_new_and_returning_accounts_shows_five_most_recent_across_months(self):
+    def test_new_and_returning_accounts_shows_four_most_recent_from_last_six_weeks(self):
         orders = [
-            {"order_date": f"2026-{month:02d}-01", "customer": f"Customer {month}", "customer_primary_key": f"customer-{month}"}
-            for month in range(1, 7)
+            {"order_date": order_date, "customer": f"Customer {index}", "customer_primary_key": f"customer-{index}"}
+            for index, order_date in enumerate((
+                "2026-09-01",
+                "2026-10-01",
+                "2026-10-10",
+                "2026-10-20",
+                "2026-11-01",
+                "2026-11-08",
+            ), start=1)
         ]
         production = sample_production_result()
         production["production_rows"][0]["date"] = "2026-11-09"
@@ -76,8 +83,12 @@ class DailyDashTests(unittest.TestCase):
 
         self.assertEqual(
             [item["customer"] for item in payload["new_and_returning_accounts"]],
-            ["Customer 6", "Customer 5", "Customer 4", "Customer 3", "Customer 2"],
+            ["Customer 6", "Customer 5", "Customer 4", "Customer 3"],
         )
+
+    def test_daily_dash_commercial_dates_use_us_format(self):
+        self.assertEqual(_format_us_date("2026-11-09"), "11/09/2026")
+        self.assertEqual(_format_us_date(""), "-")
     def test_order_mapping_accepts_filemaker_field_name_variations(self):
         record = {"recordId": "1", "fieldData": {
             "Orders::CreationTimestamp": "11/09/2026 09:37:25",

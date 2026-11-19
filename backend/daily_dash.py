@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 from app_settings import calculate_elapsed_invoice_target, get_daily_invoice_target
@@ -39,7 +39,9 @@ def _active_orders(orders, report_date):
     )
 
 
-def _new_and_returning_accounts(orders, report_date, limit=5):
+def _new_and_returning_accounts(orders, report_date, limit=4):
+    report_day = datetime.strptime(report_date, "%Y-%m-%d")
+    earliest_event_date = (report_day - timedelta(weeks=6)).strftime("%Y-%m-%d")
     orders_by_customer = defaultdict(list)
     for item in orders:
         order_date = str(item.get("order_date") or "")
@@ -72,11 +74,21 @@ def _new_and_returning_accounts(orders, report_date, limit=5):
                     "category": "Lost & lapsed return",
                     "detail": f"First order in {gap_days / 365.25:.1f} years",
                 })
-        if qualifying_events:
+        if qualifying_events and qualifying_events[-1]["order_date"] >= earliest_event_date:
             results.append(qualifying_events[-1])
 
     results.sort(key=lambda item: (item["order_date"], item["customer"].casefold()), reverse=True)
     return results[:limit]
+
+
+def _format_us_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
+    except ValueError:
+        return text
 
 
 def _new_orders_today(orders, report_date):
@@ -323,11 +335,11 @@ def build_daily_dash_pdf(payload):
 
     new_rows=[]
     for item in payload["new_and_returning_accounts"]:
-        new_rows.append([item.get("order_date") or "-",item.get("customer") or "-",item.get("detail") or "-"])
+        new_rows.append([_format_us_date(item.get("order_date")),item.get("customer") or "-",item.get("detail") or "-"])
     if not new_rows: new_rows=[["-","No qualifying accounts available","-"]]
     old_rows=[]
     for item in payload["oldest_orders"]:
-        extra=item.get("extra") or {}; old_rows.append([extra.get("Orders::Order No") or "-",item.get("customer") or "-",extra.get("Orders::Status") or "-",item.get("order_date") or "-"])
+        extra=item.get("extra") or {}; old_rows.append([extra.get("Orders::Order No") or "-",item.get("customer") or "-",extra.get("Orders::Status") or "-",_format_us_date(item.get("order_date"))])
     if not old_rows: old_rows=[["-","No open orders available","-","-"]]
     new_table=[Paragraph("New and returning accounts",styles["Section"]),data_table(["Date","Customer","Detail"],new_rows,[23*mm,77*mm,43*mm])]
     old_table=[Paragraph("Oldest orders in house",styles["Section"]),data_table(["Order","Customer","Stage","Received"],old_rows,[20*mm,65*mm,25*mm,23*mm])]
