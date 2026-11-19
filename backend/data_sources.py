@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+from tempfile import NamedTemporaryFile
 from threading import Lock
 import time
 from pathlib import Path
@@ -122,7 +123,7 @@ def clear_filemaker_orders_cache(clear_persisted=False):
             pass
 
 
-def fetch_cached_filemaker_orders():
+def fetch_cached_filemaker_orders(force_refresh=False):
     limit = get_filemaker_order_limit()
     cache_seconds = get_filemaker_cache_seconds()
     cache_key = build_filemaker_cache_key(limit)
@@ -134,7 +135,8 @@ def fetch_cached_filemaker_orders():
         disk_mtime = None
 
     if (
-        cache_seconds
+        not force_refresh
+        and cache_seconds
         and _FILEMAKER_ORDER_CACHE["key"] == cache_key
         and _FILEMAKER_ORDER_CACHE["result"] is not None
         and _FILEMAKER_ORDER_CACHE["expires_at"] > now
@@ -145,7 +147,7 @@ def fetch_cached_filemaker_orders():
     # A successful order snapshot is the durable shared cache between process
     # restarts. Explicit refresh paths delete it before fetching FileMaker.
     cached_snapshot = read_filemaker_orders_cache()
-    if cache_seconds and cached_snapshot is not None:
+    if not force_refresh and cache_seconds and cached_snapshot is not None:
         cached_result = {
             "connected": True,
             "status": "ok",
@@ -165,7 +167,8 @@ def fetch_cached_filemaker_orders():
         # Another request may have filled the cache while this one waited.
         now = time.time()
         if (
-            cache_seconds
+            not force_refresh
+            and cache_seconds
             and _FILEMAKER_ORDER_CACHE["key"] == cache_key
             and _FILEMAKER_ORDER_CACHE["result"] is not None
             and _FILEMAKER_ORDER_CACHE["expires_at"] > now
@@ -189,6 +192,9 @@ def fetch_cached_filemaker_orders():
                 _FILEMAKER_ORDER_CACHE["disk_mtime"] = get_filemaker_orders_cache_path().stat().st_mtime_ns
             except FileNotFoundError:
                 _FILEMAKER_ORDER_CACHE["disk_mtime"] = None
+            return result
+
+        if force_refresh:
             return result
 
         cached_snapshot = read_filemaker_orders_cache()
@@ -239,7 +245,14 @@ def write_filemaker_orders_cache(result):
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "orders": result.get("orders", []),
     }
-    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_path.parent, delete=False) as cache_file:
+        temporary_path = Path(cache_file.name)
+        try:
+            json.dump(payload, cache_file)
+            cache_file.close()
+            temporary_path.replace(cache_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def read_filemaker_orders_cache():

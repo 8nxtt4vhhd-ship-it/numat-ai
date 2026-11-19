@@ -1034,6 +1034,10 @@ class CustomersViewTests(unittest.TestCase):
         self.assertEqual(main.normalize_customers_return_to("https://example.com/customers-view"), "")
         self.assertEqual(main.normalize_customers_return_to("/orders-view"), "")
         self.assertEqual(
+            main.normalize_customer_detail_return_to("/orders-view?tab=incoming&page=2"),
+            "/orders-view?tab=incoming&page=2",
+        )
+        self.assertEqual(
             main.normalize_customer_detail_return_to(
                 "/action-plan-view?selected_customer=Filtered+Customer#focus-preview"
             ),
@@ -1115,6 +1119,50 @@ class CustomersViewTests(unittest.TestCase):
         self.assertEqual(loaded["orders"], snapshot["orders"])
         self.assertEqual(loaded["cache_updated_at"], snapshot["updated_at"])
         fetch.assert_not_called()
+
+    def test_forced_order_refresh_bypasses_saved_snapshot(self):
+        snapshot = {
+            "updated_at": "2026-10-30 08:00:00",
+            "orders": [{"order_number": "old"}],
+        }
+        refreshed = {"status": "ok", "orders": [{"order_number": "new"}]}
+        with (
+            patch.object(data_sources, "get_filemaker_order_limit", return_value=1000),
+            patch.object(data_sources, "get_filemaker_cache_seconds", return_value=120),
+            patch.object(data_sources, "build_filemaker_cache_key", return_value=("orders",)),
+            patch.object(data_sources, "read_filemaker_orders_cache", return_value=snapshot),
+            patch.object(data_sources, "fetch_order_records", return_value=refreshed) as fetch,
+            patch.object(data_sources, "write_filemaker_orders_cache") as write,
+        ):
+            loaded = data_sources.fetch_cached_filemaker_orders(force_refresh=True)
+
+        self.assertIs(loaded, refreshed)
+        fetch.assert_called_once_with(limit=1000)
+        write.assert_called_once_with(refreshed)
+
+    def test_orders_sync_refreshes_filemaker_and_preserves_view(self):
+        with (
+            patch.object(main, "get_order_data_source", return_value="filemaker"),
+            patch.object(
+                main,
+                "fetch_cached_filemaker_orders",
+                return_value={"status": "ok", "orders": []},
+            ) as refresh,
+        ):
+            response = main.post_orders_view_sync(
+                customer="Acme",
+                status="Complete",
+                sort="customer",
+                direction="asc",
+                tab="orders",
+                page=3,
+            )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("customer=Acme", response.headers["location"])
+        self.assertIn("page=3", response.headers["location"])
+        self.assertIn("sync=ok", response.headers["location"])
+        refresh.assert_called_once_with(force_refresh=True)
 
     def test_customer_sync_redirects_back_with_confirmation(self):
         result = {"status": "ok", "customers_by_key": {"one": {}, "two": {}}}

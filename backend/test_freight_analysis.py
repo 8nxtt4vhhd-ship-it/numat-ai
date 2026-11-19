@@ -370,6 +370,41 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(main.normalize_mat_size_key("3 × 5"), "3x5")
 
+    def test_customer_shipments_only_show_complete_orders_with_complete_freight_data(self):
+        complete = {
+            "customer": "Acme",
+            "order_date": "2026-11-18",
+            "amount": 1200,
+            "extra": {
+                "Orders::Order No": "4001",
+                "Orders::Status": "Complete",
+                "Incoming Freight": 100,
+                "Incoming Cost": 80,
+                "Outgoing Freight": 120,
+                "Outgoing Cost": 90,
+                "Act Arrival_Gross Weight": 1000,
+                "Act Arrival_Nett Weight": 900,
+                "Act Arrival_Skids": 2,
+                "Act Arrival_Cages": 1,
+                "Despatch_Gross Wright": 950,
+                "Despatch_Nett Weight": 850,
+                "Despatch_No of Skids": 2,
+                "Despatch_No of Cages": 1,
+            },
+        }
+        incomplete = {
+            "customer": "Acme",
+            "order_date": "2026-11-17",
+            "amount": 800,
+            "extra": {"Orders::Order No": "4000", "Orders::Status": "In Production"},
+        }
+
+        html = main.render_customer_shipments([complete, incomplete])
+
+        self.assertIn("4001", html)
+        self.assertNotIn("4000", html)
+        self.assertIn("Shipment breakdown by order", html)
+
 
 if __name__ == "__main__":
     unittest.main()

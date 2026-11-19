@@ -63,6 +63,8 @@ from app_settings import (
 from data_sources import (
     MAX_SAMPLE_ROWS,
     clear_filemaker_orders_cache,
+    fetch_cached_filemaker_orders,
+    get_order_data_source,
     get_orders_for_analysis,
     get_filemaker_order_limit,
     get_sample_csv_path,
@@ -14340,12 +14342,63 @@ def download_ai_company_comparison(token: str):
     )
 
 
+ORDER_VIEW_SORT_COLUMNS = {
+    "order_no": "Order No",
+    "customer": "Customer",
+    "order_date": "Order Date",
+    "amount": "Amount",
+    "status": "Status",
+    "price_list": "Price List",
+    "state": "State",
+    "territory": "Territory",
+}
+
+ORDER_VIEW_TABS = {"orders": "Orders", "incoming": "Incoming", "outgoing": "Outgoing"}
+ORDER_VIEW_FREIGHT_COLUMNS = {
+    "incoming": {
+        "Expected Arrival Skids": "Expected Skids",
+        "Expected Arrival Cages": "Expected Cages",
+        "Expected Arrival Weight": "Expected Weight",
+    },
+    "outgoing": {
+        "Despatch_No of Skids": "Dispatch Skids",
+        "Despatch_No of Cages": "Dispatch Cages",
+        "Despatch_Gross Wright": "Dispatch Gross Weight (lb)",
+        "Despatch_Nett Weight": "Dispatch Net Weight (lb)",
+    },
+}
+
+
+@app.post("/orders-view/sync")
+def post_orders_view_sync(
+    customer: str = Form(""),
+    status: str = Form(""),
+    sort: str = Form("order_date"),
+    direction: str = Form("desc"),
+    tab: str = Form("orders"),
+    page: int = Form(1),
+):
+    sync = "unavailable"
+    if get_order_data_source() == "filemaker":
+        try:
+            result = fetch_cached_filemaker_orders(force_refresh=True)
+        except OSError:
+            sync = "failed"
+        else:
+            sync = "ok" if result.get("status") == "ok" else "failed"
+    query = urlencode(dict(customer=customer, status=status, sort=sort, direction=direction, tab=tab, page=page, sync=sync))
+    return RedirectResponse(f"/orders-view?{query}", status_code=303)
+
+
 @app.get("/orders-view", response_class=HTMLResponse)
 def get_orders_view(
     customer: str = "",
     status: str = "",
     sort: str = "order_date",
     direction: str = "desc",
+    tab: str = "orders",
+    sync: str = "",
+    page: int = 1,
 ):
     result = get_orders_for_analysis()
     orders = result["orders"]
@@ -14359,67 +14412,102 @@ def get_orders_view(
             )
         )
 
+    tab = tab if tab in ORDER_VIEW_TABS else "orders"
+    freight_columns = ORDER_VIEW_FREIGHT_COLUMNS.get(tab, {})
+    columns = ORDER_VIEW_SORT_COLUMNS.copy()
+    if freight_columns:
+        del columns["amount"]
+        del columns["price_list"]
+        columns.update(freight_columns)
+    table_class = ' class="orders-freight-table"' if freight_columns else ""
+    if tab == "incoming":
+        orders = [
+            order for order in orders
+            if str(
+                (order.get("extra") or {}).get("Orders::Stage")
+                or (order.get("extra") or {}).get("Orders::Status")
+                or ""
+            ).strip().casefold() == "incoming"
+        ]
+    elif tab == "outgoing":
+        orders = filter_orders(orders, status="shipping")
+
+    sort = sort if sort in columns else "order_date"
+    direction = "asc" if direction == "asc" else "desc"
+    status_options = {"": "All statuses"}
+    order_statuses = {
+        str((order.get("extra") or {}).get("Orders::Status") or "").strip()
+        for order in orders
+    }
+    for label in sorted(order_statuses - {""}, key=lambda label: (label.lower(), label)):
+        status_options.setdefault(label.lower(), label)
+    selected_status = status.strip().lower()
+    if selected_status:
+        status_options.setdefault(selected_status, status.strip())
+
+    status = status if tab == "orders" else ""
     filtered_orders = filter_orders(orders, customer=customer, status=status)
     sorted_orders = sort_orders(
         filtered_orders,
         sort_key=sort,
-        direction=direction
+        direction=direction,
+        freight_columns=freight_columns,
     )
 
+    orders_filters = {
+        "customer": customer,
+        "status": status,
+        "sort": sort,
+        "direction": direction,
+        "tab": tab,
+    }
+    pagination = ""
+    visible_orders = sorted_orders
+    if tab == "orders":
+        page_size = 100
+        total_orders = len(sorted_orders)
+        total_pages = max(1, (total_orders + page_size - 1) // page_size)
+        page = min(max(1, page), total_pages)
+        start = (page - 1) * page_size
+        visible_orders = sorted_orders[start:start + page_size]
+        if total_pages > 1:
+            pagination = render_orders_pagination(
+                orders_filters, page, total_pages, start + 1, start + len(visible_orders), total_orders
+            )
+        orders_filters["page"] = str(page)
+    orders_query = urlencode(orders_filters)
+    orders_return_to = f"/orders-view?{orders_query}"
     rows = "".join(
-        render_customer_order_row(order)
-        for order in sorted_orders
+        render_customer_order_row(
+            order, customer_return_to=orders_return_to, freight_columns=freight_columns, show_record=False
+        )
+        for order in visible_orders
     )
 
     if not rows:
         rows = (
             "<tr>"
-            "<td colspan='9' class='empty'>No orders match the current filters.</td>"
+            f"<td colspan='{len(columns)}' class='empty'>No orders match the current filters.</td>"
             "</tr>"
         )
 
     body = f"""
         {render_data_availability_banner(result)}
 
-        <div class="summary customer-summary apollo-summary">
-            <div>
-                <span class="label">Source</span>
-                <strong>{escape(result["source"])}</strong>
-            </div>
-            <div>
-                <span class="label">Status</span>
-                <strong>{escape(result["status"])}</strong>
-            </div>
-            <div>
-                <span class="label">Orders</span>
-                <strong>{len(orders)}</strong>
-            </div>
-            <div>
-                <span class="label">Showing</span>
-                <strong>{len(sorted_orders)}</strong>
-            </div>
-        </div>
-
-        {render_orders_filter_form(customer, status, sort, direction)}
+        {render_orders_toolbar(tab, customer, orders_filters, sync)}
+        {render_orders_filter_form(customer, selected_status, sort, direction, status_options, tab, columns)}
 
         <div class="table-wrap tall-table">
-        <table>
+        <table{table_class}>
             <thead>
                 <tr>
-                    <th>Record</th>
-                    <th>Customer</th>
-                    <th>Order Date</th>
-                    <th>Amount</th>
-                    <th>Order No</th>
-                    <th>Status</th>
-                    <th>Price List</th>
-                    <th>State</th>
-                    <th>Territory</th>
+                    {render_orders_sort_headers(customer, status, sort, direction, tab, columns)}
                 </tr>
             </thead>
             <tbody>{rows}</tbody>
         </table>
         </div>
+        {pagination}
     """
 
     return render_page(title="Orders", body=body)
@@ -16168,6 +16256,61 @@ def build_freight_job_rows(orders, customer_records=None, mat_counts_by_order=No
         })
     rows.sort(key=lambda item: (item["order_date"], item["order_number"]), reverse=True)
     return rows
+
+
+def render_customer_shipments(orders):
+    rows = build_freight_job_rows(
+        order for order in orders
+        if is_complete_freight_order(order) and has_complete_freight_data(order)
+    )
+    if not rows:
+        return '<section class="panel"><p class="empty">No completed orders with complete freight data for this customer.</p></section>'
+
+    columns = (
+        ("Order No", "order_number", lambda value: escape(value or "—")),
+        ("Order Date", "order_date", lambda value: format_customer_list_date(value, "—")),
+        ("Repair revenue", "repair_revenue", format_currency),
+        ("Incoming gross (lb)", "incoming_gross_weight", format_shipment_quantity),
+        ("Incoming net (lb)", "incoming_net_weight", format_shipment_quantity),
+        ("Incoming skids", "incoming_skids", format_shipment_count),
+        ("Incoming cages", "incoming_cages", format_shipment_count),
+        ("Incoming cost", "incoming_cost", format_currency),
+        ("Outgoing gross (lb)", "outgoing_gross_weight", format_shipment_quantity),
+        ("Outgoing net (lb)", "outgoing_net_weight", format_shipment_quantity),
+        ("Outgoing skids", "outgoing_skids", format_shipment_count),
+        ("Outgoing cages", "outgoing_cages", format_shipment_count),
+        ("Outgoing cost", "outgoing_cost", format_currency),
+        ("Total freight cost", "total_freight_cost", format_currency),
+    )
+    sort_columns = [
+        (label, "date" if key == "order_date" else "number")
+        for label, key, _ in columns
+    ]
+    headers = render_customer_table_sort_headers(sort_columns, "Order Date", "desc")
+    table_rows = []
+    for row in rows:
+        cells = "".join(
+            f'<td data-label="{label}" data-sort-value="{escape(str(row[key]) if row[key] is not None else "")}">{formatter(row[key])}</td>'
+            for label, key, formatter in columns
+        )
+        table_rows.append(f"<tr>{cells}</tr>")
+    return f"""
+        {render_customer_table_mobile_sort(sort_columns)}
+        <div class="table-wrap tall-table">
+            <table class="customer-shipments-table" data-customer-sortable aria-label="Shipment breakdown by order">
+                <thead><tr>{headers}</tr></thead>
+                <tbody>{"".join(table_rows)}</tbody>
+            </table>
+        </div>
+    """
+
+
+def format_shipment_quantity(value):
+    return f"{value:,.0f}" if value is not None else "—"
+
+
+def format_shipment_count(value):
+    return format_shipment_quantity(value) if value else ""
 
 
 def build_freight_job_detail_workbook(
@@ -18258,11 +18401,19 @@ def get_customer_view(
 
     if customer_orders:
         rows = "".join(render_customer_order_row(order) for order in sorted_orders)
+        order_columns = [
+            ("Record", "number"), ("Customer", "text"), ("Order Date", "date"),
+            ("Amount", "number"), ("Order No", "number"), ("Status", "text"),
+            ("Price List", "text"), ("State", "text"), ("Territory", "text"),
+        ]
+        sort_label = {"filemaker_record_id": "Record", **ORDER_VIEW_SORT_COLUMNS}.get(sort)
+        order_headers = render_customer_table_sort_headers(order_columns, sort_label, direction)
         order_history_html = f"""
             {render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category, customers_return_to)}
+            {render_customer_table_mobile_sort(order_columns)}
             <div class="table-wrap tall-table">
-            <table>
-                <thead><tr><th>Record</th><th>Customer</th><th>Order Date</th><th>Amount</th><th>Order No</th><th>Status</th><th>Price List</th><th>State</th><th>Territory</th></tr></thead>
+            <table data-customer-sortable>
+                <thead><tr>{order_headers}</tr></thead>
                 <tbody>{rows}</tbody>
             </table>
             </div>
@@ -18345,6 +18496,7 @@ def get_customer_view(
             <button class="customer-detail-tab active" type="button" role="tab" aria-selected="true" data-customer-tab="customer-outreach-tab">Outreach</button>
             <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-crm-tab">CRM <span class="customer-tab-count">{len(crm_activities)}</span></button>
             <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-orders-tab">Orders <span class="customer-tab-count">{len(customer_orders)}</span></button>
+            <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" aria-controls="customer-shipments-tab" id="customer-shipments-button" data-customer-tab="customer-shipments-tab">Shipments</button>
             <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-contacts-tab">Contacts <span class="customer-tab-count">{len(customer_contacts)}</span></button>
         </div>
 
@@ -18380,6 +18532,10 @@ def get_customer_view(
         {order_history_html}
         </div>
 
+        <div class="customer-detail-tab-panel" id="customer-shipments-tab" role="tabpanel" aria-labelledby="customer-shipments-button" hidden>
+        {render_customer_shipments(customer_orders)}
+        </div>
+
         <div class="customer-detail-tab-panel" id="customer-contacts-tab" role="tabpanel" hidden>
         {contacts_html}
         </div>
@@ -18388,6 +18544,37 @@ def get_customer_view(
             (function () {{
                 const tabs = Array.from(document.querySelectorAll('[data-customer-tab]'));
                 const panels = Array.from(document.querySelectorAll('.customer-detail-tab-panel'));
+                document.querySelectorAll('[data-customer-sortable]').forEach(table => {{
+                    const headers = Array.from(table.tHead.rows[0].cells);
+                    const mobileSort = table.closest('.customer-detail-tab-panel').querySelector('[data-mobile-table-sort]');
+                    const collator = new Intl.Collator(undefined, {{numeric: true, sensitivity: 'base'}});
+                    function sortBy(index) {{
+                        const header = headers[index];
+                        const ascending = header.getAttribute('aria-sort') !== 'ascending';
+                        const numeric = header.dataset.sortType === 'number';
+                        const body = table.tBodies[0];
+                        function value(row) {{
+                            const cell = row.cells[index];
+                            const text = (cell.dataset.sortValue ?? cell.textContent).trim();
+                            if (!text || text === '—') return null;
+                            if (!numeric) return text;
+                            const clean = text.replace(/[$,]/g, '');
+                            return Number.isFinite(Number(clean)) ? Number(clean) : null;
+                        }}
+                        const rows = Array.from(body.rows);
+                        rows.sort((a, b) => {{
+                            const left = value(a), right = value(b);
+                            if (left === null || right === null) return Number(left === null) - Number(right === null);
+                            const result = numeric ? left - right : collator.compare(left, right);
+                            return ascending ? result : -result;
+                        }});
+                        headers.forEach(item => item.removeAttribute('aria-sort'));
+                        header.setAttribute('aria-sort', ascending ? 'ascending' : 'descending');
+                        rows.forEach(row => body.appendChild(row));
+                    }}
+                    headers.forEach((header, index) => header.querySelector('button').addEventListener('click', () => sortBy(index)));
+                    mobileSort.querySelector('button').addEventListener('click', () => sortBy(Number(mobileSort.querySelector('select').value)));
+                }});
                 function activateCustomerTab(panelId, updateHash) {{
                     if (!panels.some(panel => panel.id === panelId)) panelId = 'customer-outreach-tab';
                     tabs.forEach(tab => {{
@@ -18416,7 +18603,10 @@ def get_customer_view(
 
     log_perf_metric("customer_detail.total", view_started_at)
     return_path = urlsplit(customers_return_to).path if customers_return_to else ""
-    back_label = "Back to Action Plan" if return_path == "/action-plan-view" else "Back to customers"
+    back_label = {
+        "/action-plan-view": "Back to Action Plan",
+        "/orders-view": "Back to Orders",
+    }.get(return_path, "Back to customers")
     back_action = (
         f'<a class="button secondary small-button" href="{escape(customers_return_to)}">{back_label}</a>'
         if customers_return_to else ""
@@ -19061,22 +19251,44 @@ def render_order_row(order):
     """
 
 
-def render_customer_order_row(order):
-    extra = order.get("extra", {})
-    customer_name = str(order.get("customer", ""))
+def render_customer_order_row(order, customer_return_to="", freight_columns=None, show_record=True):
+    extra = order.get("extra") or {}
+    customer_name = str(order.get("customer") or "")
+    customer_markup = escape(customer_name)
+    if customer_name.strip() and customer_return_to:
+        query = urlencode({"customer": customer_name, "return_to": customer_return_to})
+        customer_markup = (
+            f'<a class="customer-name-link order-customer-link" href="/customer-view?{escape(query)}">'
+            f'{customer_markup}</a>'
+        )
     order_date = format_customer_list_date(order.get("order_date"), "—")
+    order_no_cell = f'<td data-label="Order no">{escape(str(extra.get("Orders::Order No", "")))}</td>'
+    record_cell = ""
+    if show_record:
+        record_cell = f'<td data-label="Record">{escape(str(order.get("filemaker_record_id", "")))}</td>'
+    amount_cell = price_list_cell = ""
+    if not freight_columns:
+        amount_cell = f'<td data-label="Amount">{escape(str(order.get("amount", "")))}</td>'
+        price_list_cell = f'<td data-label="Price list">{escape(str(get_order_price_list(order)))}</td>'
+    freight_cells = []
+    for field, label in (freight_columns or {}).items():
+        value = extra.get(field)
+        display_value = escape(str(value).strip()) if value is not None and str(value).strip() else "—"
+        freight_cells.append(f'<td data-label="{escape(label)}">{display_value}</td>')
 
     return f"""
         <tr>
-            <td data-label="Record">{escape(str(order.get("filemaker_record_id", "")))}</td>
-            <td data-label="Customer">{escape(customer_name)}</td>
-            <td data-label="Order date">{order_date}</td>
-            <td data-label="Amount">{escape(str(order.get("amount", "")))}</td>
-            <td data-label="Order no">{escape(str(extra.get("Orders::Order No", "")))}</td>
+            {record_cell}
+            {order_no_cell if not show_record else ""}
+            <td data-label="Customer">{customer_markup}</td>
+            <td data-sort-value="{escape(str(order.get("order_date") or ""))}" data-label="Order date">{order_date}</td>
+            {amount_cell}
+            {order_no_cell if show_record else ""}
             <td data-label="Status">{escape(str(extra.get("Orders::Status", "")))}</td>
-            <td data-label="Price list">{escape(str(get_order_price_list(order)))}</td>
+            {price_list_cell}
             <td data-label="State">{escape(str(get_order_state(order)))}</td>
             <td data-label="Territory">{escape(str(get_order_territory(order)))}</td>
+            {"".join(freight_cells)}
         </tr>
     """
 
@@ -19634,7 +19846,7 @@ def normalize_customer_detail_return_to(return_to):
     if not value:
         return ""
     parts = urlsplit(value)
-    if parts.scheme or parts.netloc or parts.path not in {"/customers-view", "/action-plan-view"}:
+    if parts.scheme or parts.netloc or parts.path not in {"/customers-view", "/action-plan-view", "/orders-view"}:
         return ""
     return urlunsplit(("", "", parts.path, parts.query, parts.fragment))
 
@@ -21318,9 +21530,9 @@ def filter_orders(orders, customer="", status=""):
     filtered_orders = []
 
     for order in orders:
-        extra = order.get("extra", {})
+        extra = order.get("extra") or {}
         order_customer = str(order.get("customer", "")).lower()
-        order_status = str(extra.get("Orders::Status", "")).lower()
+        order_status = str(extra.get("Orders::Status") or "").strip().lower()
 
         if customer_filter and customer_filter not in order_customer:
             continue
@@ -21353,19 +21565,20 @@ def filter_late_customers(customers, customer="", action=""):
     return filtered_customers
 
 
-def sort_orders(orders, sort_key="order_date", direction="desc"):
-    valid_sort_keys = {
-        "customer",
-        "order_date",
-        "amount",
-        "order_no",
-        "status",
-        "state",
-        "territory",
-        "last_activity",
-    }
+def sort_orders(orders, sort_key="order_date", direction="desc", freight_columns=None):
+    if sort_key in (freight_columns or {}):
+        with_values = []
+        without_values = []
+        for order in orders:
+            value = parse_freight_value((order.get("extra") or {}).get(sort_key))
+            if value is None:
+                without_values.append(order)
+            else:
+                with_values.append((value, order))
+        with_values.sort(key=lambda item: item[0], reverse=direction != "asc")
+        return [order for _, order in with_values] + without_values
 
-    if sort_key not in valid_sort_keys:
+    if sort_key not in ORDER_VIEW_SORT_COLUMNS and sort_key not in {"filemaker_record_id", "last_activity"}:
         sort_key = "order_date"
 
     reverse = direction != "asc"
@@ -21386,11 +21599,15 @@ def get_order_sort_value(order, sort_key):
         except ValueError:
             return 0
 
-    if sort_key == "order_no":
+    if sort_key in ("order_no", "filemaker_record_id"):
+        value = extra.get("Orders::Order No") if sort_key == "order_no" else order.get("filemaker_record_id")
         try:
-            return int(extra.get("Orders::Order No") or 0)
+            return int(value or 0)
         except ValueError:
             return 0
+
+    if sort_key == "price_list":
+        return str(get_order_price_list(order)).lower()
 
     if sort_key == "status":
         return str(extra.get("Orders::Status", "")).lower()
@@ -27279,23 +27496,98 @@ def analysis_date_filter_error(start="", end=""):
     return ""
 
 
-def render_orders_filter_form(customer, status, sort, direction):
-    sort_options = {
-        "order_date": "Order Date",
-        "customer": "Customer",
-        "amount": "Amount",
-        "order_no": "Order No",
-        "status": "Status",
-        "state": "State",
-        "territory": "Territory",
-    }
+def render_orders_tabs(tab, customer):
+    links = []
+    for key, label in ORDER_VIEW_TABS.items():
+        class_name = "toggle-chip active" if key == tab else "toggle-chip"
+        current = ' aria-current="page"' if key == tab else ""
+        query = urlencode({"tab": key, "customer": customer})
+        links.append(f'<a class="{class_name}" href="/orders-view?{escape(query)}"{current}>{label}</a>')
+    return f'<nav class="home-view-toggle orders-tabs" aria-label="Order views">{"".join(links)}</nav>'
+
+
+def render_orders_pagination(filters, page, total_pages, first_order, last_order, total_orders):
+    links = []
+    for label, target in (("Previous", page - 1), ("Next", page + 1)):
+        if 1 <= target <= total_pages:
+            query = escape(urlencode({**filters, "page": target}))
+            links.append(f'<a class="button secondary pager-button" href="/orders-view?{query}">{label}</a>')
+    return f"""
+        <nav class="pager customers-pager" aria-label="Orders pagination">
+            <span class="small muted">Showing {first_order:,} to {last_order:,} of {total_orders:,} orders</span>
+            <span class="small muted">Page {page:,} of {total_pages:,}</span>
+            <div class="pager-actions">{"".join(links)}</div>
+        </nav>
+    """
+
+
+def render_orders_toolbar(tab, customer, filters, sync):
+    fields = "".join(
+        f'<input type="hidden" name="{key}" value="{escape(value)}">'
+        for key, value in filters.items()
+    )
+    notice = {
+        "ok": '<span class="orders-sync-notice" role="status">Orders synced.</span>',
+        "failed": '<span class="orders-sync-notice sync-error" role="status">Could not sync orders from FileMaker.</span>',
+        "unavailable": '<span class="orders-sync-notice sync-error" role="status">FileMaker is not the active order source.</span>',
+    }.get(sync, "")
+    return f"""
+        <div class="orders-toolbar">
+            {render_orders_tabs(tab, customer)}
+            <div class="orders-sync-actions">
+                {notice}
+                <form method="post" action="/orders-view/sync">
+                    {fields}
+                    <button type="submit" class="button secondary">Sync Orders</button>
+                </form>
+            </div>
+        </div>
+    """
+
+
+def render_orders_sort_headers(customer, status, current_sort, current_direction, tab, columns):
+    headers = []
+    for key, label in columns.items():
+        active = key == current_sort
+        descending = active and current_direction == "desc"
+        next_direction = "asc" if descending or not active else "desc"
+        aria_sort = ("descending" if descending else "ascending") if active else "none"
+        indicator = ("↓" if descending else "↑") if active else "↕"
+        query = urlencode({
+            "customer": customer,
+            "status": status,
+            "sort": key,
+            "direction": next_direction,
+            "tab": tab,
+        })
+        headers.append(
+            f'<th scope="col" aria-sort="{aria_sort}"><a class="table-sort-link" '
+            f'href="/orders-view?{escape(query)}">{escape(label)}&nbsp;'
+            f'<span aria-hidden="true">{indicator}</span></a></th>'
+        )
+    return "".join(headers)
+
+
+def render_orders_filter_form(customer, status, sort, direction, status_options, tab, columns):
     direction_options = {
         "desc": "Descending",
         "asc": "Ascending",
     }
+    status_control = ""
+    if tab == "orders":
+        status_control = f"""
+            <label>
+                <span>Status</span>
+                <select name="status">
+                    {render_select_options(status_options, status)}
+                </select>
+            </label>
+        """
+    reset_query = urlencode({"tab": tab})
 
     return f"""
-        <form class="controls" method="get" action="/orders-view">
+        <form class="controls orders-filter-controls" method="get" action="/orders-view">
+            <input type="hidden" name="tab" value="{escape(tab)}">
             <label>
                 <span>Customer</span>
                 <input
@@ -27306,20 +27598,12 @@ def render_orders_filter_form(customer, status, sort, direction):
                 >
             </label>
 
-            <label>
-                <span>Status</span>
-                <input
-                    type="search"
-                    name="status"
-                    value="{escape(status)}"
-                    placeholder="Complete"
-                >
-            </label>
+            {status_control}
 
             <label>
                 <span>Sort</span>
                 <select name="sort">
-                    {render_select_options(sort_options, sort)}
+                    {render_select_options(columns, sort)}
                 </select>
             </label>
 
@@ -27331,7 +27615,7 @@ def render_orders_filter_form(customer, status, sort, direction):
             </label>
 
             <button type="submit">Apply</button>
-            <a class="button secondary" href="/orders-view">Reset</a>
+            <a class="button secondary" href="/orders-view?{escape(reset_query)}">Reset</a>
         </form>
     """
 
@@ -30596,6 +30880,32 @@ def extract_apollo_phone(person):
     return str(first_phone)
 
 
+def render_customer_table_sort_headers(columns, sort_label, direction):
+    headers = []
+    for label, sort_type in columns:
+        active = ""
+        if label == sort_label:
+            active = ' aria-sort="ascending"' if direction == "asc" else ' aria-sort="descending"'
+        headers.append(
+            f'<th scope="col" data-sort-type="{sort_type}"{active}>'
+            f'<button type="button" class="customer-table-sort">{escape(label)}</button></th>'
+        )
+    return "".join(headers)
+
+
+def render_customer_table_mobile_sort(columns):
+    options = "".join(
+        f'<option value="{index}">{escape(label)}</option>'
+        for index, (label, _) in enumerate(columns)
+    )
+    return f"""
+        <div class="customer-table-mobile-sort" data-mobile-table-sort>
+            <select aria-label="Sort column">{options}</select>
+            <button type="button">Sort</button>
+        </div>
+    """
+
+
 def render_customer_sort_form(customer, sort, direction, crm_limit, crm_page, crm_direction, crm_category, return_to=""):
     sort_options = {
         "order_date": "Order Date",
@@ -30673,6 +30983,7 @@ def render_global_nav(title):
         ]),
         ("customers", "Customers", [
             ("Customers", "/customers-view"),
+            ("Orders", "/orders-view"),
             ("Contacts", "/contacts-view"),
             ("Customer Map", "/customer-map-view"),
             ("Strategic Contacts", "/strategic-contacts-view"),
@@ -30681,7 +30992,6 @@ def render_global_nav(title):
         ]),
         ("analysis", "Analysis", [
             ("Insights", "/insights-view"),
-            ("Orders", "/orders-view"),
             ("Freight Analysis", "/freight-analysis-view"),
             ("Mat Analysis", "/mat-analysis-view"),
             ("AI Analysis", "/ai-analysis-view"),
@@ -30696,8 +31006,8 @@ def render_global_nav(title):
     normalized_title = str(title or "").strip()
     module_title_aliases = {
         "sales": {"Home", "Action Plan", "Calendar", "CRM Activities", "Outreach Prep"},
-        "customers": {"Customers", "Contacts", "Customer Map", "Strategic Contacts", "Organisation View", "Dismissed Customers"},
-        "analysis": {"Insights", "Orders", "Freight Analysis", "Mat Analysis", "AI Analysis", "Ask The Data"},
+        "customers": {"Customers", "Orders", "Contacts", "Customer Map", "Strategic Contacts", "Organisation View", "Dismissed Customers"},
+        "analysis": {"Insights", "Freight Analysis", "Mat Analysis", "AI Analysis", "Ask The Data"},
         "management": {"Weekly KPI Dashboard", "Production Analysis", "Plant Productivity Calculation", "Overbooked Operator Days", "Meeting History", "Meeting Record", "Action History", "Promised Orders", "Priority 1 Customers"},
     }
     active_module = ""
@@ -34333,7 +34643,7 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                     .customer-detail-tabs {{
                         display: grid;
-                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        grid-template-columns: repeat(5, minmax(0, 1fr));
                         gap: 4px;
                         padding: 4px;
                         border: 1px solid var(--border);
@@ -34357,6 +34667,43 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         font-size: 14px;
                         font-weight: 700;
                         box-shadow: none;
+                    }}
+
+                    .customer-shipments-table {{
+                        table-layout: fixed;
+                    }}
+
+                    .customer-table-sort {{
+                        display: inline;
+                        height: auto;
+                        padding: 0;
+                        border: 0;
+                        background: transparent;
+                        color: inherit;
+                        text-align: start;
+                        text-transform: inherit;
+                        letter-spacing: inherit;
+                    }}
+
+                    .customer-table-sort::after {{ content: " ↕" / ""; }}
+                    th[aria-sort="ascending"] .customer-table-sort::after {{ content: " ↑" / ""; }}
+                    th[aria-sort="descending"] .customer-table-sort::after {{ content: " ↓" / ""; }}
+
+                    .customer-table-mobile-sort {{ display: none; }}
+
+                    .customer-shipments-table th,
+                    .customer-shipments-table td {{
+                        padding: 7px 5px;
+                        white-space: normal;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .customer-shipments-table th:first-child {{
+                        width: 5%;
+                    }}
+
+                    .customer-shipments-table th:is(:nth-child(2), :nth-child(3), :nth-child(8), :nth-child(13), :nth-child(14)) {{
+                        width: 8%;
                     }}
 
                     .customer-detail-tab:hover,
@@ -37318,6 +37665,49 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         align-self: stretch;
                     }}
 
+                    .orders-toolbar {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        gap: 10px;
+                        margin-bottom: 12px;
+                    }}
+
+                    .orders-sync-actions {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        justify-content: flex-end;
+                        gap: 8px;
+                        margin-inline-start: auto;
+                    }}
+
+                    .orders-sync-notice {{
+                        color: var(--muted);
+                        font-size: 12px;
+                    }}
+
+                    .orders-sync-notice.sync-error {{
+                        color: #a12622;
+                    }}
+
+                    .home-view-toggle.orders-tabs {{
+                        display: grid;
+                        grid-template-columns: repeat(3, minmax(0, 1fr));
+                        width: min(350px, 100%);
+                        margin-bottom: 0;
+                    }}
+
+                    .orders-filter-controls input,
+                    .orders-filter-controls select,
+                    .orders-filter-controls button,
+                    .orders-filter-controls .button {{
+                        width: 100%;
+                        height: 40px;
+                        margin: 0;
+                        align-self: end;
+                    }}
+
                     .button.secondary {{
                         border-color: var(--blue);
                         background: var(--blue);
@@ -37446,6 +37836,61 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                         max-height: min(70vh, 760px);
                         overflow: auto;
                         overscroll-behavior: contain;
+                    }}
+
+                    a.order-customer-link {{
+                        text-decoration: none;
+                    }}
+
+                    .orders-freight-table {{
+                        width: 100%;
+                        table-layout: fixed;
+                    }}
+
+                    .orders-freight-table th,
+                    .orders-freight-table td {{
+                        padding: 8px 6px;
+                        white-space: normal;
+                        overflow-wrap: anywhere;
+                    }}
+
+                    .orders-freight-table th:nth-child(2) {{
+                        width: 22%;
+                    }}
+
+                    .orders-freight-table .table-sort-link {{
+                        display: inline;
+                        white-space: normal;
+                    }}
+
+                    @media (max-width: 720px) {{
+                        .orders-freight-table,
+                        .orders-freight-table tbody {{
+                            display: block;
+                        }}
+
+                        .orders-freight-table thead {{
+                            display: none;
+                        }}
+
+                        .orders-freight-table tr {{
+                            display: grid;
+                            grid-template-columns: repeat(auto-fit, minmax(min(125px, 100%), 1fr));
+                            border-bottom: 1px solid var(--border);
+                        }}
+
+                        .orders-freight-table td {{
+                            display: block;
+                            border: 0;
+                        }}
+
+                        .orders-freight-table td::before {{
+                            content: attr(data-label);
+                            display: block;
+                            color: var(--muted);
+                            font-size: 11px;
+                            font-weight: 600;
+                        }}
                     }}
 
                     .crm-timeline-table {{
@@ -40516,6 +40961,14 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
 
                         .customers-table thead,
                         .customer-detail-page .crm-timeline-table thead,
+                        .customer-table-mobile-sort {{
+                            display: grid;
+                            grid-template-columns: minmax(0, 1fr) auto;
+                            gap: 8px;
+                            margin-bottom: 8px;
+                            align-items: center;
+                        }}
+
                         .customer-detail-page .tall-table table:not(.crm-timeline-table) thead {{
                             display: none;
                         }}
