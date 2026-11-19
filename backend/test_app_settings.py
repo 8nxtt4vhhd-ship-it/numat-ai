@@ -44,6 +44,7 @@ class AppSettingsTests(unittest.TestCase):
         self.assertIn("Jobs are commonly shared across operators.", loaded["context"])
         self.assertIn("Around 1 hour of unbooked paid time", loaded["context"])
         self.assertIn("more than 1.5 hours", loaded["context"])
+        self.assertIn("not responding to an individual call, email or visit is common", loaded["context"])
 
     def test_existing_context_is_augmented_with_unbooked_time_rule(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -58,6 +59,7 @@ class AppSettingsTests(unittest.TestCase):
         self.assertIn("Existing plant guidance.", loaded["context"])
         self.assertIn("Around 1 hour of unbooked paid time", loaded["context"])
         self.assertIn("more than 1.5 hours", loaded["context"])
+        self.assertIn("not responding to an individual call, email or visit is common", loaded["context"])
 
     def test_three_management_report_lists_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:

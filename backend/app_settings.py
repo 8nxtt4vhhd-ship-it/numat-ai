@@ -12,6 +12,7 @@ DEFAULT_PRODUCTION_ISSUES_SEND_TIME = "18:30"
 DEFAULT_DAILY_REPORT_SEND_TIME = "18:00"
 MANAGEMENT_CHECK_REPORT_TYPES = ("production", "sales", "combined")
 PRODUCTION_BREAK_CONTEXT_LINE = "Around 1 hour of unbooked paid time per operator per day is normal because paid breaks are not deducted. Allow up to and including 1.5 hours; only report an unbooked-time anomaly when the daily gap is more than 1.5 hours."
+CUSTOMER_NON_RESPONSE_CONTEXT_LINE = "A customer not responding to an individual call, email or visit is common and must not be raised as a management concern by itself. Only treat non-response as a concern when the evidence shows a repeated pattern together with a clear commercial risk or sign of disengagement."
 DEFAULT_PRODUCTION_ISSUES_CONTEXT = """NuMat repairs rubber-backed carpeted mats; it is not a new-product manufacturing operation.
 Orders are commonly shared by several operators and may run across FF1, FF2 and FF3. This is normal and must not be raised as an issue by itself.
 Work can move between presses. A single press being below its own recent average is not automatically a concern when total press output is normal.
@@ -21,6 +22,7 @@ Re-cook activity is a quality measure and is separate from new press throughput 
 Backlog contains new customer orders awaiting their first repair only. The preferred backlog is approximately two weeks.
 Housekeeping, Engineering, Re-Runs, Extruder, Bag Building and Press Room Help are productive work and must not be treated as lost time.
 Lois's management time is expected and should not be treated as an operator productivity failure.
+A customer not responding to an individual call, email or visit is common and must not be raised as a management concern by itself. Only treat non-response as a concern when the evidence shows a repeated pattern together with a clear commercial risk or sign of disengagement.
 State only what the supplied figures support. Present possible causes as questions to check, never as established facts."""
 
 
@@ -162,6 +164,8 @@ def get_production_daily_issues_settings():
     context = str(settings.get("context") or DEFAULT_PRODUCTION_ISSUES_CONTEXT).strip()
     if PRODUCTION_BREAK_CONTEXT_LINE not in context:
         context = f"{context}\n{PRODUCTION_BREAK_CONTEXT_LINE}".strip()
+    if CUSTOMER_NON_RESPONSE_CONTEXT_LINE not in context:
+        context = f"{context}\n{CUSTOMER_NON_RESPONSE_CONTEXT_LINE}".strip()
     return {
         "enabled": any(item["enabled"] for item in reports.values()),
         "recipients": reports["combined"]["recipients"],
@@ -198,6 +202,8 @@ def set_production_daily_issues_settings(
     normalized_context = str(context or DEFAULT_PRODUCTION_ISSUES_CONTEXT).strip()
     if PRODUCTION_BREAK_CONTEXT_LINE not in normalized_context:
         normalized_context = f"{normalized_context}\n{PRODUCTION_BREAK_CONTEXT_LINE}".strip()
+    if CUSTOMER_NON_RESPONSE_CONTEXT_LINE not in normalized_context:
+        normalized_context = f"{normalized_context}\n{CUSTOMER_NON_RESPONSE_CONTEXT_LINE}".strip()
     payload = load_app_settings()
     payload["production_daily_issues"] = {
         "enabled": any(item["enabled"] for item in normalized_reports.values()),

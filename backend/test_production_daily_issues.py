@@ -400,6 +400,20 @@ class ProductionDailyIssueTests(unittest.TestCase):
 
         self.assertFalse(any(item["id"].startswith("crm-concern-") for item in candidates))
 
+    def test_single_customer_non_response_is_not_a_crm_concern(self):
+        candidates = []
+        issues.add_commercial_candidates(candidates, "2026-11-18", crm_result={"activities": [{
+            "date_created": "2026-11-18 18:50:51",
+            "direction": "outbound",
+            "activity_category": "sales_outreach",
+            "crm_type": "Meeting",
+            "customer_company": "Cintas (Maumelle, AR)",
+            "subject": "Customer visit — Cintas (Maumelle, AR)",
+            "body": "No response from Wyatt as usual so I visited and left the information on us again. Will follow up.",
+        }]})
+
+        self.assertFalse(any(item["id"].startswith("crm-concern-") for item in candidates))
+
     def test_sales_outreach_is_checked_per_individual(self):
         activities = []
         for day in (1, 2, 5, 6, 7, 8, 9, 12, 13):

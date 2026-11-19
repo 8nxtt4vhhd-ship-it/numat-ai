@@ -267,7 +267,7 @@ def add_commercial_candidates(candidates, report_key, crm_result=None, finance_r
                 "Sales",
             )
 
-    concern_pattern = re.compile(r"\b(complaint|unhappy|cancel(?:led|lation)?|lost account|quality issue|disappointed|overdue account|payment overdue|no response from|not received|late delivery|price too high|switch(?:ing)? to (?:a )?competitor)\b", re.I)
+    concern_pattern = re.compile(r"\b(complaint|unhappy|cancel(?:led|lation)?|lost account|quality issue|disappointed|overdue account|payment overdue|not received|late delivery|price too high|switch(?:ing)? to (?:a )?competitor)\b", re.I)
     for index, item in enumerate(item for item in activities if crm_activity_day(item) == report_key):
         subject = str(item.get("subject") or "").strip()
         preview = crm_preview(item)
