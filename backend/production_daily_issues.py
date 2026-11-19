@@ -153,6 +153,21 @@ def is_email_activity(item):
     return not activity_type or activity_type in {"email", "outlook", "mail"}
 
 
+def is_logged_sales_task(item):
+    activity_type = str((item or {}).get("crm_type") or "").strip().casefold()
+    return activity_type in {"task", "telephone call", "phone call", "meeting", "customer visit", "visit"}
+
+
+def crm_summary_identity(item):
+    record_id = str((item or {}).get("filemaker_record_id") or "").strip()
+    if record_id:
+        return f"record:{record_id}"
+    return "|".join(
+        str((item or {}).get(key) or "").strip().casefold()
+        for key in ("sender_email", "date_created", "crm_type", "subject", "to")
+    )
+
+
 def fetch_fresh_crm_activities_for_report():
     if get_crm_data_source() == "filemaker":
         try:
@@ -166,21 +181,49 @@ def fetch_fresh_crm_activities_for_report():
 
 def build_sales_email_summary(crm_result, report_key):
     summary = {
-        email: {"name": name, "total": 0, "sales_related": 0}
+        email: {
+            "name": name,
+            "total": 0,
+            "sales_related": 0,
+            "task_total": 0,
+            "telephone_calls": 0,
+            "meetings": 0,
+            "total_sales_activity": 0,
+        }
         for email, name in SALES_PERSON_NAMES.items()
     }
+    seen = set()
     for item in (crm_result or {}).get("activities", []):
         sender = str(item.get("sender_email") or "").strip().lower()
-        if sender not in summary or crm_activity_day(item) != report_key:
+        if sender not in summary or crm_activity_day(item) != report_key or item.get("exclude"):
             continue
-        if str(item.get("direction") or "").strip().lower() != "outbound":
+        identity = crm_summary_identity(item)
+        if identity in seen:
             continue
-        if not is_email_activity(item):
+        seen.add(identity)
+        sales_related = str(item.get("activity_category") or "").strip().lower() == "sales_outreach"
+        if is_logged_sales_task(item) and sales_related:
+            activity_type = str(item.get("crm_type") or "").strip().casefold()
+            summary[sender]["task_total"] += 1
+            if activity_type in {"telephone call", "phone call"}:
+                summary[sender]["telephone_calls"] += 1
+            elif activity_type in {"meeting", "customer visit", "visit"}:
+                summary[sender]["meetings"] += 1
+            continue
+        if str(item.get("direction") or "").strip().lower() != "outbound" or not is_email_activity(item):
             continue
         summary[sender]["total"] += 1
-        if str(item.get("activity_category") or "").strip().lower() == "sales_outreach":
+        if sales_related:
             summary[sender]["sales_related"] += 1
+    for item in summary.values():
+        item["total_sales_activity"] = item["sales_related"] + item["task_total"]
     return list(summary.values())
+
+
+def format_sales_task_breakdown(item):
+    calls = int(item.get("telephone_calls") or 0)
+    visits = int(item.get("meetings") or 0)
+    return f"{calls} call{'s' if calls != 1 else ''}, {visits} visit{'s' if visits != 1 else ''}"
 
 
 def add_commercial_candidates(candidates, report_key, crm_result=None, finance_result=None):
@@ -507,27 +550,35 @@ def build_email_report(facts, selection, report_type="combined"):
     subject = f"NuMat {report_label.lower()} - {display_date}"
     email_summary = facts.get("sales_email_summary", [])
     email_summary_text = "\n".join(
-        f"- {item['name']}: {int(item.get('total') or 0)} total emails sent; "
-        f"{int(item.get('sales_related') or 0)} sales-related"
+        f"- {item['name']}: {int(item.get('total') or 0)} outbound emails; "
+        f"{int(item.get('sales_related') or 0)} sales-related emails; "
+        f"{int(item.get('task_total') or 0)} logged sales tasks "
+        f"({format_sales_task_breakdown(item)}); "
+        f"{int(item.get('total_sales_activity') or 0)} total sales activities"
         for item in email_summary
     )
     email_summary_html = "".join(
         f"<tr><td style='padding:5px 18px 5px 0'>{escape(str(item['name']))}</td>"
         f"<td style='padding:5px 18px;text-align:right'>{int(item.get('total') or 0)}</td>"
-        f"<td style='padding:5px 0 5px 18px;text-align:right'>{int(item.get('sales_related') or 0)}</td></tr>"
+        f"<td style='padding:5px 18px;text-align:right'>{int(item.get('sales_related') or 0)}</td>"
+        f"<td style='padding:5px 18px;text-align:right'>{int(item.get('task_total') or 0)}"
+        f"<div style='font-size:11px;color:#5e7184'>{escape(format_sales_task_breakdown(item))}</div></td>"
+        f"<td style='padding:5px 0 5px 18px;text-align:right;font-weight:bold'>{int(item.get('total_sales_activity') or 0)}</td></tr>"
         for item in email_summary
     )
     summary_text_footer = (
-        f"\n\nEmails sent today\n{email_summary_text}"
+        f"\n\nSales activity recorded today\n{email_summary_text}"
         if email_summary_text else ""
     )
     summary_html_footer = (
         "<div style='margin-top:24px;padding-top:16px;border-top:1px solid #dbe6f2'>"
-        "<h2 style='margin:0 0 8px;font-size:16px;color:#17324d'>Emails sent today</h2>"
+        "<h2 style='margin:0 0 8px;font-size:16px;color:#17324d'>Sales activity recorded today</h2>"
         "<table style='border-collapse:collapse;font-size:14px'>"
         "<thead><tr><th style='padding:5px 18px 5px 0;text-align:left'>Salesperson</th>"
-        "<th style='padding:5px 18px;text-align:right'>Total</th>"
-        "<th style='padding:5px 0 5px 18px;text-align:right'>Sales-related</th></tr></thead>"
+        "<th style='padding:5px 18px;text-align:right'>Outbound emails</th>"
+        "<th style='padding:5px 18px;text-align:right'>Sales emails</th>"
+        "<th style='padding:5px 18px;text-align:right'>Logged tasks</th>"
+        "<th style='padding:5px 0 5px 18px;text-align:right'>Total sales activity</th></tr></thead>"
         f"<tbody>{email_summary_html}</tbody></table></div>"
         if email_summary_html else ""
     )

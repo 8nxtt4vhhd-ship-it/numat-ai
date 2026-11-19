@@ -108,7 +108,7 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertEqual(len(combined["candidates"]), len(facts["candidates"]))
         self.assertEqual(production["sales_email_summary"], [])
 
-    def test_email_footer_counts_total_and_sales_related_emails_for_peter_and_ben(self):
+    def test_sales_activity_footer_counts_emails_calls_visits_and_deduplicates(self):
         production_result, detail = sample_results()
         activities = [
             {
@@ -124,7 +124,12 @@ class ProductionDailyIssueTests(unittest.TestCase):
             {
                 "date_created": "2026-10-15 11:00:00", "direction": "outbound",
                 "crm_type": "Outlook", "activity_category": "sales_outreach",
-                "sender_email": "barnold@numatsystems.com",
+                "sender_email": "barnold@numatsystems.com", "filemaker_record_id": "email-1",
+            },
+            {
+                "date_created": "2026-10-15 11:00:00", "direction": "outbound",
+                "crm_type": "Outlook", "activity_category": "sales_outreach",
+                "sender_email": "barnold@numatsystems.com", "filemaker_record_id": "email-1",
             },
             {
                 "date_created": "2026-10-15 12:00:00", "direction": "outbound",
@@ -154,13 +159,22 @@ class ProductionDailyIssueTests(unittest.TestCase):
         report = issues.build_email_report(facts, {"summary": "", "issues": []})
 
         self.assertEqual(facts["sales_email_summary"], [
-            {"name": "Ben Arnold", "total": 2, "sales_related": 2},
-            {"name": "Peter Binnington", "total": 2, "sales_related": 1},
+            {
+                "name": "Ben Arnold", "total": 2, "sales_related": 2,
+                "task_total": 2, "telephone_calls": 1, "meetings": 1,
+                "total_sales_activity": 4,
+            },
+            {
+                "name": "Peter Binnington", "total": 2, "sales_related": 1,
+                "task_total": 0, "telephone_calls": 0, "meetings": 0,
+                "total_sales_activity": 1,
+            },
         ])
-        self.assertIn("Ben Arnold: 2 total emails sent; 2 sales-related", report["body_text"])
-        self.assertIn("Peter Binnington: 2 total emails sent; 1 sales-related", report["body_text"])
-        self.assertIn("Emails sent today", report["body_html"])
-        self.assertIn("Sales-related", report["body_html"])
+        self.assertIn("Ben Arnold: 2 outbound emails; 2 sales-related emails; 2 logged sales tasks", report["body_text"])
+        self.assertIn("1 call, 1 visit", report["body_text"])
+        self.assertIn("4 total sales activities", report["body_text"])
+        self.assertIn("Sales activity recorded today", report["body_html"])
+        self.assertIn("Logged tasks", report["body_html"])
 
     def test_management_report_refreshes_recent_filemaker_crm_before_counting(self):
         refreshed_result = {"status": "ok", "activities": [{"subject": "Latest email"}]}
@@ -174,6 +188,44 @@ class ProductionDailyIssueTests(unittest.TestCase):
         self.assertIs(result, refreshed_result)
         refresh.assert_called_once_with()
         fetch.assert_called_once_with()
+
+    def test_peter_field_activity_is_three_emails_plus_ten_logged_tasks(self):
+        activities = [
+            {
+                "filemaker_record_id": f"email-{index}",
+                "date_created": f"2026-11-18 07:{index:02d}:00",
+                "direction": "outbound",
+                "crm_type": "Outlook",
+                "activity_category": "sales_outreach",
+                "sender_email": "pbinnington@numatsystems.com",
+            }
+            for index in range(3)
+        ]
+        activities.extend({
+            "filemaker_record_id": f"call-{index}",
+            "date_created": f"2026-11-18 10:{index:02d}:00",
+            "direction": "outbound",
+            "crm_type": "Telephone Call",
+            "activity_category": "sales_outreach",
+            "sender_email": "pbinnington@numatsystems.com",
+        } for index in range(5))
+        activities.extend({
+            "filemaker_record_id": f"visit-{index}",
+            "date_created": f"2026-11-18 14:{index:02d}:00",
+            "direction": "outbound",
+            "crm_type": "Meeting",
+            "activity_category": "sales_outreach",
+            "sender_email": "pbinnington@numatsystems.com",
+        } for index in range(5))
+
+        summary = issues.build_sales_email_summary({"activities": activities}, "2026-11-18")
+        peter = next(item for item in summary if item["name"] == "Peter Binnington")
+
+        self.assertEqual(peter["total"], 3)
+        self.assertEqual(peter["task_total"], 10)
+        self.assertEqual(peter["telephone_calls"], 5)
+        self.assertEqual(peter["meetings"], 5)
+        self.assertEqual(peter["total_sales_activity"], 13)
 
     def test_management_report_uses_cached_crm_if_recent_refresh_fails(self):
         cached_result = {"status": "ok", "activities": []}
