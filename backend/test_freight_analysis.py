@@ -424,6 +424,18 @@ class FreightAnalysisTests(unittest.TestCase):
         self.assertIn('data-label="Incoming skids"', html)
         self.assertIn(">3</td>", html)
 
+    def test_customer_shipment_count_uses_same_eligibility_as_the_tab(self):
+        orders = [
+            {"extra": {"Orders::Status": "Complete", "Act Arrival_Skids": 2}},
+            {"extra": {"Orders::Status": "Complete", "Incoming Freight": 100}},
+            {"extra": {"Orders::Status": "In Production", "Act Arrival_Skids": 1}},
+            {"extra": {"Orders::Status": "Complete"}},
+        ]
+
+        eligible = main.get_customer_shipment_orders(orders)
+
+        self.assertEqual(len(eligible), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

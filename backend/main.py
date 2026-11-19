@@ -16267,12 +16267,16 @@ def build_freight_job_rows(
     return rows
 
 
+def get_customer_shipment_orders(orders):
+    return [
+        order for order in orders or []
+        if is_complete_freight_order(order) and order_has_shipment_data(order)
+    ]
+
+
 def render_customer_shipments(orders):
     rows = build_freight_job_rows(
-        (
-            order for order in orders
-            if is_complete_freight_order(order) and order_has_shipment_data(order)
-        ),
+        get_customer_shipment_orders(orders),
         include_shipment_only=True,
     )
     if not rows:
@@ -18314,6 +18318,7 @@ def get_customer_view(
         for order in result["orders"]
         if str(order.get("customer", "")).lower() == customer.lower()
     ]
+    customer_shipment_orders = get_customer_shipment_orders(customer_orders)
     sorted_orders = sort_orders(
         customer_orders,
         sort_key=sort,
@@ -18508,7 +18513,7 @@ def get_customer_view(
             <button class="customer-detail-tab active" type="button" role="tab" aria-selected="true" data-customer-tab="customer-outreach-tab">Outreach</button>
             <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-crm-tab">CRM <span class="customer-tab-count">{len(crm_activities)}</span></button>
             <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-orders-tab">Orders <span class="customer-tab-count">{len(customer_orders)}</span></button>
-            <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" aria-controls="customer-shipments-tab" id="customer-shipments-button" data-customer-tab="customer-shipments-tab">Shipments</button>
+            <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" aria-controls="customer-shipments-tab" id="customer-shipments-button" data-customer-tab="customer-shipments-tab">Shipments <span class="customer-tab-count">{len(customer_shipment_orders)}</span></button>
             <button class="customer-detail-tab" type="button" role="tab" aria-selected="false" data-customer-tab="customer-contacts-tab">Contacts <span class="customer-tab-count">{len(customer_contacts)}</span></button>
         </div>
 
@@ -18545,7 +18550,7 @@ def get_customer_view(
         </div>
 
         <div class="customer-detail-tab-panel" id="customer-shipments-tab" role="tabpanel" aria-labelledby="customer-shipments-button" hidden>
-        {render_customer_shipments(customer_orders)}
+        {render_customer_shipments(customer_shipment_orders)}
         </div>
 
         <div class="customer-detail-tab-panel" id="customer-contacts-tab" role="tabpanel" hidden>
