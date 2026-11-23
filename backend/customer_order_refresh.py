@@ -1,5 +1,7 @@
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -18,6 +20,18 @@ from filemaker import (  # noqa: E402
     get_filemaker_master_cache_path,
 )
 from mat_data import sync_filemaker_mat_counts  # noqa: E402
+
+
+def get_recent_order_refs(orders, days=56, now=None):
+    now = now or datetime.now(ZoneInfo("America/Chicago"))
+    cutoff = (now.date() - timedelta(days=max(1, int(days)))).isoformat()
+    refs = set()
+    for order in orders or []:
+        order_date = str(order.get("order_date") or "").strip()[:10]
+        order_ref = str((order.get("extra") or {}).get("Orders::Order No") or "").strip()
+        if order_ref and order_date >= cutoff:
+            refs.add(order_ref)
+    return sorted(refs)
 
 
 def read_cache_backup(path):
@@ -51,7 +65,14 @@ def refresh_customer_and_order_data():
     if customer_result.get("status") != "ok":
         restore_cache_backup(master_cache_path, master_cache_backup)
 
-    mat_result = sync_filemaker_mat_counts()
+    central_now = datetime.now(ZoneInfo("America/Chicago"))
+    # Recent orders are refreshed nightly so new mats and ordinary corrections
+    # appear quickly. Sunday performs a full reconciliation for older edits.
+    mat_order_refs = None if central_now.weekday() == 6 else get_recent_order_refs(
+        order_result.get("orders") or [],
+        now=central_now,
+    )
+    mat_result = sync_filemaker_mat_counts(order_refs=mat_order_refs)
 
     return {
         "status": (
@@ -75,8 +96,10 @@ def refresh_customer_and_order_data():
         },
         "mats": {
             "status": mat_result.get("status", "unknown"),
+            "mode": mat_result.get("mode", "unknown"),
             "count": mat_result.get("record_count", 0),
             "order_count": mat_result.get("order_count", 0),
+            "refreshed_order_count": mat_result.get("refreshed_order_count", 0),
             "cache_updated_at": mat_result.get("updated_at", ""),
         },
     }

@@ -83,6 +83,63 @@ class MatDataTests(unittest.TestCase):
         self.assertEqual(result["order_count"], 2)
         self.assertEqual(saved["orders"]["1"]["rejects"], 1)
 
+    def test_incremental_sync_replaces_recent_orders_and_preserves_older_orders(self):
+        existing = {
+            "status": "ok",
+            "updated_at": "2026-11-22 03:00:00",
+            "record_count": 4,
+            "skipped_count": 0,
+            "order_count": 2,
+            "orders": {
+                "100": {"mats": 3, "repairs": 3, "rejects": 0, "repair_actions": 0, "other": 0, "sizes": {}},
+                "200": {"mats": 1, "repairs": 1, "rejects": 0, "repair_actions": 0, "other": 0, "sizes": {}},
+            },
+        }
+        refreshed = {
+            "status": "ok",
+            "records": [
+                {"fieldData": {"Order Ref": "200", "Mat Outcome": "Repair"}},
+                {"fieldData": {"Order Ref": "200", "Mat Outcome": "Reject"}},
+            ],
+        }
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "mats.json"
+            with (
+                patch.object(mat_data, "read_filemaker_mat_counts_cache", return_value=existing),
+                patch.object(mat_data, "find_layout_records", return_value=refreshed) as find,
+                patch.object(mat_data, "get_mat_counts_cache_path", return_value=cache_path),
+            ):
+                result = mat_data.sync_filemaker_mat_counts(order_refs=["200", "300"])
+
+            saved = json.loads(cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["mode"], "incremental")
+        self.assertEqual(result["refreshed_order_count"], 2)
+        self.assertEqual(saved["orders"]["100"]["mats"], 3)
+        self.assertEqual(saved["orders"]["200"]["mats"], 2)
+        self.assertNotIn("300", saved["orders"])
+        self.assertEqual(saved["record_count"], 5)
+        find.assert_called_once()
+        self.assertEqual(
+            find.call_args.args[1],
+            [{"Order Ref": "==200"}, {"Order Ref": "==300"}],
+        )
+
+    def test_incremental_request_falls_back_to_full_sync_without_existing_cache(self):
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "mats.json"
+            with (
+                patch.object(mat_data, "read_filemaker_mat_counts_cache", return_value={"status": "not_synced", "orders": {}}),
+                patch.object(mat_data, "fetch_layout_records", return_value={"status": "ok", "records": []}) as fetch,
+                patch.object(mat_data, "find_layout_records") as find,
+                patch.object(mat_data, "get_mat_counts_cache_path", return_value=cache_path),
+            ):
+                result = mat_data.sync_filemaker_mat_counts(order_refs=["200"])
+
+        self.assertEqual(result["mode"], "full")
+        fetch.assert_called_once()
+        find.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

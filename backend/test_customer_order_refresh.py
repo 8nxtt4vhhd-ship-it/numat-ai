@@ -1,11 +1,27 @@
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 import customer_order_refresh
 
 
 class CustomerOrderRefreshTests(unittest.TestCase):
-    @patch.object(customer_order_refresh, "sync_filemaker_mat_counts", return_value={"status": "ok", "record_count": 10, "order_count": 2})
+    def test_recent_order_refs_only_include_last_eight_weeks(self):
+        orders = [
+            {"order_date": "2026-11-20", "extra": {"Orders::Order No": "4002"}},
+            {"order_date": "2026-10-01", "extra": {"Orders::Order No": "3900"}},
+            {"order_date": "2026-08-01", "extra": {"Orders::Order No": "3700"}},
+        ]
+
+        refs = customer_order_refresh.get_recent_order_refs(
+            orders,
+            now=datetime(2026, 11, 23, 3, tzinfo=ZoneInfo("America/Chicago")),
+        )
+
+        self.assertEqual(refs, ["3900", "4002"])
+
+    @patch.object(customer_order_refresh, "sync_filemaker_mat_counts", return_value={"status": "ok", "mode": "incremental", "record_count": 10, "order_count": 2, "refreshed_order_count": 1})
     @patch.object(customer_order_refresh, "restore_cache_backup")
     @patch.object(customer_order_refresh, "read_cache_backup", return_value=b"old cache")
     @patch.object(customer_order_refresh, "fetch_filemaker_master_data")
@@ -39,6 +55,8 @@ class CustomerOrderRefreshTests(unittest.TestCase):
         self.assertEqual(result["customers"]["count"], 1)
         self.assertEqual(result["customers"]["contact_count"], 3)
         self.assertEqual(result["mats"]["count"], 10)
+        self.assertEqual(result["mats"]["mode"], "incremental")
+        self.assertEqual(result["mats"]["refreshed_order_count"], 1)
         restore_backup.assert_not_called()
 
     @patch.object(customer_order_refresh, "sync_filemaker_mat_counts", return_value={"status": "ok", "record_count": 0, "order_count": 0})

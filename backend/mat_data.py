@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import time
 
-from filemaker import fetch_layout_records, get_field_value
+from filemaker import fetch_layout_records, find_layout_records, get_field_value
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -101,43 +101,102 @@ def add_mat_record_to_counts(counts_by_order, record):
     return True
 
 
-def sync_filemaker_mat_counts(batch_size=5000):
+def _empty_mat_counts_payload():
+    return {
+        "status": "ok",
+        "updated_at": "",
+        "layout": get_filemaker_mats_layout(),
+        "record_count": 0,
+        "skipped_count": 0,
+        "order_count": 0,
+        "orders": {},
+    }
+
+
+def _write_mat_counts_cache(payload):
+    cache_path = get_mat_counts_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps(payload), encoding="utf-8")
+    temporary_path.replace(cache_path)
+    return cache_path
+
+
+def sync_filemaker_mat_counts(batch_size=5000, order_refs=None, order_batch_size=50):
     batch_size = max(1, int(batch_size or 5000))
+    order_batch_size = max(1, int(order_batch_size or 50))
+    requested_order_refs = sorted({str(value or "").strip() for value in (order_refs or []) if str(value or "").strip()})
+    incremental = order_refs is not None
+    existing = read_filemaker_mat_counts_cache() if incremental else _empty_mat_counts_payload()
+    if incremental and existing.get("status") != "ok":
+        incremental = False
+        requested_order_refs = []
+        existing = _empty_mat_counts_payload()
+
     offset = 1
     record_count = 0
     skipped_count = 0
     counts_by_order = {}
 
-    while True:
-        result = fetch_layout_records(
-            get_filemaker_mats_layout(),
-            limit=batch_size,
-            offset=offset,
-        )
-        if result.get("status") != "ok":
-            return {
-                "status": result.get("status", "error"),
-                "record_count": record_count,
-                "order_count": len(counts_by_order),
-                "saved": False,
-            }
+    if incremental and not requested_order_refs:
+        return {**existing, "saved": False, "mode": "incremental", "refreshed_order_count": 0}
 
-        records = result.get("records") or []
-        for record in records:
-            if add_mat_record_to_counts(counts_by_order, record):
-                record_count += 1
+    queries = (
+        [requested_order_refs[index:index + order_batch_size] for index in range(0, len(requested_order_refs), order_batch_size)]
+        if incremental else [None]
+    )
+    for order_ref_batch in queries:
+        offset = 1
+        while True:
+            if incremental:
+                result = find_layout_records(
+                    get_filemaker_mats_layout(),
+                    [{"Order Ref": f"=={order_ref}"} for order_ref in order_ref_batch],
+                    limit=batch_size,
+                    offset=offset,
+                )
+                if result.get("status") == "no_records":
+                    break
             else:
-                skipped_count += 1
+                result = fetch_layout_records(
+                    get_filemaker_mats_layout(),
+                    limit=batch_size,
+                    offset=offset,
+                )
+            if result.get("status") != "ok":
+                return {
+                    "status": result.get("status", "error"),
+                    "record_count": record_count,
+                    "order_count": len(counts_by_order),
+                    "saved": False,
+                    "mode": "incremental" if incremental else "full",
+                }
 
-        print(
-            f"Mat sync: processed {record_count + skipped_count:,} records "
-            f"across {len(counts_by_order):,} orders...",
-            flush=True,
-        )
+            records = result.get("records") or []
+            for record in records:
+                if add_mat_record_to_counts(counts_by_order, record):
+                    record_count += 1
+                else:
+                    skipped_count += 1
 
-        if len(records) < batch_size:
-            break
-        offset += batch_size
+            print(
+                f"Mat sync: processed {record_count + skipped_count:,} records "
+                f"across {len(counts_by_order):,} orders...",
+                flush=True,
+            )
+
+            if len(records) < batch_size:
+                break
+            offset += batch_size
+
+    if incremental:
+        merged_orders = dict(existing.get("orders") or {})
+        for order_ref in requested_order_refs:
+            merged_orders.pop(order_ref, None)
+        merged_orders.update(counts_by_order)
+        counts_by_order = merged_orders
+        record_count = sum(normalize_count(row.get("mats")) for row in counts_by_order.values())
+        skipped_count = normalize_count(existing.get("skipped_count"))
 
     payload = {
         "status": "ok",
@@ -147,12 +206,10 @@ def sync_filemaker_mat_counts(batch_size=5000):
         "skipped_count": skipped_count,
         "order_count": len(counts_by_order),
         "orders": counts_by_order,
+        "mode": "incremental" if incremental else "full",
+        "refreshed_order_count": len(requested_order_refs) if incremental else len(counts_by_order),
     }
-    cache_path = get_mat_counts_cache_path()
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    temporary_path.write_text(json.dumps(payload), encoding="utf-8")
-    temporary_path.replace(cache_path)
+    cache_path = _write_mat_counts_cache(payload)
     return {**payload, "saved": True, "cache_path": str(cache_path)}
 
 
