@@ -1,9 +1,12 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 from unittest.mock import patch
+
+from fastapi import UploadFile
 
 import main
 import crm
@@ -67,6 +70,34 @@ class ActionPlanRecentContactTests(unittest.TestCase):
         self.assertIn('class="home-focus-customer-link"', html)
         self.assertIn("customer=Cintas%20%28Round%20Rock%2C%20TX%29", html)
         self.assertIn("return_to=%2Faction-plan-view%3Fselected_customer%3DCintas%2B%2528Round%2BRock%252C%2BTX%2529%23focus-preview", html)
+
+    def test_call_contact_selection_is_restored_after_panel_rerender(self):
+        preview = {
+            "customer": "Vestis Uniform Services (Canton, NC)",
+            "location": "Canton, NC",
+            "mode": "Call",
+            "target_name": "Kristie Edwards",
+            "target_email": "kristie@example.com",
+            "target_role": "Manager",
+            "queue_summary": {},
+            "context": {"primary_contact": {"phone": "111-111-1111"}},
+            "result": {},
+            "message_points": [],
+        }
+        contacts = [
+            {"email": "kristie@example.com", "name": "Kristie Edwards", "title": "Manager", "phone": "111-111-1111", "cell": "", "status_note": "", "label": "Kristie Edwards"},
+            {"email": "marcon@example.com", "name": "Marcon Delagarza", "title": "Contact", "phone": "222-222-2222", "cell": "", "status_note": "", "label": "Marcon Delagarza"},
+        ]
+        with (
+            patch.object(main, "build_home_focus_recipient_options", return_value=contacts),
+            patch.object(main, "get_m365_connection_state", return_value={"connected": False}),
+        ):
+            html = main.render_home_focus_work_panel(preview, "/outreach-prep", "/action-plan-view")
+
+        self.assertIn('data-contact-key="marcon@example.com|marcon delagarza"', html)
+        self.assertIn("sessionStorage.setItem", html)
+        self.assertIn("restoreHomeFocusCallContact", html)
+        self.assertIn("syncHomeFocusCallContact(slug, false)", html)
 
     def test_generated_outreach_draft_is_saved_per_user_and_customer(self):
         with TemporaryDirectory() as directory:
@@ -457,6 +488,64 @@ class ActionPlanRecentContactTests(unittest.TestCase):
             [option["email"] for option in options],
             ["curtis.turner@vestis.com"],
         )
+
+    def test_outgoing_email_passes_uploaded_document_to_m365(self):
+        upload = UploadFile(
+            filename="customer-specification.pdf",
+            file=BytesIO(b"%PDF-test-document"),
+            headers={"content-type": "application/pdf"},
+        )
+        with (
+            patch.object(main, "get_current_session_user", return_value={"username": "kelly", "m365_email": "kelly@example.com"}),
+            patch.object(main, "has_m365_config", return_value=True),
+            patch.object(main, "get_m365_connection_state", return_value={"connected": True, "mailbox": "kelly@example.com"}),
+            patch.object(main, "ensure_valid_access_token", return_value={"status": "ok", "access_token": "token"}),
+            patch.object(main, "send_m365_mail", return_value={"status": "ok"}) as send_mail,
+            patch.object(main, "record_recent_sent_email"),
+            patch.object(main, "record_audit_event"),
+            patch.object(main, "clear_attention_response_cache"),
+            patch.object(main, "clear_home_queue_summaries_cache"),
+            patch.object(main, "clear_customer_summaries_cache"),
+        ):
+            response = main.post_m365_send_email(
+                customer="Test Customer",
+                return_to="/action-plan-view",
+                to="customer@example.com",
+                subject="Specification",
+                body="Please see the attached document.",
+                recommended_to="customer@example.com",
+                recommended_subject="Specification",
+                recommended_body="Please see the attached document.",
+                attachment=upload,
+            )
+
+        self.assertEqual(response.status_code, 303)
+        sent_attachment = send_mail.call_args.kwargs["attachments"][0]
+        self.assertEqual(sent_attachment["name"], "customer-specification.pdf")
+        self.assertEqual(sent_attachment["content_type"], "application/pdf")
+        self.assertEqual(sent_attachment["content"], b"%PDF-test-document")
+
+    def test_outgoing_email_rejects_attachment_over_10_mb(self):
+        upload = UploadFile(
+            filename="too-large.pdf",
+            file=BytesIO(b"x" * (10 * 1024 * 1024 + 1)),
+            headers={"content-type": "application/pdf"},
+        )
+        with (
+            patch.object(main, "get_current_session_user", return_value={"username": "kelly"}),
+            patch.object(main, "has_m365_config", return_value=True),
+            patch.object(main, "send_m365_mail") as send_mail,
+        ):
+            response = main.post_m365_send_email(
+                customer="Test Customer",
+                to="customer@example.com",
+                subject="Specification",
+                body="Please see the attached document.",
+                attachment=upload,
+            )
+
+        self.assertIn("larger than the 10 MB limit", response)
+        send_mail.assert_not_called()
 
 
 if __name__ == "__main__":

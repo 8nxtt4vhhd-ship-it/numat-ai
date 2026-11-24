@@ -13863,6 +13863,7 @@ def post_m365_send_email(
     recommended_to: str = Form(""),
     recommended_subject: str = Form(""),
     recommended_body: str = Form(""),
+    attachment: UploadFile | None = File(None),
 ):
     current_user = get_current_session_user()
     if not current_user:
@@ -13889,6 +13890,46 @@ def post_m365_send_email(
         recommended_subject,
         recommended_body,
     )
+
+    email_attachments = []
+    attachment_name = ""
+    if attachment and str(attachment.filename or "").strip():
+        attachment_name = Path(str(attachment.filename)).name.strip()
+        allowed_extensions = {
+            ".csv", ".doc", ".docx", ".jpeg", ".jpg", ".pdf", ".png",
+            ".ppt", ".pptx", ".rtf", ".txt", ".xls", ".xlsx",
+        }
+        attachment_extension = Path(attachment_name).suffix.lower()
+        if attachment_extension not in allowed_extensions:
+            return render_page(
+                title="Send Email",
+                body=(
+                    "<p class='status error'>That file type cannot be attached. Please use a PDF, Office document, image, CSV, RTF, or text file.</p>"
+                    "<p><a class='button secondary' href='javascript:history.back()'>Back</a></p>"
+                ),
+            )
+        attachment_content = attachment.file.read(10 * 1024 * 1024 + 1)
+        if len(attachment_content) > 10 * 1024 * 1024:
+            return render_page(
+                title="Send Email",
+                body=(
+                    "<p class='status error'>The attachment is larger than the 10 MB limit.</p>"
+                    "<p><a class='button secondary' href='javascript:history.back()'>Back</a></p>"
+                ),
+            )
+        if not attachment_content:
+            return render_page(
+                title="Send Email",
+                body=(
+                    "<p class='status error'>The selected attachment is empty.</p>"
+                    "<p><a class='button secondary' href='javascript:history.back()'>Back</a></p>"
+                ),
+            )
+        email_attachments.append({
+            "name": attachment_name,
+            "content_type": str(attachment.content_type or "application/octet-stream"),
+            "content": attachment_content,
+        })
 
     if not customer_name or not recipient or not subject_text or not body_text.strip():
         return render_page(
@@ -13926,6 +13967,7 @@ def post_m365_send_email(
         recipient=recipient,
         subject=subject_text,
         body=body_text,
+        attachments=email_attachments,
     )
     if send_result.get("status") != "ok":
         error_text = send_result.get("error_message") or send_result.get("status") or "Microsoft 365 could not send the email."
@@ -13949,7 +13991,10 @@ def post_m365_send_email(
     record_audit_event(
         "send-email",
         target=customer_name,
-        details=f"Sent to {recipient} • {recommendation_usage}",
+        details=(
+            f"Sent to {recipient} • {recommendation_usage}"
+            + (f" • Attached {attachment_name}" if attachment_name else "")
+        ),
         area="customer-email",
         status="success",
     )
@@ -22651,7 +22696,7 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
         )
         cta_markup = ""
         email_draft_markup = f"""
-                <form method="post" action="/m365/send-email" class="outreach-draft-form" id="outreach-send-form">
+                <form method="post" action="/m365/send-email" enctype="multipart/form-data" class="outreach-draft-form" id="outreach-send-form">
                     <input type="hidden" name="customer" value="{escape(customer)}">
                     <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
                     <input type="hidden" name="recommended_to" value="{escape(target_email)}">
@@ -22693,6 +22738,10 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
                             placeholder="Enter email draft"
                         >{escape(email_body)}</textarea>
                     </div>
+                    <div class="outreach-draft-row outreach-attachment-row">
+                        <label class="label" for="outreach-email-attachment">Attachment <span class="muted">(optional, up to 10 MB)</span></label>
+                        <input id="outreach-email-attachment" class="outreach-draft-file" type="file" name="attachment" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.csv,.txt,.rtf,.png,.jpg,.jpeg" />
+                    </div>
                     <div class="outreach-draft-actions">
                         {send_button_markup}
                     </div>
@@ -22704,6 +22753,7 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
                                 <div><span class="label">From</span><strong id="m365-confirm-from">{escape(sender_mailbox or (current_user or {}).get('m365_email') or '')}</strong></div>
                                 <div><span class="label">To</span><strong id="m365-confirm-to">{escape(target_email)}</strong></div>
                                 <div><span class="label">Subject</span><strong id="m365-confirm-subject">{escape(email_subject)}</strong></div>
+                                <div><span class="label">Attachment</span><strong id="m365-confirm-attachment">None</strong></div>
                             </div>
                             <div class="outreach-confirm-preview" id="m365-confirm-body">{escape(email_body)}</div>
                             <div class="outreach-confirm-actions">
@@ -22720,12 +22770,15 @@ def render_outreach_prep_page(customer, context, result, data_results, return_to
                         const to = document.getElementById('outreach-email-to')?.value?.trim() || '';
                         const subject = document.getElementById('outreach-email-subject')?.value || '';
                         const body = document.getElementById('outreach-email-body')?.value || '';
+                        const attachment = document.getElementById('outreach-email-attachment')?.files?.[0];
                         const toField = document.getElementById('m365-confirm-to');
                         const subjectField = document.getElementById('m365-confirm-subject');
                         const bodyField = document.getElementById('m365-confirm-body');
+                        const attachmentField = document.getElementById('m365-confirm-attachment');
                         if (toField) toField.textContent = to || 'Not set';
                         if (subjectField) subjectField.textContent = subject || 'Not set';
                         if (bodyField) bodyField.textContent = body || 'No body text';
+                        if (attachmentField) attachmentField.textContent = attachment ? attachment.name : 'None';
                         overlay.hidden = false;
                     }}
                     function hideM365SendConfirm() {{
@@ -26017,6 +26070,7 @@ def render_home_focus_work_panel(
         f' data-phone="{escape(item.get("phone") or "")}"'
         f' data-cell="{escape(item.get("cell") or "")}"'
         f' data-status="{escape(item.get("status_note") or "")}"'
+        f' data-contact-key="{escape((str(item.get("email") or "").strip().casefold() + "|" + str(item.get("name") or "").strip().casefold()))}"'
         f'{" selected" if str(item.get("email") or "").strip().lower() == str(target_email or "").strip().lower() else ""}>'
         f'{escape(item["label"] or item["email"])}{" — " if item["label"] else ""}{escape(item["email"])}</option>'
         for item in recipient_options
@@ -26180,7 +26234,7 @@ def render_home_focus_work_panel(
                         data-home-focus-slug="{slug}"
                         {'hidden' if initial_mode != 'email' else ''}
                     >
-                        <form method="post" action="/m365/send-email" class="outreach-draft-form home-focus-draft-form" id="home-focus-send-form-{slug}">
+                        <form method="post" action="/m365/send-email" enctype="multipart/form-data" class="outreach-draft-form home-focus-draft-form" id="home-focus-send-form-{slug}">
                             <input type="hidden" name="customer" value="{escape(customer_name)}">
                             <input type="hidden" name="return_to" value="{escape(return_to or '/action-plan-view')}">
                             <input id="{recommended_to_id}" type="hidden" name="recommended_to" value="{escape(target_email)}">
@@ -26210,6 +26264,10 @@ def render_home_focus_work_panel(
                                 <label class="label" for="{body_input_id}">Body</label>
                                 <textarea id="{body_input_id}" class="outreach-draft-textarea home-focus-draft-textarea" name="body" rows="9" placeholder="Enter an email or generate AI outreach">{escape(email_body)}</textarea>
                             </div>
+                            <div class="outreach-draft-row outreach-attachment-row">
+                                <label class="label" for="home-focus-email-attachment-{slug}">Attachment <span class="muted">(optional, up to 10 MB)</span></label>
+                                <input id="home-focus-email-attachment-{slug}" class="outreach-draft-file" type="file" name="attachment" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.csv,.txt,.rtf,.png,.jpg,.jpeg" />
+                            </div>
                             <div class="home-focus-generate-draft-row">
                                 <button id="{generate_draft_button_id}" type="button" class="home-focus-generate-draft-link" onclick="loadHomeFocusDraft('{slug}')">Generate AI outreach</button>
                             </div>
@@ -26224,6 +26282,7 @@ def render_home_focus_work_panel(
                                         <div><span class="label">From</span><strong>{escape(sender_mailbox or (current_user or {}).get('m365_email') or '')}</strong></div>
                                         <div><span class="label">To</span><strong id="{confirm_to_id}">{escape(target_email)}</strong></div>
                                         <div><span class="label">Subject</span><strong id="{confirm_subject_id}">{escape(email_subject)}</strong></div>
+                                        <div><span class="label">Attachment</span><strong id="home-focus-confirm-attachment-{slug}">None</strong></div>
                                     </div>
                                     <div class="outreach-confirm-preview" id="{confirm_body_id}">{escape(email_body)}</div>
                                     <div class="outreach-confirm-actions">
@@ -26363,12 +26422,15 @@ def render_home_focus_work_panel(
                         const to = document.getElementById(`home-focus-email-to-${{slug}}`)?.value?.trim() || '';
                         const subject = document.getElementById(`home-focus-email-subject-${{slug}}`)?.value || '';
                         const body = document.getElementById(`home-focus-email-body-${{slug}}`)?.value || '';
+                        const attachment = document.getElementById(`home-focus-email-attachment-${{slug}}`)?.files?.[0];
                         const toField = document.getElementById(`home-focus-confirm-to-${{slug}}`);
                         const subjectField = document.getElementById(`home-focus-confirm-subject-${{slug}}`);
                         const bodyField = document.getElementById(`home-focus-confirm-body-${{slug}}`);
+                        const attachmentField = document.getElementById(`home-focus-confirm-attachment-${{slug}}`);
                         if (toField) toField.textContent = to || 'Not set';
                         if (subjectField) subjectField.textContent = subject || 'Not set';
                         if (bodyField) bodyField.textContent = body || 'No body text';
+                        if (attachmentField) attachmentField.textContent = attachment ? attachment.name : 'None';
                         overlay.hidden = false;
                     }}
                     function hideHomeFocusM365SendConfirm(slug) {{
@@ -26381,7 +26443,7 @@ def render_home_focus_work_panel(
                         if (!picker || !input) return;
                         if (picker.value) input.value = picker.value;
                     }}
-                    function syncHomeFocusCallContact(slug) {{
+                    function syncHomeFocusCallContact(slug, remember = true) {{
                         const picker = document.getElementById(`home-focus-call-select-${{slug}}`);
                         if (!picker) return;
                         const selected = picker.options[picker.selectedIndex];
@@ -26420,6 +26482,20 @@ def render_home_focus_work_panel(
                         if (missingState) missingState.hidden = !!(phone || cell);
                         if (callToField) callToField.value = selected.value || '';
                         if (visitToField) visitToField.value = selected.value || '';
+                        if (remember && selected.dataset.contactKey) {{
+                            try {{ sessionStorage.setItem(`home-focus-call-contact-${{slug}}`, selected.dataset.contactKey); }} catch (error) {{}}
+                        }}
+                    }}
+                    function restoreHomeFocusCallContact(slug) {{
+                        const picker = document.getElementById(`home-focus-call-select-${{slug}}`);
+                        if (!picker) return;
+                        let savedKey = '';
+                        try {{ savedKey = sessionStorage.getItem(`home-focus-call-contact-${{slug}}`) || ''; }} catch (error) {{}}
+                        if (savedKey) {{
+                            const savedOption = Array.from(picker.options).find(option => option.dataset.contactKey === savedKey);
+                            if (savedOption) picker.selectedIndex = savedOption.index;
+                        }}
+                        syncHomeFocusCallContact(slug, false);
                     }}
                     async function loadHomeFocusDraft(slug) {{
                         const form = document.getElementById(`home-focus-send-form-${{slug}}`);
@@ -26470,7 +26546,7 @@ def render_home_focus_work_panel(
                     document.addEventListener('DOMContentLoaded', function () {{
                         hideHomeFocusM365SendConfirm('{slug}');
                         setHomeFocusMode('{slug}', '{initial_mode}');
-                        syncHomeFocusCallContact('{slug}');
+                        restoreHomeFocusCallContact('{slug}');
                     }});
                 </script>
             </section>
@@ -36755,6 +36831,27 @@ def render_page(title, body, top_right="", show_title=True, show_nav=True, main_
                     .outreach-draft-form {{
                         display: grid;
                         gap: 10px;
+                    }}
+
+                    .outreach-draft-file {{
+                        width: 100%;
+                        padding: 10px 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: #fff;
+                        color: var(--text);
+                        font: inherit;
+                    }}
+
+                    .outreach-draft-file::file-selector-button {{
+                        margin-right: 12px;
+                        padding: 7px 12px;
+                        border: 0;
+                        border-radius: 8px;
+                        background: rgba(36, 92, 255, 0.1);
+                        color: var(--blue);
+                        font-weight: 700;
+                        cursor: pointer;
                     }}
 
                     .outreach-edit-note {{
