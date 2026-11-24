@@ -7,6 +7,26 @@ import daily_crm_report
 
 
 class DailyCrmReportTests(unittest.TestCase):
+    def test_successful_refresh_uses_combined_crm_result_like_management_checks(self):
+        refreshed = {"status": "ok", "activities": []}
+        combined = {
+            "status": "ok",
+            "activities": [{"subject": "Customer visit", "crm_type": "Meeting"}],
+        }
+        with patch.object(
+            daily_crm_report,
+            "sync_filemaker_crm_recent_cache",
+            return_value=refreshed,
+        ), patch.object(
+            daily_crm_report,
+            "fetch_crm_activities",
+            return_value=combined,
+        ) as fetch:
+            result = daily_crm_report.fetch_fresh_crm_activities()
+
+        self.assertIs(result, combined)
+        fetch.assert_called_once_with()
+
     def test_failed_fresh_refresh_marks_fallback_as_unsafe_for_delivery(self):
         with patch.object(
             daily_crm_report,

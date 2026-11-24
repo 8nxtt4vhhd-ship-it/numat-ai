@@ -55,7 +55,11 @@ def fetch_fresh_crm_activities():
     except Exception as error:
         refreshed = {"status": "error", "error_message": str(error)}
     if refreshed.get("status") == "ok":
-        return refreshed
+        # Match the management-check report: after refreshing the recent
+        # FileMaker overlay, read the combined CRM result so task-style
+        # activities and the durable history are evaluated consistently.
+        combined = fetch_crm_activities()
+        return combined if combined.get("status") == "ok" else refreshed
     fallback = dict(fetch_crm_activities() or {})
     fallback["fresh_refresh_failed"] = True
     fallback["fresh_refresh_status"] = str(refreshed.get("status") or "error")

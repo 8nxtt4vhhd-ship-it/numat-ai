@@ -1672,12 +1672,9 @@ def normalize_crm_row(row, index):
         "crm_is_complete": normalize_crm_completion(completion_value),
         "is_promise_of_order": crm_type.casefold() == "promise of order",
         "customer_label": str(
-            get_row_value(
-                row,
-                "emails::Customer",
-                recipient_company,
-                sender_company,
-            )
+            get_row_value(row, "emails::Customer", "Customer")
+            or recipient_company
+            or sender_company
         ).strip(),
         "sender_email": sender_email,
         "to": to_field,

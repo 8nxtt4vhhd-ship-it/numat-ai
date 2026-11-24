@@ -119,6 +119,17 @@ class CustomersViewTests(unittest.TestCase):
         self.assertEqual(activity["date_created"], "2026-11-17 09:30:00")
         self.assertEqual(activity["date_source"], "Date Created")
 
+    def test_logged_task_uses_customer_field_when_company_relationships_are_blank(self):
+        activity = crm.normalize_crm_row({
+            "emails::Date Created": "11/23/2026 17:30:00",
+            "emails::CRM Type": "Meeting",
+            "emails::Customer": "Cintas (Maumelle, AR)",
+            "emails::sender_email": "sales@numatsystems.com",
+            "emails::To": "customer@example.com",
+        }, 1)
+
+        self.assertEqual(activity["customer_label"], "Cintas (Maumelle, AR)")
+
     def test_manual_full_crm_sync_forces_complete_cache_rebuild(self):
         with patch.object(
             main,
