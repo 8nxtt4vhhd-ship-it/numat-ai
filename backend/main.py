@@ -16,7 +16,7 @@ import secrets
 from threading import Lock, Thread
 import time
 import traceback
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 import itsdangerous
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -10304,6 +10304,13 @@ async def post_weekly_kpi_todos_batch(request: Request):
     payload = await request.json()
     proposed = payload.get("actions", []) if isinstance(payload, dict) else []
     meeting_id = str(payload.get("meeting_id") or "").strip() if isinstance(payload, dict) else ""
+    result = create_weekly_kpi_todos(proposed, meeting_id)
+    if result.get("status") != "ok":
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+def create_weekly_kpi_todos(proposed, meeting_id=""):
     current_user = get_current_session_user() or {}
     items = load_weekly_kpi_todos()
     created = 0
@@ -10332,15 +10339,27 @@ async def post_weekly_kpi_todos_batch(request: Request):
         approved_actions.append({"text": text[:500], "owner": owner[:120]})
         created += 1
     if not created:
-        return JSONResponse(
-            {"status": "no_actions", "created": 0, "meeting_id": meeting_id, "error_message": "No valid selected actions were received."},
-            status_code=400,
-        )
+        return {"status": "no_actions", "created": 0, "meeting_id": meeting_id, "error_message": "No valid selected actions were received."}
     save_weekly_kpi_todos(items)
     record_audit_event("meeting-actions-ai-create", target=f"{created} actions", area="weekly-kpi")
     if meeting_id:
         update_weekly_kpi_meeting_actions(meeting_id, approved_actions)
     return {"status": "ok", "created": created, "meeting_id": meeting_id}
+
+
+@app.post("/weekly-kpi/todos/batch-form")
+def post_weekly_kpi_todos_batch_form(
+    action: list[str] = Form([]),
+    meeting_id: str = Form(""),
+):
+    proposed = []
+    for encoded in action[:25]:
+        try:
+            proposed.append(json.loads(unquote(str(encoded or ""))))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    create_weekly_kpi_todos(proposed, str(meeting_id or "").strip())
+    return RedirectResponse(url="/weekly-kpi-dashboard#weekly-actions", status_code=303)
 
 
 @app.get("/api/weekly-kpis")
@@ -10749,36 +10768,10 @@ def get_weekly_kpi_dashboard(refresh: str = "", message: str = "", presentation:
                 const actions = data.actions || [];
                 const list = items => (items || []).length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '<p class="small muted">None recorded.</p>';
                 const summary = `<div class="kpi-meeting-result"><h3>Meeting summary</h3><p>${escapeHtml(data.summary || 'No summary was produced.')}</p><h3>Key decisions</h3>${list(data.decisions)}<h3>Notable updates</h3>${list(data.updates)}<p><a href="/weekly-kpi-meetings/${encodeURIComponent(data.meeting_id)}" target="_blank" rel="noopener">Open saved meeting record</a></p></div>`;
-                const actionMarkup = actions.length ? actions.map((action, index) => `<label class="kpi-proposal"><input type="checkbox" checked data-index="${index}"><span><strong>${escapeHtml(action.text)}</strong>${action.owner ? `<small>${escapeHtml(action.owner)}</small>` : ''}</span></label>`).join('') + '<button class="button small-button" type="button" id="meeting-actions-add">Add selected actions</button>' : '<p class="small muted">No explicit actions were found.</p>';
+                const actionMarkup = actions.length ? `<form method="post" action="/weekly-kpi/todos/batch-form"><input type="hidden" name="meeting_id" value="${escapeHtml(data.meeting_id || '')}">${actions.map((action, index) => `<label class="kpi-proposal"><input type="checkbox" checked name="action" value="${encodeURIComponent(JSON.stringify(action))}" data-index="${index}"><span><strong>${escapeHtml(action.text)}</strong>${action.owner ? `<small>${escapeHtml(action.owner)}</small>` : ''}</span></label>`).join('')}<button class="button small-button" type="submit" id="meeting-actions-add">Add selected actions</button></form>` : '<p class="small muted">No explicit actions were found.</p>';
                 proposals.innerHTML = summary + '<h3>Proposed actions</h3>' + actionMarkup;
                 proposals.dataset.actions = JSON.stringify(actions);
                 status.textContent = 'Review the proposed actions.';
-                document.getElementById('meeting-actions-add')?.addEventListener('click', async () => {
-                    const selected = actions.filter((_, index) => proposals.querySelector(`input[data-index="${index}"]`)?.checked);
-                    const button = document.getElementById('meeting-actions-add');
-                    if (!selected.length) {
-                        status.textContent = 'Select at least one action to add.';
-                        return;
-                    }
-                    button.disabled = true;
-                    status.textContent = `Adding ${selected.length} selected action${selected.length === 1 ? '' : 's'}…`;
-                    try {
-                        const saved = await fetch('/api/weekly-kpi/todos/batch', {
-                            method:'POST',
-                            headers:{'Content-Type':'application/json'},
-                            body:JSON.stringify({actions:selected, meeting_id:data.meeting_id}),
-                        });
-                        const result = await saved.json().catch(() => ({}));
-                        if (!saved.ok || result.status !== 'ok' || Number(result.created || 0) < 1) {
-                            throw new Error(result.error_message || 'The selected actions could not be saved.');
-                        }
-                        status.textContent = `${result.created} action${result.created === 1 ? '' : 's'} added.`;
-                        location.href = '/weekly-kpi-dashboard#weekly-actions';
-                    } catch (error) {
-                        status.textContent = error?.message || 'The selected actions could not be saved. Please try again.';
-                        button.disabled = false;
-                    }
-                });
             };
             const transcribeSavedRecording = async () => {
                 retry.disabled = true;
@@ -10975,9 +10968,32 @@ def get_weekly_kpi_meeting_page(meeting_id: str, message: str = ""):
     current_user = get_current_session_user()
     actions = record.get("approved_actions") or []
     proposed_note = ""
+    meeting_actions_markup = render_meeting_action_list(actions)
     if not record.get("finalized_at") and record.get("proposed_actions"):
         actions = record.get("proposed_actions") or []
         proposed_note = "<p class='small muted'>These actions were proposed by AI but were not yet confirmed from the dashboard.</p>"
+        proposal_rows = []
+        for index, action in enumerate(actions):
+            if isinstance(action, str):
+                text = action.strip()
+                owner = ""
+            else:
+                text = str((action or {}).get("text") or (action or {}).get("action") or (action or {}).get("task") or "").strip()
+                owner = str((action or {}).get("owner") or (action or {}).get("assigned_to") or "").strip()
+            if not text:
+                continue
+            encoded = quote(json.dumps(action))
+            proposal_rows.append(
+                f'<label class="kpi-proposal"><input type="checkbox" checked name="action" value="{escape(encoded)}" data-index="{index}">'
+                f'<span><strong>{escape(text)}</strong>{f"<small>{escape(owner)}</small>" if owner else ""}</span></label>'
+            )
+        meeting_actions_markup = f'''
+            <form method="post" action="/weekly-kpi/todos/batch-form">
+                <input type="hidden" name="meeting_id" value="{escape(str(meeting_id))}">
+                {''.join(proposal_rows)}
+                <button class="button small-button" type="submit">Add selected actions</button>
+            </form>
+        '''
     transcript = str(record.get("transcript") or "")
     transcript_edit_note = ""
     if record.get("transcript_edited_at"):
@@ -11006,7 +11022,7 @@ def get_weekly_kpi_meeting_page(meeting_id: str, message: str = ""):
                 <div class="meeting-record-section"><h3>Key decisions</h3>{render_meeting_record_list(record.get('decisions'))}</div>
                 <div class="meeting-record-section"><h3>Notable updates</h3>{render_meeting_record_list(record.get('updates'))}</div>
             </div>
-            <div class="meeting-record-section"><h3>Actions</h3>{proposed_note}{render_meeting_action_list(actions)}</div>
+            <div class="meeting-record-section"><h3>Actions</h3>{proposed_note}{meeting_actions_markup}</div>
             <details class="meeting-transcript"><summary>View transcript</summary><div class="meeting-transcript-copy">{escape(transcript or 'No transcript recorded.')}</div>{transcript_edit_note}{transcript_editor}</details>
         </section>
     """

@@ -1,9 +1,11 @@
 import asyncio
+import json
 import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from urllib.parse import quote
 
 import main
 import crm
@@ -161,6 +163,50 @@ class WeeklyKpiPeriodTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in saved], ["Call the customer", "Review press capacity"])
         self.assertEqual(saved[1]["owner"], "Lois")
         update.assert_called_once()
+
+    def test_meeting_actions_standard_form_saves_selected_items(self):
+        encoded = quote(json.dumps({"text": "Review press output", "owner": "Lois"}))
+        with TemporaryDirectory() as temp_dir, patch.object(
+            main, "get_weekly_kpi_todos_path", return_value=Path(temp_dir) / "todos.json"
+        ), patch.object(main, "update_weekly_kpi_meeting_actions") as update, patch.object(
+            main, "record_audit_event"
+        ):
+            response = main.post_weekly_kpi_todos_batch_form([encoded], "meeting-2")
+            saved = main.load_weekly_kpi_todos()
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/weekly-kpi-dashboard#weekly-actions")
+        self.assertEqual(saved[0]["text"], "Review press output")
+        self.assertEqual(saved[0]["owner"], "Lois")
+        update.assert_called_once_with(
+            "meeting-2",
+            [{"text": "Review press output", "owner": "Lois"}],
+        )
+
+    def test_meeting_action_control_uses_standard_form_submission(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn('action="/weekly-kpi/todos/batch-form"', source)
+        self.assertIn('name="action"', source)
+        self.assertIn('type="submit" id="meeting-actions-add"', source)
+
+    def test_saved_meeting_page_can_add_unconfirmed_proposed_actions(self):
+        record = {
+            "id": "meeting-1",
+            "title": "Weekly meeting",
+            "created_at": "2026-11-24 10:00:00",
+            "proposed_actions": [{"text": "Call customer", "owner": "Ben"}],
+            "approved_actions": [],
+            "finalized_at": "",
+        }
+        with patch.object(main, "get_weekly_kpi_meeting", return_value=record):
+            response = main.get_weekly_kpi_meeting_page("meeting-1")
+
+        html = str(response)
+        self.assertIn("These actions were proposed by AI", html)
+        self.assertIn('action="/weekly-kpi/todos/batch-form"', html)
+        self.assertIn("Add selected actions", html)
+        self.assertIn("Call customer", html)
 
     def test_meeting_retry_explains_expired_sessions_before_parsing_json(self):
         source = Path(main.__file__).read_text(encoding="utf-8")
