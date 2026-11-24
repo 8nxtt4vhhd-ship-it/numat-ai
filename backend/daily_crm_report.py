@@ -80,6 +80,34 @@ def activities_for_day(crm_result, report_day):
     ]
 
 
+def activity_diagnostics(crm_result, report_day):
+    report_key = report_day.isoformat()
+    raw = [
+        item for item in crm_result.get("activities", [])
+        if str(item.get("date_created") or "")[:10] == report_key
+    ]
+    excluded = routine = unidentified = included = 0
+    for item in raw:
+        if item.get("exclude"):
+            excluded += 1
+        elif is_routine_non_sales_activity(item):
+            routine += 1
+        elif resolve_customer(item) == "Customer not identified":
+            unidentified += 1
+        else:
+            included += 1
+    return {
+        "report_date": report_key,
+        "source": str(crm_result.get("source") or "unknown"),
+        "synced_at": str(crm_result.get("synced_at") or crm_result.get("updated_at") or ""),
+        "raw_for_date": len(raw),
+        "excluded_internal": excluded,
+        "excluded_routine": routine,
+        "excluded_unidentified_customer": unidentified,
+        "included_for_ai": included,
+    }
+
+
 def is_routine_non_sales_activity(activity):
     text = " ".join(str(activity.get(key) or "") for key in ("subject", "body", "crm_type", "crm_category")).casefold()
     return any(phrase in text for phrase in (
@@ -206,12 +234,18 @@ def generate_report(report_day):
         raise RuntimeError(
             "The fresh FileMaker CRM update failed, so the Daily CRM Summary was not sent from stale data."
         )
+    diagnostics = activity_diagnostics(result, report_day)
     activities = activities_for_day(result, report_day)
     analysis = generate_analysis(report_day, activities) if activities else {
         "overall_summary": "No material CRM activity was recorded for this date.",
         "opportunities": [], "follow_ups": [], "concerns": [], "meaningful_updates": [],
     }
-    return {**build_email(report_day, analysis), "analysis": analysis, "activity_count": len(activities)}
+    return {
+        **build_email(report_day, analysis),
+        "analysis": analysis,
+        "activity_count": len(activities),
+        "diagnostics": diagnostics,
+    }
 
 
 def schedule_is_due(now=None, settings=None):
@@ -249,7 +283,14 @@ def deliver(report_day=None, dry_run=False, output_dir=None, force=False, recipi
     if not has_m365_reporting_config():
         return {"status": "m365_reporting_disabled", "key": key}
     result = send_m365_reporting_mail(recipient_list, report["subject"], report["body_html"], body_content_type="HTML")
-    log[key] = {"status": "sent" if result.get("status") == "ok" else "failed", "attempted_at": datetime.now(PLANT_TIMEZONE).isoformat(timespec="seconds"), "recipients": recipient_list, "error": str(result.get("error_message") or "")}
+    log[key] = {
+        "status": "sent" if result.get("status") == "ok" else "failed",
+        "attempted_at": datetime.now(PLANT_TIMEZONE).isoformat(timespec="seconds"),
+        "recipients": recipient_list,
+        "error": str(result.get("error_message") or ""),
+        "activity_count": report.get("activity_count", 0),
+        "diagnostics": report.get("diagnostics", {}),
+    }
     save_delivery_log(log)
     return {**result, "key": key, "recipients": recipient_list}
 

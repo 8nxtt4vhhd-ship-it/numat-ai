@@ -6699,7 +6699,24 @@ def get_admin_daily_crm_report_preview(report_date: str = ""):
         report = generate_report(parse_day(report_date))
     except Exception as error:
         return RedirectResponse(url="/admin-settings?error=" + quote(str(error)) + "#scheduled-daily-reports", status_code=303)
-    body = f'''<section class="panel"><div class="panel-head"><div><h2>{escape(report['subject'])}</h2><p class="subtle">Local preview only - no email was sent.</p></div><a class="button secondary small-button" href="/admin-settings#scheduled-daily-reports">Back to settings</a></div><div style="margin-top:18px">{report['body_html']}</div></section>'''
+    diagnostics = report.get("diagnostics", {})
+    diagnostic_cards = "".join(
+        f'<div><span class="label">{escape(label)}</span><strong>{escape(str(diagnostics.get(key, 0)))}</strong></div>'
+        for key, label in (
+            ("raw_for_date", "Raw activity"),
+            ("excluded_internal", "Internal excluded"),
+            ("excluded_routine", "Routine excluded"),
+            ("excluded_unidentified_customer", "No customer excluded"),
+            ("included_for_ai", "Sent to AI"),
+        )
+    )
+    diagnostic_summary = f'''
+        <section class="panel" style="margin-bottom:16px">
+            <div class="panel-head"><div><h2>CRM selection audit</h2><p class="subtle">Source: {escape(str(diagnostics.get('source') or 'unknown'))} · refreshed {escape(str(diagnostics.get('synced_at') or 'time unavailable'))}</p></div></div>
+            <div class="summary customer-summary" style="margin-top:12px">{diagnostic_cards}</div>
+        </section>
+    '''
+    body = f'''{diagnostic_summary}<section class="panel"><div class="panel-head"><div><h2>{escape(report['subject'])}</h2><p class="subtle">Local preview only - no email was sent.</p></div><a class="button secondary small-button" href="/admin-settings#scheduled-daily-reports">Back to settings</a></div><div style="margin-top:18px">{report['body_html']}</div></section>'''
     return render_page(title="Daily CRM Summary Preview", body=body)
 
 

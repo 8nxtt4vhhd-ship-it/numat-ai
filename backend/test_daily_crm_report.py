@@ -1,4 +1,7 @@
 from datetime import date, datetime
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -66,6 +69,24 @@ class DailyCrmReportTests(unittest.TestCase):
         rows = daily_crm_report.activities_for_day(result, date(2026, 11, 9))
         self.assertEqual([item["subject"] for item in rows], ["Sales call"])
 
+    def test_activity_diagnostics_record_each_exclusion_stage(self):
+        result = {"source": "combined_cache", "synced_at": "2026-11-09 18:00:00", "activities": [
+            {"date_created": "2026-11-09 08:00:00", "exclude": True},
+            {"date_created": "2026-11-09 09:00:00", "subject": "Payroll review", "customer_company": "Example"},
+            {"date_created": "2026-11-09 10:00:00", "subject": "Call notes"},
+            {"date_created": "2026-11-09 11:00:00", "subject": "Repair order", "customer_company": "Customer A"},
+            {"date_created": "2026-11-08 11:00:00", "subject": "Previous day", "customer_company": "Customer B"},
+        ]}
+
+        diagnostics = daily_crm_report.activity_diagnostics(result, date(2026, 11, 9))
+
+        self.assertEqual(diagnostics["raw_for_date"], 4)
+        self.assertEqual(diagnostics["excluded_internal"], 1)
+        self.assertEqual(diagnostics["excluded_routine"], 1)
+        self.assertEqual(diagnostics["excluded_unidentified_customer"], 1)
+        self.assertEqual(diagnostics["included_for_ai"], 1)
+        self.assertEqual(diagnostics["source"], "combined_cache")
+
     def test_filters_payroll_and_resolves_external_customer(self):
         result = {"activities": [
             {"date_created": "2026-11-09 08:00:00", "subject": "Payroll review", "exclude": False},
@@ -111,6 +132,30 @@ class DailyCrmReportTests(unittest.TestCase):
         timezone = ZoneInfo("America/Chicago")
         self.assertTrue(daily_crm_report.schedule_is_due(datetime(2026, 11, 9, 18, 5, tzinfo=timezone), settings))
         self.assertFalse(daily_crm_report.schedule_is_due(datetime(2026, 11, 8, 18, 5, tzinfo=timezone), settings))
+
+    def test_delivery_history_records_crm_selection_diagnostics(self):
+        report = {
+            "subject": "Daily CRM",
+            "body_html": "<p>Summary</p>",
+            "activity_count": 36,
+            "diagnostics": {"raw_for_date": 40, "included_for_ai": 36},
+        }
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "deliveries.json"
+            with (
+                patch.object(daily_crm_report, "delivery_log_path", return_value=log_path),
+                patch.object(daily_crm_report, "get_daily_crm_report_settings", return_value={"recipients": ["manager@example.com"]}),
+                patch.object(daily_crm_report, "generate_report", return_value=report),
+                patch.object(daily_crm_report, "has_m365_reporting_config", return_value=True),
+                patch.object(daily_crm_report, "send_m365_reporting_mail", return_value={"status": "ok"}),
+            ):
+                outcome = daily_crm_report.deliver(date(2026, 11, 9), force=True)
+
+            saved = json.loads(log_path.read_text(encoding="utf-8"))["daily-crm:2026-11-09"]
+
+        self.assertEqual(outcome["status"], "ok")
+        self.assertEqual(saved["activity_count"], 36)
+        self.assertEqual(saved["diagnostics"]["raw_for_date"], 40)
 
 
 if __name__ == "__main__":
